@@ -72,11 +72,20 @@ namespace Zigurat
   {
     this->_includes.clear();
     this->_links.clear();
-    if (ast.token.value == "SUITE") {
-      this->_suite(ast);
-    } else {
+    if (ast.token.value != "SUITE") {
       throw CompileException("wrong parse", ast);
     }
+
+    // A suite holds declarations -- TABLE, PROCEDURE, CLASS, PAGE, TYPE, ENUM,
+    // SEQUENCE -- and nothing else. Source that begins with anything else parses
+    // to an empty suite rather than an error, and used to compile to silence:
+    // Connector::compile("ECHO 'hello';") reported success and did nothing.
+    if (ast.args.empty()) {
+      throw CompileException("nothing to compile: a suite holds declarations, "
+			     "and statements belong in a procedure or a page", ast);
+    }
+
+    this->_suite(ast);
   }
 
   void Compiler::_build(std::string name, std::list<std::string>& requires, 

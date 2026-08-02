@@ -191,8 +191,36 @@ is linked against, so declaration order matters.
 
 The `Connector` class speaks the binary protocol on port 2160:
 
+Compile the procedure with `parsi` first — `Connector::compile` is not usable,
+see [Status](#status) — and note the explicit commit:
+
+```parsi
+PROCEDURE demo::add_visitor(name AS String)
+RETURNS Long
+REQUIRES demo::visitors, demo::visitors_id_sequence
+BEGIN
+    DECLARE id AS Long = demo::visitors_id_sequence::NEXT();
+    INSERT INTO demo::visitors VALUES (id, name);
+    TRANSACTION COMMIT;
+    RETURN id;
+END
+```
+
+**With `TRANSACTION/MODE: NON-AUTOCOMMIT` — the shipped default — a procedure
+called over the binary protocol has to commit its own work with
+`TRANSACTION COMMIT;`.** Nothing commits it afterwards: the connection closing
+discards it, and `Connector::commit()` does not pick it up. The alternative is
+`Connector::auto_commit(true)`, which makes the server commit after every
+`call`.
+
+Then the client calls it. Arguments go out after `call`, and the results come
+back as a sequence the caller drains:
+
 ```cpp
 #include "connector.hpp"
+#include "typelong.hpp"
+#include "typestring.hpp"
+#include <iostream>
 using namespace Zigurat;
 
 int main()
@@ -200,8 +228,15 @@ int main()
     Connector db;
     db.open("127.0.0.1", "2160", true, 10);
 
-    db.compile("ECHO 'compiled and run on the server';");
-    db.commit();
+    db.call("demo::add_visitor");
+    db.write_string(String("pitarugi"));
+
+    Long id(0);
+    for (ResultType r = db.result(); r != ResultType::SUCCESSFUL_DONE; r = db.result()) {
+        if (r == ResultType::CURSOR_OPEN)       db.columns();
+        else if (r == ResultType::RETURN_VALUE) db.fetch(id);
+    }
+    std::cout << "inserted visitor " << id.value() << std::endl;
 
     db.close();
     return 0;
@@ -214,7 +249,8 @@ c++ -std=c++11 -I$ZIGURATIP_HOME/include client.cpp -o client \
     -lType -lConfiguration -lCryptography -lEncoding
 ```
 
-Each connection opens a transaction; `commit()` and `rollback()` bound it.
+Each connection opens a transaction, and `commit()` and `rollback()` bound the
+statements the client itself issues.
 
 ### 4. Sessions on the web side
 
@@ -368,6 +404,17 @@ suite passes. Some things are known to be incomplete:
   the top-level `Makefile` for that reason. Until they are ported,
   `REQUIRES Session` has nothing to link against; the C++ `Session` in
   `HTTP` is complete and callable from generated pages in the meantime.
+- **Compiling over the binary protocol kills the server.** One
+  `Connector::compile(...)` and the process is gone, whatever the source says.
+  The parser recurses deeply and a pool worker's stack is a fraction of the main
+  thread's, which is why `parsi` compiles the same text without complaint. The
+  client is told the call succeeded, because what it reads is the acknowledgement
+  the server sent before it died. Compile with `parsi`; use the connector to
+  `call`.
+- **`Connector::commit()` does not commit a `call`'s work.** The transaction is
+  thread-local to the worker, and what the procedure wrote is not part of what
+  the commit sees. Either end the procedure with `TRANSACTION COMMIT;` or turn
+  on `Connector::auto_commit(true)`; both are verified to persist.
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
 - **`nbostream` and `hbostream` are identical** — the "network byte order"

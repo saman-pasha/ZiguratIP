@@ -27,10 +27,18 @@ Checks whether the connection is open or closed.
 
 Gets a Text, send it to the server for compile and gets the result of compilation back.
 
+**Do not use this.** It brings the server down — see the project README's Status
+section. Compile with `parsi` and use the connector to `call` what it built.
+
 ## AUTO_COMMIT(Bool) RETURNS Void
 
 Sets the connection auto commit option.
 If this option be true, the server calls a commit after all Remote Procedure Call.
+
+With the shipped `TRANSACTION/MODE: NON-AUTOCOMMIT` this is off, so a procedure
+that writes has to end with `TRANSACTION COMMIT;` or its work is discarded when
+the connection closes. `COMMIT()` on the connector does not stand in for it.
+See [TRANSACTION](transaction.md).
 
 ## ISOLATE(IsolationLevel) RETURNS Void
 
@@ -95,6 +103,42 @@ Rollbacks the current transaction.
 ## CLOSE() RETURNS Void
 
 Closes the connection if it is open.
+
+## Reading what a call sends back
+
+`CALL` returns as soon as the server has accepted the name. Everything the
+procedure produces — its cursors and its return value — arrives afterwards as a
+sequence of results, and the caller reads them until `SUCCESSFUL_DONE`:
+
+| `RESULT()` | What to do |
+|---|---|
+| `CURSOR_OPEN` | `COLUMNS()` — the column names of the cursor about to be read |
+| `CURSOR_FETCH` | `FETCH(...)` — one row, in the column order just given |
+| `CURSOR_CLOSE` | nothing; that cursor is finished |
+| `RETURN_VALUE` | `FETCH(value)` — the procedure's `RETURNS` value, once |
+| `SUCCESSFUL_DONE` | the call is over; stop reading |
+| `EXCEPTION_THROWN` | `RESULT()` throws it as a `ConnectorException` |
+
+A procedure returning `Void` sends no `RETURN_VALUE`, and one that runs no
+`SELECT` sends no cursor, so a loop that handles whatever turns up is the only
+form that works for every procedure:
+
+```cpp
+db.call("demo::add_visitor");
+db.write_string(String("pitarugi"));    // arguments go out after the call
+
+Long id(0);
+for (ResultType r = db.result(); r != ResultType::SUCCESSFUL_DONE; r = db.result()) {
+    if (r == ResultType::CURSOR_OPEN)       db.columns();
+    else if (r == ResultType::RETURN_VALUE) db.fetch(id);
+}
+std::cout << "inserted visitor " << id.value() << std::endl;
+```
+
+The value has to be read into the type the procedure declares — a `RETURNS Long`
+into a `Long` — because the fetch unpacks by type. Reading the results is not
+optional: what is left unread stays in the stream and the next call reads it
+instead of its own reply.
 
 ## Example
 

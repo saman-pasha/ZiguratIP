@@ -171,6 +171,14 @@ void handle_client()
       Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::EXCEPTION_THROWN);
       Globals::client_stream()->write_std_string(error.what());
       break;
+    } catch (...) {
+      // Nothing a client sends may bring the server down. Anything that gets
+      // this far ends the connection, not the process.
+      if (Globals::trace_mode())
+	std::cout << "error: unknown" << std::endl;
+      Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::EXCEPTION_THROWN);
+      Globals::client_stream()->write_std_string("unknown error");
+      break;
     }
   } while (function != "close");
 
