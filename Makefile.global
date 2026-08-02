@@ -148,4 +148,10 @@ clean:
 	$(RM) $(OBJECTS)
 	@echo [Project: $(PROJECT)] "******* clean done *******"
 
+# Building the dependency file compiles each source against home/include, so it
+# must not happen during the headers pass: at that point the projects later in
+# the build order have not published their headers yet, the -MM run fails, and
+# the resulting file is missing rules for the objects it could not analyse.
+ifeq ($(filter headers clean,$(MAKECMDGOALS)),)
 include $(DEPEND_FILE)
+endif
