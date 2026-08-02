@@ -13,7 +13,8 @@ namespace Zigurat
   filestream::filestream(std::basic_string<char> filename, std::ios_base::openmode mode)
     : hbostream(new std::basic_filebuf<char>())
   {
-    dynamic_cast<std::basic_filebuf<char>*>(this->rdbuf())->open(filename, mode);
+    if (dynamic_cast<std::basic_filebuf<char>*>(this->rdbuf())->open(filename, mode) == nullptr)
+      this->setstate(std::ios_base::failbit);
   }
 
   filestream& filestream::operator=(filestream&& other)
@@ -26,10 +27,22 @@ namespace Zigurat
     return *this;
   }
 
+  // std::fstream::open sets failbit when the buffer cannot be opened; going
+  // straight to the filebuf skipped that, so good() kept reporting success on a
+  // file that was never opened and callers checking it were none the wiser.
   void filestream::open(std::basic_string<char> filename, std::ios_base::openmode mode)
   {
-    dynamic_cast<std::basic_filebuf<char>*>(this->rdbuf())->close();
-    dynamic_cast<std::basic_filebuf<char>*>(this->rdbuf())->open(filename, mode);
+    std::basic_filebuf<char>* buffer = dynamic_cast<std::basic_filebuf<char>*>(this->rdbuf());
+    if (buffer == nullptr) {
+      this->setstate(std::ios_base::failbit);
+      return;
+    }
+
+    buffer->close();
+    if (buffer->open(filename, mode) == nullptr)
+      this->setstate(std::ios_base::failbit);
+    else
+      this->clear();
   }
   
   bool filestream::is_open() const

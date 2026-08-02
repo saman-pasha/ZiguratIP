@@ -5,8 +5,8 @@
 #   Test/run-e2e.sh            run every suite
 #   Test/run-e2e.sh Connector  run one suite
 #
-# Note: the shipped etc/ziguratip.conf has RESET_MODE: TRUE, so starting the
-# server truncates home/data/hexmap and home/data/data.
+# The suite keeps its own stores under /tmp, so it neither reads nor disturbs
+# home/data.
 
 set -e
 

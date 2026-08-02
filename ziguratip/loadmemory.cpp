@@ -7,6 +7,7 @@
 #include "configuration.h"
 #include "shared.cpp"
 #include <ctime>
+#include <fstream>
 
 
 using namespace Zigurat;
@@ -52,23 +53,42 @@ void load_memory(const Configuration &conf)
   }
   std::cout << "Transaction isolation level: '" << (int)Globals::default_isolation_level() << "'" << std::endl;
 
-  memory_hexmap_file.open(home_path + "data/hexmap", std::ios::in | std::ios::out |
-			  ((Globals::reset_mode()) ? (std::ios::binary | std::ios::trunc) : std::ios::binary));
-  memory_data_file.open(home_path + "data/data", std::ios::in | std::ios::out |
-			((Globals::reset_mode()) ? (std::ios::binary | std::ios::trunc) : std::ios::binary));
+  const std::string hexmap_path = home_path + "data/hexmap";
+  const std::string data_path = home_path + "data/data";
+
+  // Opening in|out requires the file to already exist, so without this a first
+  // run with RESET_MODE FALSE would refuse to start on an empty install. An
+  // empty store is a valid one: it initialises to zero pages.
+  if (!Globals::reset_mode()) {
+    for (const std::string& path : {hexmap_path, data_path}) {
+      std::ifstream probe(path);
+      if (!probe.good()) {
+	std::ofstream create(path, std::ios::binary | std::ios::app);
+	if (!create.good())
+	  throw ZiguratIPException("cannot create the store file '" + path + "'");
+      }
+    }
+  }
+
+  const std::ios_base::openmode store_mode = std::ios::in | std::ios::out | std::ios::binary |
+    (Globals::reset_mode() ? std::ios::trunc : (std::ios_base::openmode)0);
+
+  memory_hexmap_file.open(hexmap_path, store_mode);
+  memory_data_file.open(data_path, store_mode);
 
   if (!memory_hexmap_file.good())
     throw ZiguratIPException("invalid hexmap file");
   if (!memory_data_file.good())
     throw ZiguratIPException("invalid data file");
   
-  std::cout << "Hexmap file: '" << home_path + "data/hexmap" << "'" << std::endl;
-  std::cout << "Data file: '" << home_path + "data/data" << "'" << std::endl;
+  std::cout << "Hexmap file: '" << hexmap_path << "'" << std::endl;
+  std::cout << "Data file: '" << data_path << "'" << std::endl;
   
   Globals::set_memory_hexmap_stream(&memory_hexmap_file);
   Globals::set_memory_data_stream(&memory_data_file);
   
-  if (conf.get("/MEMORY/MEMORY_PAGE_SIZE", value)) {
+  if (conf.get("/MEMORY/PAGE_SIZE", value) || conf.get("/MEMORY/MEMORY_PAGE_SIZE", value) ||
+      conf.get("/MEMORY/BLOCK_SIZE", value)) {
     std::stringstream bsss(value);
     bsss >> memory_page_size;
   }

@@ -164,12 +164,15 @@ build.
 
 ## Notes
 
-**`RESET_MODE: TRUE`** in `home/etc/ziguratip.conf` erases `home/data` on every
-start, which is convenient for a demo and wrong for anything else. Set it to
-`FALSE` to keep your rows, and re-run `/setup.zt` only when you want more.
+**Your rows survive a restart.** `RESET_MODE` is `FALSE` in the shipped
+configuration, so the store in `home/data` is created on first use and kept
+afterwards — run `/setup.zt` once, not on every start. Set `RESET_MODE: TRUE`
+if you would rather start from an empty store each time; running `/setup.zt`
+twice simply seeds a second copy of everything.
 
-**Recompiling** an object while the server is running has no effect until it is
-restarted — shared objects are loaded once and cached.
+**Recompiling** an object takes effect on the next request, because
+`LIBRARY/CACHE_MODE` is `NONE`. Set it to `GLOBAL` or `LOCAL` for speed and a
+recompiled object is then ignored until the server restarts.
 
 **Reading the generated code** is the fastest way to understand a compile
 error. The `.out` file next to it holds the exact compiler invocation and its

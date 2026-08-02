@@ -83,15 +83,15 @@ export ZIGURATIP_HOME=$PWD/home
 export DYLD_LIBRARY_PATH=$ZIGURATIP_HOME/lib    # LD_LIBRARY_PATH on Linux
 ```
 
-Settings live in `home/etc/ziguratip.conf`. The defaults are usable as shipped,
-with one caveat worth knowing before you store anything real:
+Settings live in `home/etc/ziguratip.conf`, which documents every option the
+server reads. The shipped values run the demo and the tutorials as they are:
+the store is created on first use and kept between restarts, objects are
+reloaded rather than cached so a recompile takes effect, and requests are
+traced to stdout.
 
-```
-RESET_MODE: TRUE    # erases home/data on every start -- set to FALSE to keep data
-```
-
-Also check `COMPILER/CPP` and `COMPILER/CPP_FLAGS`; the shipped values assume a
-Red Hat toolchain and are ignored elsewhere.
+Two worth knowing about before anything busy: `TRACE_MODE` logs every request,
+and `LIBRARY/CACHE_MODE: NONE` reloads each compiled object on every use.
+Set the first to `FALSE` and the second to `GLOBAL` for a real deployment.
 
 ### Run
 
