@@ -176,12 +176,18 @@ BEGIN
 END
 
 PROCEDURE demo::add_visitor(name AS String)
-RETURNS Void
+RETURNS Long
 REQUIRES demo::visitors, demo::visitors_id_sequence
 BEGIN
-    INSERT INTO demo::visitors VALUES (demo::visitors_id_sequence::NEXT(), name);
+    DECLARE id AS Long = demo::visitors_id_sequence::NEXT();
+    INSERT INTO demo::visitors VALUES (id, name);
+    RETURN id;
 END
 ```
+
+A procedure that inserts returns the key it inserted. The sequence is consumed
+inside the procedure, so the caller has no other way to learn it, and both the
+web side and a connector client usually want it.
 
 Each object becomes a catalogue entry under `home/catalog` and a shared object
 under `home/ld`, which the server loads on demand. Anything named in `REQUIRES`
@@ -189,10 +195,9 @@ is linked against, so declaration order matters.
 
 ### 3. Talking to the server from C++
 
-The `Connector` class speaks the binary protocol on port 2160:
-
-Compile the procedure with `parsi` first — `Connector::compile` is not usable,
-see [Status](#status) — and note the explicit commit:
+The `Connector` class speaks the binary protocol on port 2160. Compile the
+procedure with `parsi` first — `Connector::compile` is not usable, see
+[Status](#status) — and note the explicit commit:
 
 ```parsi
 PROCEDURE demo::add_visitor(name AS String)

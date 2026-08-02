@@ -33,14 +33,18 @@ END
 -- Note the arithmetic: 'i % 5 + 2020' rather than '2020 + i % 5'. The typed
 -- operators are members of the left operand, so a literal cannot start the
 -- expression.
+-- A procedure that inserts returns the key it inserted, because the sequence is
+-- consumed in here and the caller has no other way to learn it. This one loads
+-- many rows, so it returns the last of them.
 PROCEDURE demo::bulk_load(rows AS Long)
-RETURNS Void
+RETURNS Long
 REQUIRES demo::sales, demo::sales_seq
 BEGIN
     DECLARE i AS Long = 0;
+    DECLARE id AS Long = 0;
     WHILE i < rows
     BEGIN
-        DECLARE id AS Long = demo::sales_seq::NEXT();
+        SET id = demo::sales_seq::NEXT();
 
         DECLARE region AS String = 'EU';
         IF i % 4 == 1 BEGIN SET region = 'US'; END
@@ -51,4 +55,6 @@ BEGIN
 
         SET i = i + 1;
     END
+
+    RETURN id;
 END

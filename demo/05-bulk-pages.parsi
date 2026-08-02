@@ -9,14 +9,16 @@ PUBLIC:
     OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
     BEGIN
         -- One HTTP request is one transaction, so all of these rows commit
-        -- together or none of them do.
-        CALL demo::bulk_load(500);
+        -- together or none of them do. The procedure returns the last key it
+        -- inserted, which is the only way to find out what the sequence gave it.
+        DECLARE last_id AS Long = demo::bulk_load(500);
 
         ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
         ECHO '<title>Bulk load</title></head>';
         ECHO '<body style="font-family:system-ui,sans-serif;background:#fff;color:#222;';
         ECHO 'margin:2em auto;max-width:44em">';
         ECHO '<h1>Loaded 500 sales rows</h1>';
+        ECHO '<p>Last id inserted: ', last_id, '</p>';
         ECHO '<p>Reload to add another 500. ';
         ECHO '<a href="report.zt">Query them</a>.</p>';
         ECHO '</body></html>';

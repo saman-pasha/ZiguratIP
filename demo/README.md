@@ -93,6 +93,13 @@ END
 the compiler links the listed shared objects, so **anything you name must
 already be compiled**. That is why the demo builds in numbered order.
 
+**A procedure that inserts returns the key it inserted.** The sequence is
+consumed inside the procedure, so the caller has no other way to learn which
+number the row got — and it usually needs it, to link a child row to it or to
+report it back. `demo::seed` uses the author id it gets back as the
+`author_id` of every book it then adds. `demo::bulk_load` inserts many rows, so
+it returns the last of them, and `bulk.zt` prints it.
+
 A procedure may call another, so long as it requires it:
 
 ```parsi
@@ -324,16 +331,19 @@ The `report` page ends with exactly this.
 
 ```parsi
 PROCEDURE demo::bulk_load(rows AS Long)
-RETURNS Void
+RETURNS Long
 REQUIRES demo::sales, demo::sales_seq
 BEGIN
     DECLARE i AS Long = 0;
+    DECLARE id AS Long = 0;
     WHILE i < rows
     BEGIN
-        DECLARE id AS Long = demo::sales_seq::NEXT();
+        SET id = demo::sales_seq::NEXT();
         INSERT INTO demo::sales VALUES (id, region, i % 5 + 2020, i * 10);
         SET i = i + 1;
     END
+
+    RETURN id;
 END
 ```
 
