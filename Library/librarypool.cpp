@@ -61,10 +61,8 @@ namespace Zigurat
 
       typename HandlesMap::iterator iter = this->_global_handles.find(path); 
       if (iter != this->_global_handles.end()) {
-	std::cout << "LDLIBRARY: GLOBAL FOUND" << std::endl;
 	return iter->second;
       }
-      std::cout << "LDLIBRARY: GLOBAL NOT FOUND" << std::endl;
       LibraryLoader::handle_t handle = LibraryLoader::handle(path);
       if (handle)
         this->_global_handles.insert({path, handle});
@@ -74,18 +72,15 @@ namespace Zigurat
 
       typename HandlesMap::iterator iter = this->_local_handles().find(path); 
       if (iter != this->_local_handles().end()) {
-	std::cout << "LDLIBRARY: LOCAL FOUND" << std::endl;
 	return iter->second;
       }
       LibraryLoader::handle_t handle = LibraryLoader::handle(path);
       if (handle)
         this->_local_handles().insert({path, handle});
-      std::cout << "LDLIBRARY: LOCAL NOT FOUND" << std::endl;
       return handle;
 
     }
 
-    std::cout << "LDLIBRARY: NOT FOUND" << std::endl;
     return LibraryLoader::handle(path);
   }
 
@@ -96,11 +91,9 @@ namespace Zigurat
       auto pair_iter = this->_global_symbols.equal_range(handle); 
       for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
 	if (iter->second.first == sym_name) {
-	  std::cout << "LDLIBRARY: GLOBAL SYM FOUND" << std::endl;
 	  return iter->second.second;
 	}
       }
-      std::cout << "LDLIBRARY: GLOBAL NOT SYM FOUND" << std::endl;
       LibraryLoader::symbol_t symbol = LibraryLoader::symbol(handle, sym_name);
       if (symbol)
         this->_global_symbols.insert({handle, {sym_name, symbol}});
@@ -111,11 +104,9 @@ namespace Zigurat
       auto pair_iter = this->_local_symbols().equal_range(handle); 
       for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
 	if (iter->second.first == sym_name) {
-	  std::cout << "LDLIBRARY: LOCAL SYM FOUND" << std::endl;
 	  return iter->second.second;
 	}
       }
-      std::cout << "LDLIBRARY: LOCAL NOT SYM FOUND" << std::endl;
 
       LibraryLoader::symbol_t symbol = LibraryLoader::symbol(handle, sym_name);
       if (symbol)
@@ -124,7 +115,6 @@ namespace Zigurat
     
     }
 
-    std::cout << "LDLIBRARY: NOT SYM FOUND" << std::endl;
     return LibraryLoader::symbol(handle, sym_name);
   }
 

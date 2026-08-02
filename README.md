@@ -108,7 +108,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 197 cases
+Starts a server, runs the full suite against it, stops it again. 200 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -385,6 +385,9 @@ Generate your own with `ca keygen` for anything real — see
 
 ## Licence
 
-Not yet chosen. Add a `LICENSE` file before making the repository public —
-without one, default copyright applies and nobody may use, copy or modify the
-code.
+[GNU General Public License v3](LICENSE). You may use, study, share and modify
+this software; anything you distribute that is derived from it has to carry the
+same licence and offer its source.
+
+Note that the vendored `zlib/` keeps its own, more permissive licence — see
+`zlib/README`.

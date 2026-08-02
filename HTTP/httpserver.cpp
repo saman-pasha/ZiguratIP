@@ -42,6 +42,12 @@ namespace Zigurat
 
       std::getline(stream, line);
 
+      // A keep-alive connection the client has closed reads as an empty line
+      // on a stream that is no longer good. That is the end of the
+      // conversation, not a malformed request -- treating it as one rejected
+      // every completed exchange with a 400.
+      if (line.empty() && !stream.good()) break;
+
       // HTTP lines end CRLF but getline only consumes the LF. Without dropping
       // the CR the blank separator line reads as "\r", so the end of the
       // headers is never recognised and every request fails to parse.

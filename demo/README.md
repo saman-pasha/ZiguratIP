@@ -359,8 +359,19 @@ build.
 **Your rows survive a restart.** `RESET_MODE` is `FALSE` in the shipped
 configuration, so the store in `home/data` is created on first use and kept
 afterwards — run `/setup.zt` once, not on every start. Set `RESET_MODE: TRUE`
-if you would rather start from an empty store each time; running `/setup.zt`
-twice simply seeds a second copy of everything.
+if you would rather start from an empty store each time.
+
+Requesting `/setup.zt` a second time is refused, and refused cleanly:
+
+```
+Zeytun Catch: unique key 'IDX_DEMO_AUTHORS_NAME'
+```
+
+`demo::authors.name` is a `UNIQUE KEY`, so the duplicate author is rejected —
+and because the request is one transaction, the books it had already inserted
+before reaching that point go back too. The catalogue still holds exactly seven
+rows, not eleven. That is the constraint and the rollback both doing their job,
+in one line of log.
 
 **Recompiling an object needs a server restart**, whatever `CACHE_MODE` says.
 Nothing calls `dlclose`, so the dynamic loader keeps handing back the copy it
