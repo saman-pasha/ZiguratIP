@@ -364,6 +364,11 @@ suite passes. Some things are known to be incomplete:
 - **`nbostream` and `hbostream` are identical** — the "network byte order"
   stream does not actually swap, so the wire format is host-endian.
 
+The CA material under `home/etc/ca` is a sample, named `dont-use-*` for the
+obvious reason: its private key is in this repository and is therefore public.
+Generate your own with `ca keygen` for anything real — see
+[home/etc/ca/README.md](home/etc/ca/README.md).
+
 ---
 
 ## Licence

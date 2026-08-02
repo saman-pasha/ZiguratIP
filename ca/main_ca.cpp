@@ -181,8 +181,8 @@ void help()
   std::cout << "\t--public           ::= public.key" << std::endl;
   std::cout << "\t--serial           ::= random 20 octet positive integer" << std::endl;
   std::cout << "\t--issuer           ::= ZIGURATIP_HOME/etc/ca/issuer.conf" << std::endl;
-  std::cout << "\t--issuer-pik       ::= ZIGURATIP_HOME/etc/ca/private.key" << std::endl;
-  std::cout << "\t--issuer-puk       ::= ZIGURATIP_HOME/etc/ca/public.key" << std::endl;
+  std::cout << "\t--issuer-pik       ::= ZIGURATIP_HOME/etc/ca/dont-use-private.key" << std::endl;
+  std::cout << "\t--issuer-puk       ::= ZIGURATIP_HOME/etc/ca/dont-use-public.key" << std::endl;
   std::cout << "\t--from             ::= now" << std::endl;
   std::cout << "\t--to               ::= --from + 1 year" << std::endl;
   std::cout << "\t--subject          ::= subject.conf" << std::endl;
@@ -355,7 +355,7 @@ void issue(int argc, char* argv[])
   // Issuer Private Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-pik", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/private.key");
+    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-private.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {
@@ -442,7 +442,7 @@ void pikval(int argc, char* argv[])
   // Issuer Private Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-pik", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/private.key");
+    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-private.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {
@@ -481,7 +481,7 @@ void pukval(int argc, char* argv[])
   // Issuer Public Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-puk", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/public.key");
+    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-public.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {

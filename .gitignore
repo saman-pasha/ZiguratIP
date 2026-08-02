@@ -19,25 +19,103 @@ home/log/*
 
 !home/*/.gitkeep
 
-# --- generated anywhere -----------------------------------------------------
-# Dependency files are regenerated per platform and compiler
-# (Project-OS-compiler.depend).
-*.depend
+# --- object and intermediate files ------------------------------------------
 *.o
+*.obj
 *.lo
+*.slo
+*.ko
+*.elf
+*.gch
+*.pch
+*.mod
+*.smod
+
+# --- static libraries -------------------------------------------------------
 *.a
+*.la
+*.lai
+*.lib
+
+# --- shared libraries -------------------------------------------------------
 *.so
 *.so.*
 *.dylib
+*.dylib.*
 *.dll
+*.exp
+
+# --- executables ------------------------------------------------------------
 *.exe
+*.app
+*.out
+*.bin
+*.hex
+*.i*86
+*.x86_64
+
+# --- debug and profiling ----------------------------------------------------
+*.pdb
+*.ilk
+*.idb
+*.dwo
+*.su
+*.dSYM/
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
+
+# --- archives ---------------------------------------------------------------
+# Distribution bundles, never sources.
+*.zip
+*.tar
+*.tar.*
+*.tgz
+*.tbz2
+*.txz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.jar
+*.iso
+*.dmg
+*.pkg
+
+# --- generated build metadata -----------------------------------------------
+# Dependency files are regenerated per platform and compiler
+# (Project-OS-compiler.depend).
+*.depend
+compile_commands.json
+zlib/configure.log
+zlib/zlib.pc
+zlib/Makefile.bak
+
+# --- keys ---------------------------------------------------------------
+# Nothing carrying a private key belongs in a repository.
+*.key
+*.pem
+*.p12
+*.pfx
+
+# The shipped CA material is a sample, named so that nobody mistakes it for
+# something usable. It is deliberately tracked so the ca examples run out of
+# the box; generate your own with "ca keygen" for anything real.
+!home/etc/ca/dont-use-*.key
 
 # --- editors and platforms --------------------------------------------------
 .DS_Store
 *~
 *.swp
+*.swo
 *.orig
 *.rej
 .vscode/
 .idea/
-compile_commands.json
+
+# Note: the site assets under home/http (*.png, *.ico, *.gif) and zlib's
+# documentation (*.pdf) are binary, but they are genuine sources rather than
+# build output. Do not add blanket image or document patterns here.
