@@ -2,11 +2,11 @@
 INCLUDE '<map>';
 INCLUDE '<mutex>';
 INCLUDE '<thread>';
-INCLUDE '"utility.h"';
-INCLUDE '"shahelper.h"';
-INCLUDE '"bufferstream.h"';
-INCLUDE '"httprequest.h"';
-INCLUDE '"httpresponse.h"';
+INCLUDE '"utility.hpp"';
+INCLUDE '"shahelper.hpp"';
+INCLUDE '"bufferstream.hpp"';
+INCLUDE '"httprequest.hpp"';
+INCLUDE '"httpresponse.hpp"';
 
 CLASS Session
 BEGIN

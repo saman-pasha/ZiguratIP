@@ -1,9 +1,9 @@
-#include "parser.h"
-#include "tokenizer.h"
-#include "parseexception.h"
-#include "utility.h"
+#include "parser.hpp"
+#include "tokenizer.hpp"
+#include "parseexception.hpp"
+#include "utility.hpp"
 #include <regex>
-#include "expression.h"
+#include "expression.hpp"
 
 
 namespace Zigurat

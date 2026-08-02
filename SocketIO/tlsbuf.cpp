@@ -1,11 +1,11 @@
-#include "tlsbuf.h"
+#include "tlsbuf.hpp"
 #include <cstring>
-#include "utility.h"
-#include "bufferstream.h"
-#include "arraystream.h"
-#include "tlsexception.h"
-#include "zlibhelper.h"
-#include "aes.h"
+#include "utility.hpp"
+#include "bufferstream.hpp"
+#include "arraystream.hpp"
+#include "tlsexception.hpp"
+#include "zlibhelper.hpp"
+#include "aes.hpp"
 #include <cassert>
 
 

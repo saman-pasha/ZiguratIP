@@ -1,6 +1,6 @@
-#include "httpserver.h"
-#include "httpexception.h"
-#include "utility.h"
+#include "httpserver.hpp"
+#include "httpexception.hpp"
+#include "utility.hpp"
 #include <iostream>
 #include <sstream>
 #include <chrono>
@@ -8,11 +8,11 @@
 #include <atomic>
 #include <cstring>
 #include <condition_variable>
-#include "httprequest.h"
-#include "httpresponse.h"
-#include "bufferstream.h"
-#include "tcpstream.h"
-#include "thread.h"
+#include "httprequest.hpp"
+#include "httpresponse.hpp"
+#include "bufferstream.hpp"
+#include "tcpstream.hpp"
+#include "thread.hpp"
 
 
 namespace Zigurat

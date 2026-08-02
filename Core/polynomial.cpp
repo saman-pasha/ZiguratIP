@@ -1,6 +1,6 @@
-#include "polynomial.h"
-#include "arithmeticexception.h"
-#include "utility.h"
+#include "polynomial.hpp"
+#include "arithmeticexception.hpp"
+#include "utility.hpp"
 #include <cmath>
 #include <cstring>
 #include <iostream>

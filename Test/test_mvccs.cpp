@@ -1,12 +1,12 @@
-#include "ztest.h"
-#include "dbfixture.h"
-#include "globals.h"
-#include "memory.h"
-#include "btreerecord.h"
-#include "btreeindex.h"
-#include "isolationlevel.h"
-#include "filestream.h"
-#include "bufferstream.h"
+#include "ztest.hpp"
+#include "dbfixture.hpp"
+#include "globals.hpp"
+#include "memory.hpp"
+#include "btreerecord.hpp"
+#include "btreeindex.hpp"
+#include "isolationlevel.hpp"
+#include "filestream.hpp"
+#include "bufferstream.hpp"
 #include <cstdio>
 #include <string>
 

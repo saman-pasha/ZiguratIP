@@ -1,7 +1,7 @@
-#include "base16.h"
-#include "basecodec.h"
-#include "encodingexception.h"
-#include "bufferstream.h"
+#include "base16.hpp"
+#include "basecodec.hpp"
+#include "encodingexception.hpp"
+#include "bufferstream.hpp"
 
 
 namespace Zigurat

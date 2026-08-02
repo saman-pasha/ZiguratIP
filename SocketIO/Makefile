@@ -2,18 +2,18 @@
 PROJECT := SocketIO
 TYPE := Library
 
-HEADERS := socketioexception.h \
-	socket.h \
-	socketbuf.h \
-	tcpbuf.h \
-	tcpstream.h \
-	tcpserver.h \
-	ipcbuf.h \
-	ipcstream.h \
-	ipcserver.h \
-	tls.h \
-	tlsbuf.h \
-	tlsstream.h
+HEADERS := socketioexception.hpp \
+	socket.hpp \
+	socketbuf.hpp \
+	tcpbuf.hpp \
+	tcpstream.hpp \
+	tcpserver.hpp \
+	ipcbuf.hpp \
+	ipcstream.hpp \
+	ipcserver.hpp \
+	tls.hpp \
+	tlsbuf.hpp \
+	tlsstream.hpp
 
 SOURCES := socket.cpp \
 	socketbuf.cpp \

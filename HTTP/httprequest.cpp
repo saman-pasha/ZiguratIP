@@ -1,7 +1,7 @@
-#include "httprequest.h"
-#include "bufferstream.h"
-#include "typechar.h"
-#include "utility.h"
+#include "httprequest.hpp"
+#include "bufferstream.hpp"
+#include "typechar.hpp"
+#include "utility.hpp"
 
 
 namespace Zigurat

@@ -1,4 +1,4 @@
-#include "arraystream.h"
+#include "arraystream.hpp"
 
 
 namespace Zigurat

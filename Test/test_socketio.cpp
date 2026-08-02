@@ -1,9 +1,9 @@
-#include "ztest.h"
-#include "socket.h"
-#include "socketbuf.h"
-#include "tcpbuf.h"
-#include "tcpstream.h"
-#include "tcpserver.h"
+#include "ztest.hpp"
+#include "socket.hpp"
+#include "socketbuf.hpp"
+#include "tcpbuf.hpp"
+#include "tcpstream.hpp"
+#include "tcpserver.hpp"
 #include <thread>
 #include <chrono>
 #include <atomic>

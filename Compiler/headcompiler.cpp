@@ -1,6 +1,6 @@
-#include "headcompiler.h"
-#include "compiler.h"
-#include "compileexception.h"
+#include "headcompiler.hpp"
+#include "compiler.hpp"
+#include "compileexception.hpp"
 
 
 namespace Zigurat

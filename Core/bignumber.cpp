@@ -1,6 +1,6 @@
-#include "bignumber.h"
-#include "utility.h"
-#include "arithmeticexception.h"
+#include "bignumber.hpp"
+#include "utility.hpp"
+#include "arithmeticexception.hpp"
 #include <iomanip>
 #include <cstring>
 

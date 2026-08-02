@@ -1,8 +1,8 @@
-#include "rsa.h"
-#include "shahelper.h"
+#include "rsa.hpp"
+#include "shahelper.hpp"
 #include <cmath>
 #include <cstring>
-#include "cryptographyexception.h"
+#include "cryptographyexception.hpp"
 #include <iostream>
 
 

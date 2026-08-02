@@ -1,4 +1,4 @@
-#include "binarystream.h"
+#include "binarystream.hpp"
 #include <limits>
 #include <vector>
 

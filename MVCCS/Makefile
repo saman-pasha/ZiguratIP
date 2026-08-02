@@ -2,25 +2,25 @@
 PROJECT := MVCCS
 TYPE := Library
 
-HEADERS := memorybase.h \
-	rowstate.h \
-	rowlock.h \
-	isolationlevel.h \
-	control.h \
-	pointer.h \
-	transaction.h \
-	memoryexception.h \
-	memory.h \
-	basetable.h \
-	indexexception.h \
-	btreerecord.h \
-	btreenode.h \
-	btreekey.h \
-	btreevalue.h \
-	btreeindex.h \
-	sequenceexception.h \
-	basesequence.h \
-	globals.h
+HEADERS := memorybase.hpp \
+	rowstate.hpp \
+	rowlock.hpp \
+	isolationlevel.hpp \
+	control.hpp \
+	pointer.hpp \
+	transaction.hpp \
+	memoryexception.hpp \
+	memory.hpp \
+	basetable.hpp \
+	indexexception.hpp \
+	btreerecord.hpp \
+	btreenode.hpp \
+	btreekey.hpp \
+	btreevalue.hpp \
+	btreeindex.hpp \
+	sequenceexception.hpp \
+	basesequence.hpp \
+	globals.hpp
 
 SOURCES := pointer.cpp \
 	transaction.cpp \

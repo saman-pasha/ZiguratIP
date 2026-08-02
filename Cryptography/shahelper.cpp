@@ -1,7 +1,7 @@
-#include "shahelper.h"
-#include "sha.h"
-#include "cryptographyexception.h"
-#include "utility.h"
+#include "shahelper.hpp"
+#include "sha.hpp"
+#include "cryptographyexception.hpp"
+#include "utility.hpp"
 
 
 namespace Zigurat

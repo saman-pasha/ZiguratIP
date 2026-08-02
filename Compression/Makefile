@@ -2,7 +2,7 @@
 PROJECT := Compression
 TYPE := Library
 
-HEADERS := zlibhelper.h
+HEADERS := zlibhelper.hpp
 
 SOURCES := zlibhelper.cpp
 

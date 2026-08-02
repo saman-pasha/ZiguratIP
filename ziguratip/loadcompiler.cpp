@@ -1,8 +1,8 @@
-#include "ziguratipexception.h"
-#include "configuration.h"
-#include "utility.h"
-#include "token.h"
-#include "tokenizer.h"
+#include "ziguratipexception.hpp"
+#include "configuration.hpp"
+#include "utility.hpp"
+#include "token.hpp"
+#include "tokenizer.hpp"
 #include "shared.cpp"
 
 

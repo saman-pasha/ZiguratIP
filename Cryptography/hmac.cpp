@@ -11,7 +11,7 @@
  *      the various SHA algorithms.
  */
 
-#include "sha.h"
+#include "sha.hpp"
 
 /*
  *  hmac

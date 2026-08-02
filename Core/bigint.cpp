@@ -1,9 +1,9 @@
-#include "bigint.h"
-#include "utility.h"
-#include "arithmeticexception.h"
+#include "bigint.hpp"
+#include "utility.hpp"
+#include "arithmeticexception.hpp"
 #include <iomanip>
 #include <cstring>
-#include "bufferstream.h"
+#include "bufferstream.hpp"
 
 
 namespace Zigurat

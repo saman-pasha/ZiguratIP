@@ -2,10 +2,10 @@
 PROJECT := Threading
 TYPE := Library
 
-HEADERS := threadingexception.h \
-	job.h \
-	thread.h \
-	threadpool.h
+HEADERS := threadingexception.hpp \
+	job.hpp \
+	thread.hpp \
+	threadpool.hpp
 
 SOURCES := threadpool.cpp
 

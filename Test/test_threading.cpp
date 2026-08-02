@@ -1,5 +1,5 @@
-#include "ztest.h"
-#include "threadpool.h"
+#include "ztest.hpp"
+#include "threadpool.hpp"
 #include <atomic>
 #include <chrono>
 #include <thread>

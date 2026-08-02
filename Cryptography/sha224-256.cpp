@@ -27,7 +27,7 @@
  *
  * Portability Issues:
  *   SHA-224 and SHA-256 are defined in terms of 32-bit "words".
- *   This code uses <stdint.h> (included via "sha.h") to define 32-
+ *   This code uses <stdint.h> (included via "sha.hpp") to define 32-
  *   and 8-bit unsigned integer types.  If your C compiler does not
  *   support 32-bit unsigned integers, this code is not
  *   appropriate.
@@ -40,8 +40,8 @@
  *   to hash the final few bits of the input.
  */
 
-#include "sha.h"
-#include "sha-private.h"
+#include "sha.hpp"
+#include "sha-private.hpp"
 
 /* Define the SHA shift, rotate left, and rotate right macros */
 #define  SHA256_SHR(bits,word) ((word) >> (bits))

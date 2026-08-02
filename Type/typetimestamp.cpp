@@ -1,7 +1,7 @@
-#include "typetimestamp.h"
-#include "typestring.h"
+#include "typetimestamp.hpp"
+#include "typestring.hpp"
 #include <cstring>
-#include "binarystream.h"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

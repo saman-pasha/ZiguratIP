@@ -1,8 +1,8 @@
-#include "compiler.h"
-#include "compileexception.h"
-#include "configuration.h"
-#include "wherecompiler.h"
-#include "headcompiler.h"
+#include "compiler.hpp"
+#include "compileexception.hpp"
+#include "configuration.hpp"
+#include "wherecompiler.hpp"
+#include "headcompiler.hpp"
 #include <sstream>
 
 

@@ -1,11 +1,11 @@
 #include <cstdlib>
 #include <csignal>
 #include <clocale>
-#include "utility.h"
-#include "globals.h"
-#include "argument.h"
-#include "configuration.h"
-#include "ziguratipexception.h"
+#include "utility.hpp"
+#include "globals.hpp"
+#include "argument.hpp"
+#include "configuration.hpp"
+#include "ziguratipexception.hpp"
 #include "shared.cpp"
 
 using namespace Zigurat;

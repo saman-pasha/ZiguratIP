@@ -114,7 +114,7 @@ all: $(HEADERS_DEST) $(OUTPUT)
 
 # Publish this project's headers without compiling anything. The modules are
 # mutually recursive at the header level -- Core/bigint.cpp includes StreamIO's
-# bufferstream.h, and StreamIO builds after Core -- so dependency generation
+# bufferstream.hpp, and StreamIO builds after Core -- so dependency generation
 # cannot run until every public header is already in place. The top level runs
 # this pass over all projects first.
 headers:

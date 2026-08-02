@@ -1,7 +1,7 @@
-#include "base64url.h"
-#include "basecodec.h"
-#include "encodingexception.h"
-#include "bufferstream.h"
+#include "base64url.hpp"
+#include "basecodec.hpp"
+#include "encodingexception.hpp"
+#include "bufferstream.hpp"
 #include <cmath>
 
 

@@ -1,7 +1,7 @@
-#include "ztest.h"
-#include "configuration.h"
-#include "argument.h"
-#include "utility.h"
+#include "ztest.hpp"
+#include "configuration.hpp"
+#include "argument.hpp"
+#include "utility.hpp"
 #include <sstream>
 #include <list>
 

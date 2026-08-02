@@ -2,8 +2,8 @@
 PROJECT := Library
 TYPE := Library
 
-HEADERS := libraryloader.h \
-	librarypool.h
+HEADERS := libraryloader.hpp \
+	librarypool.hpp
 
 SOURCES := libraryloader.cpp \
 	librarypool.cpp

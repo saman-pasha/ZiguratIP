@@ -2,13 +2,13 @@
 PROJECT := HTTP
 TYPE := Library
 
-HEADERS := session.h \
-	httpexception.h \
-	httprequest.h \
-	httpresponse.h \
-	httpserver.h \
-	basepage.h \
-	http.h
+HEADERS := session.hpp \
+	httpexception.hpp \
+	httprequest.hpp \
+	httpresponse.hpp \
+	httpserver.hpp \
+	basepage.hpp \
+	http.hpp
 
 SOURCES := session.cpp \
 	httpexception.cpp \

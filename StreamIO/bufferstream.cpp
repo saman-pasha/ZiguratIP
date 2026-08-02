@@ -1,4 +1,4 @@
-#include "bufferstream.h"
+#include "bufferstream.hpp"
 
 
 namespace Zigurat

@@ -2,18 +2,18 @@
 PROJECT := Compiler
 TYPE := Library
 
-HEADERS := tokenizeexception.h \
-	tokentype.h \
-	token.h \
-	tokenizer.h \
-	expression.h \
-	parseexception.h \
-	parser.h \
-	compileexception.h \
-	headcompiler.h \
-	exprcompiler.h \
-	wherecompiler.h \
-	compiler.h
+HEADERS := tokenizeexception.hpp \
+	tokentype.hpp \
+	token.hpp \
+	tokenizer.hpp \
+	expression.hpp \
+	parseexception.hpp \
+	parser.hpp \
+	compileexception.hpp \
+	headcompiler.hpp \
+	exprcompiler.hpp \
+	wherecompiler.hpp \
+	compiler.hpp
 
 SOURCES := tokenizeexception.cpp \
 	tokenizer.cpp \

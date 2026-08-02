@@ -1,7 +1,7 @@
-#include "ztest.h"
-#include "utility.h"
-#include "array.h"
-#include "bigint.h"
+#include "ztest.hpp"
+#include "utility.hpp"
+#include "array.hpp"
+#include "bigint.hpp"
 #include <cstring>
 
 using namespace Zigurat;

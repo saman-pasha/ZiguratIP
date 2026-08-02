@@ -1,7 +1,7 @@
-#include "ztest.h"
-#include "types.h"
-#include "typevector.h"
-#include "arraystream.h"
+#include "ztest.hpp"
+#include "types.hpp"
+#include "typevector.hpp"
+#include "arraystream.hpp"
 #include <cstring>
 
 using namespace Zigurat;

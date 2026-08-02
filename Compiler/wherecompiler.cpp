@@ -1,6 +1,6 @@
-#include "wherecompiler.h"
-#include "expression.h"
-#include "compiler.h"
+#include "wherecompiler.hpp"
+#include "expression.hpp"
+#include "compiler.hpp"
 #include <iostream>
 
 

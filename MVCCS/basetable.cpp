@@ -1,4 +1,4 @@
-#include "basetable.h"
+#include "basetable.hpp"
 
 
 namespace Zigurat

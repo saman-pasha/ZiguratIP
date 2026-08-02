@@ -1,8 +1,8 @@
-#include "ztest.h"
-#include "arraystream.h"
-#include "arraybuf.h"
-#include "bufferstream.h"
-#include "filestream.h"
+#include "ztest.hpp"
+#include "arraystream.hpp"
+#include "arraybuf.hpp"
+#include "bufferstream.hpp"
+#include "filestream.hpp"
 #include <cstdio>
 #include <cstring>
 

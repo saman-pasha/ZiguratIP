@@ -1,6 +1,6 @@
-#include "ztest.h"
-#include "dbfixture.h"
-#include "transaction.h"
+#include "ztest.hpp"
+#include "dbfixture.hpp"
+#include "transaction.hpp"
 #include <thread>
 #include <atomic>
 #include <chrono>

@@ -1,7 +1,7 @@
-#include "basepage.h"
-#include "binarystream.h"
-#include "httprequest.h"
-#include "httpresponse.h"
+#include "basepage.hpp"
+#include "binarystream.hpp"
+#include "httprequest.hpp"
+#include "httpresponse.hpp"
 
 
 namespace Zigurat

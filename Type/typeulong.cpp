@@ -1,8 +1,8 @@
-#include "typeulong.h"
-#include "typeint.h"
-#include "typeuint.h"
-#include "typestring.h"
-#include "binarystream.h"
+#include "typeulong.hpp"
+#include "typeint.hpp"
+#include "typeuint.hpp"
+#include "typestring.hpp"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

@@ -1,4 +1,4 @@
-#include "nbostream.h"
+#include "nbostream.hpp"
 #include <iostream>
 
 

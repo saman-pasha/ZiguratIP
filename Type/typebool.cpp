@@ -1,7 +1,7 @@
-#include "typebool.h"
-#include "typestring.h"
+#include "typebool.hpp"
+#include "typestring.hpp"
 #include <sstream>
-#include "binarystream.h"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

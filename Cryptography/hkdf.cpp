@@ -11,7 +11,7 @@
  *      expressed in terms of the various SHA algorithms.
  */
 
-#include "sha.h"
+#include "sha.hpp"
 #include <cstring>
 #include <cstdlib>
 

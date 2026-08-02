@@ -3,13 +3,13 @@
 #include <string>
 #include <cstring>
 #include <ctime>
-#include "certificateexception.h"
-#include "utility.h"
-#include "argument.h"
-#include "bigint.h"
-#include "x509.h"
-#include "rsa.h"
-#include "bufferstream.h"
+#include "certificateexception.hpp"
+#include "utility.hpp"
+#include "argument.hpp"
+#include "bigint.hpp"
+#include "x509.hpp"
+#include "rsa.hpp"
+#include "bufferstream.hpp"
 #include <sstream>
 
 

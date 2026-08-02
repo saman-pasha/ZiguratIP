@@ -1,4 +1,4 @@
-#include "ipcstream.h"
+#include "ipcstream.hpp"
 
 
 namespace Zigurat

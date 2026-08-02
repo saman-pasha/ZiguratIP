@@ -1,10 +1,10 @@
-#include "ztest.h"
-#include "tokenizer.h"
-#include "token.h"
-#include "parser.h"
-#include "expression.h"
-#include "utility.h"
-#include "zexception.h"
+#include "ztest.hpp"
+#include "tokenizer.hpp"
+#include "token.hpp"
+#include "parser.hpp"
+#include "expression.hpp"
+#include "utility.hpp"
+#include "zexception.hpp"
 #include <string>
 #include <list>
 #include <fstream>
@@ -393,7 +393,7 @@ ZTEST(Grammar, suite_directives_need_an_object_after_them)
   ZCHECK(!parses("SUITE", "LINK '-lm';"));
 
   ZCHECK(parses("SUITE", "INCLUDE '<vector>' ; TABLE t BEGIN COLUMN id AS Long PRIMARY KEY; END"));
-  ZCHECK(parses("SUITE", "INCLUDE '\"header.h\"' ; TABLE t BEGIN COLUMN id AS Long PRIMARY KEY; END"));
+  ZCHECK(parses("SUITE", "INCLUDE '\"header.hpp\"' ; TABLE t BEGIN COLUMN id AS Long PRIMARY KEY; END"));
 
   Expression ast = parse("SUITE",
 			 "INCLUDE '<vector>'; "

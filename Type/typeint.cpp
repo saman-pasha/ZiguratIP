@@ -1,6 +1,6 @@
-#include "typeint.h"
-#include "typestring.h"
-#include "binarystream.h"
+#include "typeint.hpp"
+#include "typestring.hpp"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

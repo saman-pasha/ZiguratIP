@@ -1,7 +1,7 @@
-#include "httpresponse.h"
-#include "utility.h"
-#include "httprequest.h"
-#include "textstream.h"
+#include "httpresponse.hpp"
+#include "utility.hpp"
+#include "httprequest.hpp"
+#include "textstream.hpp"
 #include <ctime>
 
 

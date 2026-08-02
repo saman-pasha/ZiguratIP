@@ -1,6 +1,6 @@
 
-INCLUDE '"shahelper.h"';
-INCLUDE '"utility.h"';
+INCLUDE '"shahelper.hpp"';
+INCLUDE '"utility.hpp"';
 
 PAGE Mem
 REQUIRES Connector

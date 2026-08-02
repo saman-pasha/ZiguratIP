@@ -1,8 +1,8 @@
-#include "configuration.h"
-#include "configurationexception.h"
+#include "configuration.hpp"
+#include "configurationexception.hpp"
 #include <sstream>
 #include <fstream>
-#include "utility.h"
+#include "utility.hpp"
 
 
 namespace Zigurat

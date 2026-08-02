@@ -2,13 +2,13 @@
 PROJECT := Cryptography
 TYPE := Library
 
-HEADERS := sha-private.h \
-	sha.h \
-	shahelper.h \
-	aes.h \
-	rsa.h \
-	certificateexception.h \
-	x509.h
+HEADERS := sha-private.hpp \
+	sha.hpp \
+	shahelper.hpp \
+	aes.hpp \
+	rsa.hpp \
+	certificateexception.hpp \
+	x509.hpp
 
 SOURCES := sha1.cpp \
 	sha224-256.cpp \

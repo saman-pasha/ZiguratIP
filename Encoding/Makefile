@@ -2,14 +2,14 @@
 PROJECT := Encoding
 TYPE := Library
 
-HEADERS := base16.h \
-	base32.h \
-	base32hex.h \
-	base64.h \
-	base64url.h \
-	cte.h \
-	der.h \
-	asn1.h
+HEADERS := base16.hpp \
+	base32.hpp \
+	base32hex.hpp \
+	base64.hpp \
+	base64url.hpp \
+	cte.hpp \
+	der.hpp \
+	asn1.hpp
 
 SOURCES := base16.cpp \
 	base32.cpp \

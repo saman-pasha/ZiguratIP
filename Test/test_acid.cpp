@@ -1,5 +1,5 @@
-#include "ztest.h"
-#include "dbfixture.h"
+#include "ztest.hpp"
+#include "dbfixture.hpp"
 
 using namespace Zigurat;
 

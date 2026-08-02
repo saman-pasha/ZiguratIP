@@ -1,10 +1,10 @@
-#include "cte.h"
-#include "base16.h"
-#include "base32.h"
-#include "base32hex.h"
-#include "base64.h"
-#include "base64url.h"
-#include "encodingexception.h"
+#include "cte.hpp"
+#include "base16.hpp"
+#include "base32.hpp"
+#include "base32hex.hpp"
+#include "base64.hpp"
+#include "base64url.hpp"
+#include "encodingexception.hpp"
 
 
 namespace Zigurat

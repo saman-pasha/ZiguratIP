@@ -1,7 +1,7 @@
-#include "ztest.h"
-#include "shahelper.h"
-#include "utility.h"
-#include "bufferstream.h"
+#include "ztest.hpp"
+#include "shahelper.hpp"
+#include "utility.hpp"
+#include "bufferstream.hpp"
 #include <cstring>
 
 using namespace Zigurat;

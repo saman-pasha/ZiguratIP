@@ -1,7 +1,7 @@
-#include "compiler.h"
-#include "compileexception.h"
-#include "utility.h"
-#include "shahelper.h"
+#include "compiler.hpp"
+#include "compileexception.hpp"
+#include "utility.hpp"
+#include "shahelper.hpp"
 #include <sstream>
 
 
@@ -143,15 +143,15 @@ namespace Zigurat
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
 
-    head << "#include \"globals.h\"" << std::endl;
-    head << "#include \"basetable.h\"" << std::endl;
-    head << "#include \"btreeindex.h\"" << std::endl;
+    head << "#include \"globals.hpp\"" << std::endl;
+    head << "#include \"basetable.hpp\"" << std::endl;
+    head << "#include \"btreeindex.hpp\"" << std::endl;
     
     if (ast.args.size() > 1 && ast.args[2].token.value == "REQUIRES") {
       for (const Expression& expr : ast.args[1].args) {
 	std::string inc_name = this->_include_name(expr);
 	requires.push_back(inc_name);
-	head << "#include \"" << inc_name << ".h\"" << std::endl;
+	head << "#include \"" << inc_name << ".hpp\"" << std::endl;
       }
     }
 
@@ -223,7 +223,7 @@ namespace Zigurat
 
     // implementation file
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     impl << "std::string " << name << "::name = \"" << type_name << "\";" << std::endl;
     impl << "Zigurat::hashkey_t " << name << "::hash_key = {";
@@ -522,14 +522,14 @@ namespace Zigurat
       
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
-    head << "#include \"globals.h\"" << std::endl;
+    head << "#include \"globals.hpp\"" << std::endl;
     
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
 	  std::string inc_name = this->_include_name(ch_expr);
 	  requires.push_back(inc_name);
-	  head << "#include \"" << inc_name << ".h\"" << std::endl;
+	  head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 	}
 	break;
       }
@@ -547,7 +547,7 @@ namespace Zigurat
 
     head << "extern \"C\" void call();" << std::endl;
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     
     impl << TAB1 << this->_type_name(ast.args[2].args[0]);
@@ -692,16 +692,16 @@ namespace Zigurat
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
 
-    head << "#include \"globals.h\"" << std::endl;
+    head << "#include \"globals.hpp\"" << std::endl;
     if (is_page)
-      head << "#include \"basepage.h\"" << std::endl;
+      head << "#include \"basepage.hpp\"" << std::endl;
 
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "INHERITS" || expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
 	  std::string inc_name = this->_include_name(ch_expr);
 	  requires.push_back(inc_name);
-	  head << "#include \"" << inc_name << ".h\"" << std::endl;
+	  head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 	}
       }
     }
@@ -823,7 +823,7 @@ namespace Zigurat
 
     // implementation file
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     
     for (const Expression& expr : ast.args) {
@@ -961,14 +961,14 @@ namespace Zigurat
   
     std::string inc_name = this->_include_name(ast.args[ast.args.size() - 1]);
     requires.push_back(inc_name);
-    head << "#include \"" << inc_name << ".h\"" << std::endl;
+    head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
 	  std::string inc_name = this->_include_name(ch_expr);
 	  requires.push_back(inc_name);
-	  head << "#include \"" << inc_name << ".h\"" << std::endl;
+	  head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 	}
       }
     }
@@ -1002,7 +1002,7 @@ namespace Zigurat
  
     // implementation file
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     this->_close_namespace(ast.args[0], impl);
 
@@ -1053,7 +1053,7 @@ namespace Zigurat
  
     // implementation file
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     this->_close_namespace(ast.args[0], impl);
 
@@ -1091,14 +1091,14 @@ namespace Zigurat
 
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
-    head << "#include \"basesequence.h\"" << std::endl;
+    head << "#include \"basesequence.hpp\"" << std::endl;
     size_t offset = 0;
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
 	  std::string inc_name = this->_include_name(ch_expr);
 	  requires.push_back(inc_name);
-	  head << "#include \"" << inc_name << ".h\"" << std::endl;
+	  head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 	}
 	offset = 1;
 	break;
@@ -1123,7 +1123,7 @@ namespace Zigurat
  
     // implementation file
 
-    impl << "#include \"" << include_name << ".h\"" << std::endl;
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
 
     impl << TAB1 << "const Zigurat::hashkey_t " << type_name << "::hash_key = {";

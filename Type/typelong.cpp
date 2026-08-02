@@ -1,8 +1,8 @@
-#include "typelong.h"
-#include "typeint.h"
-#include "typestring.h"
+#include "typelong.hpp"
+#include "typeint.hpp"
+#include "typestring.hpp"
 #include <limits>
-#include "binarystream.h"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

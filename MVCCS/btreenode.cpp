@@ -1,5 +1,5 @@
-#include "btreenode.h"
-#include "binarystream.h"
+#include "btreenode.hpp"
+#include "binarystream.hpp"
 
 
 namespace Zigurat

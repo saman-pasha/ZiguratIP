@@ -2,9 +2,9 @@
 PROJECT := Connector
 TYPE := Library
 
-HEADERS := connector.h \
-	connectorexception.h \
-	resulttype.h
+HEADERS := connector.hpp \
+	connectorexception.hpp \
+	resulttype.hpp
 
 SOURCES := connector.cpp
 

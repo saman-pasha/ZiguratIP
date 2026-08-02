@@ -2,14 +2,14 @@
 PROJECT := StreamIO
 TYPE := Library
 
-HEADERS := binarystream.h \
-	hbostream.h \
-	nbostream.h \
-	bufferstream.h \
-	filestream.h \
-	textstream.h \
-	arraybuf.h \
-	arraystream.h
+HEADERS := binarystream.hpp \
+	hbostream.hpp \
+	nbostream.hpp \
+	bufferstream.hpp \
+	filestream.hpp \
+	textstream.hpp \
+	arraybuf.hpp \
+	arraystream.hpp
 
 SOURCES := binarystream.cpp \
 	hbostream.cpp \

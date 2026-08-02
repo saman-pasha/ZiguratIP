@@ -1,10 +1,10 @@
-#include "ziguratipexception.h"
-#include "globals.h"
-#include "filestream.h"
-#include "memory.h"
-#include "btreerecord.h"
-#include "btreeindex.h"
-#include "configuration.h"
+#include "ziguratipexception.hpp"
+#include "globals.hpp"
+#include "filestream.hpp"
+#include "memory.hpp"
+#include "btreerecord.hpp"
+#include "btreeindex.hpp"
+#include "configuration.hpp"
 #include "shared.cpp"
 #include <ctime>
 #include <fstream>

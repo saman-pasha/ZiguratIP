@@ -2,7 +2,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/types.h>
-#include "utility.h"
+#include "utility.hpp"
 #include <iostream>
 #include <fstream>
 #if defined(_WIN32) || defined(_WIN64)

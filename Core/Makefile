@@ -2,11 +2,11 @@
 PROJECT := Core
 TYPE := Library
 
-HEADERS := zexception.h \
-	utility.h \
-	array.h \
-	polynomial.h \
-	bigint.h
+HEADERS := zexception.hpp \
+	utility.hpp \
+	array.hpp \
+	polynomial.hpp \
+	bigint.hpp
 
 SOURCES := zexception.cpp \
 	utility.cpp \

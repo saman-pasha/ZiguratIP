@@ -1,7 +1,7 @@
-#include "ziguratipexception.h"
-#include "librarypool.h"
-#include "configuration.h"
-#include "utility.h"
+#include "ziguratipexception.hpp"
+#include "librarypool.hpp"
+#include "configuration.hpp"
+#include "utility.hpp"
 #include "shared.cpp"
 
 

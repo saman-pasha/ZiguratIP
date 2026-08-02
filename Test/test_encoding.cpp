@@ -1,12 +1,12 @@
-#include "ztest.h"
-#include "base16.h"
-#include "base32.h"
-#include "base32hex.h"
-#include "base64.h"
-#include "base64url.h"
-#include "cte.h"
-#include "bufferstream.h"
-#include "utility.h"
+#include "ztest.hpp"
+#include "base16.hpp"
+#include "base32.hpp"
+#include "base32hex.hpp"
+#include "base64.hpp"
+#include "base64url.hpp"
+#include "cte.hpp"
+#include "bufferstream.hpp"
+#include "utility.hpp"
 #include <cstring>
 
 using namespace Zigurat;

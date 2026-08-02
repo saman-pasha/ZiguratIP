@@ -1,6 +1,6 @@
-#include "zlibhelper.h"
+#include "zlibhelper.hpp"
 #include "zlib.h"
-#include "compressionexception.h"
+#include "compressionexception.hpp"
 #include <cassert>
 
 

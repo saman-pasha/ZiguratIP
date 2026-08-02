@@ -1,8 +1,8 @@
-#include "session.h"
-#include "httprequest.h"
-#include "httpresponse.h"
-#include "shahelper.h"
-#include "utility.h"
+#include "session.hpp"
+#include "httprequest.hpp"
+#include "httpresponse.hpp"
+#include "shahelper.hpp"
+#include "utility.hpp"
 #include <random>
 #include <sstream>
 

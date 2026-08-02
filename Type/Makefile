@@ -2,26 +2,26 @@
 PROJECT := Type
 TYPE := Library
 
-HEADERS := tdbyte.h \
-	typeobject.h \
-	typebool.h \
-	typechar.h \
-	typebyte.h \
-	typeubyte.h \
-	typeshort.h \
-	typeushort.h \
-	typeint.h \
-	typeuint.h \
-	typelong.h \
-	typeulong.h \
-	typefloat.h \
-	typedouble.h \
-	typereal.h \
-	typetimestamp.h \
-	typestring.h \
-	typetext.h \
-	typevector.h \
-	types.h
+HEADERS := tdbyte.hpp \
+	typeobject.hpp \
+	typebool.hpp \
+	typechar.hpp \
+	typebyte.hpp \
+	typeubyte.hpp \
+	typeshort.hpp \
+	typeushort.hpp \
+	typeint.hpp \
+	typeuint.hpp \
+	typelong.hpp \
+	typeulong.hpp \
+	typefloat.hpp \
+	typedouble.hpp \
+	typereal.hpp \
+	typetimestamp.hpp \
+	typestring.hpp \
+	typetext.hpp \
+	typevector.hpp \
+	types.hpp
 
 SOURCES := tdbyte.cpp \
 	typeobject.cpp \

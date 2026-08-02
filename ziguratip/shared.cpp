@@ -1,9 +1,9 @@
 #include <string>
-#include "isolationlevel.h"
-#include "filestream.h"
-#include "librarypool.h"
-#include "parser.h"
-#include "compiler.h"
+#include "isolationlevel.hpp"
+#include "filestream.hpp"
+#include "librarypool.hpp"
+#include "parser.hpp"
+#include "compiler.hpp"
 
 
 using namespace Zigurat;

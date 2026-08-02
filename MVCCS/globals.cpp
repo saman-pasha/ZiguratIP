@@ -1,5 +1,5 @@
-#include "globals.h"
-#include "memory.h"
+#include "globals.hpp"
+#include "memory.hpp"
 
 
 bool Globals::_reset_mode = false;

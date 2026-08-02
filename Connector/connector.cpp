@@ -1,9 +1,9 @@
-#include "connector.h"
-#include "connectorexception.h"
-#include "types.h"
-#include "utility.h"
-#include "configuration.h"
-#include "tcpstream.h"
+#include "connector.hpp"
+#include "connectorexception.hpp"
+#include "types.hpp"
+#include "utility.hpp"
+#include "configuration.hpp"
+#include "tcpstream.hpp"
 
 
 namespace Zigurat

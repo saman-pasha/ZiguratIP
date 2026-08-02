@@ -1,5 +1,5 @@
-#include "typenull.h"
-#include "typestring.h"
+#include "typenull.hpp"
+#include "typestring.hpp"
 
 
 namespace Zigurat

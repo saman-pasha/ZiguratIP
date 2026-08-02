@@ -8,7 +8,7 @@ Due to Parsi is case insensitive, C++ imported classes should be used case sensi
 INCLUDE clause includes C++ headers into your code.
 
 ```ebnf
-INCLUDE '"header.h" | <header>';
+INCLUDE '"header.hpp" | <header>';
 ```
 
 ## LINK

@@ -1,7 +1,7 @@
-#include "compiler.h"
-#include "compileexception.h"
-#include "utility.h"
-#include "libraryloader.h"
+#include "compiler.hpp"
+#include "compileexception.hpp"
+#include "utility.hpp"
+#include "libraryloader.hpp"
 #include <fstream>
 #include <sstream>
 #include <set>
@@ -82,7 +82,7 @@ namespace Zigurat
   void Compiler::_build(std::string name, std::list<std::string>& requires, 
 			std::stringstream& head, std::stringstream& impl, std::stringstream& conf, const Expression& expr)
   {
-    std::string head_file_path = this->_ld_path + name + ".h";
+    std::string head_file_path = this->_ld_path + name + ".hpp";
     std::string impl_file_path = this->_tmp_path + name + ".cpp";
     std::string conf_file_path = this->_catalog_path + name + ".conf";
     std::string obj_file_path = this->_obj_path + name + ".o";
@@ -338,7 +338,7 @@ namespace Zigurat
     std::string name = this->_include_name(ast);
     for (size_t i = 0; i < name.size(); i++)
       if (name[i] == ':') name[i] = '_';
-    return name + "H_";
+    return name + "HPP_";
   }
 	
   std::string Compiler::_include_name(const Expression& ast) const

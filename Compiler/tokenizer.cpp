@@ -1,9 +1,9 @@
-#include "tokenizer.h"
-#include "tokenizeexception.h"
+#include "tokenizer.hpp"
+#include "tokenizeexception.hpp"
 #include <iostream>
 #include <algorithm>
-#include "token.h"
-#include "utility.h"
+#include "token.hpp"
+#include "utility.hpp"
 
 
 namespace Zigurat

@@ -1,6 +1,6 @@
-#include "exprcompiler.h"
-#include "compiler.h"
-#include "compileexception.h"
+#include "exprcompiler.hpp"
+#include "compiler.hpp"
+#include "compileexception.hpp"
 
 
 namespace Zigurat

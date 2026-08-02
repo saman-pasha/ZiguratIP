@@ -4,16 +4,16 @@
 #include <string>
 #include <ctime>
 #include <clocale>
-#include "zexception.h"
-#include "utility.h"
-#include "configuration.h"
-#include "argument.h"
-#include "tokenizer.h"
-#include "parser.h"
-#include "expression.h"
-#include "compiler.h"
-#include "globals.h"
-#include "parsiexception.h"
+#include "zexception.hpp"
+#include "utility.hpp"
+#include "configuration.hpp"
+#include "argument.hpp"
+#include "tokenizer.hpp"
+#include "parser.hpp"
+#include "expression.hpp"
+#include "compiler.hpp"
+#include "globals.hpp"
+#include "parsiexception.hpp"
 
 
 using namespace Zigurat;

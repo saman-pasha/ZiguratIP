@@ -1,5 +1,5 @@
 
-INCLUDE '"connector.h"';
+INCLUDE '"connector.hpp"';
 LINK '-lConnector';
 
 CLASS Connector BASE `Zigurat::`Connector

@@ -2,11 +2,11 @@
 PROJECT := Configuration
 TYPE := Library
 
-HEADERS := option.h \
-	configurationexception.h \
-	configuration.h \
-	argumentexception.h \
-	argument.h
+HEADERS := option.hpp \
+	configurationexception.hpp \
+	configuration.hpp \
+	argumentexception.hpp \
+	argument.hpp
 
 SOURCES := option.cpp \
 	configurationexception.cpp \

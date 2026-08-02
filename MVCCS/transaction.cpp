@@ -1,7 +1,7 @@
-#include "transaction.h"
-#include "memory.h"
-#include "globals.h"
-#include "utility.h"
+#include "transaction.hpp"
+#include "memory.hpp"
+#include "globals.hpp"
+#include "utility.hpp"
 
 
 namespace Zigurat

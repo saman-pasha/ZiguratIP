@@ -1,13 +1,13 @@
-#include "x509.h"
-#include "cte.h"
-#include "der.h"
-#include "rsa.h"
-#include "aes.h"
-#include "base64.h"
-#include "bufferstream.h"
-#include "configuration.h"
-#include "utility.h"
-#include "certificateexception.h"
+#include "x509.hpp"
+#include "cte.hpp"
+#include "der.hpp"
+#include "rsa.hpp"
+#include "aes.hpp"
+#include "base64.hpp"
+#include "bufferstream.hpp"
+#include "configuration.hpp"
+#include "utility.hpp"
+#include "certificateexception.hpp"
 #include <cstring>
 
 

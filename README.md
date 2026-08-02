@@ -192,7 +192,7 @@ is linked against, so declaration order matters.
 The `Connector` class speaks the binary protocol on port 2160:
 
 ```cpp
-#include "connector.h"
+#include "connector.hpp"
 using namespace Zigurat;
 
 int main()
@@ -343,6 +343,10 @@ Each module is an independent make target producing one shared library; the
 top-level `Makefile` builds them in dependency order. `System` is the exception:
 its sources are Parsi, compiled by `parsi` rather than by `make`, and it is not
 part of the default build (see [Status](#status)).
+
+Headers are `.hpp` and implementations `.cpp`, so nothing in the tree is
+mistaken for C. The headers the compiler generates for Parsi objects follow the
+same convention. Vendored zlib is C and keeps its own `.h` names.
 
 ---
 

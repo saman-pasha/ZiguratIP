@@ -2,7 +2,7 @@
 PROJECT := parsi
 TYPE := Executable
 
-HEADERS := parsiexception.h
+HEADERS := parsiexception.hpp
 
 SOURCES := main_parsi.cpp
 

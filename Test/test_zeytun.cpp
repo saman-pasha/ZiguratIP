@@ -1,9 +1,9 @@
-#include "ztest.h"
-#include "session.h"
-#include "httprequest.h"
-#include "httpresponse.h"
-#include "bufferstream.h"
-#include "types.h"
+#include "ztest.hpp"
+#include "session.hpp"
+#include "httprequest.hpp"
+#include "httpresponse.hpp"
+#include "bufferstream.hpp"
+#include "types.hpp"
 #include <map>
 #include <set>
 #include <mutex>

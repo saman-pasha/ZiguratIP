@@ -1,4 +1,4 @@
-#include "hbostream.h"
+#include "hbostream.hpp"
 #include <iostream>
 
 

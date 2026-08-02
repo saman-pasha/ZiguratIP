@@ -1,9 +1,9 @@
-#include "der.h"
+#include "der.hpp"
 #include <cstring>
 #include <algorithm>
-#include "encodingexception.h"
-#include "utility.h"
-#include "bufferstream.h"
+#include "encodingexception.hpp"
+#include "utility.hpp"
+#include "bufferstream.hpp"
 
 
 namespace Zigurat

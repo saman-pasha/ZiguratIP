@@ -1,15 +1,15 @@
-#include "memory.h"
-#include "memoryexception.h"
+#include "memory.hpp"
+#include "memoryexception.hpp"
 #include <cmath>
 #include <thread>
 #include <chrono>
 #include <iterator>
-#include "shahelper.h"
-#include "control.h"
-#include "basetable.h"
-#include "transaction.h"
-#include "utility.h"
-#include "tcpstream.h"
+#include "shahelper.hpp"
+#include "control.hpp"
+#include "basetable.hpp"
+#include "transaction.hpp"
+#include "utility.hpp"
+#include "tcpstream.hpp"
 
 
 namespace Zigurat

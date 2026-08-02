@@ -1,5 +1,5 @@
-#include "threadpool.h"
-#include "threadingexception.h"
+#include "threadpool.hpp"
+#include "threadingexception.hpp"
 #include <iostream>
 
 
