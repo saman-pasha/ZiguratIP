@@ -1,0 +1,57 @@
+-- ---------------------------------------------------------------------------
+-- Step 3: web pages.
+--
+-- A PAGE overrides PAGE_LOAD. Zeytun maps the URL to the object name, so
+-- /catalog.zt loads the page named catalog. Names must not collide with the
+-- tables: a page called demo::books would clash with the table of that name.
+--
+-- SELECT is a cursor: everything listed runs once per row, so the row markup
+-- goes inside the SELECT and the table markup around it.
+-- ---------------------------------------------------------------------------
+
+PAGE setup
+REQUIRES demo::seed
+BEGIN
+PUBLIC:
+    OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+    BEGIN
+        CALL demo::seed();
+        ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+        ECHO '<title>Demo seeded</title></head><body>';
+        ECHO '<h1>Demo seeded</h1>';
+        ECHO '<p>Authors and books inserted. ';
+        ECHO '<a href="catalog.zt">Open the catalog</a>.</p>';
+        ECHO '</body></html>';
+    END
+END
+
+PAGE catalog
+REQUIRES demo::books, demo::authors
+BEGIN
+PUBLIC:
+    OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+    BEGIN
+        ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+        ECHO '<title>Catalog</title>';
+        ECHO '<style>body{font-family:system-ui,sans-serif;background:#fff;color:#222;';
+        ECHO 'margin:2em auto;max-width:44em}table{border-collapse:collapse;width:100%}';
+        ECHO 'th,td{text-align:left;padding:.45em .6em;border-bottom:1px solid #e0e0e0}';
+        ECHO 'th{background:#73a7e1;color:#fff}</style></head><body>';
+
+        ECHO '<h1>Catalog</h1>';
+
+        ECHO '<h2>Books</h2><table><tr><th>ID</th><th>Title</th><th>Author</th><th>Year</th></tr>';
+        SELECT '<tr><td>', id, '</td><td>', title, '</td><td>', author_id, '</td><td>', year, '</td></tr>'
+        FROM demo::books;
+        ECHO '</table>';
+
+        ECHO '<h2>Authors</h2><table><tr><th>ID</th><th>Name</th><th>Country</th></tr>';
+        SELECT '<tr><td>', id, '</td><td>', name, '</td><td>', country, '</td></tr>'
+        FROM demo::authors;
+        ECHO '</table>';
+
+        ECHO '<p><a href="setup.zt">Seed again</a> &middot; ';
+        ECHO '<a href="/">Back to Zeytun</a></p>';
+        ECHO '</body></html>';
+    END
+END

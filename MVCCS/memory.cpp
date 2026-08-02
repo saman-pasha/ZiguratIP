@@ -464,6 +464,15 @@ namespace Zigurat
 
     do {
       this->_hexmap_io.read_std_ubyte(hex_byte);
+
+      // Reading past the end of the hexmap leaves the stream in a failed state
+      // and every further read a no-op, so without this the loop spins forever
+      // on a truncated or empty store rather than reporting the problem.
+      if (!this->_hexmap_io.good()) {
+	this->_hexmap_io.clear();
+	throw MemoryException("hexmap ends inside the chunk at " + std::to_string(address));
+      }
+
       if ( (hex_byte & (uint8_t)64) == 64) { // last chunk is standalone
 	return Pointer(hash_key, address, size + (hex_byte & (uint8_t)31));
       }

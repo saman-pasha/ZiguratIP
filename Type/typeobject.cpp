@@ -75,15 +75,18 @@ namespace Zigurat
     return instream;
   }
 
+  // to_std_string(), not to_string(): the latter returns a String, which is
+  // itself an Object, so it selected this very overload again and recursed
+  // until the stack ran out. Every ECHO of a value went that way.
   textstream& operator<<(textstream& outstream, Object&& object)
   {
-    outstream << object.to_string();
+    static_cast<std::ostream&>(outstream) << object.to_std_string();
     return outstream;
   }
-  
+
   textstream& operator<<(textstream& outstream, const Object& object)
   {
-    outstream << object.to_string();
+    static_cast<std::ostream&>(outstream) << object.to_std_string();
     return outstream;
   }  
 

@@ -1,0 +1,40 @@
+-- ---------------------------------------------------------------------------
+-- Step 2: procedures.
+--
+-- REQUIRES names every object this one links against; declaration order
+-- matters, so the schema has to be compiled first.
+-- ---------------------------------------------------------------------------
+
+PROCEDURE demo::add_author(name AS String, country AS String)
+RETURNS Long
+REQUIRES demo::authors, demo::authors_seq
+BEGIN
+    DECLARE id AS Long = demo::authors_seq::NEXT();
+    INSERT INTO demo::authors VALUES (id, name, country);
+    RETURN id;
+END
+
+PROCEDURE demo::add_book(title AS String, author_id AS Long, year AS Int)
+RETURNS Long
+REQUIRES demo::books, demo::books_seq
+BEGIN
+    DECLARE id AS Long = demo::books_seq::NEXT();
+    INSERT INTO demo::books VALUES (id, title, author_id, year);
+    RETURN id;
+END
+
+-- A procedure may call other procedures, as long as it REQUIRES them.
+PROCEDURE demo::seed()
+RETURNS Void
+REQUIRES demo::add_author, demo::add_book
+BEGIN
+    DECLARE le_guin AS Long = demo::add_author('Ursula K. Le Guin', 'US');
+    CALL demo::add_book('A Wizard of Earthsea', le_guin, 1968);
+    CALL demo::add_book('The Left Hand of Darkness', le_guin, 1969);
+
+    DECLARE borges AS Long = demo::add_author('Jorge Luis Borges', 'AR');
+    CALL demo::add_book('Ficciones', borges, 1944);
+
+    DECLARE hedayat AS Long = demo::add_author('Sadegh Hedayat', 'IR');
+    CALL demo::add_book('The Blind Owl', hedayat, 1937);
+END

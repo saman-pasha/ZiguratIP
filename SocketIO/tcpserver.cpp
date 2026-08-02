@@ -39,15 +39,19 @@ namespace Zigurat
       }
     }
 
+    // Before bind, not after: SO_REUSEADDR only has any effect on the bind that
+    // follows it. Setting it afterwards meant a restart inside the TIME_WAIT
+    // window failed with "tcp bind failed".
+    Socket::set_reusable(this->_handle, true);
+
     error_code = Socket::bind(this->_handle, res->ai_addr, res->ai_addrlen);
-    if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("tcp bind failed");    
+    if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("tcp bind failed");
 
     error_code = Socket::listen(this->_handle, backlog);
     if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("tcp listen failed");
-    
+
     Socket::free_address_info(res);
 
-    Socket::set_reusable(this->_handle, true);
     Socket::set_blocking_mode(this->_handle, true);
 
     Socket::poll_info_t info[1];

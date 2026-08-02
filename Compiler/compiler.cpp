@@ -329,15 +329,16 @@ namespace Zigurat
     return name;
   } 
 
+  // Derived from the include name so that a domain separator stays
+  // distinguishable from an underscore in the name. Joining both with "_" gave
+  // demo::books and demo_books the same guard, and whichever header came second
+  // was then skipped in silence -- taking its includes with it.
   std::string Compiler::_guard_name(const Expression& ast) const
   {
-    const Expression* expr = &ast;
-    std::string name = "_" + expr->token.value;
-    while (!expr->args.empty() && expr->args[0].token.value != "$tmpl") {
-      expr = &(expr->args[0]);
-      name = name + "_" + expr->token.value;
-    }
-    return name + "_H_";
+    std::string name = this->_include_name(ast);
+    for (size_t i = 0; i < name.size(); i++)
+      if (name[i] == ':') name[i] = '_';
+    return name + "H_";
   }
 	
   std::string Compiler::_include_name(const Expression& ast) const

@@ -116,6 +116,11 @@ isolation, concurrency and durability behaviour.
 
 ## Your first application
 
+A worked example with tables, indexes, sequences, procedures and pages lives in
+[`demo/`](demo/README.md) — build it with `demo/build.sh` and browse it at
+<http://127.0.0.1:2190/setup.zt>. The rest of this section covers the same
+ground in miniature.
+
 ### 1. A page
 
 Zeytun serves any URL ending in `.zt` from a compiled Parsi page. Write

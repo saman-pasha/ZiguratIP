@@ -1,0 +1,36 @@
+-- ---------------------------------------------------------------------------
+-- Step 1: the schema.
+--
+-- Two tables and the sequences that number them. Sequences are declared, not
+-- implied by a primary key, and each one becomes its own catalogue object.
+-- ---------------------------------------------------------------------------
+
+TABLE demo::authors
+BEGIN
+    COLUMN id      AS Long   PRIMARY KEY;
+    COLUMN name    AS String UNIQUE KEY NOT NULL;
+    COLUMN country AS String;
+END
+
+SEQUENCE demo::authors_seq
+BEGIN
+    FROM 1;
+    TO Long::MAX;
+    STEP 1;
+END
+
+TABLE demo::books
+BEGIN
+    COLUMN id        AS Long   PRIMARY KEY;
+    COLUMN title     AS String NOT NULL;
+    -- INDEX KEY: not unique, but indexed, so lookups by author do not scan.
+    COLUMN author_id AS Long   INDEX KEY;
+    COLUMN year      AS Int;
+END
+
+SEQUENCE demo::books_seq
+BEGIN
+    FROM 1;
+    TO Long::MAX;
+    STEP 1;
+END
