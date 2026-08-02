@@ -70,12 +70,14 @@ endif
 ifeq ($(OS),Windows)
 	RM := -del
 	CP := -copy /Y
+	COPY := copy /Y
 	SEP := &
 	TAB := ^	
 	MK := -mkdir
 else
 	RM := -rm -f
 	CP := -cp
+	COPY := cp
 	SEP := ;
 	TAB := '	'
 	MK := -mkdir -p
@@ -118,7 +120,7 @@ all: $(HEADERS_DEST) $(OUTPUT)
 headers:
 	@$(MK) "$(ZIGURATIP_HOME)/include"
 	@- $(foreach head,$(HEADERS), \
-		$(CP) $(head) "$(ZIGURATIP_HOME)/include" $(SEP)\
+		$(COPY) $(head) "$(ZIGURATIP_HOME)/include" $(SEP)\
 	)
 
 DEPEND_FILE := $(PROJECT)-$(OS)-$(CXX).depend
