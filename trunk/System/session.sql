@@ -1,0 +1,63 @@
+
+INCLUDE '<map>';
+INCLUDE '<mutex>';
+INCLUDE '<thread>';
+INCLUDE '"utility.h"';
+INCLUDE '"shahelper.h"';
+INCLUDE '"bufferstream.h"';
+INCLUDE '"httprequest.h"';
+INCLUDE '"httpresponse.h"';
+
+CLASS Session
+BEGIN
+PRIVATE:
+	DECLARE GLOBAL _sessions AS `std::`multimap<`std::`string, `std::`pair<`std::`string, `std::`string> >;
+	DECLARE GLOBAL _mutex AS `std::`mutex;
+	DECLARE SESSION LOCAL _id AS String;
+
+PUBLIC:
+	GLOBAL FUNCTION id() RETURNS String
+	BEGIN
+		IF Session::_id.size() == 0ul BEGIN
+			SET Session::_id = `Zigurat::`SHA::`checksum(`Zigurat::SHA::SHA1, `std::`to_string(`Zigurat::`Utility::`generate_id()));
+		END
+		RETURN _id;
+	END
+
+	GLOBAL FUNCTION initialize(request AS `Zigurat::`HTTPRequest INOUT, response AS `Zigurat::`HTTPResponse INOUT) RETURNS Void
+	BEGIN
+		IF request.has_cookie('session_id') BEGIN
+			SET Session::_id = request.cookie('session_id');
+		END
+		CALL response.set_cookie('session_id', Session::id());
+		CALL response.set_cookie_attribute('session_id', 'MAX_AGE', '300');
+		CALL response.set_cookie_attribute('session_id', 'HttpOnly');
+	END
+
+	GLOBAL FUNCTION set<T>(key AS String, value AS T) RETURNS Void
+	BEGIN
+		DECLARE lock AS `std::`lock_guard<`std::`mutex>(Session::_mutex);
+		DECLARE sstream AS `std::`stringstream;
+		DECLARE bstream AS `Zigurat::`BufferStream(sstream);
+		CALL bstream.TEMPLATE_METHOD(`write<T>(value));
+		CALL Session::_sessions.`insert(`std::`make_pair(Session::id().`value(), `std::`make_pair(key.`value(), sstream.`str())));
+	END
+
+	GLOBAL FUNCTION get<T>(key AS String) RETURNS T
+	BEGIN
+		DECLARE lock AS `std::`lock_guard<`std::`mutex>(Session::_mutex);
+		DECLARE pair_iter AS Auto = Session::_sessions.`equal_range(Session::id().`value());
+		DECLARE iter AS Auto = pair_iter.`first;
+		WHILE (iter <> pair_iter.`second)
+		BEGIN
+			IF (ContentOf(iter).`second.`first == key.`value()) BEGIN
+				DECLARE sstream AS `std::`stringstream(ContentOf(iter).`second.`second);
+				CALL sstream.`seekg(0, `std::`ios::`beg);
+				DECLARE bstream AS `Zigurat::`BufferStream(sstream);
+				RETURN bstream.TEMPLATE_METHOD(`read<T>());
+			END
+			CALL Increment(iter);
+		END
+		RETURN T();
+	END
+END

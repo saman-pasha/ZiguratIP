@@ -1,0 +1,71 @@
+
+CLASS Serializer
+REQUIRES Connector
+BEGIN
+PUBLIC:
+	CONSTRUCTOR(con AS Connector INOUT)
+	BEGIN
+		ECHO '<table>';
+		DECLARE columns AS Vector<String> = con.columns();
+		DECLARE i AS ULong = 0ul;
+		ECHO '<thead><tr>';
+		WHILE i < columns.size() BEGIN
+			ECHO '<th>', columns.get(i), '</th>';
+			SET i = i + 1;
+		END
+		ECHO '</tr></thead><tbody>';
+		WHILE con.result() == ResultType::CURSOR_FETCH BEGIN
+			ECHO '<tr>';
+			SET i = 0ul;
+			DECLARE descriptor AS UByte;
+			WHILE i < columns.size() BEGIN
+				ECHO '<td>';
+				SET descriptor = con.`client_stream().`read_std_ubyte();
+
+				CALL DEBUG(descriptor);
+
+				IF descriptor.`value() & TypeDesc::IS_NULL == TypeDesc::IS_NULL BEGIN
+					ECHO '{NULL}';
+				END ELSE IF descriptor == Bool::TDB BEGIN
+					ECHO con.`client_stream().`read_std_bool();
+				END ELSE IF descriptor == Char::TDB BEGIN
+					ECHO con.`client_stream().`read_std_char();
+				END ELSE IF descriptor == Byte::TDB BEGIN
+					ECHO con.`client_stream().`read_std_byte();
+				END ELSE IF descriptor == UByte::TDB BEGIN
+					ECHO con.`client_stream().`read_std_ubyte();
+				END ELSE IF descriptor == Short::TDB BEGIN
+					ECHO con.`client_stream().`read_std_short();
+				END ELSE IF descriptor == UShort::TDB BEGIN
+					ECHO con.`client_stream().`read_std_ushort();
+				END ELSE IF descriptor == Int::TDB BEGIN
+					ECHO con.`client_stream().`read_std_int();
+				END ELSE IF descriptor == UInt::TDB BEGIN
+					ECHO con.`client_stream().`read_std_uint();
+				END ELSE IF descriptor == Long::TDB BEGIN
+					ECHO con.`client_stream().`read_std_long();
+				END ELSE IF descriptor == ULong::TDB BEGIN
+					ECHO con.`client_stream().`read_std_ulong();
+				END ELSE IF descriptor == Float::TDB BEGIN
+					ECHO con.`client_stream().`read_std_float();
+				END ELSE IF descriptor == Double::TDB BEGIN
+					ECHO con.`client_stream().`read_std_double();
+				END ELSE IF descriptor == Real::TDB BEGIN
+					ECHO con.`client_stream().`read_std_real();
+				END ELSE IF descriptor == Timestamp::TDB BEGIN
+					ECHO con.`client_stream().`read_std_time();
+				END ELSE IF descriptor == String::TDB BEGIN
+					ECHO con.`client_stream().`read_std_string();
+				END ELSE IF descriptor == Text::TDB BEGIN
+					ECHO con.`client_stream().`read_std_text();
+				END ELSE BEGIN
+					ECHO columns.get(i), ': unknown TDB: ', descriptor;
+				END
+				ECHO '</td>';
+				SET i = i + 1ul;
+			END
+			ECHO '</tr>';
+		END
+		ECHO '</tbody></table>';
+	END	
+END

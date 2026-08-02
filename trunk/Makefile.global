@@ -1,0 +1,137 @@
+
+ifndef ZIGURATIP_HOME
+	ZIGURATIP_HOME := ../home
+else ifeq ($(ZIGURATIP_HOME),)
+	ZIGURATIP_HOME := ../home
+endif
+
+ifdef COMPILER
+	CXX := $(COMPILER)
+endif
+
+ifndef CXXFLAGS
+	CXXFLAGS := -Wall -std=c++11
+endif
+
+ifndef LDFLAGS
+	LDFLAGS :=
+endif
+
+ifndef MODE
+	MODE := Debug
+endif
+
+ifeq ($(MODE),Debug)
+	CXXFLAGS := $(CXXFLAGS) -g
+	LDFLAGS := $(LDFLAGS) -g
+else ifeq ($(MODE),Release)
+
+else
+	$(error $(PROJECT) Accepted MODEs are Debug|Release!)	
+endif
+
+ifndef TYPE
+	TYPE := Executable
+endif
+
+ifeq ($(OS),Windows_NT)
+	OS := Windows
+else
+	OS := $(shell uname)
+endif
+
+BIN_DIR := "$(ZIGURATIP_HOME)/bin"
+LIB_DIR := "$(ZIGURATIP_HOME)/lib"
+
+ifeq ($(TYPE),Executable)
+	LDFLAGS := $(LDFLAGS) -rdynamic
+	ifndef OUTPUT
+		ifeq ($(OS),Windows)
+			OUTPUT := $(BIN_DIR)/$(PROJECT).exe
+		else
+			OUTPUT := $(BIN_DIR)/$(PROJECT)
+		endif
+	endif
+else ifeq ($(TYPE),Library)
+	LDFLAGS := $(LDFLAGS) -shared
+	ifndef OUTPUT
+		ifeq ($(OS),Windows)
+			CXXFLAGS := $(CXXFLAGS)
+			OUTPUT := $(LIB_DIR)/$(PROJECT).dll
+		else
+			CXXFLAGS := $(CXXFLAGS) -fPIC 
+			OUTPUT := $(LIB_DIR)/lib$(PROJECT).so
+		endif
+	endif
+else
+	$(error $(PROJECT) Accepted TYPEs are Executable|Library!)
+endif
+
+ifeq ($(OS),Windows)
+	RM := -del
+	CP := -copy /Y
+	SEP := &
+	TAB := ^	
+	MK := -mkdir
+else
+	RM := -rm -f
+	CP := -cp
+	SEP := ;
+	TAB := '	'
+	MK := -mkdir -p
+endif
+
+ifeq ($(OS),FreeBSD)
+	CXXFLAGS := $(CXXFLAGS) -D_GLIBCXX_USE_C99 -D_GLIBCXX_USE_C99_MATH -D_GLIBCXX_USE_C99_MATH_TR1
+	LDFLAGS := $(LDFLAGS) -D_GLIBCXX_USE_C99 -D_GLIBCXX_USE_C99_MATH -D_GLIBCXX_USE_C99_MATH_TR1
+else ifeq ($(OS),SunOS)
+	CXXFLAGS := $(CXXFLAGS) -D_GLIBCXX_USE_C99 -D_GLIBCXX_USE_C99_MATH -D_GLIBCXX_USE_C99_MATH_TR1
+	LDFLAGS := $(LDFLAGS) -D_GLIBCXX_USE_C99 -D_GLIBCXX_USE_C99_MATH -D_GLIBCXX_USE_C99_MATH_TR1
+else ifeq ($(OS),Darwin)
+	LDFLAGS := $(LDFLAGS) -lc++
+	# The ZiguratIP libraries are mutually recursive (Core uses StreamIO's
+	# bufferstream, StreamIO uses Core's Utility). ELF shared objects tolerate
+	# unresolved symbols at link time; Mach-O does not unless asked to.
+	ifeq ($(TYPE),Library)
+		LDFLAGS := $(LDFLAGS) -Wl,-undefined,dynamic_lookup
+	endif
+endif
+
+INCLUDES := -I$(ZIGURATIP_HOME)/include $(INCLUDES)
+LINKS := -L$(LIB_DIR) $(LINKS)
+
+OBJECTS_DIR := $(ZIGURATIP_HOME)/obj
+OBJECTS := $(addprefix $(OBJECTS_DIR)/,$(subst .cpp,.o,$(SOURCES)))
+
+HEADERS_DEST := $(addprefix $(ZIGURATIP_HOME)/include/,$(HEADERS))
+
+.PHONY: all clean
+
+all: $(HEADERS_DEST) $(OUTPUT)
+	@echo [Project: $(PROJECT)] "******* all done *******"
+
+DEPEND_FILE := $(PROJECT)-$(OS)-$(CXX).depend
+
+$(OUTPUT): $(DEPEND_FILE) $(OBJECTS)
+	@$(MK) "$(OBJECTS_DIR)"
+	@$(MK) "$(LIB_DIR)"
+	$(CXX) $(LDFLAGS) $(OBJECTS) -o $(OUTPUT) $(LINKS) $(LIBS)
+
+$(DEPEND_FILE): $(SOURCES) $(HEADERS)
+	@$(RM) $(DEPEND_FILE)
+	@- $(foreach head,$(HEADERS_DEST), \
+		echo $(head): $(notdir $(head)) >> $(DEPEND_FILE)$(SEP)\
+		echo $(TAB)$(CP) $(notdir $(head)) "$(ZIGURATIP_HOME)/include" >> $(DEPEND_FILE)$(SEP)\
+	)
+	@- $(foreach src,$(SOURCES), \
+		$(CXX) $(CXXFLAGS) $(INCLUDES) -c $(src) -MM -MT $(OBJECTS_DIR)/$(src:.cpp=.o) >> $(DEPEND_FILE)$(SEP)\
+		echo $(TAB)$(CXX) $(CXXFLAGS) $(INCLUDES) -c $(src) -o $(OBJECTS_DIR)/$(src:.cpp=.o) >> $(DEPEND_FILE)$(SEP)\
+	)
+
+clean:
+	$(RM) *~
+	$(RM) $(DEPEND_FILE)
+	$(RM) $(OBJECTS)
+	@echo [Project: $(PROJECT)] "******* clean done *******"
+
+include $(DEPEND_FILE)

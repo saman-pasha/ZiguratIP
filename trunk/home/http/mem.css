@@ -1,0 +1,46 @@
+
+.table {
+    font-size: small;
+    border-top: 1px solid gray;
+    border-bottom: 1px solid gray;
+}
+
+.table th {
+    border-left: 1px solid gray;
+    border-bottom: 1px solid gray;
+}
+
+.footer {
+    color: white;
+    background-color: black;
+    text-align: center;
+}
+
+.hash-row {
+    color: white;
+    background-color: darkgray;
+}
+
+.data-row {
+    background-color: white;
+}
+
+.data-row td {
+    border-bottom: 1px dotted gray;
+}
+
+.free-row {
+    background-color: lightgray;
+}
+
+.shared-lock {
+    background-color: yellow;
+}
+
+.exclusive-lock {
+    background-color: red;
+}
+
+label {
+    color: darkgray;
+}

@@ -1,0 +1,32 @@
+
+PAGE Compiler
+REQUIRES Connector, CompilerDrawer 
+BEGIN
+PUBLIC:
+	OVERRIDE FUNCTION page_load() RETURNS Void
+	BEGIN
+		CALL response.set_header('Content-Type', 'text/html');
+		IF request.method() == 'GET' BEGIN
+	   		CALL response.set_header('Keep-Alive', 'timeout=600');
+			DECLARE drawer AS CompilerDrawer('Put your code here');
+			CALL drawer.draw();
+		END ELSE BEGIN
+			TRY BEGIN
+	    			DECLARE con AS Connector;
+				CALL con.open();
+				CALL con.compile(request.post('code'));
+				DECLARE drawer AS CompilerDrawer(request.post('code'), 'Compiled Successfully');
+				CALL drawer.draw();
+				CALL con.close();
+			END CATCH ex AS Exception BEGIN
+				DECLARE drawer AS CompilerDrawer(request.post('code'), ex.message());
+				CALL drawer.draw();
+			END
+		END
+	END
+	
+	DESTRUCTOR()
+	BEGIN
+
+	END
+END

@@ -1,0 +1,68 @@
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Memory Management</title>
+    <script src="jquery-3.2.1.min.js"></script>
+    <script src="mem.js"></script>
+    <link rel="stylesheet" type="text/css" href="mem.css" />
+  </head>
+  <body>
+    <fieldset>
+      <legend>Memory Viewer</legend>
+      <label for="txt_obj_name">Object Name:</label>
+      <input type="text" id="txt_obj_name" style="width: 25%;">
+      <input id="btn_checksum" type="button" value="Checksum">
+      <input type="text" id="txt_checksum" style="width: 35%;">
+      <br><br>
+      <label for="slc_hash_keys">Hash Key:</label>
+      <select id="slc_hash_keys">
+	<option selected="selected">None</option>
+      </select>
+      <input id="btn_pagefiles" type="button" value="Load Page Files">
+      &nbsp&nbsp&nbsp
+      <label for="slc_pagefiles">Page File:</label>
+      <select id="slc_pagefiles">
+	<option selected="selected">None</option>
+      </select>
+      <input id="btn_pointers" type="button" value="Load Pointers">
+      <br><br>
+      <table class="table">
+	<caption>Pointers</caption>
+	<thead>
+	  <th>address</th>
+	  <th>size</th>
+	  <th>actual size</th>
+	  <th>online state</th>
+	  <th>online lock</th>
+	  <th>offline state</th>
+	  <th>offline lock</th>
+	  <th>online time</th>
+	  <th>transaction id</th>
+	  <th>query id</th>
+	  <th>reference address</th>
+	  <th>modify time</th>
+	  <th>create time</th>
+	</thead>
+        <tbody id="tbl_pointers">
+        </tbody>
+	<tfoot>
+	  <tr><td colspan="13" class="footer">EOF</td></tr>
+	</tfoot>
+      </table>
+    </fieldset>
+    <fieldset>
+      <legend>Memory Watcher</legend>
+      <input id="btn_attach" type="button" value="Attach">
+      <input id="btn_detach" type="button" value="Detach">
+      &nbsp&nbsp&nbsp
+      <label for="spn_watcher_status">Split View:</label>
+      <input type="checkbox" checked="checked" id="chb_split_watch">
+      &nbsp&nbsp&nbsp
+      <label for="spn_watcher_status">Status:</label>
+      <span id="spn_watcher_status">Detached</span>
+      <br><br>
+      <div id="div_watches"></div>
+    </fieldset>
+  </body>
+</html>
+

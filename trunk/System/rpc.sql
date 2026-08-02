@@ -1,0 +1,220 @@
+
+PAGE RPC
+REQUIRES Connector, Serializer
+BEGIN
+PUBLIC:
+	OVERRIDE FUNCTION page_load() RETURNS Void
+	BEGIN
+		TRY BEGIN
+			IF request.query('do') == 'id' BEGIN
+				CALL response.set_header('Content-Type', 'text/plain');
+			END ELSE BEGIN
+				CALL response.set_header('Content-Type', 'text/html');
+			END
+
+			DECLARE SESSION LOCAL con AS Connector;
+			IF NOT con.is_open() BEGIN
+				CALL con.open();
+			END
+			
+			IF request.query('do') == 'id' BEGIN
+				ECHO con.transaction_id();
+
+			END ELSE IF request.query('do') == 'call' BEGIN
+				
+				DECLARE auto_commit AS Bool = request.query('auto_commit').to_bool(TRUE);
+				CALL con.auto_commit(auto_commit);
+
+				DECLARE isolation_level AS String = request.query('iso_lvl');
+				IF isolation_level == 'd' BEGIN
+					CALL con.isolate(CAST<IsolationLevel>(CAST<`uint8_t>(`Globals::`default_isolation_level())));
+				END ELSE IF isolation_level == 'u' BEGIN
+					CALL con.isolate(IsolationLevel::READ_UNCOMMITTED);
+				END ELSE IF isolation_level == 'c' BEGIN
+					CALL con.isolate(IsolationLevel::READ_COMMITTED);
+				END ELSE IF isolation_level == 'r' BEGIN
+					CALL con.isolate(IsolationLevel::REPEATABLE_READ);
+				END ELSE IF isolation_level == 't' BEGIN
+					CALL con.isolate(IsolationLevel::SNAPSHOT);
+				END ELSE IF isolation_level == 's' BEGIN
+					CALL con.isolate(IsolationLevel::SERIALIZABLE);
+				END ELSE BEGIN
+					ECHO '<p>Unknown isolation level: ', isolation_level, '</p>';					
+				END
+				
+				CALL con.call(request.query('proc'));
+				DECLARE i AS ULong = 0ul;
+				DECLARE count AS ULong = request.post('params_count').to_ulong();
+				DECLARE types AS Auto = request.array_post('param_types[]');
+				DECLARE quals AS Auto = request.array_post('param_quals[]');
+				DECLARE values AS Auto = request.array_post('param_values[]');
+				WHILE i < count BEGIN
+					IF quals.get(i) == 'I' OR quals.get(i) == 'B' BEGIN
+						CALL this._write_parameter(con, types.get(i), values.get(i));
+					END
+					SET i = i + 1ul;
+				END
+				DECLARE result AS ResultType = con.result();
+				WHILE TRUE BEGIN
+					IF result == ResultType::SUCCESSFUL_DONE BEGIN
+						BREAK;
+					END ELSE IF result == ResultType::CURSOR_OPEN BEGIN
+						DECLARE ser AS Serializer(con);
+					END ELSE IF result == ResultType::RETURN_VALUE BEGIN
+						SET i = 0ul;
+						WHILE i < count BEGIN
+							IF quals.get(i) == 'B' OR quals.get(i) == 'O' OR quals.get(i) == 'R' BEGIN
+								CALL this._read_parameter(con, types.get(i));
+								BREAK;
+							END
+							SET i = i + 1ul;
+						END
+					END ELSE BEGIN
+						ECHO '<p>Unknown result type: ', CAST<`int>(result), '</p>';					
+					END
+					SET result = con.result();
+				END
+				ECHO '<p>Remote Procedure Called Successfully</p>';
+
+			END ELSE IF request.query('do') == 'commit' BEGIN
+				CALL con.commit();
+				ECHO '<p>Transaction Committed</p>';
+
+			END ELSE IF request.query('do') == 'rollback' BEGIN
+				CALL con.rollback();
+				ECHO '<p>Transaction Rolled back</p>';
+			END
+		END CATCH ex AS Exception BEGIN
+			ECHO 'RPC Exception: ', ex.code(), ' ', ex.message();
+		END
+	END
+
+PRIVATE:
+	FUNCTION _write_parameter(con AS Connector INOUT, type AS String, value AS String) RETURNS Void
+	BEGIN
+		DECLARE is_null AS Bool = FALSE;
+		IF type.size() == 2ul BEGIN
+			SET is_null = TRUE;
+			SET type = type.get(0ul).to_string();		
+		END
+
+		IF is_null BEGIN
+			IF type == '?' BEGIN
+				CALL con.write(Bool(NULL));
+			END ELSE IF type == 'c' BEGIN
+				CALL con.write(Char(NULL));
+			END ELSE IF type == 'b' BEGIN
+				CALL con.write(Byte(NULL));
+			END ELSE IF type == 'B' BEGIN
+				CALL con.write(UByte(NULL));
+			END ELSE IF type == 'h' BEGIN
+				CALL con.write(Short(NULL));
+			END ELSE IF type == 'H' BEGIN
+				CALL con.write(UShort(NULL));
+			END ELSE IF type == 'i' BEGIN
+				CALL con.write(Int(NULL));
+			END ELSE IF type == 'I' BEGIN
+				CALL con.write(UInt(NULL));
+			END ELSE IF type == 'l' BEGIN
+				CALL con.write(Long(NULL));
+			END ELSE IF type == 'L' BEGIN
+				CALL con.write(ULong(NULL));
+			END ELSE IF type == 'f' BEGIN
+				CALL con.write(Float(NULL));
+			END ELSE IF type == 'd' BEGIN
+				CALL con.write(Double(NULL));
+			END ELSE IF type == 'r' BEGIN
+				CALL con.write(Real(NULL));
+			END ELSE IF type == 't' BEGIN
+				CALL con.write(Timestamp(NULL));
+			END ELSE IF type == 's' BEGIN
+				CALL con.write(String(NULL));
+			END ELSE IF type == 'S' BEGIN
+				CALL con.write(Text(NULL));
+			END
+		END ELSE BEGIN
+			IF type == '?' BEGIN
+				CALL con.write(value.to_bool(TRUE));
+			END ELSE IF type == 'c' BEGIN
+				CALL con.write(value.to_char());
+			END ELSE IF type == 'b' BEGIN
+				CALL con.write(value.to_byte());
+			END ELSE IF type == 'B' BEGIN
+				CALL con.write(value.to_ubyte());
+			END ELSE IF type == 'h' BEGIN
+				CALL con.write(value.to_short());
+			END ELSE IF type == 'H' BEGIN
+				CALL con.write(value.to_ushort());
+			END ELSE IF type == 'i' BEGIN
+				CALL con.write(value.to_int());
+			END ELSE IF type == 'I' BEGIN
+				CALL con.write(value.to_uint());
+			END ELSE IF type == 'l' BEGIN
+				CALL con.write(value.to_long());
+			END ELSE IF type == 'L' BEGIN
+				CALL con.write(value.to_ulong());
+			END ELSE IF type == 'f' BEGIN
+				CALL con.write(value.to_float());
+			END ELSE IF type == 'd' BEGIN
+				CALL con.write(value.to_double());
+			END ELSE IF type == 'r' BEGIN
+				CALL con.write(value.to_real());
+			END ELSE IF type == 't' BEGIN
+				CALL con.write(value.to_timestamp());
+			END ELSE IF type == 's' BEGIN
+				CALL con.write(value);
+			END ELSE IF type == 'S' BEGIN
+				CALL con.write(value.to_text());
+			END
+		END
+	END
+
+	FUNCTION _read_parameter(con AS Connector INOUT, type AS String) RETURNS Void
+	BEGIN
+		ECHO '<input name=\"byref_params\" type=\"hidden\" value=\"';
+		IF type.size() == 2ul BEGIN
+			SET type = type.get(0ul).to_string();
+		END
+
+		IF type == '?' BEGIN
+			ECHO con.read<Bool>(); 
+		END ELSE IF type == 'c' BEGIN
+			ECHO con.read<Char>();
+		END ELSE IF type == 'b' BEGIN
+			ECHO con.read<Byte>();
+		END ELSE IF type == 'B' BEGIN
+			ECHO con.read<UByte>();
+		END ELSE IF type == 'h' BEGIN
+			ECHO con.read<Short>();
+		END ELSE IF type == 'H' BEGIN
+			ECHO con.read<UShort>();
+		END ELSE IF type == 'i' BEGIN
+			ECHO con.read<Int>();
+		END ELSE IF type == 'I' BEGIN
+			ECHO con.read<UInt>();
+		END ELSE IF type == 'l' BEGIN
+			ECHO con.read<Long>();
+		END ELSE IF type == 'L' BEGIN
+			ECHO con.read<ULong>();
+		END ELSE IF type == 'f' BEGIN
+			ECHO con.read<Float>();
+		END ELSE IF type == 'd' BEGIN
+			ECHO con.read<Double>();
+		END ELSE IF type == 'r' BEGIN
+			ECHO con.read<Real>();
+		END ELSE IF type == 't' BEGIN
+			ECHO con.read<Timestamp>();
+		END ELSE IF type == 's' BEGIN
+			ECHO con.read<String>();
+		END ELSE IF type == 'S' BEGIN
+			ECHO con.read<Text>();
+		END
+		ECHO '\" />';
+	END
+
+PUBLIC:
+	DESTRUCTOR()
+	BEGIN
+
+	END
+END

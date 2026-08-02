@@ -1,0 +1,43 @@
+# trunk/home is both the install prefix and the runtime home directory. The
+# directories themselves are part of the expected layout and are kept with
+# .gitkeep files; everything the build or the server puts inside them is
+# generated and stays out of the repository.
+
+# --- build output -----------------------------------------------------------
+trunk/home/bin/*
+trunk/home/lib/*
+trunk/home/obj/*
+trunk/home/include/*
+
+# --- runtime state ----------------------------------------------------------
+# Page store, compiled Parsi objects, catalogue entries, scratch files, logs.
+trunk/home/data/*
+trunk/home/ld/*
+trunk/home/tmp/*
+trunk/home/catalog/*
+trunk/home/log/*
+
+!trunk/home/*/.gitkeep
+
+# --- generated anywhere -----------------------------------------------------
+# Dependency files are regenerated per platform and compiler
+# (Project-OS-compiler.depend).
+*.depend
+*.o
+*.lo
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# --- editors and platforms --------------------------------------------------
+.DS_Store
+*~
+*.swp
+*.orig
+*.rej
+.vscode/
+.idea/
+compile_commands.json

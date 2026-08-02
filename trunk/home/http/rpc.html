@@ -1,0 +1,129 @@
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Remote Procedure Call</title>
+    <script src="jquery-3.2.1.min.js"></script>
+    <script src="rpc.js"></script>
+    <link rel="stylesheet" type="text/css" href="rpc.css" />
+  </head>
+  <body>
+    <fieldset>
+      <legend>Remote Procedure Call</legend>
+      <fieldset>
+	<legend>Transaction</legend>
+	<label for="spn_transaction_id">Id:</label>
+	<span id="spn_transaction_id"></span>
+	&nbsp&nbsp&nbsp
+	<label for="slc_iso_lvl">Isolation Level:</label>
+	<select id="slc_iso_lvl">
+	  <option value="d" selected="selected">DEFAULT</option>
+	  <option value="u">READ-UNCOMMITTED</option>
+	  <option value="c">READ-COMMITTED</option>
+	  <option value="r">REPEATABLE-READ</option>
+	  <option value="t">SNAPSHOT</option>
+	  <option value="s">SERIALIZABLE</option>
+	</select>
+	&nbsp&nbsp&nbsp
+	<input id="chb_auto_commit" type="checkbox">Auto Commit</input>
+      </fieldset>
+      <fieldset>
+	<legend>Procedure</legend>
+	<label for="txt_name">Name:</label>
+	<input type="text" id="txt_name" style="width: 50%;"></input>
+      </fieldset>
+      <fieldset>
+	<legend>Add Parameter</legend>
+	<table>
+	  <tr>
+	    <td style="width: 200px;">
+	      <label for="slc_type">Type:</label>
+	      <select id="slc_type">
+		<option value="?">Bool</option>
+		<option value="c">Char</option>
+		<option value="b">Byte</option>
+		<option value="B">UByte</option>
+		<option value="h">Short</option>
+		<option value="H">UShort</option>
+		<option value="i" selected="selected">Int</option>
+		<option value="I">UInt</option>
+		<option value="l">Long</option>
+		<option value="L">ULong</option>
+		<option value="f">Float</option>
+		<option value="d">Double</option>
+		<option value="r">Real</option>
+		<option value="t">Timestamp</option>
+		<option value="s">String</option>
+		<option value="S">Text (255)</option>
+	      </select>
+	    </td>
+	    <td style="width: 250px;">
+	      <label for="slc_qualifier">Qualifier:</label>
+	      <select id="slc_qualifier">
+		<option value="I">In</option>
+		<option value="B">InOut</option>
+		<option value="O">Out</option>
+	      </select>
+	    </td>
+	    <td>
+	      <input id="btn_add" type="button" value="Add"/>
+	    </td>
+	  </tr>
+	</table>
+      </fieldset>
+      <fieldset>
+	<legend>Parameters</legend>
+	<table id="tbl_params">
+	  <tr>
+	    <td style="width: 200px;">
+	      <label for="slc_type_ret_val">Type:</label>
+	      <select id="slc_type_ret_val" style="display: none;">
+		<option value="?">Bool</option>
+		<option value="c">Char</option>
+		<option value="b">Byte</option>
+		<option value="B">UByte</option>
+		<option value="h">Short</option>
+		<option value="H">UShort</option>
+		<option value="i" selected="selected">Int</option>
+		<option value="I">UInt</option>
+		<option value="l">Long</option>
+		<option value="L">ULong</option>
+		<option value="f">Float</option>
+		<option value="d">Double</option>
+		<option value="r">Real</option>
+		<option value="t">Timestamp</option>
+		<option value="s">String</option>
+		<option value="S">Text (255)</option>
+	      </select>
+	    </td>
+	    <td style="width: 250px;">
+	      <label for="spn_qual_ret_val">Qualifier:</label>
+	      <span id="spn_qual_ret_val" style="display: none;">Return-Value</span>
+	    </td>
+	    <td style="width: 300px;">
+	      <label for="spn_value_ret_val">Value:</label>
+	      <span id="spn_value_ret_val" style="display: none;"></span>
+	    </td>
+	    <td><input id="chb_ret_val" type="checkbox" >Has Return-Value</input></td>
+	  </tr>
+	</table>
+      </fieldset>
+      <div>
+	<br>
+	<div id="div_operations">
+	  <input id="btn_call" type="button" value="Call Procedure">
+	  <input id="btn_commit" type="button" value="Commit Transaction">
+	  <input id="btn_rollback" type="button" value="Rollback Transaction">
+	</div>
+	<div id="div_abort" style="display: none;">
+	  <input id="btn_abort" type="button" value="Abort Call">
+	</div>
+	<br>
+	<fieldset>
+	  <legend>Result Set</legend>
+	  <div id="div_result_set"></div>
+	</fieldset>
+      </div>
+    </fieldset>
+  </body>
+</html>
+
