@@ -56,11 +56,11 @@ compiler at runtime to build Parsi objects, so one must stay on `PATH`.
 
 ```bash
 git clone <your-fork-url> ZiguratIP
-cd ZiguratIP/trunk
+cd ZiguratIP
 make
 ```
 
-Everything installs into `trunk/home`, which is both the install prefix and the
+Everything installs into `home/`, which is both the install prefix and the
 server's runtime home directory:
 
 ```
@@ -233,35 +233,35 @@ END
 
 The session store is shared across worker threads and swept for idle entries
 (`HTTP/SESSION_TIMEOUT`, 1800 seconds by default). `Session` itself is written
-in Parsi, in `trunk/System/session.sql` — but see [Status](#status): that file
+in Parsi, in `System/session.sql` — but see [Status](#status): that file
 does not currently compile.
 
 ---
 
 ## Documentation
 
-Full reference in [`trunk/doc`](trunk/doc/README.md):
+Full reference in [`doc`](doc/README.md):
 
-- [Installation](trunk/doc/installation.md) ·
-  [Configuration](trunk/doc/configuration.md) ·
-  [Connector](trunk/doc/connector.md) ·
-  [C++ API](trunk/doc/cpp.md)
-- [Language overview](trunk/doc/parsi.md) ·
-  [Data types](trunk/doc/datatypes.md) ·
-  [Expressions](trunk/doc/expression.md)
-- [TABLE](trunk/doc/table.md) ·
-  [PROCEDURE](trunk/doc/procedure.md) ·
-  [CLASS](trunk/doc/class.md) ·
-  [SEQUENCE](trunk/doc/sequence.md)
-- [SELECT](trunk/doc/select.md) ·
-  [INSERT](trunk/doc/insert.md) ·
-  [UPDATE](trunk/doc/update.md) ·
-  [DELETE](trunk/doc/delete.md) ·
-  [TRANSACTION](trunk/doc/transaction.md)
-- [PAGE](trunk/doc/page.md) ·
-  [Request](trunk/doc/request.md) ·
-  [Response](trunk/doc/response.md) ·
-  [Session](trunk/doc/session.md)
+- [Installation](doc/installation.md) ·
+  [Configuration](doc/configuration.md) ·
+  [Connector](doc/connector.md) ·
+  [C++ API](doc/cpp.md)
+- [Language overview](doc/parsi.md) ·
+  [Data types](doc/datatypes.md) ·
+  [Expressions](doc/expression.md)
+- [TABLE](doc/table.md) ·
+  [PROCEDURE](doc/procedure.md) ·
+  [CLASS](doc/class.md) ·
+  [SEQUENCE](doc/sequence.md)
+- [SELECT](doc/select.md) ·
+  [INSERT](doc/insert.md) ·
+  [UPDATE](doc/update.md) ·
+  [DELETE](doc/delete.md) ·
+  [TRANSACTION](doc/transaction.md)
+- [PAGE](doc/page.md) ·
+  [Request](doc/request.md) ·
+  [Response](doc/response.md) ·
+  [Session](doc/session.md)
 
 ---
 
@@ -310,29 +310,28 @@ earlier point in time.
 ## Project layout
 
 ```
-trunk/
-  Core/           big integers, arrays, polynomials, utility
-  StreamIO/       binary streams, custom streambufs, typed serialisation
-  Type/           Bool, Int, Long, String, Text, Timestamp, Vector, ...
-  Encoding/       base16/32/32hex/64/64url, CTE, DER, ASN.1
-  Compression/    zlib wrapper
-  Cryptography/   SHA-1/2, HMAC, HKDF, AES, RSA, X.509
-  Configuration/  configuration files and command line arguments
-  Threading/      thread pool
-  SocketIO/       sockets, TCP/IPC streams, TLS records
-  Connector/      client library for the binary protocol
-  HTTP/           request, response, server, session
-  MVCCS/          the storage engine
-  Compiler/       tokenizer, parser, Parsi to C++ compiler
-  Library/        shared object loader and pool
-  System/         built-in catalogue objects, written in Parsi
-  ca/             X.509 certificate authority tool
-  parsi/          standalone Parsi compiler
-  ziguratip/      the server
-  Test/           test suite
-  doc/            language and API reference
-  home/           install prefix and runtime home
-  zlib/           vendored zlib
+Core/           big integers, arrays, polynomials, utility
+StreamIO/       binary streams, custom streambufs, typed serialisation
+Type/           Bool, Int, Long, String, Text, Timestamp, Vector, ...
+Encoding/       base16/32/32hex/64/64url, CTE, DER, ASN.1
+Compression/    zlib wrapper
+Cryptography/   SHA-1/2, HMAC, HKDF, AES, RSA, X.509
+Configuration/  configuration files and command line arguments
+Threading/      thread pool
+SocketIO/       sockets, TCP/IPC streams, TLS records
+Connector/      client library for the binary protocol
+HTTP/           request, response, server, session
+MVCCS/          the storage engine
+Compiler/       tokenizer, parser, Parsi to C++ compiler
+Library/        shared object loader and pool
+System/         built-in catalogue objects, written in Parsi
+ca/             X.509 certificate authority tool
+parsi/          standalone Parsi compiler
+ziguratip/      the server
+Test/           test suite
+doc/            language and API reference
+home/           install prefix and runtime home
+zlib/           vendored zlib
 ```
 
 Each module is an independent make target producing one shared library; the
@@ -353,13 +352,13 @@ suite passes. Some things are known to be incomplete:
   `BigInt` emits word-padded DER integers where the spec wants minimal-length
   encoding, and certificates omit the `[0] EXPLICIT Version` field, so OpenSSL
   rejects them.
-- **The system catalogue objects do not build.** `trunk/System` holds the
+- **The system catalogue objects do not build.** `System` holds the
   built-in objects written in Parsi itself — `Session`, `Connector`, the RPC
   console and the memory viewer among them — but 9 of the 12 are written
   against the pre-migration C++ API and no longer compile. `System` is not in
   the top-level `Makefile` for that reason. Until they are ported,
   `REQUIRES Session` has nothing to link against; the C++ `Session` in
-  `trunk/HTTP` is complete and callable from generated pages in the meantime.
+  `HTTP` is complete and callable from generated pages in the meantime.
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
 - **`nbostream` and `hbostream` are identical** — the "network byte order"

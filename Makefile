@@ -27,13 +27,21 @@ else
 	SEP := ;
 endif
 
-.PHONY: all clean
+.PHONY: all clean headers
 
-all:
+all: headers
 	@- $(foreach project,$(PROJECTS), \
 		$(MAKE) -C $(CURDIR)/$(project)/ $(SEP)\
 	)
 	@echo [Workspace] "******* all done *******"
+
+# Every public header goes to home/include before anything is compiled, so a
+# clean checkout builds without needing a previously populated include tree.
+headers:
+	@- $(foreach project,$(PROJECTS), \
+		$(MAKE) -C $(CURDIR)/$(project)/ headers $(SEP)\
+	)
+	@echo [Workspace] "******* headers done *******"
 
 clean:
 	@- $(foreach project,$(PROJECTS), \
