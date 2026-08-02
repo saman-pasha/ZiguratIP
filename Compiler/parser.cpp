@@ -395,6 +395,13 @@ namespace Zigurat
     
     this->_level = 0;
     this->_break_loop = false;
+    // _eof and _return survive from the previous parse otherwise. Once _eof is
+    // set every option succeeds without consuming a token, so a reused Parser
+    // silently returned an empty tree for its second and every later source --
+    // and the server keeps exactly one Parser for the life of the process.
+    this->_eof = false;
+    this->_return = false;
+    this->_return_value = false;
     this->_tokens = &tokens;
     this->_iter = tokens.begin();
     this->_references.clear();

@@ -18,7 +18,8 @@ SOURCES := main_test.cpp \
 	test_acid.cpp \
 	test_isolation.cpp \
 	test_concurrency.cpp \
-	test_zeytun.cpp
+	test_zeytun.cpp \
+	test_grammar.cpp
 
 LIBS := -lStreamIO \
 	-lType \
