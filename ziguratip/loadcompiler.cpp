@@ -1,5 +1,6 @@
 #include "ziguratipexception.hpp"
 #include "configuration.hpp"
+#include "globals.hpp"
 #include "utility.hpp"
 #include "token.hpp"
 #include "tokenizer.hpp"
@@ -63,6 +64,13 @@ void load_compiler(const Configuration &config)
   }
   std::cout << "Parser trace mode: '" << ((parser_trace) ? "TRUE" : "FALSE") << "'" << std::endl;
 
-  parser.configure(patterns_file, parser_trace);  
+  parser.configure(patterns_file, parser_trace);
   compiler.configure(cpp, cpp_flags, ld_flags, catalog_path, include_path, obj_path, lib_path, tmp_path, ld_path, trace_mode);
+
+  // Both are reached through Globals by the compile function of the binary
+  // protocol, and registering them is what makes that pointer non-null. Without
+  // this the first Connector::compile dereferenced null and took the server down
+  // with it -- the client saw only the acknowledgement sent before it died.
+  Globals::set_parser(&parser);
+  Globals::set_compiler(&compiler);
 }

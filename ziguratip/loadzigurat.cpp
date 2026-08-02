@@ -182,6 +182,12 @@ void handle_client()
     }
   } while (function != "close");
 
+  // Every branch that reports an error breaks out of the loop, so nothing reads
+  // from the socket afterwards to push the buffer out. Unflushed, the error byte
+  // died with the connection and the client read a zero off the closed stream --
+  // which is SUCCESSFUL_DONE. A failed compile looked like a successful one.
+  Globals::client_stream()->flush();
+
   std::cout << "Transaction Closed " << Globals::memory()->transaction_id() << std::endl;
 }
 

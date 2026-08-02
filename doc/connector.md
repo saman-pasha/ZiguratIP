@@ -27,8 +27,9 @@ Checks whether the connection is open or closed.
 
 Gets a Text, send it to the server for compile and gets the result of compilation back.
 
-**Do not use this.** It brings the server down — see the project README's Status
-section. Compile with `parsi` and use the connector to `call` what it built.
+The source is a suite: `TABLE`, `SEQUENCE`, `PROCEDURE`, `CLASS`, `PAGE`, `TYPE`
+and `ENUM` declarations. A bare statement is not one, and neither is an empty
+string; both come back as an exception rather than a silent success.
 
 ## AUTO_COMMIT(Bool) RETURNS Void
 

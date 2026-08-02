@@ -196,8 +196,8 @@ is linked against, so declaration order matters.
 ### 3. Talking to the server from C++
 
 The `Connector` class speaks the binary protocol on port 2160. Compile the
-procedure with `parsi` first — `Connector::compile` is not usable, see
-[Status](#status) — and note the explicit commit:
+procedure first — with `parsi`, or by sending the same source through
+`Connector::compile` — and note the explicit commit:
 
 ```parsi
 PROCEDURE demo::add_visitor(name AS String)
@@ -409,13 +409,6 @@ suite passes. Some things are known to be incomplete:
   the top-level `Makefile` for that reason. Until they are ported,
   `REQUIRES Session` has nothing to link against; the C++ `Session` in
   `HTTP` is complete and callable from generated pages in the meantime.
-- **Compiling over the binary protocol kills the server.** One
-  `Connector::compile(...)` and the process is gone, whatever the source says.
-  The parser recurses deeply and a pool worker's stack is a fraction of the main
-  thread's, which is why `parsi` compiles the same text without complaint. The
-  client is told the call succeeded, because what it reads is the acknowledgement
-  the server sent before it died. Compile with `parsi`; use the connector to
-  `call`.
 - **`Connector::commit()` does not commit a `call`'s work.** The transaction is
   thread-local to the worker, and what the procedure wrote is not part of what
   the commit sees. Either end the procedure with `TRANSACTION COMMIT;` or turn
