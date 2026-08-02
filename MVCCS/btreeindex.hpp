@@ -59,10 +59,16 @@ namespace Zigurat
     void _cursor_values(hashkey_ptr, std::function<bool (int64_t, BTreeValue&)>&&);
     void _cursor_values(const BTreeKey<_First>&, std::function<bool (int64_t, BTreeValue&)>&&);
 
-    void _split_node(BTreeNode*, BTreeNode&);
-    void _map_to_internal(BTreeNode*, BTreeNode&, BTreeKey<_First>&);
+    // The chain of nodes above the one being worked on, root first. A split
+    // promotes a key into its parent, which can push the parent over the limit
+    // and split that too, all the way up -- so the whole path has to be to hand,
+    // not just one level of it.
+    typedef std::vector<BTreeNode*> path_t;
+
+    void _split_node(path_t&, BTreeNode&);
+    void _map_to_internal(path_t&, BTreeNode&, BTreeKey<_First>&);
     virtual void _map_callback(const _Table&, const _First&, const Long&, BTreeKey<_First>&);
-    void _map(BTreeNode*, BTreeNode&, const _Table&, const _First&, const Long&);
+    void _map(path_t&, BTreeNode&, const _Table&, const _First&, const Long&);
 
     virtual void _unmap_callback(const _Table&, const _First&, const Long&, BTreeKey<_First>&);
     void _unmap(BTreeNode&, const _Table&, const _First&, const Long&);
@@ -74,13 +80,15 @@ namespace Zigurat
   
     bool _cursor_output(const BTreeKey<_First>&, const std::function<bool (_Table&)>&);
     
-    void _cursor(const Long&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_not_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_less_than(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_less_than_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_greater_than(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
-    void _cursor_greater_than_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    // Each returns false once the caller's callback has asked to stop, so the
+    // recursion unwinds instead of carrying on in the parent node.
+    bool _cursor(const Long&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_not_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_less_than(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_less_than_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_greater_than(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
+    bool _cursor_greater_than_equal(const Long&, const _First&, const std::function<bool (BTreeKey<_First>&)>&);
 
   public:
     BTreeIndex(Memory*, std::string, bool, _First _Table::*);
@@ -100,6 +108,10 @@ namespace Zigurat
     void cursor_less_than_equal(const _First, std::function<bool (_Table&)>);
     void cursor_greater_than(const _First, std::function<bool (_Table&)>);
     void cursor_greater_than_equal(const _First, std::function<bool (_Table&)>);
+
+    // The multi column index derives from this one and overrides the map and
+    // unmap callbacks, so it has to be destroyable through a base pointer.
+    virtual ~BTreeIndex() { }
   };
 
   template <typename _Table, typename _First>
@@ -205,6 +217,10 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_select_btreeindex()
   {
+    // The catalogue index cannot look itself up through the catalogue, so it
+    // scans the index rows directly. Not recording the hit there left the
+    // catalogue re-inserting its own row on every restart: the root address was
+    // read back correctly, but the store gained a duplicate each time.
     bool found = false;
     if (this->_name == "IDX_ZIGURAT_BTREERECORD_HASH_NAME") {
 
@@ -222,8 +238,9 @@ namespace Zigurat
 	  this->_memory->_data_io.unpack(hash_name_, is_unique_, branching_factor_, root_address_);
 
 	  if (this->_hash_name == hash_name_.value()) {
-	    this->_root_address = root_address_;	
+	    this->_root_address = root_address_;
 	    this->_pointer = index_pointer;
+	    found = true;
 	    return false;
 	  }
 
@@ -374,9 +391,16 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_split_node(BTreeNode* parent_node, BTreeNode& node)
+  void BTreeIndex<_Table, _First>::_split_node(path_t& ancestors, BTreeNode& node)
   {
     BTreeNode new_node;
+
+    // The upper half of the split is the same kind of node as the half it came
+    // from. BTreeNode defaults is_internal to false, and leaving it there turned
+    // the right half of a split internal node into a leaf: its children stopped
+    // being descended and every key underneath them left the index.
+    new_node.is_internal = node.is_internal;
+
     this->_memory->_offline_insert(this->_hash_key, new_node);
 
     BTreeKey<_First> left_key;
@@ -397,18 +421,29 @@ namespace Zigurat
 
 	  this->_memory->_offline_update(current_key);
 
-	  if (parent_node == nullptr) { // is root
+	  if (ancestors.empty()) { // is root
 
 	    BTreeNode root;
 	    root.is_internal = true;
 	    this->_memory->_offline_insert(this->_hash_key, root);
-            this->_map_to_internal(nullptr, root, current_key);
+
+	    path_t none;
+            this->_map_to_internal(none, root, current_key);
 
 	    this->_root_address = root.pointer.address;
             this->_update_btreeindex();
 
 	  } else {
-	    this->_map_to_internal(nullptr, *parent_node, current_key);
+
+	    // The promoted key goes to the immediate parent, and the parent's own
+	    // ancestors travel with it. Passing an empty path here made every
+	    // overflowing parent believe it was the root: it grew a fresh root of
+	    // its own and the real one, along with its other children, was
+	    // dropped from the index.
+	    BTreeNode* parent_node = ancestors.back();
+	    path_t above(ancestors.begin(), ancestors.end() - 1);
+
+	    this->_map_to_internal(above, *parent_node, current_key);
 	  }
 	
         } else if (current_index > this->_min_degree) { // first key of new node
@@ -429,7 +464,7 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_map_to_internal(BTreeNode* parent_node, BTreeNode& node, BTreeKey<_First>& new_key)
+  void BTreeIndex<_Table, _First>::_map_to_internal(path_t& ancestors, BTreeNode& node, BTreeKey<_First>& new_key)
   {
     if (node.keys_address.value() == -1) {
       
@@ -501,10 +536,10 @@ namespace Zigurat
       });
 
     if (node.degree.value() > this->_max_degree) {
-      this->_split_node(parent_node, node);
+      this->_split_node(ancestors, node);
     }
   }
-  
+
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_map_callback(const _Table& object, const _First& key, const Long& value, BTreeKey<_First>& current_key)
   {
@@ -512,7 +547,7 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_map(BTreeNode* parent_node, BTreeNode& node, const _Table& object, const _First& key, const Long& value)
+  void BTreeIndex<_Table, _First>::_map(path_t& ancestors, BTreeNode& node, const _Table& object, const _First& key, const Long& value)
   {
     if (node.keys_address.value() == -1) {
 
@@ -538,7 +573,9 @@ namespace Zigurat
 	  if (node.is_internal) {
 
 	    BTreeNode left_node = this->_btreenode(current_key.left_node_address);
-	    this->_map(&node, left_node, object, key, value);
+	    ancestors.push_back(&node);
+	    this->_map(ancestors, left_node, object, key, value);
+	    ancestors.pop_back();
 	    return false;
 
 	  } else {
@@ -605,9 +642,11 @@ namespace Zigurat
 	    if (current_index == node.degree.value() - 1) { // last key
 
 	      BTreeNode right_node = this->_btreenode(current_key.right_node_address);
-	      this->_map(&node, right_node, object, key, value);
+	      ancestors.push_back(&node);
+	      this->_map(ancestors, right_node, object, key, value);
+	      ancestors.pop_back();
 	      return false;
-	      
+
 	    }
 	    
 	  } else {
@@ -638,9 +677,9 @@ namespace Zigurat
       });
 
     if (node.degree.value() > this->_max_degree) {
-      this->_split_node(parent_node, node);
+      this->_split_node(ancestors, node);
     }
-    
+
   }
 
   template <typename _Table, typename _First>
@@ -662,7 +701,8 @@ namespace Zigurat
 
     BTreeNode root_node = this->_btreenode(this->_root_address);
     Long value = object.pointer.address;
-    this->_map(nullptr, root_node, object, object.*this->_column, value);
+    path_t ancestors;
+    this->_map(ancestors, root_node, object, object.*this->_column, value);
   }
   
   template <typename _Table, typename _First>
@@ -789,7 +829,10 @@ namespace Zigurat
     this->_memory->_offline_delete(right_node);
 
     if (left_node.degree.value() > this->_max_degree) {
-      this->_split_node(&node, left_node);
+      // Only the immediate parent is known here, which is as much as this path
+      // ever had. It is reached from unmap_key, which nothing calls yet.
+      path_t ancestors(1, &node);
+      this->_split_node(ancestors, left_node);
     }
 
     if (node.degree == Short(Int(0))) {
@@ -953,7 +996,11 @@ namespace Zigurat
   template <typename _Table, typename _First>
   bool BTreeIndex<_Table, _First>::_cursor_output(const BTreeKey<_First>& key, const std::function<bool (_Table&)>& callback)
   {
-    bool do_continue = false;
+    // True unless the caller's callback asks to stop. An unmapped row leaves its
+    // key behind with an empty bucket, and an empty bucket is not a reason to
+    // end the walk -- starting this at false ended the whole cursor at the first
+    // key whose rows had been deleted.
+    bool do_continue = true;
     this->_cursor_values(key, [&] (int64_t, BTreeValue& current_value) -> bool {
 
 	_Table object(this->_memory->_pointer(_Table::hash_key, current_value.value));
@@ -968,26 +1015,42 @@ namespace Zigurat
     return do_continue;
   }
 
+  // How the children of an internal node hang off its keys, because every
+  // cursor below depends on it:
+  //
+  //     c0   k0   c1   k1   c2   k2   c3
+  //
+  // c0 is k0.left_node_address, and c(i+1) is k(i).right_node_address. The keys
+  // are a linked list, and _map_to_internal keeps k(i).right_node_address and
+  // k(i+1).left_node_address pointing at the same node -- consecutive keys share
+  // a child. So an in-order walk descends the left child of the *first* key
+  // only, and then alternates key, right child. Descending the left child of
+  // every key visits c1..c(m-1) twice.
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor(const Long& node_address, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor(const Long& node_address, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
 
-    this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
+    this->_cursor_keys(node, [&] (int16_t current_index, BTreeKey<_First>& current_key) -> bool {
+
+	if (node.is_internal && current_index == 0) {
+	  do_continue = this->_cursor(current_key.left_node_address, callback);
+	  if (!do_continue) return false;
+	}
+
+	do_continue = callback(current_key);
+	if (!do_continue) return false;
 
 	if (node.is_internal) {
-	  this->_cursor(current_key.left_node_address, callback);
+	  do_continue = this->_cursor(current_key.right_node_address, callback);
+	  if (!do_continue) return false;
 	}
 
-	if (callback(current_key)) {
-	  if (node.is_internal) {
-	    this->_cursor(current_key.right_node_address, callback);
-	  }
-	  return true;
-	}
-
-	return false;
+	return true;
       });
+
+    return do_continue;
   }
 
 
@@ -1002,35 +1065,43 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
 
     this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
 
 	if (key < current_key.key) {
-	  
-	  if (node.is_internal) {
-	    this->_cursor_equal(current_key.left_node_address, key, callback);
-	    return false;
-	  }
-	  
-	} else if (key == current_key.key) {
-	  
-	  callback(current_key);
+
+	  // Everything from here on is larger, so the key is either in the child
+	  // between the previous key and this one, or not in the tree at all.
+	  if (node.is_internal)
+	    do_continue = this->_cursor_equal(current_key.left_node_address, key, callback);
+
 	  return false;
-	    
+
+	} else if (key == current_key.key) {
+
+	  do_continue = callback(current_key);
+	  return false;
+
 	} else {
-	  
-	  if (node.is_internal) {
-	    this->_cursor_equal(current_key.right_node_address, key, callback);
+
+	  // Larger than this key: keep scanning the node. Only once the last key
+	  // has been passed does the rightmost child become the one to descend --
+	  // descending here would skip every key after this one.
+	  if (node.is_internal && current_key.right_address.value() == -1) {
+	    do_continue = this->_cursor_equal(current_key.right_node_address, key, callback);
 	    return false;
 	  }
-	  
+
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>
@@ -1043,33 +1114,34 @@ namespace Zigurat
     }
   }
 
+  // A full walk with one key held back.
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_not_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_not_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
 
-    this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
+    this->_cursor_keys(node, [&] (int16_t current_index, BTreeKey<_First>& current_key) -> bool {
 
-	if (key < current_key.key) {
-	  
-	  if (node.is_internal) {
-	    this->_cursor_not_equal(current_key.left_node_address, key, callback);
-	  }
-	  callback(current_key);
+	if (node.is_internal && current_index == 0) {
+	  do_continue = this->_cursor_not_equal(current_key.left_node_address, key, callback);
+	  if (!do_continue) return false;
+	}
 
-	} else if (key == current_key.key) {
-	  	    
-	} else {
-	  
-	  callback(current_key);
-	  if (node.is_internal) {
-	    this->_cursor_not_equal(current_key.right_node_address, key, callback);
-	  }
-	  
+	if (!(key == current_key.key)) {
+	  do_continue = callback(current_key);
+	  if (!do_continue) return false;
+	}
+
+	if (node.is_internal) {
+	  do_continue = this->_cursor_not_equal(current_key.right_node_address, key, callback);
+	  if (!do_continue) return false;
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>
@@ -1082,26 +1154,38 @@ namespace Zigurat
     }
   }
 
+  // Walks in order from the smallest key and stops at the bound. The leftmost
+  // child is descended before the first key is tested, because it holds keys
+  // below it that may still qualify.
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_less_than(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_less_than(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
 
-    this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
+    this->_cursor_keys(node, [&] (int16_t current_index, BTreeKey<_First>& current_key) -> bool {
 
-	if (current_key.key < key) {
-	  
-	  if (node.is_internal) {
-	    this->_cursor_less_than(current_key.left_node_address, key, callback);
-	  }
-	  callback(current_key);
+	if (node.is_internal && current_index == 0) {
+	  do_continue = this->_cursor_less_than(current_key.left_node_address, key, callback);
+	  if (!do_continue) return false;
+	}
 
-	} else {
-	  return false;
+	// This key and every key after it is at or above the bound. The child
+	// that straddles the bound has already been walked.
+	if (!(current_key.key < key)) return false;
+
+	do_continue = callback(current_key);
+	if (!do_continue) return false;
+
+	if (node.is_internal) {
+	  do_continue = this->_cursor_less_than(current_key.right_node_address, key, callback);
+	  if (!do_continue) return false;
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>
@@ -1115,30 +1199,37 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_less_than_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_less_than_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
 
-    this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
+    this->_cursor_keys(node, [&] (int16_t current_index, BTreeKey<_First>& current_key) -> bool {
 
-	if (current_key.key < key) {
-	  
-	  if (node.is_internal) {
-	    this->_cursor_less_than_equal(current_key.left_node_address, key, callback);
-	  }
-	  callback(current_key);
+	if (node.is_internal && current_index == 0) {
+	  do_continue = this->_cursor_less_than_equal(current_key.left_node_address, key, callback);
+	  if (!do_continue) return false;
+	}
 
-	} else if (key == current_key.key) {
-	  
-	  callback(current_key);
-	  return false;
+	if (key < current_key.key) return false;
 
-	} else {
-	  return false;
+	do_continue = callback(current_key);
+	if (!do_continue) return false;
+
+	// Keys are distinct in the tree -- a non unique index buckets its
+	// duplicates under one key -- so once the bound itself has been emitted
+	// there is nothing above it left to match.
+	if (key == current_key.key) return false;
+
+	if (node.is_internal) {
+	  do_continue = this->_cursor_less_than_equal(current_key.right_node_address, key, callback);
+	  if (!do_continue) return false;
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>
@@ -1151,32 +1242,51 @@ namespace Zigurat
     }
   }
 
+  // Skips forward to the bound and then walks in order to the end. Only the
+  // first qualifying key needs its left child descended: the child straddles the
+  // bound, and every later key's left child is the previous key's right child,
+  // already walked.
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_greater_than(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_greater_than(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
+    bool started = false;
 
     this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
 
-	if (current_key.key < key) {
-	  
-	} else if (key == current_key.key) {
+	if (!started) {
 
-	  if (node.is_internal) {
-	    this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
+	  if (!(key < current_key.key)) {
+	    // Still at or below the bound. The rightmost child is the only one
+	    // left to try once the keys run out.
+	    if (node.is_internal && current_key.right_address.value() == -1) {
+	      do_continue = this->_cursor_greater_than(current_key.right_node_address, key, callback);
+	      return false;
+	    }
+	    return true;
 	  }
 
-	} else {
-	  
-	  callback(current_key);
-	  if (node.is_internal) {
-	    this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
-	  }
+	  started = true;
 
+	  if (node.is_internal) {
+	    do_continue = this->_cursor_greater_than(current_key.left_node_address, key, callback);
+	    if (!do_continue) return false;
+	  }
+	}
+
+	do_continue = callback(current_key);
+	if (!do_continue) return false;
+
+	if (node.is_internal) {
+	  do_continue = this->_cursor_greater_than(current_key.right_node_address, key, callback);
+	  if (!do_continue) return false;
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>
@@ -1190,32 +1300,44 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_greater_than_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
+  bool BTreeIndex<_Table, _First>::_cursor_greater_than_equal(const Long& node_address, const _First& key, const std::function<bool (BTreeKey<_First>&)>& callback)
   {
     BTreeNode node = this->_btreenode(node_address);
+    bool do_continue = true;
+    bool started = false;
 
     this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
 
-	if (current_key.key < key) {
-	  
-	} else if (key == current_key.key) {
-	  
-	  callback(current_key);
-	  if (node.is_internal) {
-	    this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
+	if (!started) {
+
+	  if (current_key.key < key) {
+	    if (node.is_internal && current_key.right_address.value() == -1) {
+	      do_continue = this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
+	      return false;
+	    }
+	    return true;
 	  }
 
-	} else {
+	  started = true;
 
 	  if (node.is_internal) {
-	    this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
+	    do_continue = this->_cursor_greater_than_equal(current_key.left_node_address, key, callback);
+	    if (!do_continue) return false;
 	  }
-	  callback(current_key);
+	}
 
+	do_continue = callback(current_key);
+	if (!do_continue) return false;
+
+	if (node.is_internal) {
+	  do_continue = this->_cursor_greater_than_equal(current_key.right_node_address, key, callback);
+	  if (!do_continue) return false;
 	}
 
 	return true;
       });
+
+    return do_continue;
   }
 
   template <typename _Table, typename _First>

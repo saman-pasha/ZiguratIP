@@ -235,16 +235,17 @@ read `home/tmp/_REPORT_.cpp` to see which one a query became:
 | `amount > 100` | `Globals::memory()->cursor<...>` — `amount` has no index, so every row is read |
 | `name LIKE 'The %'` | a scan — a pattern cannot be looked up in a B-tree |
 | `id BETWEEN 1 AND 5` | a scan — see below |
+| `id == 1 OR id == 2` | a scan — see below |
 
-So indexes are not only for equality: ranges compile to range cursors too.
+So indexes are not only for equality: ranges compile to range cursors too, and
+they stay correct as the table grows. `Test/test_btree.cpp` is the suite that
+holds them to that; it loads thousands of rows and checks every cursor against
+the answer worked out in plain C++ over the same data.
 
-**But the range cursors only work on small tables.** `cursor_less_than`,
-`cursor_less_than_equal`, `cursor_greater_than` and `cursor_greater_than_equal`
-return the right rows on the four-row `demo::books`, and return **nothing at
-all** on the five-hundred-row `demo::sales`. `cursor_equal` and
-`cursor_not_equal` are unaffected. Until that is fixed, treat `<`, `<=`, `>`
-and `>=` on an indexed column as unreliable once a table outgrows a single
-B-tree node, and prefer `==`, `<>` or a scan.
+`OR` reads every row and filters. One cursor per operand would be faster, but a
+row satisfying both sides would come back twice and there is nowhere to
+deduplicate it, so the whole condition becomes a filter over a scan. `AND` is
+the one that reaches an index.
 
 ### BETWEEN and LIKE
 
@@ -291,10 +292,9 @@ The same applies to a composite: `year == 2022 AND region == 'EU'` scans,
 because the leading column of the index is not the leading condition. **Put the
 indexed column first.** The `report` page shows both orders side by side.
 
-**`OR` crashes the compiler.** `WHERE id == 1 OR id == 2` segfaults `parsi`
-rather than reporting an error. The grammar accepts `OR`, so this is a defect
-in the where-clause compiler, not a language restriction — avoid it until it is
-fixed.
+**`OR` reads every row.** `WHERE id == 1 OR id == 2` is correct but is a scan,
+for the reason given above. Put the condition you want indexed on its own, or
+join it with `AND`.
 
 ### Loading enough rows to matter
 

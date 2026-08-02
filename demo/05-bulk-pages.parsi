@@ -80,6 +80,15 @@ PUBLIC:
         FROM demo::sales WHERE amount > 4000 AND region == 'EU';
         ECHO '</ul>';
 
+        -- OR cannot use an index: one cursor per operand would return a row
+        -- twice when both sides match it. The whole condition becomes a filter
+        -- over a scan instead.
+        ECHO '<h2>Either <code>WHERE id &lt; 4 OR id &gt; 497</code></h2>';
+        ECHO '<p>Correct, but read by scanning every row.</p><ul>';
+        SELECT '<li>', id, ': ', region, ' ', year, ' &mdash; ', amount, '</li>'
+        FROM demo::sales WHERE id < 4 OR id > 497;
+        ECHO '</ul>';
+
         ECHO '<p><a href="bulk.zt">Load more</a> &middot; ';
         ECHO '<a href="/">Back to Zeytun</a></p>';
         ECHO '</body></html>';

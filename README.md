@@ -108,7 +108,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 200 cases
+Starts a server, runs the full suite against it, stops it again. 212 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -368,13 +368,6 @@ suite passes. Some things are known to be incomplete:
   the top-level `Makefile` for that reason. Until they are ported,
   `REQUIRES Session` has nothing to link against; the C++ `Session` in
   `HTTP` is complete and callable from generated pages in the meantime.
-- **Range cursors on an index return nothing on larger tables.** `<`, `<=`,
-  `>` and `>=` on an indexed column compile to `cursor_less_than` and friends,
-  which work on a four-row table and return no rows at all on a five-hundred
-  row one. `cursor_equal` and `cursor_not_equal` are fine. `demo/README.md`
-  shows how to reproduce it.
-- **`OR` in a WHERE clause segfaults the compiler.** The grammar accepts it;
-  the where-clause compiler does not survive it.
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
 - **`nbostream` and `hbostream` are identical** — the "network byte order"

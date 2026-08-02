@@ -24,8 +24,12 @@ namespace Zigurat
       if (where->args[0].token.value == "AND") {
 	this->_compile(*where, code, lvl, content, &where->args[0]);
       } else if (where->args[0].token.value == "OR") {
-	this->compile(where, code, lvl, content);
-	this->compile(where, code, lvl, content);
+	// OR reads every row and filters, like BETWEEN and LIKE. Opening one
+	// cursor per operand instead would emit a row twice when both sides
+	// match it, and there is nowhere to deduplicate. (This branch used to
+	// call compile() with its own arguments, which recursed until the stack
+	// ran out -- an OR in a WHERE clause killed the compiler outright.)
+	this->_compile(*where, code, lvl, content, nullptr);
       } else {
 	this->_compile(*where, code, lvl, content, nullptr);
       }
