@@ -12,8 +12,15 @@ demo/build.sh        # compile the demo objects
 home/bin/ziguratip   # start the server
 ```
 
-Then open <http://127.0.0.1:2190/setup.zt> to load the data, and
-<http://127.0.0.1:2190/catalog.zt> to browse it.
+Then, in order:
+
+| | |
+|---|---|
+| <http://127.0.0.1:2190/setup.zt> | seed the catalogue |
+| <http://127.0.0.1:2190/catalog.zt> | browse it |
+| <http://127.0.0.1:2190/lookup.zt> | queries served from single-column indexes |
+| <http://127.0.0.1:2190/bulk.zt> | load 500 rows into a second table |
+| <http://127.0.0.1:2190/report.zt> | query those through a two-column index |
 
 ---
 
@@ -133,7 +140,163 @@ sharing a table's name would collide in the catalogue.
 
 ---
 
-## 4. What happens when you request the page
+## 4. Lookups that use the indexes
+
+The catalog reads every row, because it wants every row. A `WHERE` on an
+indexed column is different: the compiler resolves it against the B-tree
+instead of scanning.
+
+[`03-pages.parsi`](03-pages.parsi) ends with a `lookup` page doing exactly
+that:
+
+```parsi
+SELECT '<li>', title, ' (', year, ')</li>'
+FROM demo::books WHERE author_id == 1;
+```
+
+You can see which path was taken, because the generated C++ names it. After
+`demo/build.sh`, look at `home/tmp/_LOOKUP_.cpp`:
+
+| The query | What it compiles to |
+|---|---|
+| `WHERE author_id == 1` | `IDX_DEMO_BOOKS_AUTHOR_ID.cursor_equal` |
+| `WHERE id == 3` | `IDX_DEMO_BOOKS_ID.cursor_equal` |
+| `WHERE id > 2` | `IDX_DEMO_BOOKS_ID.cursor_greater_than` |
+| `WHERE name == '...'` | `IDX_DEMO_AUTHORS_NAME.cursor_equal` |
+| `WHERE year > 1950` | `Globals::memory()->cursor<...>` — a full scan |
+
+So all three key kinds are used, and not only for equality: `>` becomes
+`cursor_greater_than`, `<>` becomes `cursor_not_equal`. `year` is the control
+case — it carries no key, so that query reads every row and filters.
+
+In a compound condition the compiler indexes what it can and filters the rest,
+so `WHERE author_id == 1 AND year > 1960` still enters through
+`IDX_DEMO_BOOKS_AUTHOR_ID`.
+
+Adding an index is therefore just a column attribute — `INDEX KEY` on
+`author_id` is what turns that first query from a scan into a lookup.
+
+---
+
+## 5. Indexes: creating them and searching them
+
+The catalogue has seven rows, too few to tell a lookup from a scan.
+[`04-bulk.parsi`](04-bulk.parsi) adds a table that carries as many as you like,
+and this section covers every way to index it and every way to search it.
+
+### Creating an index
+
+An index is a column attribute or a table-level declaration. There is no
+separate `CREATE INDEX`; the table definition is the whole story.
+
+```parsi
+TABLE demo::sales
+BEGIN
+    COLUMN id     AS Long PRIMARY KEY;   -- unique, and the row's identity
+    COLUMN region AS String;
+    COLUMN year   AS Long;
+    COLUMN amount AS Long;
+
+    INDEX KEY (region, year);            -- one index over two columns
+END
+```
+
+| Written as | Kind | Index built |
+|---|---|---|
+| `COLUMN a AS Long PRIMARY KEY` | unique, the identity | `IDX_DEMO_SALES_A` |
+| `COLUMN b AS String UNIQUE KEY` | unique, not the identity | `IDX_DEMO_SALES_B` |
+| `COLUMN c AS Long INDEX KEY` | not unique | `IDX_DEMO_SALES_C` |
+| `PRIMARY KEY (a, b);` | composite identity | `IDX_DEMO_SALES_A_B` |
+| `UNIQUE KEY (a, b);` | composite unique | `IDX_DEMO_SALES_A_B` |
+| `INDEX KEY (a, b);` | composite, not unique | `IDX_DEMO_SALES_A_B` |
+
+Every one becomes a B-tree in the storage engine, named
+`IDX_<DOMAIN>_<TABLE>_<COLUMNS>`. That name is what you look for in the
+generated C++ to confirm which index a query used.
+
+**Two columns is the limit.** `INDEX KEY (b, c, d)` fails to compile with
+`call to non-static member function without an object argument`. The engine's
+`BTreeIndex` template is variadic, so this is a code generation gap rather than
+a storage limit — but for now, two.
+
+### Searching through an index
+
+Every comparison operator has an index cursor behind it. Compile the demo and
+read `home/tmp/_REPORT_.cpp` to see which one a query became:
+
+| `WHERE` | Compiles to |
+|---|---|
+| `id == 1` | `IDX_DEMO_SALES_ID.cursor_equal` |
+| `id <> 1` | `IDX_DEMO_SALES_ID.cursor_not_equal` |
+| `id < 5` | `IDX_DEMO_SALES_ID.cursor_less_than` |
+| `id <= 5` | `IDX_DEMO_SALES_ID.cursor_less_than_equal` |
+| `id > 5` | `IDX_DEMO_SALES_ID.cursor_greater_than` |
+| `id >= 5` | `IDX_DEMO_SALES_ID.cursor_greater_than_equal` |
+| `amount > 100` | `Globals::memory()->cursor<...>` — `amount` has no index, so every row is read |
+
+So indexes are not only for equality: ranges use them too.
+
+### Three rules worth knowing
+
+**A composite index is used left to right.** `INDEX KEY (region, year)`
+answers a question about `region`, or about `region` and `year` together, but
+not about `year` alone:
+
+| `WHERE` | Result |
+|---|---|
+| `region == 'EU' AND year == 2022` | `IDX_DEMO_SALES_REGION_YEAR` |
+| `region == 'EU'` | `IDX_DEMO_SALES_REGION_YEAR` — a leading prefix still uses it |
+| `year == 2022` | full scan — `year` is not the leading column |
+
+If you need to search on `year` by itself, declare a second index for it.
+
+**Inside `AND`, only the first condition chooses the index.** These return
+identical rows, and only the first is a lookup:
+
+```parsi
+SELECT amount FROM demo::sales WHERE region == 'EU' AND amount > 4000;  -- index
+SELECT amount FROM demo::sales WHERE amount > 4000 AND region == 'EU';  -- scan
+```
+
+The same applies to a composite: `year == 2022 AND region == 'EU'` scans,
+because the leading column of the index is not the leading condition. **Put the
+indexed column first.** The `report` page shows both orders side by side.
+
+**`OR` crashes the compiler.** `WHERE id == 1 OR id == 2` segfaults `parsi`
+rather than reporting an error. The grammar accepts `OR`, so this is a defect
+in the where-clause compiler, not a language restriction — avoid it until it is
+fixed.
+
+### Loading enough rows to matter
+
+```parsi
+PROCEDURE demo::bulk_load(rows AS Long)
+RETURNS Void
+REQUIRES demo::sales, demo::sales_seq
+BEGIN
+    DECLARE i AS Long = 0;
+    WHILE i < rows
+    BEGIN
+        DECLARE id AS Long = demo::sales_seq::NEXT();
+        INSERT INTO demo::sales VALUES (id, region, i % 5 + 2020, i * 10);
+        SET i = i + 1;
+    END
+END
+```
+
+<http://127.0.0.1:2190/bulk.zt> loads 500 rows and can be reloaded for more;
+<http://127.0.0.1:2190/report.zt> queries them. The whole load is one
+transaction, so 500 rows either all arrive or none do.
+
+Note `i % 5 + 2020` rather than `2020 + i % 5`: the typed operators are members
+of their left operand, so a bare literal cannot start the expression. For the
+same reason, mixing `Int` and `Long` in one expression will not compile — keep
+a column and the variables feeding it the same width. And Parsi has no escape
+for a quote inside a string, so a literal `'` in output is written `&#39;`.
+
+---
+
+## 6. What happens when you request the page
 
 1. Zeytun maps `/catalog.zt` to the object `catalog` and loads
    `home/ld/lib_CATALOG_.so`, compiling nothing at request time.

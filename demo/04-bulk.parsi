@@ -1,0 +1,54 @@
+-- ---------------------------------------------------------------------------
+-- Step 4: volume, and a multi-column index.
+--
+-- The catalogue is too small to tell a lookup from a scan. This table carries
+-- as many rows as you care to load, and a composite index over two of its
+-- columns.
+--
+-- A table-level KEY declaration covers several columns at once. The order is
+-- significant: an index on (region, year) serves a query on region, or on
+-- region and year together, but not one on year alone.
+-- ---------------------------------------------------------------------------
+
+TABLE demo::sales
+BEGIN
+    COLUMN id     AS Long PRIMARY KEY;
+    COLUMN region AS String;
+    COLUMN year   AS Long;
+    COLUMN amount AS Long;
+
+    INDEX KEY (region, year);
+END
+
+SEQUENCE demo::sales_seq
+BEGIN
+    FROM 1;
+    TO Long::MAX;
+    STEP 1;
+END
+
+-- Generates rows in a WHILE loop, spreading them over four regions and five
+-- years so the index has something to discriminate on.
+--
+-- Note the arithmetic: 'i % 5 + 2020' rather than '2020 + i % 5'. The typed
+-- operators are members of the left operand, so a literal cannot start the
+-- expression.
+PROCEDURE demo::bulk_load(rows AS Long)
+RETURNS Void
+REQUIRES demo::sales, demo::sales_seq
+BEGIN
+    DECLARE i AS Long = 0;
+    WHILE i < rows
+    BEGIN
+        DECLARE id AS Long = demo::sales_seq::NEXT();
+
+        DECLARE region AS String = 'EU';
+        IF i % 4 == 1 BEGIN SET region = 'US'; END
+        IF i % 4 == 2 BEGIN SET region = 'AP'; END
+        IF i % 4 == 3 BEGIN SET region = 'ME'; END
+
+        INSERT INTO demo::sales VALUES (id, region, i % 5 + 2020, i * 10);
+
+        SET i = i + 1;
+    END
+END

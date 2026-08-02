@@ -1,0 +1,70 @@
+-- ---------------------------------------------------------------------------
+-- Step 5: loading the rows, and querying them through the composite index.
+-- ---------------------------------------------------------------------------
+
+PAGE bulk
+REQUIRES demo::bulk_load
+BEGIN
+PUBLIC:
+    OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+    BEGIN
+        -- One HTTP request is one transaction, so all of these rows commit
+        -- together or none of them do.
+        CALL demo::bulk_load(500);
+
+        ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+        ECHO '<title>Bulk load</title></head>';
+        ECHO '<body style="font-family:system-ui,sans-serif;background:#fff;color:#222;';
+        ECHO 'margin:2em auto;max-width:44em">';
+        ECHO '<h1>Loaded 500 sales rows</h1>';
+        ECHO '<p>Reload to add another 500. ';
+        ECHO '<a href="report.zt">Query them</a>.</p>';
+        ECHO '</body></html>';
+    END
+END
+
+PAGE report
+REQUIRES demo::sales
+BEGIN
+PUBLIC:
+    OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+    BEGIN
+        ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+        ECHO '<title>Composite index</title>';
+        ECHO '<style>body{font-family:system-ui,sans-serif;background:#fff;color:#222;';
+        ECHO 'margin:2em auto;max-width:46em}code{background:#f0f0f0;padding:.1em .35em;';
+        ECHO 'border-radius:3px}td{padding:.15em .5em;border-bottom:1px solid #eee}';
+        ECHO 'th{text-align:left;background:#73a7e1;color:#fff;padding:.35em .5em}</style>';
+        ECHO '</head><body><h1>Querying through a composite index</h1>';
+
+        -- Both columns of INDEX KEY (region, year): served by the index.
+        -- Parsi has no escape for a quote inside a string, so the displayed
+        -- query uses the HTML entity for it.
+        ECHO '<h2><code>WHERE region == &#39;EU&#39; AND year == 2022</code></h2>';
+        ECHO '<p>Both columns, so the composite index answers it.</p>';
+        ECHO '<table><tr><th>ID</th><th>Region</th><th>Year</th><th>Amount</th></tr>';
+        SELECT '<tr><td>', id, '</td><td>', region, '</td><td>', year, '</td><td>', amount, '</td></tr>'
+        FROM demo::sales WHERE region == 'EU' AND year == 2022;
+        ECHO '</table>';
+
+        -- The compiler picks the index from the FIRST condition only, so an
+        -- indexed column has to lead. These two return the same rows; only the
+        -- upper one is answered from the index.
+        ECHO '<h2>Order inside AND</h2>';
+        ECHO '<p><code>WHERE region == &#39;EU&#39; AND amount > 4000</code>';
+        ECHO ' &mdash; indexed column first, so the index answers it.</p><ul>';
+        SELECT '<li>', id, ': ', region, ' ', year, ' &mdash; ', amount, '</li>'
+        FROM demo::sales WHERE region == 'EU' AND amount > 4000;
+        ECHO '</ul>';
+
+        ECHO '<p><code>WHERE amount > 4000 AND region == &#39;EU&#39;</code>';
+        ECHO ' &mdash; same rows, but read by scanning every one of them.</p><ul>';
+        SELECT '<li>', id, ': ', region, ' ', year, ' &mdash; ', amount, '</li>'
+        FROM demo::sales WHERE amount > 4000 AND region == 'EU';
+        ECHO '</ul>';
+
+        ECHO '<p><a href="bulk.zt">Load more</a> &middot; ';
+        ECHO '<a href="/">Back to Zeytun</a></p>';
+        ECHO '</body></html>';
+    END
+END

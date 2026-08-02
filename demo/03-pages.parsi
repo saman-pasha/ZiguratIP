@@ -50,8 +50,63 @@ PUBLIC:
         FROM demo::authors;
         ECHO '</table>';
 
-        ECHO '<p><a href="setup.zt">Seed again</a> &middot; ';
+        ECHO '<p><a href="lookup.zt">Indexed lookups</a> &middot; ';
+        ECHO '<a href="setup.zt">Seed again</a> &middot; ';
         ECHO '<a href="/">Back to Zeytun</a></p>';
+        ECHO '</body></html>';
+    END
+END
+
+-- ---------------------------------------------------------------------------
+-- A WHERE on an indexed column is served from the B-tree rather than by
+-- reading every row. Compile this page, then read the generated C++ in
+-- home/tmp/_LOOKUP_.cpp: each SELECT below turns into a different cursor.
+-- ---------------------------------------------------------------------------
+
+PAGE lookup
+REQUIRES demo::books, demo::authors
+BEGIN
+PUBLIC:
+    OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+    BEGIN
+        ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+        ECHO '<title>Indexed lookups</title>';
+        ECHO '<style>body{font-family:system-ui,sans-serif;background:#fff;color:#222;';
+        ECHO 'margin:2em auto;max-width:44em}li{margin:.2em 0}';
+        ECHO 'code{background:#f0f0f0;padding:.1em .35em;border-radius:3px}</style>';
+        ECHO '</head><body><h1>Indexed lookups</h1>';
+
+        -- INDEX KEY on author_id: IDX_DEMO_BOOKS_AUTHOR_ID.cursor_equal
+        ECHO '<h2>Books by author 1 <code>WHERE author_id == 1</code></h2><ul>';
+        SELECT '<li>', title, ' (', year, ')</li>'
+        FROM demo::books WHERE author_id == 1;
+        ECHO '</ul>';
+
+        -- PRIMARY KEY on id: IDX_DEMO_BOOKS_ID.cursor_equal
+        ECHO '<h2>One book <code>WHERE id == 3</code></h2><ul>';
+        SELECT '<li>', title, '</li>'
+        FROM demo::books WHERE id == 3;
+        ECHO '</ul>';
+
+        -- PRIMARY KEY, a range: IDX_DEMO_BOOKS_ID.cursor_greater_than
+        ECHO '<h2>Books after the second <code>WHERE id > 2</code></h2><ul>';
+        SELECT '<li>', id, ': ', title, '</li>'
+        FROM demo::books WHERE id > 2;
+        ECHO '</ul>';
+
+        -- UNIQUE KEY on name: IDX_DEMO_AUTHORS_NAME.cursor_equal
+        ECHO '<h2>One author <code>WHERE name == ...</code></h2><ul>';
+        SELECT '<li>', name, ' (', country, ')</li>'
+        FROM demo::authors WHERE name == 'Jorge Luis Borges';
+        ECHO '</ul>';
+
+        -- year has no index, so this one reads every row and filters.
+        ECHO '<h2>Not indexed <code>WHERE year > 1950</code></h2><ul>';
+        SELECT '<li>', title, ' (', year, ')</li>'
+        FROM demo::books WHERE year > 1950;
+        ECHO '</ul>';
+
+        ECHO '<p><a href="catalog.zt">Catalog</a> &middot; <a href="/">Back to Zeytun</a></p>';
         ECHO '</body></html>';
     END
 END
