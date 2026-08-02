@@ -1,30 +1,81 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <meta charset="UTF-8">
-    <title>Zigurat Informational Platform</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zeytun HTTP Server</title>
+    <link rel="shortcut icon" type="image/x-icon" href="favicon.ico" />
     <style>
-      body { font-family: system-ui, sans-serif; margin: 3em auto; max-width: 46em; color: #222; }
-      h1 { margin-bottom: 0; }
-      p.sub { color: #666; margin-top: .3em; }
-      ul { line-height: 1.9; }
-      code { background: #f4f4f4; padding: .1em .35em; border-radius: 3px; }
+      /* The banner artwork has a white background, so the page commits to a
+	 light surface rather than inheriting the browser's colour scheme. */
+      body {
+	  font-family: system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+	  color: #222;
+	  background: #fff;
+	  margin: 0;
+	  padding: 2em 1em;
+	  line-height: 1.55;
+      }
+      .page { max-width: 728px; margin: 0 auto; }
+      .banner img { display: block; width: 100%; max-width: 728px; height: auto; }
+      h3 { margin: 1.2em 0 .3em; }
+      hr { border: none; border-top: 1px solid #d7d7d7; margin: .8em 0 1.4em; }
+      .panel {
+	  color: #fff;
+	  background-color: #73a7e1;
+	  padding: 20px;
+	  border-radius: 3px;
+      }
+      .panel a { color: #fff; }
+      .panel code {
+	  background: rgba(255, 255, 255, .22);
+	  padding: .1em .35em;
+	  border-radius: 3px;
+      }
+      ul { line-height: 1.9; margin: .4em 0 0; }
+      .foot { color: #666; font-size: .9em; margin-top: 1.6em; }
+      .foot code { background: #f0f0f0; padding: .1em .35em; border-radius: 3px; }
     </style>
   </head>
   <body>
-    <h1>Zigurat Informational Platform</h1>
-    <p class="sub">Served by Zeytun, the ZiguratIP web front end.</p>
+    <div class="page">
 
-    <p>This is the default static page under <code>$ZIGURATIP_HOME/http</code>.
-       Zeytun serves files from that directory, and compiles and runs any request
-       ending in <code>.zt</code> as a Parsi page.</p>
+      <div class="banner"><img src="zeytun.png" alt="Zeytun" /></div>
 
-    <ul>
-      <li><a href="zigurat.html">About Zigurat</a></li>
-      <li><a href="mem.html">Memory / page store viewer</a></li>
-      <li><a href="rpc.html">RPC console</a></li>
-    </ul>
+      <h3>Welcome to Zeytun</h3>
+      <hr>
 
-    <p>See <code>doc/</code> in the source tree for the Parsi language reference.</p>
+      <div class="panel">
+	<p>
+	  <b>Zeytun</b> is the web front end of the Zigurat Informational Platform.
+	  It serves this directory as static content and compiles any request ending
+	  in <code>.zt</code> into a native page that runs inside the database
+	  process.
+	</p>
+	<p>
+	  Every request is one transaction: Zeytun opens it before the page runs,
+	  commits when the page returns cleanly and rolls it back otherwise. Sessions
+	  are separate and outlive the request, carried by a cookie.
+	</p>
+	<p>
+	  If you are seeing this page, the server is running and reading from
+	  <code>$ZIGURATIP_HOME/http</code>.
+	</p>
+	<p>Elsewhere in the family:</p>
+	<ul>
+	  <li><a href="zigurat.html">Zigurat</a> &mdash; the platform and its products</li>
+	  <li><a href="mem.html">Memory viewer</a> &mdash; inspect the page store and its indexes</li>
+	  <li><a href="rpc.html">RPC console</a> &mdash; call procedures over the binary protocol</li>
+	</ul>
+      </div>
+
+      <p class="foot">
+	Replace this page by dropping your own <code>index.html</code> into
+	<code>$ZIGURATIP_HOME/http</code>, or remove it and Zeytun will look for a
+	compiled <code>index.zt</code> instead. The Parsi language reference lives in
+	<code>doc/</code> in the source tree.
+      </p>
+
+    </div>
   </body>
 </html>
