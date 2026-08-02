@@ -52,6 +52,15 @@ namespace Zigurat
 	  code << ast.token.value;
 	}
 	this->compile(ast.args[0], code);
+      } else if (ast.args.size() == 2 && ast.token.value == "LIKE") {
+	// A pattern match is a method on the subject, not an infix operator.
+	// The subject needs its own parentheses: a column compiles to
+	// "row.*row.COLUMN", and .* binds looser than the . of the call.
+	code << '(';
+	this->compile(ast.args[0], code);
+	code << ").LIKE(";
+	this->compile(ast.args[1], code);
+	code << ')';
       } else if (ast.args.size() == 2) {
 	this->compile(ast.args[0], code);
 	if (ast.token.value == "=") {
@@ -64,12 +73,22 @@ namespace Zigurat
 	  code << "||";
 	} else if (ast.token.value == "IS") {
 	  code << "==";
-	} else if (ast.token.value == "LIKE") {
-	  code << "==";
 	} else {
 	  code << ast.token.value;
 	}
 	this->compile(ast.args[1], code);
+      } else if (ast.args.size() == 3 && ast.token.value == "BETWEEN") {
+	// x BETWEEN low AND high is (x >= low) && (x <= high), inclusive at both
+	// ends. The subject is emitted twice, so keep side effects out of it.
+	code << '(';
+	this->compile(ast.args[0], code);
+	code << " >= ";
+	this->compile(ast.args[1], code);
+	code << ") && (";
+	this->compile(ast.args[0], code);
+	code << " <= ";
+	this->compile(ast.args[2], code);
+	code << ')';
       } else {
 	throw CompileException("wrong expression", ast);
       }

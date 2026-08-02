@@ -100,6 +100,18 @@ PUBLIC:
         FROM demo::authors WHERE name == 'Jorge Luis Borges';
         ECHO '</ul>';
 
+        -- LIKE matches a pattern: % is any run of characters, _ is exactly one.
+        -- It is a scan, because a pattern cannot be looked up in a B-tree.
+        ECHO '<h2>Title search <code>WHERE title LIKE &#39;The %&#39;</code></h2><ul>';
+        SELECT '<li>', title, '</li>'
+        FROM demo::books WHERE title LIKE 'The %';
+        ECHO '</ul>';
+
+        ECHO '<h2>Single character <code>WHERE country LIKE &#39;_S&#39;</code></h2><ul>';
+        SELECT '<li>', name, ' (', country, ')</li>'
+        FROM demo::authors WHERE country LIKE '_S';
+        ECHO '</ul>';
+
         -- year has no index, so this one reads every row and filters.
         ECHO '<h2>Not indexed <code>WHERE year > 1950</code></h2><ul>';
         SELECT '<li>', title, ' (', year, ')</li>'

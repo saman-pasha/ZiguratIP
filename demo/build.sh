@@ -17,8 +17,17 @@ fi
 
 for step in "$HERE"/0*.parsi; do
   echo "==> $(basename "$step")"
-  "$ROOT/home/bin/parsi" "$step" | tail -1
+  # No pipe here: piping into tail would hide a non-zero exit from parsi and
+  # the build would carry on as if the step had succeeded.
+  if ! "$ROOT/home/bin/parsi" "$step" > "$HERE/.build.log" 2>&1; then
+    echo "failed:" >&2
+    tail -5 "$HERE/.build.log" >&2
+    rm -f "$HERE/.build.log"
+    exit 1
+  fi
+  tail -1 "$HERE/.build.log"
 done
+rm -f "$HERE/.build.log"
 
 echo
 echo "Compiled into $ZIGURATIP_HOME/ld:"

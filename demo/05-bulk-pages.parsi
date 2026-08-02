@@ -47,6 +47,23 @@ PUBLIC:
         FROM demo::sales WHERE region == 'EU' AND year == 2022;
         ECHO '</table>';
 
+        -- BETWEEN is inclusive at both ends, and expands to (x >= low) AND
+        -- (x <= high). It reads every row: write the two comparisons out by
+        -- hand if you want the leading one to use the index.
+        ECHO '<h2>Range <code>WHERE id BETWEEN 40 AND 48</code></h2>';
+        ECHO '<p>Inclusive at both ends. BETWEEN expands to two comparisons and';
+        ECHO ' reads every row, so it is a scan.</p><ul>';
+        SELECT '<li>', id, ': ', region, ' ', year, ' &mdash; ', amount, '</li>'
+        FROM demo::sales WHERE id BETWEEN 40 AND 48;
+        ECHO '</ul>';
+
+        ECHO '<h2>Pattern <code>WHERE id BETWEEN 1 AND 12 AND region LIKE';
+        ECHO ' &#39;%U%&#39;</code></h2>';
+        ECHO '<p>% matches any run of characters, _ exactly one.</p><ul>';
+        SELECT '<li>', id, ': ', region, '</li>'
+        FROM demo::sales WHERE id BETWEEN 1 AND 12 AND region LIKE '%U%';
+        ECHO '</ul>';
+
         -- The compiler picks the index from the FIRST condition only, so an
         -- indexed column has to lead. These two return the same rows; only the
         -- upper one is answered from the index.

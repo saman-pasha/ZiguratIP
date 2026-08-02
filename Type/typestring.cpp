@@ -278,6 +278,39 @@ namespace Zigurat
     return (uint64_t)this->std_length();
   }
 
+  // Iterative rather than recursive: a pattern of many % against a long
+  // subject would otherwise be exponential. The backtrack pair records the
+  // last % seen and where to resume the subject from if the tail fails.
+  Bool String::LIKE(const String& pattern) const
+  {
+    if (this->_pointer == nullptr || pattern._pointer == nullptr) return Bool(nullptr);
+
+    const std::string& text = *(std::string*)this->_pointer;
+    const std::string& glob = *(std::string*)pattern._pointer;
+
+    size_t t = 0, g = 0;
+    size_t star = std::string::npos, resume = 0;
+
+    while (t < text.size()) {
+      if (g < glob.size() && (glob[g] == '_' || glob[g] == text[t])) {
+	t++;
+	g++;
+      } else if (g < glob.size() && glob[g] == '%') {
+	star = g++;
+	resume = t;
+      } else if (star != std::string::npos) {
+	g = star + 1;
+	t = ++resume;
+      } else {
+	return Bool(false);
+      }
+    }
+
+    while (g < glob.size() && glob[g] == '%') g++;
+
+    return Bool(g == glob.size());
+  }
+
   Char String::GET(ULong index) const
   {
     if (this->_pointer == nullptr) throw NULL_EXCEPTION;

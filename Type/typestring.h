@@ -82,6 +82,10 @@ namespace Zigurat
     virtual ULong length() const;
     virtual ULong LENGTH() const;
 
+    // SQL style pattern match: % stands for any run of characters, _ for
+    // exactly one. Returns NULL if either side is NULL.
+    virtual Bool LIKE(const String&) const;
+
     virtual Char GET(ULong) const;
     virtual void SET(ULong, const Char);
 

@@ -44,7 +44,13 @@ namespace Zigurat
   {
     const Expression& opr = (bitwise) ? bitwise->args[0] : where.args[0];
 
-    if (opr.args[0].token.value == "$obj" && (opr.args[0].args[0].token.value[0] != '@' || 
+    // BETWEEN carries three operands, so it does not fit the single-bound cursor
+    // calls below. It falls through to the scan, where the expression compiler
+    // expands it to (x >= low) && (x <= high) and applies that as a filter.
+    // Writing the two comparisons out by hand instead lets the leading one pick
+    // up the index.
+    if (opr.token.value != "BETWEEN" && opr.token.value != "LIKE" &&
+	opr.args[0].token.value == "$obj" && (opr.args[0].args[0].token.value[0] != '@' || 
 					      (opr.args[0].args[0].token.value == "." && opr.args[0].args[0].args[0].token.value[0] != '@'))) {
       const Expression& obj = opr.args[0];
       const std::string clm = (obj.args[0].token.value != ".") ? obj.args[0].token.value : obj.args[0].args[1].token.value;

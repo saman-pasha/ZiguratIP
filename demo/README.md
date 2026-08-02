@@ -233,8 +233,37 @@ read `home/tmp/_REPORT_.cpp` to see which one a query became:
 | `id > 5` | `IDX_DEMO_SALES_ID.cursor_greater_than` |
 | `id >= 5` | `IDX_DEMO_SALES_ID.cursor_greater_than_equal` |
 | `amount > 100` | `Globals::memory()->cursor<...>` — `amount` has no index, so every row is read |
+| `name LIKE 'The %'` | a scan — a pattern cannot be looked up in a B-tree |
+| `id BETWEEN 1 AND 5` | a scan — see below |
 
-So indexes are not only for equality: ranges use them too.
+So indexes are not only for equality: ranges compile to range cursors too.
+
+**But the range cursors only work on small tables.** `cursor_less_than`,
+`cursor_less_than_equal`, `cursor_greater_than` and `cursor_greater_than_equal`
+return the right rows on the four-row `demo::books`, and return **nothing at
+all** on the five-hundred-row `demo::sales`. `cursor_equal` and
+`cursor_not_equal` are unaffected. Until that is fixed, treat `<`, `<=`, `>`
+and `>=` on an indexed column as unreliable once a table outgrows a single
+B-tree node, and prefer `==`, `<>` or a scan.
+
+### BETWEEN and LIKE
+
+```parsi
+SELECT title FROM demo::books WHERE title LIKE 'The %';
+SELECT id, region FROM demo::sales WHERE id BETWEEN 1 AND 12;
+```
+
+`BETWEEN` is inclusive at both ends and expands to `(x >= low) && (x <= high)`.
+It always reads every row: writing the two comparisons out by hand instead lets
+the leading one reach an index. Its subject is evaluated twice, so keep side
+effects out of it.
+
+`LIKE` matches a pattern, with `%` for any run of characters and `_` for
+exactly one. `NULL` on either side gives `NULL`. It is always a scan.
+
+Both bind tighter than `AND`, so
+`WHERE id BETWEEN 1 AND 12 AND region LIKE '%U%'` reads as two conditions, not
+one. The `report` page runs exactly that.
 
 ### Three rules worth knowing
 
@@ -333,9 +362,9 @@ afterwards — run `/setup.zt` once, not on every start. Set `RESET_MODE: TRUE`
 if you would rather start from an empty store each time; running `/setup.zt`
 twice simply seeds a second copy of everything.
 
-**Recompiling** an object takes effect on the next request, because
-`LIBRARY/CACHE_MODE` is `NONE`. Set it to `GLOBAL` or `LOCAL` for speed and a
-recompiled object is then ignored until the server restarts.
+**Recompiling an object needs a server restart**, whatever `CACHE_MODE` says.
+Nothing calls `dlclose`, so the dynamic loader keeps handing back the copy it
+first loaded. Rebuild, restart, then reload the page.
 
 **Reading the generated code** is the fastest way to understand a compile
 error. The `.out` file next to it holds the exact compiler invocation and its

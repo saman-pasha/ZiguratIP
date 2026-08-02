@@ -129,6 +129,43 @@ ZTEST(Grammar, expression_operators)
   ZCHECK(parses("EXPR", "a AND b OR NOT c"));
 }
 
+ZTEST(Grammar, between_operator)
+{
+  ZCHECK(clause("SELECT a FROM t WHERE id BETWEEN 1 AND 5;"));
+  ZCHECK(clause("SELECT a FROM t WHERE id BETWEEN a AND b;"));
+  // A following AND belongs to the enclosing condition, not to the high bound.
+  ZCHECK(clause("SELECT a FROM t WHERE id BETWEEN 1 AND 5 AND x == 2;"));
+  ZCHECK(!clause("SELECT a FROM t WHERE id BETWEEN 1;"));
+  ZCHECK(!clause("SELECT a FROM t WHERE id BETWEEN AND 5;"));
+}
+
+ZTEST(Grammar, between_binds_tighter_than_and)
+{
+  Expression ast = parse("EXPR", "id BETWEEN 1 AND 12 AND x == 2");
+
+  ZCHECK_EQ(ast.args.size(), (size_t)1);
+  if (ast.args.empty()) return;
+
+  // AND at the root, with BETWEEN as its left operand rather than the other
+  // way round -- otherwise the high bound swallows the second condition.
+  const Expression& root = ast.args[0];
+  ZCHECK_STR(root.token.value, "AND");
+  ZCHECK_EQ(root.args.size(), (size_t)2);
+  if (root.args.size() == 2) {
+    ZCHECK_STR(root.args[0].token.value, "BETWEEN");
+    ZCHECK_EQ(root.args[0].args.size(), (size_t)3);   // subject, low, high
+  }
+}
+
+ZTEST(Grammar, like_operator)
+{
+  ZCHECK(clause("SELECT a FROM t WHERE name LIKE 'abc%';"));
+  ZCHECK(clause("SELECT a FROM t WHERE name LIKE '_bc';"));
+  ZCHECK(clause("SELECT a FROM t WHERE name LIKE p;"));
+  ZCHECK(clause("SELECT a FROM t WHERE name LIKE 'a%' AND id == 1;"));
+  ZCHECK(!clause("SELECT a FROM t WHERE name LIKE;"));
+}
+
 ZTEST(Grammar, expression_names_and_calls)
 {
   ZCHECK(parses("EXPR", "a"));
