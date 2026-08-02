@@ -264,6 +264,23 @@ ZTEST(Grammar, select_statement)
   ZCHECK(clause("SELECT id FROM t WHERE id == 1 ORDER BY id;"));
 }
 
+// An item written "name = expression" assigns once per row instead of being
+// emitted -- SET, in the one place a statement block cannot go.
+ZTEST(Grammar, select_assigns_to_a_variable)
+{
+  ZCHECK(clause("SELECT last_id = id FROM t;"));
+  ZCHECK(clause("SELECT total = total + amount FROM t;"));
+  ZCHECK(clause("SELECT n = n + 1, s = s + amount FROM t;"));
+  ZCHECK(clause("SELECT last_id = id, name FROM t WHERE id > 1;"));
+  ZCHECK(clause("SELECT total = total + amount FROM t WHERE id == 1 ORDER BY id;"));
+
+  // "==" still compares, and the WHERE clause is unaffected either way.
+  ZCHECK(clause("SELECT id == 1 FROM t;"));
+  ZCHECK(clause("SELECT id FROM t WHERE id = 1;"));
+
+  ZCHECK(!clause("SELECT total = FROM t;"));
+}
+
 ZTEST(Grammar, insert_statement)
 {
   ZCHECK(clause("INSERT INTO t VALUES (1, 'a');"));

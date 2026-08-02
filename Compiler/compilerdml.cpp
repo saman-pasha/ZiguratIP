@@ -37,31 +37,82 @@ namespace Zigurat
     code << tab << "Globals::memory()->online_insert(" << obj << ");" << std::endl;
   }
 
+  // An item of the form "name = expression" assigns instead of being emitted:
+  // the SET clause, in a SELECT, where there is no BEGIN/END to put one in.
+  // "=" is the assignment of SET and DECLARE; "==" is the comparison, which is
+  // what a WHERE clause uses.
+  bool Compiler::_is_select_assignment(const Expression& item)
+  {
+    return !item.args.empty()
+      && item.args[0].token.type == TokenType::OP
+      && item.args[0].token.value == "="
+      && item.args[0].args.size() == 2;
+  }
+
+  // Assignments run first and in the order they were written, so that a value
+  // an item assigns is the value any later item reads -- and so that the echo
+  // and the connector paths agree about it.
+  void Compiler::_select_assignments(const Expression& ast, ExprCompiler& expr_compiler,
+				     std::stringstream& code, int lvl) const
+  {
+    std::string tab(lvl, '\t');
+
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "FROM")
+	break;
+      if (!Compiler::_is_select_assignment(expr))
+	continue;
+
+      if (expr.args.size() > 1)
+	throw CompileException("an assignment in SELECT cannot be named with AS", expr);
+
+      code << tab;
+      expr_compiler.compile(expr.args[0].args[0], code);
+      code << " = ";
+      expr_compiler.compile(expr.args[0].args[1], code);
+      code << ';' << std::endl;
+    }
+  }
+
   void Compiler::_select_content(const Expression& ast, std::stringstream& code, int lvl, bool echo_mode)
   {
     std::string tab(lvl, '\t');
     ExprCompiler* expr_compiler;
-    
+
     if (ast.args[ast.args.size() - 1].token.value == "FROM") {
       expr_compiler = new ExprCompiler(*this, {ast.args[ast.args.size() - 1]});
     } else if (ast.args[ast.args.size() - 1].token.value == "WHERE") {
       expr_compiler = new ExprCompiler(*this, {ast.args[ast.args.size() - 2]});
-    } 
-    
+    }
+
+    this->_select_assignments(ast, *expr_compiler, code, lvl);
+
+    bool has_output = false;
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "FROM")
+	break;
+      if (!Compiler::_is_select_assignment(expr))
+	has_output = true;
+    }
+
     if (echo_mode) {
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "FROM")
 	  break;
+	if (Compiler::_is_select_assignment(expr))
+	  continue;
 	code << tab << "*Globals::echo_stream() << ";
 	expr_compiler->compile(expr.args[0], code);
 	code << ';' << std::endl;
       }
-    } else {
+    } else if (has_output) {
       code << tab << "Globals::client_stream()->write_std_ubyte((uint8_t)Zigurat::ResultType::CURSOR_FETCH);" << std::endl;
       code << tab << "Globals::client_stream()->pack(" << std::endl;
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "FROM")
 	  break;
+	if (Compiler::_is_select_assignment(expr))
+	  continue;
 	code << tab << TAB1;
 	expr_compiler->compile(expr.args[0], code);
 	code << ", " << std::endl;
@@ -97,14 +148,22 @@ namespace Zigurat
 
       HeadCompiler head_compiler(*this, {*from});
 
+      // An assignment produces no column, so it is not named here either. A
+      // SELECT of nothing but assignments still opens and closes its cursor,
+      // with an empty column list and no rows.
+      bool has_column = false;
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "FROM")
 	  break;
-      
+	if (Compiler::_is_select_assignment(expr))
+	  continue;
+
 	head_compiler.compile(expr, code);
 	code << ",";
+	has_column = true;
       }
-      code.seekp(-1, std::ios::cur);
+      if (has_column)
+	code.seekp(-1, std::ios::cur);
       code << "\");" << std::endl;
     }
     

@@ -296,6 +296,30 @@ indexed column first.** The `report` page shows both orders side by side.
 for the reason given above. Put the condition you want indexed on its own, or
 join it with `AND`.
 
+### Counting and totalling
+
+`SELECT` is a cursor, so there is no result set to ask how many rows came back
+or what they add up to. An item written `name = expression` assigns to that
+variable once per row instead of being emitted — the `SET` clause, in the one
+statement that has no `BEGIN`/`END` to put one in:
+
+```parsi
+DECLARE rows AS Long = 0;
+DECLARE total AS Long = 0;
+
+SELECT rows = rows + 1, total = total + amount
+FROM demo::sales WHERE region == 'EU';
+
+ECHO 'EU rows: ', rows, ' &mdash; amount total: ', total;
+```
+
+`=` assigns and `==` compares, which is the same split `SET` and `DECLARE`
+already use. An assignment emits nothing and produces no column, so the `SELECT`
+above prints nothing by itself; the `ECHO` after it does the printing. Inside a
+`WHERE` clause both spellings still mean comparison.
+
+The `report` page ends with exactly this.
+
 ### Loading enough rows to matter
 
 ```parsi

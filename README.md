@@ -108,7 +108,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 212 cases
+Starts a server, runs the full suite against it, stops it again. 213 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 

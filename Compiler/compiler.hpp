@@ -98,6 +98,8 @@ namespace Zigurat
     void _throw(const Expression&, std::stringstream&, int);
 
     void _insert(const Expression&, std::stringstream&, int);
+    static bool _is_select_assignment(const Expression&);
+    void _select_assignments(const Expression&, ExprCompiler&, std::stringstream&, int) const;
     void _select_content(const Expression&, std::stringstream&, int, bool);
     void _select(const Expression&, std::stringstream&, int, bool);
     void _select(const Expression&, std::stringstream&, int);

@@ -89,6 +89,19 @@ PUBLIC:
         FROM demo::sales WHERE id < 4 OR id > 497;
         ECHO '</ul>';
 
+        -- An item written "name = expression" assigns once per row instead of
+        -- being emitted: SET, in the one statement that has no BEGIN/END to put
+        -- one in. It is how a SELECT counts and totals.
+        DECLARE rows AS Long = 0;
+        DECLARE total AS Long = 0;
+        SELECT rows = rows + 1, total = total + amount
+        FROM demo::sales WHERE region == 'EU';
+
+        ECHO '<h2>Totals <code>SELECT rows = rows + 1, total = total + amount</code></h2>';
+        ECHO '<p>The assignments run per row and emit nothing, so this SELECT ';
+        ECHO 'prints nothing by itself.</p>';
+        ECHO '<p>EU rows: ', rows, ' &mdash; amount total: ', total, '</p>';
+
         ECHO '<p><a href="bulk.zt">Load more</a> &middot; ';
         ECHO '<a href="/">Back to Zeytun</a></p>';
         ECHO '</body></html>';
