@@ -5,6 +5,10 @@
 #include "libraryloader.hpp"
 #include "librarypool.hpp"
 #include "connector.hpp"
+#include "resulttype.hpp"
+#include "typeint.hpp"
+#include "typestring.hpp"
+#include "typelong.hpp"
 #include "bufferstream.hpp"
 #include <list>
 #include <string>
@@ -248,4 +252,67 @@ ZTEST(Connector, round_trip_against_a_live_server)
 
   ZCHECK_NOTHROW(connector.close());
   ZCHECK(!connector.is_open());
+}
+
+// A connection holds one worker thread, and the transaction is that thread's,
+// so it lives for as long as the connection does. Several calls therefore belong
+// to one transaction and the client decides its fate: commit and all of them
+// stand, roll back and none of them do.
+//
+// This needs procedures to call, so it runs only where the demo has been built.
+ZTEST(Connector, a_transaction_spans_calls_until_the_client_ends_it)
+{
+  const char* service = std::getenv("ZIGURATIP_TEST_SERVICE");
+  if (service == nullptr) service = "2160";
+
+  // How many books there are, counted in a transaction of its own.
+  auto count_books = [service] () -> int64_t {
+    Connector reader;
+    reader.open("127.0.0.1", service, true, 10);
+    int64_t rows = 0;
+    reader.call("demo::count_books");
+    Long total(0);
+    for (ResultType r = reader.result(); r != ResultType::SUCCESSFUL_DONE; r = reader.result()) {
+      if (r == ResultType::CURSOR_OPEN)       reader.columns();
+      else if (r == ResultType::RETURN_VALUE) reader.fetch(total);
+    }
+    rows = total.is_null().value() ? -1 : total.value();
+    reader.close();
+    return rows;
+  };
+
+  auto add_three = [service] (const std::string& tag, bool commit) {
+    Connector writer;
+    writer.open("127.0.0.1", service, true, 10);
+    for (int n = 1; n <= 3; n++) {
+      writer.call("demo::add_book");
+      writer.write_string(String(tag + " " + std::to_string(n)));
+      writer.write_long(Long((int64_t)1));
+      writer.write_int(Int(2026));
+      Long id(0);
+      for (ResultType r = writer.result(); r != ResultType::SUCCESSFUL_DONE; r = writer.result()) {
+	if (r == ResultType::CURSOR_OPEN)       writer.columns();
+	else if (r == ResultType::RETURN_VALUE) writer.fetch(id);
+      }
+    }
+    if (commit) writer.commit(); else writer.rollback();
+    writer.close();
+  };
+
+  int64_t before = 0;
+  try {
+    before = count_books();
+  } catch (...) {
+    std::cout << "          (skipped: no server, or the demo is not built)" << std::endl;
+    return;
+  }
+  if (before < 0) { std::cout << "          (skipped: demo::count_books is unavailable)" << std::endl; return; }
+
+  // Rolled back: none of the three survive.
+  ZCHECK_NOTHROW(add_three("rolled back", false));
+  ZCHECK_EQ(count_books(), before);
+
+  // Committed: all three do, and the client committed them, not the procedure.
+  ZCHECK_NOTHROW(add_three("committed", true));
+  ZCHECK_EQ(count_books(), before + 3);
 }

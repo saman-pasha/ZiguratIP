@@ -20,25 +20,29 @@ TRANSACTION ISOLATION LEVEL SNAPSHOT;
 
 ## Procedures called over the binary protocol
 
-`TRANSACTION/MODE` in `ziguratip.conf` is `NON-AUTOCOMMIT` by default, and a
-procedure reached through the connector is not committed for you: closing the
-connection discards the work, and `Connector::commit()` does not pick it up. A
-procedure that writes and is meant to be called this way commits itself:
+`TRANSACTION/MODE` in `ziguratip.conf` is `NON-AUTOCOMMIT` by default, and
+nothing commits for you. The transaction belongs to the connection: a connection
+holds one worker thread for its whole life and the transaction is that thread's,
+so every call made down one connection is part of the same transaction.
 
-```parsi
-PROCEDURE demo::add_visitor(name AS String)
-RETURNS Long
-REQUIRES demo::visitors, demo::visitors_id_sequence
-BEGIN
-    DECLARE id AS Long = demo::visitors_id_sequence::NEXT();
-    INSERT INTO demo::visitors VALUES (id, name);
-    TRANSACTION COMMIT;
-    RETURN id;
-END
+The client ends it. `Connector::commit()` makes the work of every call so far
+stand; `Connector::rollback()` discards all of it; closing without either
+discards it too. That is what lets a client treat several calls as one unit:
+
+```cpp
+db.call("demo::add_visitor");   // ... and its arguments and results
+db.call("demo::add_visitor");
+db.commit();                    // both, or with rollback() neither
 ```
 
-`Connector::auto_commit(true)` is the alternative: the server then commits after
-every `call`, and the procedure needs no clause of its own.
+`Connector::auto_commit(true)` is the alternative: the server commits after
+every `call`, so each one stands on its own and none can be rolled back.
+
+A procedure may also commit its own work with `TRANSACTION COMMIT;`, which is
+what you want when the procedure is a unit in itself — the TRUNCATE example in
+[TRUNCATE](truncate.md) needs it, because a truncate only reclaims deletes that
+have already settled. Be aware that it takes the decision away from the client:
+what a procedure has committed, the client can no longer roll back.
 
 Zeytun is different — an HTTP request is already one transaction, opened before
 the page runs and committed when it returns cleanly — so a page needs no

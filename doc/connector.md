@@ -36,10 +36,11 @@ string; both come back as an exception rather than a silent success.
 Sets the connection auto commit option.
 If this option be true, the server calls a commit after all Remote Procedure Call.
 
-With the shipped `TRANSACTION/MODE: NON-AUTOCOMMIT` this is off, so a procedure
-that writes has to end with `TRANSACTION COMMIT;` or its work is discarded when
-the connection closes. `COMMIT()` on the connector does not stand in for it.
-See [TRANSACTION](transaction.md).
+With the shipped `TRANSACTION/MODE: NON-AUTOCOMMIT` this is off, and the
+transaction is instead the connection's: it lives as long as the connection
+does, so every call made down one is part of it. `COMMIT()` makes all of that
+work stand and `ROLLBACK()` discards all of it; closing without either discards
+it. See [TRANSACTION](transaction.md).
 
 ## ISOLATE(IsolationLevel) RETURNS Void
 

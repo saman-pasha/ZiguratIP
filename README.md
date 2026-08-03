@@ -109,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 239 cases and a keep-alive check
+Starts a server, runs the full suite against it, stops it again. 240 cases and a keep-alive check
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -198,7 +198,7 @@ is linked against, so declaration order matters.
 
 The `Connector` class speaks the binary protocol on port 2160. Compile the
 procedure first — with `parsi`, or by sending the same source through
-`Connector::compile` — and note the explicit commit:
+`Connector::compile`:
 
 ```parsi
 PROCEDURE demo::add_visitor(name AS String)
@@ -207,17 +207,18 @@ REQUIRES demo::visitors, demo::visitors_id_sequence
 BEGIN
     DECLARE id AS Long = demo::visitors_id_sequence::NEXT();
     INSERT INTO demo::visitors VALUES (id, name);
-    TRANSACTION COMMIT;
     RETURN id;
 END
 ```
 
-**With `TRANSACTION/MODE: NON-AUTOCOMMIT` — the shipped default — a procedure
-called over the binary protocol has to commit its own work with
-`TRANSACTION COMMIT;`.** Nothing commits it afterwards: the connection closing
-discards it, and `Connector::commit()` does not pick it up. The alternative is
-`Connector::auto_commit(true)`, which makes the server commit after every
-`call`.
+**The transaction belongs to the connection, and the client decides its fate.**
+A connection holds one worker thread for its whole life, and the transaction is
+that thread's, so every `call` made down one connection is part of the same
+transaction: `Connector::commit()` makes all of them stand and
+`Connector::rollback()` discards all of them. Closing without either discards
+the work. `Connector::auto_commit(true)` commits after every `call` instead, and
+a procedure may still end with `TRANSACTION COMMIT;` to commit its own work —
+but then the client can no longer roll it back.
 
 Then the client calls it. Arguments go out after `call`, and the results come
 back as a sequence the caller drains:
@@ -434,10 +435,6 @@ suite passes. Some things are known to be incomplete:
   the top-level `Makefile` for that reason. Until they are ported,
   `REQUIRES Session` has nothing to link against; the C++ `Session` in
   `HTTP` is complete and callable from generated pages in the meantime.
-- **`Connector::commit()` does not commit a `call`'s work.** The transaction is
-  thread-local to the worker, and what the procedure wrote is not part of what
-  the commit sees. Either end the procedure with `TRANSACTION COMMIT;` or turn
-  on `Connector::auto_commit(true)`; both are verified to persist.
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
 ## Licence

@@ -23,6 +23,17 @@ BEGIN
     RETURN id;
 END
 
+-- A SELECT is a cursor, not a result set: what it lists is evaluated once per
+-- row. Counting is therefore an assignment that runs per row, not a COUNT().
+PROCEDURE demo::count_books()
+RETURNS Long
+REQUIRES demo::books
+BEGIN
+    DECLARE total AS Long = 0;
+    SELECT total = total + 1 FROM demo::books;
+    RETURN total;
+END
+
 -- A procedure may call other procedures, as long as it REQUIRES them.
 PROCEDURE demo::seed()
 RETURNS Void
