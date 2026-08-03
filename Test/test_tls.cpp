@@ -212,13 +212,15 @@ ZTEST(TLS, sequence_numbers_are_counted_per_direction)
   server.detach();
 }
 
-// A record carrying more than the 2048 octet transport buffer. Sizes that are
-// an exact multiple of that buffer are left out on purpose -- see the defect
-// recorded in the project README: the framing lengths come out right and the
-// cipher text arrives corrupted, so the MAC rejects it.
+// Records larger than the 2048 octet transport buffer, including the exact
+// multiples of it. Those were the lengths where TLS::MAC asked for htons(length)
+// octets of fragment -- eight of them, for 2048 -- and ran the rest of the MAC
+// over uninitialised stack.
 ZTEST(TLS, a_large_fragment_survives)
 {
-  const size_t sizes[] = {1000, 2040, 3000, 5000};
+  // Capped below the socket pair's own buffer: both ends live in one thread
+  // here, so a record larger than the kernel will hold has nobody to drain it.
+  const size_t sizes[] = {1000, 2040, 2048, 3000, 4096, 5000};
 
   for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
     Pair pair;
@@ -243,11 +245,8 @@ ZTEST(TLS, a_large_fragment_survives)
 }
 
 // Closing is a clean shutdown, not a failure. close_notify used to go out at
-// FATAL, which made _alert throw on the way out of every healthy close.
-//
-// Only the first end is closed here. Closing the second, once its peer has
-// already gone, does not return -- see the defect recorded in the project
-// README: the write of its own close_notify has nobody to reach.
+// FATAL, which made _alert throw on the way out of every healthy close. Closing
+// the second end, once its peer has already gone, has to come back too.
 ZTEST(TLS, closing_a_connection_does_not_throw)
 {
   Pair pair;
@@ -263,5 +262,55 @@ ZTEST(TLS, closing_a_connection_does_not_throw)
   ZCHECK_NOTHROW(client.close());
   ZCHECK(!client.is_open());
 
+  ZCHECK_NOTHROW(server.close());
+  ZCHECK(!server.is_open());
+}
+
+// Writing to a socket whose peer has hung up must fail, not kill the process.
+// SIGPIPE was only ignored inside the server's own main, so the connector, this
+// test binary and anybody's client died the moment the far end went away. The
+// socket layer suppresses it now, per socket or per send depending on platform.
+ZTEST(TLS, writing_to_a_departed_peer_does_not_kill_the_process)
+{
+  Pair pair;
+  if (!pair.ready) { ZCHECK(false); return; }
+
+  Endpoint client, server;
+  client.attach(TLS::ConnectionEnd::CLIENT, TLS::TLS_RSA_WITH_AES_256_CBC_SHA256,
+		pair.ends[0], sample_master_secret());
+  server.attach(TLS::ConnectionEnd::SERVER, TLS::TLS_RSA_WITH_AES_256_CBC_SHA256,
+		pair.ends[1], sample_master_secret());
+
+  client.detach();   // the peer simply goes
+
+  // Reaching this line at all is most of the point.
+  ZCHECK_NOTHROW(server.put(TLS::ContentType::APPLICATION_DATA, "into the void"));
   server.detach();
+}
+
+// Record IVs come from the platform's entropy. They were derived from
+// srand(time(nullptr)), so every IV within a second was the same octets.
+ZTEST(TLS, record_ivs_do_not_repeat)
+{
+  const int count = 64;
+  std::string seen[count];
+
+  for (int i = 0; i < count; i++) {
+    uint8_t iv[16];
+    TLS::IV(iv, sizeof(iv));
+    seen[i].assign((const char*)iv, sizeof(iv));
+  }
+
+  int duplicates = 0;
+  for (int i = 0; i < count; i++)
+    for (int j = i + 1; j < count; j++)
+      if (seen[i] == seen[j]) duplicates++;
+
+  ZCHECK_EQ(duplicates, 0);
+
+  // And an IV is not all one value, which a zeroed or unwritten buffer would be.
+  bool varied = false;
+  for (size_t k = 1; k < seen[0].size(); k++)
+    if (seen[0][k] != seen[0][0]) varied = true;
+  ZCHECK(varied);
 }

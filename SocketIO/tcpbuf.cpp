@@ -31,6 +31,7 @@ namespace Zigurat
 
     this->_handle = handle;
 
+    Socket::suppress_sigpipe(this->_handle);
     Socket::set_timeout(this->_handle, timeout);
     Socket::set_reusable(this->_handle, true);
     Socket::set_blocking_mode(this->_handle, blocking_mode);
@@ -80,6 +81,7 @@ namespace Zigurat
 
     if (!connected) throw SocketIOException("tcp connect failed");
 
+    Socket::suppress_sigpipe(this->_handle);
     Socket::set_timeout(this->_handle, timeout);
     Socket::set_reusable(this->_handle, true);
     Socket::set_blocking_mode(this->_handle, blocking_mode);

@@ -118,7 +118,7 @@ namespace Zigurat
     std::streamsize pending = this->pptr() - this->pbase();
 
     while (pending > 0) {
-      int count = (int)Socket::send(this->_handle, cursor, (size_t)pending, 0);
+      int count = (int)Socket::send(this->_handle, cursor, (size_t)pending, Socket::SEND_FLAGS);
 
       if (count == Socket::SOCKET_ERROR) {
 	if (Socket::error_code() == EINTR) continue;

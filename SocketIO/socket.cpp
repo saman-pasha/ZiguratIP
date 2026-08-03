@@ -28,6 +28,16 @@ namespace Zigurat
     return errno;
   }
 
+  void Socket::suppress_sigpipe(Socket::handle_t handle)
+  {
+#if defined(SO_NOSIGPIPE)
+    int on = 1;
+    Socket::set_option(handle, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+    (void)handle;   // Linux carries MSG_NOSIGNAL on the send instead
+#endif
+  }
+
   bool Socket::is_open(Socket::handle_t handle)
   {
     int error = 0;

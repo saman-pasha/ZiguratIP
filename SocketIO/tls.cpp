@@ -1,5 +1,6 @@
 #include "tls.hpp"
 #include <vector>
+#include <random>
 #include "tlsexception.hpp"
 #include "shahelper.hpp"
 #include <cstring>
@@ -129,6 +130,20 @@ namespace Zigurat
     std::memcpy(server_write_IV, cursor, parameters.fixed_iv_length);
   }
 
+  // RFC 5246 6.2.3.1:
+  //
+  //     MAC(MAC_write_key, seq_num + type + version + length + fragment)
+  //
+  // The key authenticates the message; it is not part of the message. It used to
+  // be prepended to the input as well, which is not the construction and buys
+  // nothing.
+  //
+  // The length field was the real fault. It was byte swapped in place and then
+  // reused as the number of octets to copy, so on a little endian machine a
+  // 2048 octet fragment asked for htons(2048) == 8 of them and left the rest of
+  // the buffer as whatever the stack happened to hold. Both ends read the same
+  // uninitialised bytes often enough to agree, which is why this only showed at
+  // some lengths.
   void TLS::MAC(MACAlgorithm algorithm,
 		const uint8_t* secret, size_t secret_length,
 	        uint64_t sequence_number,
@@ -136,56 +151,66 @@ namespace Zigurat
 		binarystream& compressed, uint16_t compressed_length,
 		uint8_t* mac)
   {
-    size_t   length = secret_length + sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint16_t) + compressed_length; 
-    uint8_t  buffer[length];
-    uint8_t* cursor = buffer;
-    
-    std::memcpy(cursor, secret, secret_length);                  // MAC_write_key
-    sequence_number = Utility::htonll(sequence_number);
-    cursor += secret_length;
-    std::memcpy(cursor, &sequence_number, sizeof(uint64_t));     // seq_number
+    const size_t header_length = sizeof(uint64_t) + (sizeof(uint8_t) * 3) + sizeof(uint16_t);
+
+    std::vector<uint8_t> buffer(header_length + compressed_length);
+    uint8_t* cursor = buffer.data();
+
+    const uint64_t network_sequence = Utility::htonll(sequence_number);
+    std::memcpy(cursor, &network_sequence, sizeof(uint64_t));     // seq_num
     cursor += sizeof(uint64_t);
-    *cursor++ = (uint8_t)type;                                   // TLSCompressed.type
+
+    *cursor++ = (uint8_t)type;                                    // TLSCompressed.type
     *cursor++ = version.major;
-    *cursor++ = version.minor;                                   // TLSCompressed.version
-    compressed_length = Utility::htons(compressed_length);
-    std::memcpy(cursor, &compressed_length, sizeof(uint16_t));   // TLSCompressed.length
+    *cursor++ = version.minor;                                    // TLSCompressed.version
+
+    const uint16_t network_length = Utility::htons(compressed_length);
+    std::memcpy(cursor, &network_length, sizeof(uint16_t));       // TLSCompressed.length
     cursor += sizeof(uint16_t);
-    compressed.read((char*)cursor, 0, compressed_length);        // TLSCompressed.fragment 
-    
+
+    // The fragment, all of it, read by the length it actually has.
+    if (compressed_length > 0)
+      compressed.read((char*)cursor, 0, compressed_length);       // TLSCompressed.fragment
+
     switch (algorithm) {
     case MACAlgorithm::HMAC_SHA1:
-      SHA::hmac(SHA::SHA1  , secret, secret_length, buffer, length, mac);
+      SHA::hmac(SHA::SHA1  , secret, secret_length, buffer.data(), buffer.size(), mac);
       break;
     case MACAlgorithm::HMAC_SHA256:
-      SHA::hmac(SHA::SHA256, secret, secret_length, buffer, length, mac);
+      SHA::hmac(SHA::SHA256, secret, secret_length, buffer.data(), buffer.size(), mac);
       break;
     case MACAlgorithm::HMAC_SHA384:
-      SHA::hmac(SHA::SHA384, secret, secret_length, buffer, length, mac);
+      SHA::hmac(SHA::SHA384, secret, secret_length, buffer.data(), buffer.size(), mac);
       break;
     case MACAlgorithm::HMAC_SHA512:
-      SHA::hmac(SHA::SHA512, secret, secret_length, buffer, length, mac);
+      SHA::hmac(SHA::SHA512, secret, secret_length, buffer.data(), buffer.size(), mac);
       break;
     default:
       throw TLSException("unsupported MAC algorithm");
     }
   }
 
+  // Random octets, for record IVs and for the hello randoms.
+  //
+  // This used to be std::srand(std::time(nullptr)) followed by std::rand(),
+  // done twice -- so the "secret" and the "seed" fed to the PRF were the same
+  // three numbers, and every IV produced within the same second was identical.
+  // A predictable CBC IV is what BEAST attacks, and identical ones are worse
+  // still. std::random_device is the platform's own entropy.
   void TLS::IV(uint8_t* buffer, uint8_t length)
   {
-    std::srand(std::time(nullptr));
-    int secret[3];
-    secret[0] = std::rand();
-    secret[1] = std::rand();
-    secret[2] = std::rand();
+    static std::random_device source;
 
-    std::srand(std::time(nullptr));
-    int seed[3];
-    seed[0] = std::rand();
-    seed[1] = std::rand();
-    seed[2] = std::rand();
+    uint8_t* cursor = buffer;
+    uint8_t  remaining = length;
 
-    TLS::PRF(PRFAlgorithm::TLS_PRF_SHA256, (uint8_t*)&secret, 12, (uint8_t*)"record IV", 9, (uint8_t*)&seed, 12, buffer, length);
+    while (remaining > 0) {
+      const unsigned int word = source();
+      const uint8_t take = (remaining < sizeof(unsigned int)) ? remaining : (uint8_t)sizeof(unsigned int);
+      std::memcpy(cursor, &word, take);
+      cursor += take;
+      remaining -= take;
+    }
   }
 
   void TLS::uint24(uint32_t d, binarystream& stream)

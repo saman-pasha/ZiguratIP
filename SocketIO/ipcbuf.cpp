@@ -31,6 +31,7 @@ namespace Zigurat
 
     this->_handle = handle;
 
+    Socket::suppress_sigpipe(this->_handle);
     Socket::set_timeout(this->_handle, timeout);
     Socket::set_reusable(this->_handle, true);
     Socket::set_blocking_mode(this->_handle, blocking_mode);
@@ -73,6 +74,7 @@ namespace Zigurat
     error_code = Socket::connect(this->_handle, (Socket::address_t*)&server_address, sizeof(Socket::ipc_address_t));
     if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("ipc connect failed");    
 
+    Socket::suppress_sigpipe(this->_handle);
     Socket::set_timeout(this->_handle, timeout);
     Socket::set_blocking_mode(this->_handle, blocking_mode);
 

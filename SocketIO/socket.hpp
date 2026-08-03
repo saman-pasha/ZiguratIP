@@ -77,6 +77,22 @@ namespace Zigurat
     static constexpr auto get_option = &::getsockopt;
     static constexpr auto set_option = &::setsockopt;
 
+    // Writing to a socket whose peer has hung up raises SIGPIPE, and the default
+    // disposition kills the process. main_ziguratip ignores the signal, so the
+    // server survives; nothing else did, so the connector, the test binary and
+    // anybody's own client died the moment the far end went away. Suppressing it
+    // is the socket layer's job, not every caller's.
+    //
+    // Two mechanisms, because no single one is portable: BSD and Darwin take
+    // SO_NOSIGPIPE on the socket, Linux takes MSG_NOSIGNAL on the send.
+#if defined(MSG_NOSIGNAL)
+    static const int SEND_FLAGS = MSG_NOSIGNAL;
+#else
+    static const int SEND_FLAGS = 0;
+#endif
+
+    static void suppress_sigpipe(handle_t);
+
     static int  error_code();
     static bool is_open(handle_t);
     static bool input_available(handle_t);
