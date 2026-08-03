@@ -42,10 +42,16 @@ namespace Zigurat
     // Before bind, not after: SO_REUSEADDR only has any effect on the bind that
     // follows it. Setting it afterwards meant a restart inside the TIME_WAIT
     // window failed with "tcp bind failed".
-    Socket::set_reusable(this->_handle, true);
+    if (Socket::set_reusable(this->_handle, true) == Socket::SOCKET_ERROR)
+      throw SocketIOException(std::string("tcp cannot make the socket reusable: ")
+			      + std::strerror(Socket::error_code()));
 
+    // Which port, and why. "tcp bind failed" on its own tells an operator
+    // nothing about whether the address is taken, privileged, or unavailable.
     error_code = Socket::bind(this->_handle, res->ai_addr, res->ai_addrlen);
-    if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("tcp bind failed");
+    if (error_code == Socket::SOCKET_ERROR)
+      throw SocketIOException("tcp bind failed on service '" + service + "': "
+			      + std::strerror(Socket::error_code()));
 
     error_code = Socket::listen(this->_handle, backlog);
     if (error_code == Socket::SOCKET_ERROR) throw SocketIOException("tcp listen failed");

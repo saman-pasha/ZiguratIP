@@ -63,9 +63,18 @@ namespace Zigurat
       return false;
   }
 
+  // The value has to be an int. It was a bool, so the call went in with an
+  // option length of one, and setsockopt rejects that for SO_REUSEADDR with
+  // EINVAL -- the option was never actually set, on any socket, ever. Nobody
+  // looked at the return value, so it failed in silence.
+  //
+  // What that cost: restarting the server while any connection to it was still
+  // in TIME_WAIT failed with "Address already in use". Moving this call to
+  // before bind, which it needed, was necessary and not sufficient.
   int Socket::set_reusable(Socket::handle_t handle, bool reusable)
   {
-    return Socket::set_option(handle, SOL_SOCKET,  SO_REUSEADDR, (char *)&reusable, sizeof(reusable));
+    const int value = (reusable) ? 1 : 0;
+    return Socket::set_option(handle, SOL_SOCKET, SO_REUSEADDR, (const char*)&value, sizeof(value));
   }
 
   // The timeout is in seconds, matching /SERVER/TIMEOUT and /HTTP/TIMEOUT in

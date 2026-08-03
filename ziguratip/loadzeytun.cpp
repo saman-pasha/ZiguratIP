@@ -142,8 +142,18 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
       std::string page_path = library_path + "/lib_" + name + "_.so";
 #endif
 
+      // LibraryLoader::handle throws when dlopen fails rather than returning
+      // null, so the check below it was dead: a request for a page that does not
+      // exist fell through to the catch-all, which answered 200 with the dlopen
+      // message -- absolute server paths and all -- in the body. A page that is
+      // not there is a 404, and the client is told nothing about the filesystem.
       LibraryLoader::handle_t handle = nullptr;
-      handle = library_pool.handle(page_path);
+      try {
+	handle = library_pool.handle(page_path);
+      } catch (const std::exception& why) {
+	std::cout << "Zeytun: no page '" << name << "': " << why.what() << std::endl;
+	throw HTTPException("404 Not Found");
+      }
 
       if (!handle)
 	throw HTTPException("404 Not Found");
@@ -198,11 +208,12 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
     response->flush(true);
 
   } catch (std::exception& ex) {
+    // What went wrong goes to the log, not to the client. The message from an
+    // arbitrary failure carries whatever the failing code had to hand -- dlopen
+    // reports the full path it tried -- and none of that is the caller's
+    // business.
     std::cout << "Zeytun Catch: " << ex.what() << std::endl;
-    response->SET_HEADER("Content-Type", "text/html");
-    *Globals::echo_stream() << "<html><title>Error</title><body>Server side error message: " + 
-      std::string(ex.what()) + "</body></html>";
-    response->flush(true);
+    response->flush_error("500 Internal Server Error");
   }
 }
 

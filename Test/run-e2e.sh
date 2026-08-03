@@ -33,15 +33,52 @@ SERVER_PID=$!
 stop_server() {
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
+
+  # And wait for the ports to actually clear. The suite leaves connections
+  # behind it, and until the kernel has finished with those the next run of this
+  # script cannot bind -- which looked like the server failing to start.
+  i=0
+  while [ $i -lt 100 ]; do
+    if python3 - <<'FREE' 2>/dev/null
+import socket, sys
+for port in (2160, 2190):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        sys.exit(1)          # still answering
+    except OSError:
+        pass
+FREE
+    then
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
 }
 trap stop_server EXIT INT TERM
 
-# Wait for the binary server to come up rather than guessing at a sleep.
+# Wait until both ports actually accept a connection.
+#
+# Watching the log for "Zeytun is ready" is not enough: the server prints that
+# and then calls run(), which is what binds and listens, so the message arrives
+# before there is anything to connect to. Tests that started on the strength of
+# it raced the listener, and intermittently found nothing there.
 READY=0
 i=0
-while [ $i -lt 100 ]; do
-  if grep -q "Zeytun is ready" "$LOG" 2>/dev/null; then READY=1; break; fi
+while [ $i -lt 200 ]; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
+  if python3 - <<'LISTENING' 2>/dev/null
+import socket, sys
+for port in (2160, 2190):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    except OSError:
+        sys.exit(1)
+LISTENING
+  then
+    READY=1
+    break
+  fi
   sleep 0.1
   i=$((i + 1))
 done
@@ -94,6 +131,21 @@ else
   echo "  keep-alive FAILED"
   STATUS=1
 fi
+
+# A page that is not there is a 404, and the body says nothing about the
+# filesystem. LibraryLoader throws rather than returning null when dlopen fails,
+# so this used to answer 200 with the full path it had tried.
+echo
+echo "checking a missing page"
+MISSING_STATUS=$(curl -s -o "$HOME_DIR/log/missing-body.txt" -w '%{http_code}' \
+                 "http://127.0.0.1:2190/no-such-page-here.zt" 2>/dev/null || echo "000")
+if [ "$MISSING_STATUS" = "404" ] && ! grep -q "$HOME_DIR" "$HOME_DIR/log/missing-body.txt" 2>/dev/null; then
+  echo "  404, and no server path in the body: ok"
+else
+  echo "  missing page FAILED (status $MISSING_STATUS)"
+  STATUS=1
+fi
+rm -f "$HOME_DIR/log/missing-body.txt"
 
 echo
 echo "server transcript:"
