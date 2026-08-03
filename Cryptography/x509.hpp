@@ -37,6 +37,21 @@ namespace Zigurat
     static void   validate_by_pik(binarystream&, std::string, binarystream&);
     static void   validate_by_puk(binarystream&, binarystream&);
 
+    // The pieces a certificate carries, for anything that has to act on one --
+    // TLS most of all, which encrypts to a peer's key, checks the signature a
+    // peer made with it, and will one day decide what a peer may do from who the
+    // certificate says it is.
+    //
+    // certificate_public_key yields a DER SubjectPublicKeyInfo, the same shape
+    // the .pub files hold, so it drops straight into validate_by_puk and verify.
+    static void        certificate_public_key(binarystream&, binarystream&);
+    static std::string certificate_subject(binarystream&);
+
+    // Sign and check an arbitrary message. sign takes a private key file and its
+    // pass phrase; verify takes a certificate and reads the key out of it.
+    static void sign  (binarystream&, std::string, std::string, binarystream&, binarystream&);
+    static bool verify(binarystream&, std::string, binarystream&, binarystream&);
+
   };
 
 }

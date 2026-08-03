@@ -1,6 +1,11 @@
 #include "ztest.hpp"
 #include "shahelper.hpp"
 #include "rsa.hpp"
+#include "x509.hpp"
+#include "der.hpp"
+#include "filestream.hpp"
+#include <fstream>
+#include <string>
 #include "utility.hpp"
 #include "bufferstream.hpp"
 #include <cstring>
@@ -176,4 +181,96 @@ ZTEST(Cryptography, pkcs1_v1_5_digest_info_carries_the_hash_oid)
     }
     ZCHECK_STR(prefix, cases[c].prefix);
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// What a certificate carries
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The shipped sample material, wherever the tests are run from.
+  std::string certificate_file(const std::string& name)
+  {
+    std::string found = Utility::config_path("cert/" + name);
+    if (found.size() > 0) return found;
+
+    const char* candidates[] = {"home/etc/cert/", "../home/etc/cert/"};
+    for (int i = 0; i < 2; i++) {
+      std::ifstream probe(std::string(candidates[i]) + name);
+      if (probe.good()) return std::string(candidates[i]) + name;
+    }
+    return "";
+  }
+}
+
+// TLS has to encrypt to a peer's key and check what the peer signed with it, so
+// the key has to come back out of the certificate. Verified byte for byte
+// against "openssl x509 -pubkey" when this was written.
+ZTEST(Cryptography, a_certificates_public_key_can_be_read_back_out)
+{
+  const std::string path = certificate_file("dont-use-certificate.crt");
+  if (path.empty()) { ZCHECK(false); return; }
+
+  filestream crt(path, std::ios::in | std::ios::binary);
+  ZCHECK(crt.good());
+
+  bufferstream puk_info;
+  ZCHECK_NOTHROW(X509::certificate_public_key(crt, puk_info));
+  ZCHECK(puk_info.length() > 0);
+
+  // It is a SubjectPublicKeyInfo, so validate_by_puk takes it as it stands:
+  // the sample certificate is self signed, so its own key checks its signature.
+  bufferstream puk_der;
+  DER::encode_sequence(puk_der, puk_info);
+
+  filestream crt_again(path, std::ios::in | std::ios::binary);
+  ZCHECK_NOTHROW(X509::validate_by_puk(puk_der, crt_again));
+}
+
+// The hook a permission would be keyed on: who the certificate says its holder
+// is, rendered the way OpenSSL prints a name.
+ZTEST(Cryptography, a_certificates_subject_reads_as_a_distinguished_name)
+{
+  const std::string path = certificate_file("dont-use-certificate.crt");
+  if (path.empty()) { ZCHECK(false); return; }
+
+  filestream crt(path, std::ios::in | std::ios::binary);
+  const std::string subject = X509::certificate_subject(crt);
+
+  ZCHECK(subject.find("C=US") != std::string::npos);
+  ZCHECK(subject.find("CN=ZiguratIP") != std::string::npos);
+  ZCHECK(subject.find("emailAddress=") != std::string::npos);
+  ZCHECK(subject.find(", ") != std::string::npos);       // more than one attribute
+}
+
+// Signing an arbitrary message with a private key file, and checking it with
+// the certificate that carries the matching public key. This is what proves a
+// peer holds the key its certificate names.
+ZTEST(Cryptography, a_message_signed_with_a_key_verifies_against_its_certificate)
+{
+  const std::string crt_path = certificate_file("dont-use-certificate.crt");
+  const std::string key_path = certificate_file("dont-use-private.key");
+  if (crt_path.empty() || key_path.empty()) { ZCHECK(false); return; }
+
+  const char* text = "a handshake transcript would go here";
+  const std::streamsize length = (std::streamsize)std::strlen(text);
+
+  filestream key(key_path, std::ios::in | std::ios::binary);
+  bufferstream message, signature;
+  message.write(text, length);
+  ZCHECK_NOTHROW(X509::sign(key, "", "SHA-256", message, signature));
+  ZCHECK(signature.length() > 0);
+
+  filestream crt(crt_path, std::ios::in | std::ios::binary);
+  bufferstream same;
+  same.write(text, length);
+  ZCHECK(X509::verify(crt, "SHA-256", same, signature));
+
+  // A different message under the same signature has to be refused.
+  filestream crt_again(crt_path, std::ios::in | std::ios::binary);
+  bufferstream tampered;
+  tampered.write("a handshake transcript would go HERE", 35);
+  ZCHECK(!X509::verify(crt_again, "SHA-256", tampered, signature));
 }

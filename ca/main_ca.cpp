@@ -6,6 +6,7 @@
 #include "certificateexception.hpp"
 #include "utility.hpp"
 #include "argument.hpp"
+#include "configuration.hpp"
 #include "bigint.hpp"
 #include "x509.hpp"
 #include "rsa.hpp"
@@ -40,6 +41,33 @@ void csr   (int, char*[]);
 void issue (int, char*[]);
 void pikval(int, char*[]);
 void pukval(int, char*[]);
+
+// Where the certificates live. SECURITY/CERTIFICATE_PATH in ziguratip.conf if it
+// is set, otherwise ZIGURATIP_HOME/etc/cert. Everything the tool defaults to --
+// the issuer configuration and its key pair -- is looked for in there, so moving
+// the directory moves all of it at once.
+static std::string shipped_certificate(const std::string& file_name)
+{
+  std::string configured;
+
+  std::string conf = Zigurat::Utility::config_path("ziguratip.conf");
+  if (conf.size() > 0) {
+    try {
+      Zigurat::Configuration config(conf);
+      config.get("/SECURITY/CERTIFICATE_PATH", configured);
+    } catch (...) {
+      // An unreadable configuration is not this tool's problem: fall through to
+      // the built in location.
+    }
+  }
+
+  if (configured.size() > 0) {
+    if (configured.back() != '/') configured.push_back('/');
+    return configured + file_name;
+  }
+
+  return Zigurat::Utility::config_path("cert/" + file_name);
+}
 
 int main(int argc, char* argv[])
 {
@@ -180,9 +208,9 @@ void help()
   std::cout << "\t--private          ::= private.key" << std::endl;
   std::cout << "\t--public           ::= public.key" << std::endl;
   std::cout << "\t--serial           ::= random 20 octet positive integer" << std::endl;
-  std::cout << "\t--issuer           ::= ZIGURATIP_HOME/etc/ca/issuer.conf" << std::endl;
-  std::cout << "\t--issuer-pik       ::= ZIGURATIP_HOME/etc/ca/dont-use-private.key" << std::endl;
-  std::cout << "\t--issuer-puk       ::= ZIGURATIP_HOME/etc/ca/dont-use-public.key" << std::endl;
+  std::cout << "\t--issuer           ::= ZIGURATIP_HOME/etc/cert/issuer.conf" << std::endl;
+  std::cout << "\t--issuer-pik       ::= ZIGURATIP_HOME/etc/cert/dont-use-private.key" << std::endl;
+  std::cout << "\t--issuer-puk       ::= ZIGURATIP_HOME/etc/cert/dont-use-public.key" << std::endl;
   std::cout << "\t--from             ::= now" << std::endl;
   std::cout << "\t--to               ::= --from + 1 year" << std::endl;
   std::cout << "\t--subject          ::= subject.conf" << std::endl;
@@ -344,7 +372,7 @@ void issue(int argc, char* argv[])
   // Issuer Configuration File
   std::string issuer_path;
   if (!args.get("--issuer", issuer_path)) {
-    issuer_path = Zigurat::Utility::config_path("ca/issuer.conf");
+    issuer_path = shipped_certificate("issuer.conf");
   }
   std::ifstream issuer_file(issuer_path);
   if (!issuer_file.good()) {
@@ -355,7 +383,7 @@ void issue(int argc, char* argv[])
   // Issuer Private Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-pik", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-private.key");
+    issuer_key_path = shipped_certificate("dont-use-private.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {
@@ -442,7 +470,7 @@ void pikval(int argc, char* argv[])
   // Issuer Private Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-pik", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-private.key");
+    issuer_key_path = shipped_certificate("dont-use-private.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {
@@ -481,7 +509,7 @@ void pukval(int argc, char* argv[])
   // Issuer Public Key File
   std::string issuer_key_path;
   if (!args.get("--issuer-puk", issuer_key_path)) {
-    issuer_key_path = Zigurat::Utility::config_path("ca/dont-use-public.key");
+    issuer_key_path = shipped_certificate("dont-use-public.key");
   }
   std::ifstream issuer_key_file(issuer_key_path);
   if (!issuer_key_file.good()) {

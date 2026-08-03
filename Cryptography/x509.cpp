@@ -790,6 +790,145 @@ namespace Zigurat
     X509::_verify(puk_info, signature_algorithm_id, tbs_certificate_data, signature_value);
   }
 
+  // tbsCertificate is
+  //
+  //     serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo
+  //
+  // for the v1 certificates the CA issues, so the key is the sixth element and
+  // the subject the fifth. Nothing here assumes extensions; when they arrive the
+  // optional [0] version has to be stepped over first.
+  static void _tbs_element(binarystream& certificate, int index, binarystream& element)
+  {
+    bufferstream tbs;
+    DER::decode_sequence(certificate, tbs);
+
+    for (int i = 0; i < index; i++) {
+      bufferstream skipped;
+      DER::decode_tlv(tbs, skipped);
+    }
+
+    DER::decode_tlv(tbs, element);
+  }
+
+  void X509::certificate_public_key(binarystream& crt_stream, binarystream& puk_info)
+  {
+    bufferstream certificate;
+    X509::_load_certificate(crt_stream, certificate);
+
+    bufferstream spki;
+    _tbs_element(certificate, 5, spki);          // subjectPublicKeyInfo
+
+    DER::decode_sequence(spki, puk_info);
+  }
+
+  // Rendered the way OpenSSL prints a name -- "C=US, CN=..." -- so what a
+  // permission would be keyed on reads the same in both tools.
+  static std::string _attribute_name(DER::oid_t& oid)
+  {
+    if (oid.size() == 4 && oid[0] == 2 && oid[1] == 5 && oid[2] == 4) {
+      switch (oid[3]) {
+      case  3: return "CN";
+      case  4: return "SN";
+      case  5: return "serialNumber";
+      case  6: return "C";
+      case  7: return "L";
+      case  8: return "ST";
+      case 10: return "O";
+      case 11: return "OU";
+      case 12: return "title";
+      case 41: return "name";
+      case 42: return "givenName";
+      case 43: return "initials";
+      case 44: return "generationQualifier";
+      case 46: return "dnQualifier";
+      case 65: return "pseudonym";
+      default: break;
+      }
+    }
+    if (oid.size() == 7 && oid[0] == 0 && oid[1] == 9 && oid[2] == 2342
+	&& oid[3] == 19200300 && oid[4] == 100 && oid[5] == 1 && oid[6] == 25)
+      return "DC";
+    if (oid.size() == 7 && oid[0] == 1 && oid[1] == 2 && oid[2] == 840
+	&& oid[3] == 113549 && oid[4] == 1 && oid[5] == 9 && oid[6] == 1)
+      return "emailAddress";
+
+    return DER::oid_to_string(oid);
+  }
+
+  std::string X509::certificate_subject(binarystream& crt_stream)
+  {
+    bufferstream certificate;
+    X509::_load_certificate(crt_stream, certificate);
+
+    bufferstream subject_tlv;
+    _tbs_element(certificate, 4, subject_tlv);   // subject
+
+    bufferstream rdns;
+    DER::decode_sequence(subject_tlv, rdns);
+
+    std::string name;
+    while (rdns.length() > rdns.tellg()) {
+
+      bufferstream rdn, attribute;
+      DER::decode_set(rdns, rdn);
+      DER::decode_sequence(rdn, attribute);
+
+      DER::oid_t oid = DER::decode_oid(attribute);
+
+      bufferstream value;
+      DER::decode_tlv(attribute, value);
+      DER::decode_tag(value);
+      const size_t length = DER::decode_length(value);
+      std::string text((size_t)length, 0);
+      if (length > 0) value.read(&text[0], (std::streamsize)length);
+
+      if (!name.empty()) name += ", ";
+      name += _attribute_name(oid) + "=" + text;
+    }
+
+    return name;
+  }
+
+  void X509::sign(binarystream& pik_stream, std::string cipher_key, std::string hash,
+		  binarystream& message, binarystream& signature)
+  {
+    hash = Utility::to_upper(hash);
+
+    bufferstream pik_info, pik_algorithm_id, pik;
+    X509::_load_pik_info(pik_stream, cipher_key, pik_info);
+    X509::_extract_pik_info(pik_info, pik_algorithm_id, pik);
+
+    bufferstream signature_algorithm_id;
+    X509::_signature_algorithm_id(pik_algorithm_id, hash, signature_algorithm_id);
+
+    X509::_sign(signature_algorithm_id, pik, message, signature);
+  }
+
+  bool X509::verify(binarystream& crt_stream, std::string hash,
+		    binarystream& message, binarystream& signature)
+  {
+    hash = Utility::to_upper(hash);
+
+    bufferstream puk_info;
+    X509::certificate_public_key(crt_stream, puk_info);
+
+    // _signature_algorithm_id wants the key's own algorithm id to decide what it
+    // may be signed with, and the certificate carries it in front of the key.
+    bufferstream puk_copy, algorithm_id;
+    puk_info.read(puk_copy, 0, puk_info.length());
+    DER::decode_sequence(puk_copy, algorithm_id);
+
+    bufferstream signature_algorithm_id;
+    X509::_signature_algorithm_id(algorithm_id, hash, signature_algorithm_id);
+
+    try {
+      X509::_verify(puk_info, signature_algorithm_id, message, signature);
+    } catch (const std::exception&) {
+      return false;
+    }
+    return true;
+  }
+
   void X509::validate_by_puk(binarystream& puk_stream, binarystream& crt_stream)
   {
     bufferstream puk_info;

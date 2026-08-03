@@ -68,6 +68,7 @@ home/bin      ziguratip, parsi, ca, Test
 home/lib      the 14 shared libraries
 home/include  public headers
 home/etc      configuration
+home/etc/cert certificates and keys (SECURITY/CERTIFICATE_PATH)
 home/http     static web assets
 home/data     the page store (created on first run)
 home/ld       compiled Parsi objects
@@ -108,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 230 cases
+Starts a server, runs the full suite against it, stops it again. 233 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -431,10 +432,10 @@ suite passes. Some things are known to be incomplete:
 - **`nbostream` and `hbostream` are identical** — the "network byte order"
   stream does not actually swap, so the wire format is host-endian.
 
-The CA material under `home/etc/ca` is a sample, named `dont-use-*` for the
+The CA material under `home/etc/cert` is a sample, named `dont-use-*` for the
 obvious reason: its private key is in this repository and is therefore public.
 Generate your own with `ca keygen` for anything real — see
-[home/etc/ca/README.md](home/etc/ca/README.md).
+[home/etc/cert/README.md](home/etc/cert/README.md).
 
 ---
 

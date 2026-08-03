@@ -1,4 +1,12 @@
-# Sample CA material — do not use
+# Certificates and keys
+
+This is where ZiguratIP looks for certificate material: the issuer
+configuration the `ca` tool defaults to, its key pair, and the certificates a
+secure connection will be built on. `SECURITY/CERTIFICATE_PATH` in
+`ziguratip.conf` moves the whole directory somewhere else — off the install
+prefix and out of any repository, which is where real keys belong.
+
+## Sample CA material — do not use
 
 Everything named `dont-use-*` in this directory is a **sample**, committed so
 the `ca` examples run against a working default without anyone having to
