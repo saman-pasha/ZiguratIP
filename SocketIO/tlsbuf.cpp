@@ -61,6 +61,15 @@ namespace Zigurat
     message.read(this->_transcript, 0, length);
   }
 
+  // Everything said so far, as it crossed the wire. What CertificateVerify signs:
+  // RFC 5246 7.4.8 signs the handshake messages themselves, and the signature
+  // operation does the hashing.
+  void tlsbuf::_transcript_bytes(binarystream& out)
+  {
+    const std::streamsize length = this->_transcript.length();
+    this->_transcript.read(out, 0, length);
+  }
+
   // SHA-256 over everything said so far. TLS 1.2 ties the digest to the cipher
   // suite's PRF hash, and every suite here uses SHA-256.
   void tlsbuf::_transcript_hash(uint8_t* digest)
@@ -200,13 +209,19 @@ namespace Zigurat
       bufferstream compressed;
       if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::NONE) {
 
+	// read_exact, not read: a record is whatever length its header says, and
+	// TCP is free to deliver that in as many pieces as it likes. A single read
+	// returns what has arrived so far, which for anything that did not fit one
+	// segment left the rest of the record to be parsed as the next one. The
+	// encrypted path below already did this; the plain one did not, and the
+	// plain path is the one every handshake starts on.
 	if (params.mac_algorithm == TLS::MACAlgorithm::NONE) {
 	  compressed_length = this->_tcpstream.read_std_ushort();
-	  this->_tcpstream.read(compressed, compressed_length);
+	  this->_tcpstream.read_exact(compressed, compressed_length);
 	} else {
 	  compressed_length = this->_tcpstream.read_std_ushort() - params.mac_length;
-	  this->_tcpstream.read(compressed, compressed_length);
-	
+	  this->_tcpstream.read_exact(compressed, compressed_length);
+
 	  uint8_t mac[params.mac_length];
 	  TLS::MAC(params.mac_algorithm,
 		   (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_MAC_key : this->server_write_MAC_key,
@@ -214,7 +229,7 @@ namespace Zigurat
 	  compressed.seekg(0, std::ios_base::beg);
 	
 	  uint8_t record_mac[params.mac_length];
-	  this->_tcpstream.read((char*)record_mac, params.mac_length);
+	  this->_tcpstream.read_exact((char*)record_mac, params.mac_length);
 
 	  if (std::memcmp(mac, record_mac, params.mac_length) != 0)	  
 	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_RECORD_MAC);
@@ -653,33 +668,49 @@ namespace Zigurat
     // Read from client_body, write into server_body. These were reading the
     // client's offer out of the reply being built, which is empty at this point,
     // so no cipher suite and no compression method could ever be agreed.
+    // The client's whole offer is read before any of it is answered. Breaking
+    // out of these loops on the first match left the rest of the list unread,
+    // and everything after it -- compressions, extensions -- was then parsed
+    // from the middle of a cipher suite. A peer that offers exactly what this
+    // end wants and nothing more never showed it; any other peer desynchronised
+    // on its first message.
+    const uint16_t cipher_suites_length = client_body.read_std_ushort();
+    std::vector<TLS::CipherSuite> offered_suites;
+    for (uint16_t i = 0; i + 1 < cipher_suites_length; i += 2) {
+      TLS::CipherSuite suite {client_body.read_std_ubyte(), client_body.read_std_ubyte()};
+      offered_suites.push_back(suite);
+    }
+
+    const uint8_t compressions_count = client_body.read_std_ubyte();
+    std::vector<TLS::CompressionMethod> offered_compressions;
+    for (uint8_t i = 0; i < compressions_count; i++)
+      offered_compressions.push_back((TLS::CompressionMethod)client_body.read_std_ubyte());
+
+    // This end's preference wins, which is the server's right and keeps the
+    // choice out of the peer's hands.
     bool cipher_suite_found = false;
-    uint16_t cipher_suites_count = client_body.read_std_ushort() / sizeof(TLS::CipherSuite);
-    for (uint16_t i = 0; i < cipher_suites_count; i++) {
-      TLS::CipherSuite client_suite {client_body.read_std_ubyte(), client_body.read_std_ubyte()};
-      for (TLS::CipherSuite& server_suite : this->_handshake_params.cipher_suites) {
-	if (client_suite.revision == server_suite.revision && client_suite.suite_id == server_suite.suite_id) {
+    for (TLS::CipherSuite& server_suite : this->_handshake_params.cipher_suites) {
+      for (TLS::CipherSuite& client_suite : offered_suites) {
+	if (client_suite.revision == server_suite.revision
+	    && client_suite.suite_id == server_suite.suite_id) {
 	  TLS::cipher_suite(server_suite, this->_pending_state);
-	  server_body.write_std_ubyte(client_suite.revision);
-	  server_body.write_std_ubyte(client_suite.suite_id);	  
+	  server_body.write_std_ubyte(server_suite.revision);
+	  server_body.write_std_ubyte(server_suite.suite_id);
 	  cipher_suite_found = true;
 	  break;
 	}
       }
       if (cipher_suite_found) break;
     }
-    if (!cipher_suite_found) {
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);  // cipher_suites
-    }
-    
+    if (!cipher_suite_found)
+      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
+
     bool compression_found = false;
-    uint8_t client_compressions_count = client_body.read_std_ubyte();
-    for (uint8_t i = 0; i < client_compressions_count; i++) {
-      TLS::CompressionMethod client_compression = (TLS::CompressionMethod)client_body.read_std_ubyte();
-      for (TLS::CompressionMethod server_compression : this->_handshake_params.compression_methods) {
+    for (TLS::CompressionMethod server_compression : this->_handshake_params.compression_methods) {
+      for (TLS::CompressionMethod client_compression : offered_compressions) {
 	if (client_compression == server_compression) {
 	  this->_pending_state.compression_algorithm = server_compression;
-	  server_body.write_std_ubyte((uint8_t)client_compression);
+	  server_body.write_std_ubyte((uint8_t)server_compression);
 	  compression_found = true;
 	  break;
 	}
@@ -687,39 +718,56 @@ namespace Zigurat
       if (compression_found) break;
     }
     if (!compression_found) {
+      // NONE is always acceptable and every client offers it.
       this->_pending_state.compression_algorithm = TLS::CompressionMethod::NONE;
-      server_body.write_std_ubyte((uint8_t)TLS::CompressionMethod::NONE);         // compression_methods
+      server_body.write_std_ubyte((uint8_t)TLS::CompressionMethod::NONE);
     }
 
-    std::vector<TLS::Extension> server_extensions;                                // extensions
-    uint16_t extensions_length = client_body.read_std_ushort();
-    if (!client_body.eof() && this->_handshake_params.extensions.size() > 0) {
-      uint8_t extensions_buffer[extensions_length];
-      client_body.read((char*)extensions_buffer, extensions_length);
-      arraystream extensions(extensions_buffer, extensions_length);
+    // extensions. Walked by declared length and otherwise ignored: an extension
+    // this end does not implement is not an error, and skipping it by its own
+    // length is what keeps the rest of the block readable. The previous version
+    // consumed the block twice, never advanced past an extension it did not
+    // recognise, and answered with a length it had not written anything for.
+    //
+    // The reply carries none. RFC 5246 7.4.1.4 forbids a server from sending an
+    // extension the client did not offer, and there is none here worth echoing,
+    // so the block is left off entirely -- which is legal and is what a client
+    // that sent no extensions expects to see.
+    bool peer_named_algorithms  = false;
+    bool peer_signs_with_sha256 = false;
 
-      while (extensions_length > 0) {
-	TLS::Extension client_extension;
-        client_extension.extension_type = (TLS::ExtensionType)client_body.read_std_ushort();
-	extensions_length -= sizeof(TLS::ExtensionType);
-	for (TLS::Extension& server_extension : this->_handshake_params.extensions) {
-	  if (client_extension.extension_type == server_extension.extension_type) {
-	    uint16_t data_length = client_body.read_std_ushort();
-	    client_extension.extension_data = new uint8_t[data_length];
-	    client_body.read((char*)client_extension.extension_data, data_length);
-	    extensions_length -= sizeof(uint16_t) + data_length;
-	    bufferstream supported_extension;
-	    TLS::check_extension(server_extension, client_extension, supported_extension);
-	    supported_extension.read(server_body, supported_extension.tellp());
-	  }
+    if (client_body.tellg() < client_body.length()) {
+
+      const uint16_t extensions_length = client_body.read_std_ushort();
+      std::streamsize remaining = extensions_length;
+
+      while (remaining >= 4) {
+
+	const uint16_t extension_type = client_body.read_std_ushort();
+	const uint16_t data_length = client_body.read_std_ushort();
+	remaining -= 4;
+
+	if (data_length > remaining) break;              // malformed: stop reading
+
+	if ((TLS::ExtensionType)extension_type == TLS::ExtensionType::SIGNATURE_ALGORITHMS) {
+	  peer_named_algorithms = true;
+	  peer_signs_with_sha256 =
+	    TLS::accepts_signature_algorithm(client_body, data_length, TLS::SIG_RSA_SHA256);
+	} else {
+	  client_body.ignore(data_length);
 	}
-      }
 
-      extensions_length = extensions.tellp();
-      server_body.write_std_ushort(extensions_length);
-      extensions.read(server_body, extensions_length);
+	remaining -= data_length;
+      }
     }
-    
+
+    // A peer that named its algorithms and did not name this one cannot produce
+    // the CertificateVerify this end is about to ask for. A peer that named none
+    // is let through: the specification reads that as SHA-1, and refusing it here
+    // would turn a stricter check into a worse error message further on.
+    if (peer_named_algorithms && !peer_signs_with_sha256)
+      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
+
     TLS::Handshake server_hello {TLS::HandshakeType::SERVER_HELLO, server_body.tellp(), server_body};
     this->_send_handshake(server_hello);
   }
@@ -750,8 +798,16 @@ namespace Zigurat
       // CertificateRequest. One type, RSA signing, and no acceptable authority
       // named -- there is only ever one, and the peer already has it.
       bufferstream body;
-      body.write_std_ubyte(1);
+      body.write_std_ubyte(1);                        // certificate_types
       body.write_std_ubyte((uint8_t)TLS::ClientCertificateType::RSA_SIGN);
+
+      // supported_signature_algorithms. Required in TLS 1.2 and it sits between
+      // the types and the authorities; leaving it out shifted everything after
+      // it, so a conforming client could not read the message.
+      std::vector<TLS::SignatureAndHashAlgorithm> algorithms;
+      algorithms.push_back(TLS::SIG_RSA_SHA256);
+      TLS::write_signature_algorithms(body, algorithms);
+
       body.write_std_ushort(0);                       // certificate_authorities
       TLS::Handshake message {TLS::HandshakeType::CERTIFICATE_REQUEST, body.length(), body};
       this->_send_handshake(message);
@@ -794,8 +850,10 @@ namespace Zigurat
     // could present somebody else's certificate: encrypting to the server's key
     // proves nothing about who is doing the encrypting.
     {
-      uint8_t digest[SHA::size(SHA::SHA256)];
-      this->_transcript_hash(digest);
+      // Captured before the message joins the transcript, because what it signs
+      // is everything that came before it.
+      bufferstream signed_messages;
+      this->_transcript_bytes(signed_messages);
 
       bufferstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
@@ -803,16 +861,19 @@ namespace Zigurat
       if (message.msg_type != TLS::HandshakeType::CERTIFICATE_VERIFY)
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
 
-      body.read_std_ubyte();                          // hash algorithm
-      body.read_std_ubyte();                          // signature algorithm
+      const uint8_t hash_algorithm = body.read_std_ubyte();
+      const uint8_t signature_algorithm = body.read_std_ubyte();
+      if (hash_algorithm != (uint8_t)TLS::HashAlgorithm::SHA256
+	  || signature_algorithm != (uint8_t)TLS::SignatureAlgorithm::RSA)
+	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::ILLEGAL_PARAMETER);
+
       const uint16_t length = body.read_std_ushort();
 
-      bufferstream signature, signed_digest, certificate;
+      bufferstream signature, certificate;
       body.read(signature, length);
-      signed_digest.write((char*)digest, (std::streamsize)sizeof(digest));
       peer_certificate.read(certificate, 0, peer_certificate.length());
 
-      if (!X509::verify(certificate, "SHA-256", signed_digest, signature))
+      if (!X509::verify(certificate, "SHA-256", signed_messages, signature))
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECRYPT_ERROR);
     }
 
@@ -851,25 +912,23 @@ namespace Zigurat
     client_body.write((char*)this->_handshake_params.compression_methods.data(),
 		 this->_handshake_params.compression_methods.size());                // compression_methods
 
-    if (this->_handshake_params.extensions.size() > 0) {                             // extensions
-      bufferstream extensions;
-      for (TLS::Extension& extension : this->_handshake_params.extensions) {
-	switch (extension.extension_type) {                                          // extension_data
-	case TLS::ExtensionType::SIGNATURE_ALGORITHMS:
-	  break;
-	default:
-	  throw TLSException("unsupported extention");
-	}
-        extensions.write_std_ushort((uint16_t)extension.extension_type);
-	uint16_t data_length = Utility::ntohs(*((uint16_t*)extension.extension_data));
-	client_body.write((char*)extension.extension_data, sizeof(uint16_t));
-	client_body.write((char*)extension.extension_data + sizeof(uint16_t), data_length);
-	delete[] extension.extension_data;
-      }
+    // extensions. RFC 5246 7.4.1.4.1: a TLS 1.2 client that offers no
+    // signature_algorithms is taken to have offered SHA-1 with its certificate's
+    // key type, which is not what this end signs CertificateVerify with. It goes
+    // out unconditionally.
+    {
+      bufferstream extension, extensions;
 
-      uint16_t extensions_length = extensions.tellp();
-      client_body.write_std_ushort(extensions_length);
-      extensions.read(client_body, extensions_length);
+      std::vector<TLS::SignatureAndHashAlgorithm> algorithms;
+      algorithms.push_back(TLS::SIG_RSA_SHA256);
+      TLS::write_signature_algorithms(extension, algorithms);
+
+      extensions.write_std_ushort((uint16_t)TLS::ExtensionType::SIGNATURE_ALGORITHMS);
+      extensions.write_std_ushort((uint16_t)extension.length());
+      extension.read(extensions, 0, extension.length());
+
+      client_body.write_std_ushort((uint16_t)extensions.length());
+      extensions.read(client_body, 0, extensions.length());
     }
 
     TLS::Handshake client_hello {TLS::HandshakeType::CLIENT_HELLO, client_body.tellp(), client_body};
@@ -916,6 +975,20 @@ namespace Zigurat
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::CERTIFICATE_REQUEST)
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
+
+      // certificate_types, then the algorithms the server will verify with. If
+      // it will not take an RSA certificate signed under SHA-256, this end has
+      // nothing it can offer and should say so now rather than be refused later.
+      const uint8_t types_count = body.read_std_ubyte();
+      bool rsa_sign_wanted = false;
+      for (uint8_t i = 0; i < types_count; i++)
+	if (body.read_std_ubyte() == (uint8_t)TLS::ClientCertificateType::RSA_SIGN)
+	  rsa_sign_wanted = true;
+
+      const std::streamsize left = body.length() - body.tellg();
+      if (!rsa_sign_wanted
+	  || !TLS::accepts_signature_algorithm(body, left, TLS::SIG_RSA_SHA256))
+	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
     }
     {
       bufferstream body;
@@ -953,12 +1026,12 @@ namespace Zigurat
     // CertificateVerify: this end signs the conversation so far, which is what
     // proves it holds the key its certificate names.
     {
-      uint8_t digest[SHA::size(SHA::SHA256)];
-      this->_transcript_hash(digest);
-
+      // The handshake messages themselves. Signing their digest instead put a
+      // second SHA-256 inside the signature, which both ends agreed on and no
+      // other implementation would.
       bufferstream key, to_sign, signature;
       this->_credential(this->_handshake_params.credentials.private_key, key);
-      to_sign.write((char*)digest, (std::streamsize)sizeof(digest));
+      this->_transcript_bytes(to_sign);
       X509::sign(key, this->_handshake_params.credentials.private_key_cipher,
 		 "SHA-256", to_sign, signature);
 

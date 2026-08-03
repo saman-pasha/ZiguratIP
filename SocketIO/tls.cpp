@@ -310,68 +310,38 @@ namespace Zigurat
     }
   }
 
-  TLS::Extension TLS::signature_algorithm_extention(std::vector<SignatureAndHashAlgorithm> algorithms)
+  // The body of a signature_algorithms extension or a CertificateRequest's list:
+  // a two octet length, then one (hash, signature) pair per entry.
+  void TLS::write_signature_algorithms(binarystream& out,
+				       const std::vector<SignatureAndHashAlgorithm>& algorithms)
   {
-    bufferstream data;
-    data.write_std_ushort(sizeof(uint16_t) + (algorithms.size() * sizeof(SignatureAndHashAlgorithm)));
-    data.write_std_ushort(algorithms.size() * sizeof(SignatureAndHashAlgorithm));
+    out.write_std_ushort((uint16_t)(algorithms.size() * 2));
     for (const SignatureAndHashAlgorithm& algorithm : algorithms) {
-      data.write_std_ubyte((uint8_t)algorithm.hash);
-      data.write_std_ubyte((uint8_t)algorithm.signature);
+      out.write_std_ubyte((uint8_t)algorithm.hash);
+      out.write_std_ubyte((uint8_t)algorithm.signature);
     }
-    uint16_t length = data.tellp();
-    uint8_t* buffer = new uint8_t[length];
-    data.read((char*)buffer, length);
-    return Extension {ExtensionType::SIGNATURE_ALGORITHMS, buffer};
   }
 
-  void TLS::check_extension(const Extension& server_extension, const Extension& client_extension, binarystream& extension_buffer)
+  // Whether a list of that shape names the pair given. Reads no further than the
+  // length it declares, so a truncated or overlong list cannot walk past its end.
+  bool TLS::accepts_signature_algorithm(binarystream& in, std::streamsize available,
+					const SignatureAndHashAlgorithm& wanted)
   {
-    assert(server_extension.extension_type == client_extension.extension_type);
-    uint8_t *server_cursor = server_extension.extension_data;
-    uint8_t *client_cursor = client_extension.extension_data;
-    uint16_t server_length = Utility::ntohs(*((uint16_t*)server_cursor));
-    uint16_t client_length = Utility::ntohs(*((uint16_t*)client_cursor));
-    server_cursor += sizeof(uint16_t);
-    client_cursor += sizeof(uint16_t);
+    if (available < 2) return false;
 
-    switch (server_extension.extension_type) {
-    case TLS::ExtensionType::SIGNATURE_ALGORITHMS:
-      {
-	if (server_length > 0 && client_length > 0) {
-	  extension_buffer.write_std_ushort((uint16_t)TLS::ExtensionType::SIGNATURE_ALGORITHMS);
-    
-	  uint16_t server_count = Utility::ntohs(*((uint16_t*)server_cursor));
-	  uint16_t client_count = Utility::ntohs(*((uint16_t*)client_cursor));
-	  server_cursor += sizeof(uint16_t);
-	  client_cursor += sizeof(uint16_t);
+    const uint16_t length = in.read_std_ushort();
+    available -= 2;
 
-	  std::vector<SignatureAndHashAlgorithm> supported;
-	  
-	  for (uint16_t i = 0; i < server_count; i++) {
-	    for (uint16_t j = 0; j < client_count; j++) {
-	      if (*(server_cursor + (i * sizeof(SignatureAndHashAlgorithm))) ==
-		  *(client_cursor + (j * sizeof(SignatureAndHashAlgorithm))) &&
-		  *(server_cursor + (i * sizeof(SignatureAndHashAlgorithm)) + sizeof(uint8_t)) ==
-		  *(client_cursor + (j * sizeof(SignatureAndHashAlgorithm)) + sizeof(uint8_t))) {
-		supported.push_back(SignatureAndHashAlgorithm {
-		    (HashAlgorithm)*(server_cursor + (i * sizeof(SignatureAndHashAlgorithm))),
-		    (SignatureAlgorithm)*(server_cursor + (i * sizeof(SignatureAndHashAlgorithm)) + sizeof(uint8_t))});
-	      }
-	    }
-	  }
+    if (length > available || (length % 2) != 0) return false;
 
-	  extension_buffer.write_std_ushort((uint16_t)(supported.size() * sizeof(SignatureAndHashAlgorithm)));
-	  for (const SignatureAndHashAlgorithm& algorithm : supported) {
-	    extension_buffer.write_std_ubyte((uint8_t)algorithm.hash);
-	    extension_buffer.write_std_ubyte((uint8_t)algorithm.signature);
-	  }
-	}
-      }
-      break;
-    default:
-      throw TLSException("unsupported extention");
+    for (uint16_t i = 0; i + 1 < length; i += 2) {
+      const uint8_t hash = in.read_std_ubyte();
+      const uint8_t signature = in.read_std_ubyte();
+      if (hash == (uint8_t)wanted.hash && signature == (uint8_t)wanted.signature)
+	return true;
     }
+
+    return false;
   }
 
 }

@@ -52,6 +52,7 @@ namespace Zigurat
 
     void _transcribe(binarystream&);
     void _transcript_hash(uint8_t*);
+    void _transcript_bytes(binarystream&);
 
     void _send_record(TLS::Record&);
     void _recv_record(TLS::Record&);

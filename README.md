@@ -434,7 +434,14 @@ suite passes. Some things are known to be incomplete:
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
 - **`nbostream` and `hbostream` are identical** — the "network byte order"
-  stream does not actually swap, so the wire format is host-endian.
+  stream does not byte swap, so every multi-octet field written to a `tcpstream`
+  or a `tlsstream` goes out in host order. Both ends of every ZiguratIP
+  connection have the same defect and therefore agree, which is why nothing has
+  noticed. It is also what stops the TLS handshake from being readable by
+  another implementation: `openssl s_client` reads the two octet cipher suite
+  list length `00 02` as 512. Fixing it changes the wire format of the Zigurat
+  binary protocol; nothing on disk is affected, because the page store and every
+  buffer use `hbostream` deliberately.
 
 The CA material under `home/etc/cert` is a sample, named `dont-use-*` for the
 obvious reason: its private key is in this repository and is therefore public.

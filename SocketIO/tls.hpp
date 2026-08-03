@@ -242,7 +242,6 @@ namespace Zigurat
       SessionID                      session_id;
       std::vector<CipherSuite>       cipher_suites;
       std::vector<CompressionMethod> compression_methods;
-      std::vector<Extension>         extensions;
       Credentials                    credentials;
     };
 
@@ -397,8 +396,11 @@ namespace Zigurat
     static void uint24(uint32_t, binarystream&);
     static uint32_t uint24(binarystream&);
     static void cipher_suite(const CipherSuite&, SecurityParameters&);
-    static Extension signature_algorithm_extention(std::vector<SignatureAndHashAlgorithm>);
-    static void check_extension(const Extension&, const Extension&, binarystream&);
+    // signature_algorithms, RFC 5246 7.4.1.4.1: the pairs this end will sign
+    // and verify with. A TLS 1.2 client that sends none is taken to mean SHA-1
+    // only, so it is written whether or not anything else is.
+    static void write_signature_algorithms(binarystream&, const std::vector<SignatureAndHashAlgorithm>&);
+    static bool accepts_signature_algorithm(binarystream&, std::streamsize, const SignatureAndHashAlgorithm&);
   };
 
 }
