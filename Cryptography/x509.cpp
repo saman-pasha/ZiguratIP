@@ -720,15 +720,43 @@ namespace Zigurat
     X509::_dump_csr(csr, encoding, csr_stream);
   }
 
-  void X509::issue(binarystream& serial_number, binarystream& issuer_stream, binarystream& pik_stream, std::string cipher_key, 
-		   time_t not_before_time, time_t not_after_time, binarystream& csr_stream, 
+  const char* X509::PERMISSIONS_OID = "1.3.6.1.4.1.55447.1.1";
+
+  // The same arc as nodes, which is what the encoder wants.
+  static DER::oid_t permissions_oid()
+  {
+    return DER::oid_t {1, 3, 6, 1, 4, 1, 55447, 1, 1};
+  }
+
+  void X509::issue(binarystream& serial_number, binarystream& issuer_stream, binarystream& pik_stream, std::string cipher_key,
+		   time_t not_before_time, time_t not_after_time, binarystream& csr_stream,
 		   std::string hash, std::string encoding, binarystream& crt_stream)
+  {
+    X509::issue(serial_number, issuer_stream, pik_stream, cipher_key, not_before_time, not_after_time,
+		csr_stream, hash, encoding, std::vector<std::string>(), crt_stream);
+  }
+
+  void X509::issue(binarystream& serial_number, binarystream& issuer_stream, binarystream& pik_stream, std::string cipher_key,
+		   time_t not_before_time, time_t not_after_time, binarystream& csr_stream,
+		   std::string hash, std::string encoding, const std::vector<std::string>& permissions,
+		   binarystream& crt_stream)
   {
     hash     = Utility::to_upper(hash);
     encoding = Utility::to_upper(encoding);
 
-    // X.509 v3 TBSCertificate
+    // A certificate is v1 unless it carries something only v3 can hold. Version
+    // is [0] EXPLICIT and defaults to v1 when absent, so emitting it only when
+    // it is needed keeps every certificate issued so far byte for byte the same.
+    const bool is_v3 = !permissions.empty();
+
     bufferstream tbs_certificate;
+
+    if (is_v3) {
+      bufferstream version;
+      DER::encode_integer(version, 2);                   // v3
+      DER::encode_context(tbs_certificate, version, 0);
+    }
+
     DER::encode_integer(tbs_certificate, serial_number);
 
     bufferstream pik_info, pik_algorithm_id, signature_algorithm_id, pik;
@@ -763,6 +791,33 @@ namespace Zigurat
 
     DER::encode_sequence(tbs_certificate, subject);
     DER::encode_sequence(tbs_certificate, puk_info);
+
+    // Extensions: [3] EXPLICIT SEQUENCE OF Extension, and one Extension is
+    // { OID, critical BOOLEAN DEFAULT FALSE, OCTET STRING }. The octet string
+    // holds the DER of whatever the extension means -- here a SEQUENCE OF
+    // UTF8String, one per permission.
+    //
+    // Not marked critical. A certificate that says what its holder may do
+    // should still be readable by something that has never heard of these
+    // permissions; marking it critical would make every other implementation
+    // reject the certificate outright.
+    if (is_v3) {
+      bufferstream granted, extension, extensions, extensions_wrapper;
+
+      for (const std::string& permission : permissions)
+	DER::encode_utf8_string(granted, permission);
+
+      bufferstream payload, payload_octets;
+      DER::encode_sequence(payload, granted);
+      DER::encode_octet_string(payload_octets, payload);
+
+      DER::encode_oid(extension, permissions_oid());
+      extension.write(payload_octets, payload_octets.length());
+
+      DER::encode_sequence(extensions, extension);
+      DER::encode_sequence(extensions_wrapper, extensions);
+      DER::encode_context(tbs_certificate, extensions_wrapper, 3);
+    }
 
     // X.509 v3 Certificate
     bufferstream certificate, tbs_certificate_data, signature_value;
@@ -803,6 +858,13 @@ namespace Zigurat
     bufferstream tbs;
     DER::decode_sequence(certificate, tbs);
 
+    // Version is [0] EXPLICIT and only present on a v3 certificate, where it
+    // sits in front of the serial number. Everything below counts from the
+    // serial, so it is stepped over when it is there and nothing changes when
+    // it is not.
+    bufferstream version;
+    DER::decode_context(tbs, version, 0);
+
     // Every step is checked against what is left. The bytes come off the wire --
     // a peer presents its own certificate -- so a structure that is not a
     // certificate at all, or is truncated, has to be refused rather than walked
@@ -820,6 +882,76 @@ namespace Zigurat
 
     if (element.length() == 0)
       throw CertificateException("empty element " + std::to_string(index) + " of tbsCertificate");
+  }
+
+  std::vector<std::string> X509::certificate_permissions(binarystream& crt_stream)
+  {
+    std::vector<std::string> permissions;
+
+    bufferstream certificate;
+    X509::_load_certificate(crt_stream, certificate);
+
+    bufferstream tbs;
+    DER::decode_sequence(certificate, tbs);
+
+    bufferstream version;
+    if (!DER::decode_context(tbs, version, 0))
+      return permissions;                       // v1: there is nowhere for them to be
+
+    // Past serial, signature, issuer, validity, subject and the key, to [3].
+    for (int i = 0; i < 6; i++) {
+      if (tbs.tellg() >= tbs.length()) return permissions;
+      bufferstream skipped;
+      DER::decode_tlv(tbs, skipped);
+    }
+
+    bufferstream wrapper, extensions;
+    if (!DER::decode_context(tbs, wrapper, 3)) return permissions;
+    DER::decode_sequence(wrapper, extensions);
+
+    const DER::oid_t wanted = permissions_oid();
+
+    while (extensions.tellg() < extensions.length()) {
+
+      bufferstream extension;
+      DER::decode_sequence(extensions, extension);
+
+      DER::oid_t oid = DER::decode_oid(extension);
+      if (oid != wanted) continue;              // some other extension: not ours to read
+
+      // critical is optional and defaults to false, so it may or may not be
+      // sitting between the OID and the payload.
+      bufferstream payload;
+      const std::streampos mark = extension.tellg();
+      try {
+	DER::decode_octet_string(extension, payload);
+      } catch (const std::exception&) {
+	extension.clear();
+	extension.seekg(mark, std::ios::beg);
+	DER::decode_boolean(extension);
+	payload.string("");
+	DER::decode_octet_string(extension, payload);
+      }
+
+      bufferstream granted;
+      DER::decode_sequence(payload, granted);
+
+      // decode_utf8_string writes into an array, so the length is read from the
+      // header first to know how much room to give it.
+      while (granted.tellg() < granted.length()) {
+	const std::streampos mark = granted.tellg();
+	DER::decode_tag(granted);
+	const size_t length = DER::decode_length(granted);
+	granted.clear();
+	granted.seekg(mark, std::ios::beg);
+
+	std::vector<uint8_t> text(length + 1, 0);
+	DER::decode_utf8_string(granted, text.data());
+	permissions.push_back(std::string((const char*)text.data(), length));
+      }
+    }
+
+    return permissions;
   }
 
   void X509::certificate_public_key(binarystream& crt_stream, binarystream& puk_info)

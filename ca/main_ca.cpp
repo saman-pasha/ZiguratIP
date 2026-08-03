@@ -191,6 +191,7 @@ void help()
   std::cout << "\t--private          ::= \"private key file\"" << std::endl;
   std::cout << "\t--public           ::= \"public key file\"" << std::endl;
   std::cout << "\t--serial           ::= from 0 to " << std::to_string(std::numeric_limits<size_t>::max()) << " --! certificate serial number !--" << std::endl;
+  std::cout << "\t--permission       ::= \"name\" --! repeatable; issues a v3 certificate !--" << std::endl;
   std::cout << "\t--issuer           ::= \"issuer name configuration file\"" << std::endl;
   std::cout << "\t--issuer-pik       ::= \"issuer private key file\"" << std::endl;
   std::cout << "\t--issuer-puk       ::= \"issuer public key file\"" << std::endl;
@@ -226,7 +227,7 @@ void help()
   std::cout << "\tcsr --subject=? --subject-pik=? --cipher=\"?\" --hash=? --encoding=? --csr=?" << std::endl;
   std::cout << std::endl;
   std::cout << "\t--! Issuing a Certificate from Certificate Signing Request !--" << std::endl;
-  std::cout << "\tissue --serial=? --issuer=? --issuer-pik=? --cipher=\"?\" --from=? --to=? --csr=? --hash=? --encoding=? --certificate=?" << std::endl;
+  std::cout << "\tissue --serial=? --issuer=? --issuer-pik=? --cipher=\"?\" --from=? --to=? --csr=? --hash=? --encoding=? --permission=? --certificate=?" << std::endl;
   std::cout << std::endl;
   std::cout << "\t--! Validating an Issued Certificate by issuer private key!--" << std::endl;
   std::cout << "\tpikval --issuer-pik=? --cipher=\"?\" --certificate=?" << std::endl;
@@ -455,7 +456,22 @@ void issue(int argc, char* argv[])
   load_stream(issuer_file, issuer_stream);
   load_stream(issuer_key_file, pik_stream);
   load_stream(csr_file, csr_stream);
-  X509::issue(serial_number, issuer_stream, pik_stream, cipher_key, not_before_time, not_after_time, csr_stream, hash, encoding, crt_stream);
+  // --permission may be given more than once. Each one is a string the issuer
+  // is asserting about the holder; ZiguratIP matches them against an object's
+  // qualified name and attaches no other meaning to them. Naming none issues a
+  // v1 certificate exactly as before.
+  std::vector<std::string> permissions;
+  args.get("--permission", permissions);
+
+  if (!permissions.empty()) {
+    std::cout << "            Permissions: ";
+    for (size_t i = 0; i < permissions.size(); i++)
+      std::cout << ((i > 0) ? ", " : "") << permissions[i];
+    std::cout << std::endl;
+  }
+
+  X509::issue(serial_number, issuer_stream, pik_stream, cipher_key, not_before_time, not_after_time,
+	      csr_stream, hash, encoding, permissions, crt_stream);
   dump_stream(crt_stream, certificate_file);
   certificate_file.close();
   std::cout << "Certificated Issued" << std::endl;

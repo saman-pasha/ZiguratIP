@@ -400,3 +400,66 @@ ZTEST(Cryptography, a_non_certificate_is_refused_rather_than_crashing)
   filestream again(path, std::ios::in | std::ios::binary);
   ZCHECK_THROWS(X509::certificate_subject(again));
 }
+
+// Permissions the issuer wrote into the certificate, which is where they live
+// when there is to be no server-side store of them. Carrying them makes the
+// certificate v3: the version field appears, and the extensions after the key.
+ZTEST(Cryptography, a_certificate_carries_the_permissions_it_was_issued_with)
+{
+  const std::string issuer_path = certificate_file("issuer.conf");
+  const std::string key_path    = certificate_file("dont-use-private.key");
+  if (issuer_path.empty() || key_path.empty()) { ZCHECK(false); return; }
+
+  // A request to issue against, made here so the test needs nothing on disk.
+  bufferstream subject_conf;
+  subject_conf.write("COUNTRY: US\nCOMMON_NAME: permission-holder\n", 42);
+
+  filestream subject_key(key_path, std::ios::in | std::ios::binary);
+  bufferstream csr;
+  ZCHECK_NOTHROW(X509::csr(subject_conf, subject_key, "", "SHA-256", "DER", csr));
+
+  const std::vector<std::string> granted {"DEMO", "DEMO::SALES", "BENCH::ITEM"};
+
+  filestream issuer(issuer_path, std::ios::in | std::ios::binary);
+  filestream issuer_key(key_path, std::ios::in | std::ios::binary);
+  bufferstream serial, certificate;
+  serial.write_std_ubyte(0x51);
+
+  ZCHECK_NOTHROW(X509::issue(serial, issuer, issuer_key, "", std::time(0), std::time(0) + 3600,
+			     csr, "SHA-256", "DER", granted, certificate));
+
+  bufferstream reading;
+  certificate.read(reading, 0, certificate.length());
+  const std::vector<std::string> read = X509::certificate_permissions(reading);
+
+  ZCHECK_EQ((int)read.size(), (int)granted.size());
+  for (size_t i = 0; i < granted.size() && i < read.size(); i++)
+    ZCHECK_STR(read[i], granted[i]);
+
+  // The subject and the key still come out of it, which is what proves the
+  // version field is being stepped over rather than read as the serial.
+  bufferstream for_subject;
+  certificate.read(for_subject, 0, certificate.length());
+  ZCHECK(X509::certificate_subject(for_subject).find("CN=permission-holder") != std::string::npos);
+
+  bufferstream for_key, puk_info;
+  certificate.read(for_key, 0, certificate.length());
+  ZCHECK_NOTHROW(X509::certificate_public_key(for_key, puk_info));
+  ZCHECK(puk_info.length() > 0);
+}
+
+// Naming none leaves the certificate exactly as it was before any of this
+// existed: v1, with no version field and nothing after the key.
+ZTEST(Cryptography, a_certificate_without_permissions_stays_v1)
+{
+  const std::string crt_path = certificate_file("dont-use-certificate.crt");
+  if (crt_path.empty()) { ZCHECK(false); return; }
+
+  filestream crt(crt_path, std::ios::in | std::ios::binary);
+  const std::vector<std::string> none = X509::certificate_permissions(crt);
+  ZCHECK_EQ((int)none.size(), 0);
+
+  // And it is still readable in every other way.
+  filestream again(crt_path, std::ios::in | std::ios::binary);
+  ZCHECK(X509::certificate_subject(again).find("CN=") != std::string::npos);
+}

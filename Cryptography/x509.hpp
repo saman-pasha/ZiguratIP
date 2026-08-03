@@ -3,6 +3,7 @@
 #define __X509_HPP__
 
 #include <string>
+#include <vector>
 #include <iostream>
 #include "binarystream.hpp"
 
@@ -34,6 +35,7 @@ namespace Zigurat
     static size_t keygen(std::string, std::string, std::string, std::string, binarystream&, binarystream&);
     static void   csr   (binarystream&, binarystream&, std::string, std::string, std::string, binarystream&);
     static void   issue (binarystream&, binarystream&, binarystream&, std::string, time_t, time_t, binarystream&, std::string, std::string, binarystream&);
+    static void   issue (binarystream&, binarystream&, binarystream&, std::string, time_t, time_t, binarystream&, std::string, std::string, const std::vector<std::string>&, binarystream&);
     static void   validate_by_pik(binarystream&, std::string, binarystream&);
     static void   validate_by_puk(binarystream&, binarystream&);
 
@@ -46,6 +48,16 @@ namespace Zigurat
     // the .pub files hold, so it drops straight into validate_by_puk and verify.
     static void        certificate_public_key(binarystream&, binarystream&);
     static std::string certificate_subject(binarystream&);
+
+    // What the holder of this certificate may do, as the issuer wrote it. The
+    // strings mean nothing here -- they are matched by whoever cares. An empty
+    // list comes back for a certificate carrying no such extension, which is
+    // every v1 one and every one issued before this existed.
+    static std::vector<std::string> certificate_permissions(binarystream&);
+
+    // 1.3.6.1.4.1.55447.1.1. This arc is not registered with IANA: put your own
+    // Private Enterprise Number here if you have one, and reissue.
+    static const char* PERMISSIONS_OID;
 
     // Sign and check an arbitrary message. sign takes a private key file and its
     // pass phrase; verify takes a certificate and reads the key out of it.

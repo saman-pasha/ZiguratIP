@@ -686,6 +686,36 @@ namespace Zigurat
     content_stream.read(stream, 0, length);
   }
 
+  void DER::encode_context(binarystream& stream, binarystream& content_stream, uint8_t number)
+  {
+    stream.put((uint8_t)(DER::CONTEXT | (number & 0x1F)));
+    size_t length = content_stream.length();
+    DER::encode_length(stream, length);
+    content_stream.read(stream, 0, length);
+  }
+
+  // Optional by nature: a context tag marks a field that may simply be absent,
+  // so not finding it is an answer rather than an error. The stream is left
+  // exactly where it was when the answer is no.
+  bool DER::decode_context(binarystream& stream, binarystream& content, uint8_t number)
+  {
+    const std::streampos start = stream.tellg();
+    if (stream.length() <= start) return false;
+
+    const uint8_t expected = (uint8_t)(DER::CONTEXT | (number & 0x1F));
+    if ((uint8_t)DER::decode_tag(stream) != expected) {
+      stream.clear();
+      stream.seekg(start, std::ios::beg);
+      return false;
+    }
+
+    size_t length = DER::decode_length(stream);
+    uint8_t buffer[length];
+    stream.read((char*)buffer, length);
+    content.write((char*)buffer, stream.gcount());
+    return true;
+  }
+
   void DER::encode_set(binarystream& stream, binarystream& content_stream)
   {
     stream.put((uint8_t)DER::SET);

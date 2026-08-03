@@ -50,7 +50,12 @@ namespace Zigurat
       GENERALIZED_TIME = 0x18,
       BMP_STRING       = 0x1E,
       SEQUENCE         = 0x30,
-      SET              = 0x31
+      SET              = 0x31,
+
+      // Context specific and constructed: [0] is 0xA0, [3] is 0xA3. X.509 uses
+      // these for the optional fields of a v3 certificate -- the version and the
+      // extensions -- which is why they are needed at all.
+      CONTEXT          = 0xA0
     };
 
     class Integer
@@ -109,7 +114,9 @@ namespace Zigurat
     static void encode_utc_time(binarystream&, time_t, bool = true);          // Encodes a time to DER UTC TIME format
     static void encode_generalized_time(binarystream&, time_t, bool = true);  // Encodes a time to DER GENERALIZED TIME format
     static void encode_bmp_string(binarystream&, uint8_t*, size_t);           // Encodes unicode array to DER BMP STRING format
-    static void encode_sequence(binarystream&, binarystream&);                // Encodes sequence type, length, value to DER SEQUENCE format
+    static void encode_sequence(binarystream&, binarystream&);
+    static void encode_context(binarystream&, binarystream&, uint8_t);        // Wraps content in [n] EXPLICIT
+    static bool decode_context(binarystream&, binarystream&, uint8_t);        // Unwraps [n] if that is what comes next                // Encodes sequence type, length, value to DER SEQUENCE format
     static void encode_set(binarystream&, binarystream&);                     // Encodes set type, length, value to DER SET format
 
     static uint8_t  decode_tag(binarystream&);                                // Decodes TAG byte of TLV DER format
