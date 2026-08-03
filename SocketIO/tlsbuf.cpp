@@ -79,7 +79,7 @@ namespace Zigurat
   {
     if (record.length > tlsbuf::BUFFER_SIZE) throw TLSException("invalid fragment length");
     
-    TLS::SecurityParameters &params = this->_current_state;
+    TLS::SecurityParameters &params = this->_write_state;
     uint64_t        sequence_number = this->_write_sequence_number++;
       
     this->_tcpstream.write_std_ubyte((uint8_t)record.type);
@@ -176,7 +176,16 @@ namespace Zigurat
   
   void tlsbuf::_recv_record(TLS::Record &record)
   {
-    TLS::SecurityParameters &params = this->_current_state;
+    TLS::SecurityParameters &params = this->_read_state;
+
+    // A tcpstream is one iostream for both directions, so a write that failed
+    // poisons reading too. That is exactly backwards at the end of a refused
+    // handshake: the peer sends its reason and hangs up, this end's next write
+    // fails because the peer has gone, and the reason -- already sitting in the
+    // receive buffer -- becomes unreadable. Clearing here costs nothing if the
+    // connection really is finished, because the read below fails again.
+    if (!this->_tcpstream.good() && !this->_tcpstream.eof())
+      this->_tcpstream.clear();
     uint64_t        sequence_number;
     
     do {
@@ -295,6 +304,15 @@ namespace Zigurat
       const std::streampos fragment_begin = start;
 
       if (record.type == TLS::ContentType::ALERT) {
+
+	// From the start of this record's fragment, not from wherever writing it
+	// left the position. Reading on past the end returned zeroes, so every
+	// alert looked like level 0 -- neither warning nor fatal -- and a fatal
+	// one fell through to be waited past instead of raised. The peer's reason
+	// for refusing was lost, and what surfaced was whatever went wrong next.
+	record.fragment.clear();
+	record.fragment.seekg(fragment_begin, std::ios_base::beg);
+
 	TLS::AlertLevel level = (TLS::AlertLevel)record.fragment.read_std_ubyte();
 	TLS::AlertDescription description = (TLS::AlertDescription)record.fragment.read_std_ubyte();
 	if (level == TLS::AlertLevel::FATAL)
@@ -495,8 +513,9 @@ namespace Zigurat
     TLS::Record record {TLS::ContentType::CHANGE_CIPHER_SPEC, this->_protocol_version, 1, body};
     this->_send_record(record);
 
-    // Everything after this goes out under the new state, counted from zero.
-    this->_current_state = this->_pending_state;
+    // Everything sent after this goes out under the new state, counted from
+    // zero. Reading is untouched: the peer decides when its own writing changes.
+    this->_write_state = this->_pending_state;
     this->_write_sequence_number = 0;
   }
 
@@ -509,7 +528,7 @@ namespace Zigurat
     if (record.type != TLS::ContentType::CHANGE_CIPHER_SPEC)
       this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
 
-    this->_current_state = this->_pending_state;
+    this->_read_state = this->_pending_state;
     this->_read_sequence_number = 0;
   }
 
@@ -565,8 +584,8 @@ namespace Zigurat
 
     bufferstream body;
     uint8_t verify_data[12];
-    TLS::PRF(this->_current_state.prf_algorithm,
-	     this->_current_state.master_secret, TLS::MASTER_SECRET_LENGTH,
+    TLS::PRF(this->_pending_state.prf_algorithm,
+	     this->_pending_state.master_secret, TLS::MASTER_SECRET_LENGTH,
 	     (const uint8_t*)label, std::strlen(label),
 	     digest, sizeof(digest),
 	     verify_data, sizeof(verify_data));
@@ -590,8 +609,8 @@ namespace Zigurat
       this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
 
     uint8_t expected[12];
-    TLS::PRF(this->_current_state.prf_algorithm,
-	     this->_current_state.master_secret, TLS::MASTER_SECRET_LENGTH,
+    TLS::PRF(this->_pending_state.prf_algorithm,
+	     this->_pending_state.master_secret, TLS::MASTER_SECRET_LENGTH,
 	     (const uint8_t*)label, std::strlen(label),
 	     digest, sizeof(digest),
 	     expected, sizeof(expected));
@@ -613,7 +632,7 @@ namespace Zigurat
     if (client_hello.msg_type != TLS::HandshakeType::CLIENT_HELLO)
       this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
     
-    this->_pending_state.entity = this->_current_state.entity;
+    this->_pending_state.entity = this->_write_state.entity;
 
     this->_protocol_version.major = client_body.read_std_ubyte();
     this->_protocol_version.minor = client_body.read_std_ubyte();
@@ -810,7 +829,7 @@ namespace Zigurat
   {
     bufferstream client_body;
 
-    this->_pending_state.entity = this->_current_state.entity;
+    this->_pending_state.entity = this->_write_state.entity;
 
     client_body.write_std_ubyte(this->_handshake_params.protocol_version.major);
     client_body.write_std_ubyte(this->_handshake_params.protocol_version.minor);        // client_version
@@ -872,7 +891,7 @@ namespace Zigurat
       if (message.msg_type != TLS::HandshakeType::SERVER_HELLO)
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
 
-      this->_pending_state.entity = this->_current_state.entity;
+      this->_pending_state.entity = this->_write_state.entity;
       this->_pending_state.prf_algorithm = TLS::PRFAlgorithm::TLS_PRF_SHA256;
 
       this->_protocol_version.major = body.read_std_ubyte();
@@ -964,9 +983,11 @@ namespace Zigurat
 
   tlsbuf* tlsbuf::open(TLS::ConnectionEnd entity, TLS::HandshakeParameters params, Socket::handle_t handle, bool blocking_mode, int timeout)
   {
-    std::memset(&this->_current_state, 0x00, sizeof(TLS::SecurityParameters));
+    std::memset(&this->_read_state,  0x00, sizeof(TLS::SecurityParameters));
+    std::memset(&this->_write_state, 0x00, sizeof(TLS::SecurityParameters));
     std::memset(&this->_pending_state, 0x00, sizeof(TLS::SecurityParameters));
-    this->_current_state.entity = entity;
+    this->_read_state.entity = entity;
+    this->_write_state.entity = entity;
     if (params.protocol_version.major != TLS::VERSION_1_2.major || params.protocol_version.minor != TLS::VERSION_1_2.minor)
       throw TLSException("unsupported protocol version");
     this->_handshake_params = params;
@@ -985,9 +1006,11 @@ namespace Zigurat
 
   tlsbuf* tlsbuf::open(TLS::HandshakeParameters params, std::string node, std::string service, bool blocking_mode, int timeout)
   {
-    std::memset(&this->_current_state, 0x00, sizeof(TLS::SecurityParameters));
+    std::memset(&this->_read_state,  0x00, sizeof(TLS::SecurityParameters));
+    std::memset(&this->_write_state, 0x00, sizeof(TLS::SecurityParameters));
     std::memset(&this->_pending_state, 0x00, sizeof(TLS::SecurityParameters));
-    this->_current_state.entity = TLS::ConnectionEnd::CLIENT;
+    this->_read_state.entity = TLS::ConnectionEnd::CLIENT;
+    this->_write_state.entity = TLS::ConnectionEnd::CLIENT;
     if (params.protocol_version.major != TLS::VERSION_1_2.major || params.protocol_version.minor != TLS::VERSION_1_2.minor)
       throw TLSException("unsupported protocol version");
     this->_handshake_params = params;
@@ -1039,6 +1062,19 @@ namespace Zigurat
 
   tlsbuf::int_type tlsbuf::underflow()
   {
+    if (this->gptr() != nullptr && this->gptr() < this->egptr())
+      return traits_type::to_int_type(*this->gptr());
+
+    // About to block waiting for the peer, so anything still queued for it has
+    // to go out first -- the same rule socketbuf follows, and for the same
+    // reason. Without it a request/response protocol deadlocks with the reply
+    // sitting unsent in the put area while both ends wait to read.
+    // A failure to flush is not a reason to stop: the peer may have hung up
+    // precisely because it has already said why, and that is what this read is
+    // about to collect.
+    if (this->pptr() != nullptr && this->pptr() > this->pbase())
+      this->overflow(traits_type::eof());
+
     arraystream plain_text(this->_buffer, this->_length);
 
     TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, plain_text};
@@ -1090,7 +1126,7 @@ namespace Zigurat
 
   void tlsbuf::renegotiate()
   {
-    if (this->_current_state.entity == TLS::ConnectionEnd::CLIENT) throw TLSException("only server could start renegotiation process");
+    if (this->_write_state.entity == TLS::ConnectionEnd::CLIENT) throw TLSException("only server could start renegotiation process");
 
     bufferstream plain_text;
     plain_text.write_std_ubyte((uint8_t)TLS::HandshakeType::HELLO_REQUEST);

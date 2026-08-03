@@ -291,6 +291,7 @@ Full reference in [`doc`](doc/README.md):
 
 - [Installation](doc/installation.md) ·
   [Configuration](doc/configuration.md) ·
+  [Server security](doc/security.md) ·
   [Connector](doc/connector.md) ·
   [C++ API](doc/cpp.md)
 - [Language overview](doc/parsi.md) ·
@@ -398,16 +399,15 @@ same convention. Vendored zlib is C and keeps its own `.h` names.
 The server runs, serves both protocols, compiles and executes Parsi, and the
 suite passes. Some things are known to be incomplete:
 
-- **TLS handshakes but is not wired in.** `tlsstream` opens a mutually
-  authenticated, encrypted connection between two ZiguratIP ends: both present a
-  certificate, each checks the other against the configured authority, and the
-  peer's distinguished name is available through `tlsbuf::peer_subject`. Neither
-  server offers it yet -- Zigurat on 2160 and Zeytun on 2190 are still plaintext,
-  and the connector has no client configuration -- and `tlsclient.cpp` and
-  `tlsserver.cpp` are still empty. The wire format is ZiguratIP's own: it is
-  shaped like TLS 1.2 and is not interoperable with one, so a browser cannot
-  speak it. It has had no adversarial review; treat it as a closed-network
-  measure, not as hardened transport security.
+- **TLS is ZiguratIP's own, not an interoperable one.** Both servers can require
+  every client to hold a certificate the configured authority issued, and the
+  connector can present one -- see [doc/security.md](doc/security.md). The wire
+  format is shaped like TLS 1.2 but is not compatible with it, so `openssl
+  s_client` and browsers cannot speak it; putting Zeytun behind `TLS_MODE: TRUE`
+  makes it unreachable from a browser. The cryptography underneath is
+  ZiguratIP's own and has had no adversarial review, and the MAC comparison is
+  not constant time. Treat it as a closed-network measure, not as transport
+  security against a capable attacker.
 - **The CA issues X.509 v1 only.** Certificates and requests are
   OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
   `openssl req -verify` accepts its signing requests — but there is no extension

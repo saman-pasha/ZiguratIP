@@ -9,6 +9,7 @@
 #include "httpresponse.hpp"
 #include "configuration.hpp"
 #include "httpserver.hpp"
+#include "tlsserver.hpp"
 #include "session.hpp"
 #include "shared.cpp"
 
@@ -32,6 +33,10 @@ std::string   mime_path;
 Configuration mime_types;
 
 HTTPServer http_server;
+bool       http_tls_mode = false;
+
+extern TLS::HandshakeParameters security_params;
+void require_security(const char*);
 
 typedef BasePage* (*NEW_PAGE)(binarystream*, HTTPRequest&, HTTPResponse&);
 typedef void (*DELETE_PAGE)(BasePage*);
@@ -273,6 +278,21 @@ void load_zeytun(const Configuration& conf)
   }
   std::cout << "Max content length: '" << max_content_length << "'" << std::endl;
 
+  if (conf.get("/HTTP/TLS_MODE", value)) {
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "TRUE")
+      http_tls_mode = true;
+    else if (value == "FALSE")
+      http_tls_mode = false;
+    else
+      throw ZiguratIPException("invalid value for '/HTTP/TLS_MODE'");
+  }
+  std::cout << "Zeytun TLS mode: '" << ((http_tls_mode) ? "TRUE" : "FALSE") << "'" << std::endl;
+
+  // Before announcing readiness, so a misconfigured secure server fails to start
+  // rather than starting insecure.
+  if (http_tls_mode) require_security("Zeytun");
+
   mime_path = Utility::config_path("mime.conf");
   conf.get("/HTTP/MIME_FILE", mime_path);
   mime_types.load(mime_path);
@@ -280,7 +300,13 @@ void load_zeytun(const Configuration& conf)
 	
   std::cout << "Zeytun is ready ..." << std::endl << std::endl;
 	
-  http_server.run(TCPServer::IPV4, http_service, http_backlog, http_pool_size, 
-		  zeytun_handler, http_blocking_mode, http_timeout, 
-		  http_async_mode, max_uri_length, max_headers_length, max_content_length);
+  if (http_tls_mode) {
+    http_server.run(security_params, TCPServer::IPV4, http_service, http_backlog, http_pool_size,
+		    zeytun_handler, http_blocking_mode, http_timeout,
+		    http_async_mode, max_uri_length, max_headers_length, max_content_length);
+  } else {
+    http_server.run(TCPServer::IPV4, http_service, http_backlog, http_pool_size,
+		    zeytun_handler, http_blocking_mode, http_timeout,
+		    http_async_mode, max_uri_length, max_headers_length, max_content_length);
+  }
 }

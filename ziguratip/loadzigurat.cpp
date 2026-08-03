@@ -9,6 +9,7 @@
 #include "tcpstream.hpp"
 #include "ipcstream.hpp"
 #include "tcpserver.hpp"
+#include "tlsserver.hpp"
 #include "ipcserver.hpp"
 #include "shared.cpp"
 
@@ -26,8 +27,13 @@ int         server_backlog = 5;
 int         server_pool_size = 5;
 bool        server_blocking_mode = true;
 int         server_timeout = 0;
+bool        server_tls_mode = false;
 
 TCPServer tcp_server;
+TLSServer tls_server;
+
+extern TLS::HandshakeParameters security_params;
+void require_security(const char*);
 #if defined(_WIN32) || defined(_WIN64)
 #else
 IPCServer ipc_server;
@@ -198,6 +204,14 @@ void zigurat_tcp_handler(Socket::handle_t client_handle)
   handle_client();
 }
 
+// The peer has already presented a certificate the authority issued by the time
+// this is called -- TLSServer does not hand over a connection that has not.
+void zigurat_tls_handler(tlsstream& client_stream)
+{
+  Globals::set_client_stream(&client_stream);
+  handle_client();
+}
+
 void zigurat_ipc_handler(Socket::handle_t client_handle)
 {
   std::unique_ptr<ipcstream> client_stream_deleter(new ipcstream(client_handle, server_blocking_mode, server_timeout));
@@ -250,6 +264,16 @@ void load_zigurat(const Configuration& conf)
     spss >> server_timeout;
   }
 
+  if (conf.get("/SERVER/TLS_MODE", value)) {
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "TRUE")
+      server_tls_mode = true;
+    else if (value == "FALSE")
+      server_tls_mode = false;
+    else
+      throw ZiguratIPException("invalid value for '/SERVER/TLS_MODE'");
+  }
+
   std::cout << "Server type: '" << server_type << "'" << std::endl;
   if (server_type == "TCP") {
     std::cout << "Server service: '" << server_tcp_service << "'" << std::endl;
@@ -265,10 +289,23 @@ void load_zigurat(const Configuration& conf)
   std::cout << "Server pool size: '" << server_pool_size << "'" << std::endl;		
   std::cout << "Server blocking mode: '" << ((server_blocking_mode) ? "TRUE" : "FALSE" ) << "'" << std::endl;
   std::cout << "Server timeout: '" << server_timeout << "'" << std::endl;
+  std::cout << "Server TLS mode: '" << ((server_tls_mode) ? "TRUE" : "FALSE") << "'" << std::endl;
+
+  // Before announcing readiness, so a misconfigured secure server fails to start
+  // rather than starting insecure.
+  if (server_tls_mode && server_type == "TCP") require_security("Zigurat");
+  if (server_tls_mode && server_type != "TCP")
+    throw ZiguratIPException("'/SERVER/TLS_MODE' needs '/SERVER/TYPE' to be TCP");
 
   std::cout << "Zigurat is ready ..." << std::endl;
 
-  if (server_type == "TCP") {
+  if (server_type == "TCP" && server_tls_mode) {
+    std::thread server_thread([&] () {
+	tls_server.credentials(security_params);
+	tls_server.run(TCPServer::IPV4, server_tcp_service, server_backlog, server_pool_size, zigurat_tls_handler);
+      });
+    server_thread.detach();
+  } else if (server_type == "TCP") {
     std::thread server_thread([&] () {
 	tcp_server.run(TCPServer::IPV4, server_tcp_service, server_backlog, server_pool_size, zigurat_tcp_handler);
       });

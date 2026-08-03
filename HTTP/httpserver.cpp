@@ -171,6 +171,18 @@ namespace Zigurat
       });
   }
 
+  void HTTPServer::run(const TLS::HandshakeParameters& params,
+		       TCPServer::Version version, std::string service, int backlog, size_t pool_size,
+		       client_handler_t handler, bool blocking_mode, int timeout,
+		       bool async_mode, size_t max_uri_length, size_t max_headers_length, size_t max_data_length)
+  {
+    this->_server.credentials(params);
+    this->_server.run(version, service, backlog, pool_size, [=] (tlsstream& stream) {
+	HTTPServer::handle_client(stream, handler, blocking_mode, timeout, async_mode,
+				  max_uri_length, max_headers_length, max_data_length);
+      });
+  }
+
   void HTTPServer::shutdown(bool force)
   {
     this->_server.shutdown(force);

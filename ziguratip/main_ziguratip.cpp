@@ -22,6 +22,7 @@ bool        reset_mode = false;
 void load_memory(const Configuration&);
 void load_library(const Configuration&);
 void load_compiler(const Configuration&);
+void load_security(const Configuration&);
 void load_zigurat(const Configuration&);
 void load_zeytun(const Configuration&);
 
@@ -106,6 +107,8 @@ int main(int argc, char** argv)
     load_compiler(config);
 
     // Zigurat Binary Server -- runs on its own thread and returns
+    load_security(config);
+
     load_zigurat(config);
 
     // Zeytun HTTP Server -- blocks, which is what keeps the process alive

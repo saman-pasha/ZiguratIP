@@ -4,6 +4,7 @@
 #include "utility.hpp"
 #include "configuration.hpp"
 #include "tcpstream.hpp"
+#include "tlsstream.hpp"
 
 
 namespace Zigurat
@@ -14,41 +15,92 @@ namespace Zigurat
 
   }
 
+  // A file name from the configuration: absolute is taken as given, anything
+  // else is looked for beside the configuration itself.
+  static std::string connector_file(const std::string& name)
+  {
+    if (name.empty()) return "";
+    if (name[0] == '/') return name;
+
+    std::string beside = Utility::config_path("cert/" + name);
+    if (!beside.empty()) return beside;
+
+    return name;
+  }
+
   void Connector::open()
   {
-    std::string host, service;
-    bool blocking_mode = true;
-    bool timeout = 0;
     std::string conf_path = Utility::config_path("connector.conf");
-    
-    if (conf_path.size() > 0) {
-      
-      Configuration conf(conf_path);
-      if (conf.get("/HOST/", host)) {	  
-	if (conf.get("/SERVICE/", service)) {
-
-	  std::string tmp;
-
-	  if (conf.get("/BLOCKING_MODE/", tmp)) {
-	    std::stringstream ss(tmp);
-	    ss >> blocking_mode;
-	  }
-
-	  if (conf.get("/TIMEOUT/", tmp)) {
-	    std::stringstream ss(tmp);
-	    ss >> timeout;
-	  }
-	  
-	} else {
-	  throw ConnectorException("connector configuration TCP service not found");
-	}
-	
-      } else {
-	throw ConnectorException("connector configuration TCP host not found");
-      }
-    } else {
+    if (conf_path.empty())
       throw ConnectorException("connector configuration not found");
+
+    Configuration conf(conf_path);
+
+    std::string host, service, tmp;
+    if (!conf.get("/HOST/", host))
+      throw ConnectorException("connector configuration TCP host not found");
+
+    // PORT is what ziguratip.conf calls it, SERVICE is what this file used to;
+    // both are accepted so an existing connector.conf keeps working.
+    if (!conf.get("/PORT/", service) && !conf.get("/SERVICE/", service))
+      throw ConnectorException("connector configuration TCP service not found");
+
+    host    = Utility::trim(host);
+    service = Utility::trim(service);
+
+    bool blocking_mode = true;
+    int  timeout = 0;
+
+    if (conf.get("/BLOCKING_MODE/", tmp)) {
+      tmp = Utility::to_upper(Utility::trim(tmp));
+      blocking_mode = (tmp != "FALSE" && tmp != "0");
     }
+
+    if (conf.get("/TIMEOUT/", tmp)) {
+      std::stringstream ss(tmp);
+      ss >> timeout;
+    }
+
+    bool tls_mode = false;
+    if (conf.get("/TLS_MODE/", tmp)) {
+      tmp = Utility::to_upper(Utility::trim(tmp));
+      if (tmp == "TRUE")
+	tls_mode = true;
+      else if (tmp == "FALSE")
+	tls_mode = false;
+      else
+	throw ConnectorException("invalid value for 'TLS_MODE' in connector configuration");
+    }
+
+    // This used to read the configuration and then return without connecting at
+    // all, leaving the caller with a Connector that had no stream.
+    if (!tls_mode) {
+      this->open(host, service, blocking_mode, timeout);
+      return;
+    }
+
+    TLS::HandshakeParameters params;
+    params.protocol_version = TLS::VERSION_1_2;
+    params.cipher_suites.push_back(TLS::TLS_RSA_WITH_AES_256_CBC_SHA256);
+    params.cipher_suites.push_back(TLS::TLS_RSA_WITH_AES_128_CBC_SHA256);
+    params.compression_methods.push_back(TLS::CompressionMethod::NONE);
+
+    if (conf.get("/CERTIFICATE/", tmp))
+      params.credentials.certificate = connector_file(Utility::trim(tmp));
+    if (conf.get("/PRIVATE_KEY/", tmp))
+      params.credentials.private_key = connector_file(Utility::trim(tmp));
+    if (conf.get("/PRIVATE_KEY_CIPHER/", tmp))
+      params.credentials.private_key_cipher = tmp;
+    if (conf.get("/AUTHORITY/", tmp))
+      params.credentials.authority = connector_file(Utility::trim(tmp));
+
+    if (params.credentials.certificate.empty()
+	|| params.credentials.private_key.empty()
+	|| params.credentials.authority.empty())
+      throw ConnectorException("connector TLS_MODE is on, but CERTIFICATE,"
+			       " PRIVATE_KEY and AUTHORITY are not all set");
+
+    this->open(params, host, service, blocking_mode, timeout);
   }
 
   void Connector::open(std::string host, std::string service, bool blocking_mode, int timeout)
@@ -59,6 +111,27 @@ namespace Zigurat
 	this->_stream = nullptr;
       }
       this->_stream = new tcpstream(host, service, blocking_mode, timeout);      
+      this->_transaction_id = this->_stream->read_std_size();
+    }
+  }
+
+  void Connector::open(const TLS::HandshakeParameters& params, std::string host, std::string service,
+		       bool blocking_mode, int timeout)
+  {
+    if (!this->is_open()) {
+      if (this->_stream != nullptr) {
+	delete this->_stream;
+	this->_stream = nullptr;
+      }
+
+      tlsstream* secure = new tlsstream();
+      this->_stream = secure;
+
+      // The handshake happens here: if the server will not have this client, or
+      // this client will not have that server, open throws and there is no
+      // connection to speak over.
+      secure->open(params, host, service, blocking_mode, timeout);
+
       this->_transaction_id = this->_stream->read_std_size();
     }
   }

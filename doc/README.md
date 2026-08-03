@@ -9,6 +9,7 @@ client interfaces. Converted from the ziguratip.com documentation.
 - [Configuration](configuration.md)
 - [Locales](locales.md)
 - [Connector](connector.md)
+- [Server security](security.md)
 - [C++ API](cpp.md)
 
 ## The Parsi language

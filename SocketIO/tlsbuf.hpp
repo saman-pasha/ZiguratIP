@@ -29,7 +29,13 @@ namespace Zigurat
     uint64_t                 _read_sequence_number = 0;
     uint64_t                 _write_sequence_number = 0;
 
-    TLS::SecurityParameters  _current_state, _pending_state;
+    // TLS keeps one cipher state per direction, and they change at different
+    // moments: a ChangeCipherSpec only ever settles the direction it travels in.
+    // A single shared state meant that sending one also switched this end's
+    // reading, so anything the peer sent before its own ChangeCipherSpec -- an
+    // alert refusing the handshake, most importantly -- was decrypted with keys
+    // the peer had not started using, and came out as noise.
+    TLS::SecurityParameters  _read_state, _write_state, _pending_state;
 
     uint8_t *client_write_MAC_key = nullptr;
     uint8_t *server_write_MAC_key = nullptr;

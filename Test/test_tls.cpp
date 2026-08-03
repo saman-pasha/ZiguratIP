@@ -36,17 +36,21 @@ namespace
     {
       this->_tcpstream.open(handle, true, 0);
 
-      std::memset(&this->_current_state, 0x00, sizeof(TLS::SecurityParameters));
-      this->_current_state.entity = entity;
-      this->_current_state.prf_algorithm = TLS::PRFAlgorithm::TLS_PRF_SHA256;
-      this->_current_state.compression_algorithm = TLS::CompressionMethod::NONE;
-      TLS::cipher_suite(suite, this->_current_state);
+      std::memset(&this->_write_state, 0x00, sizeof(TLS::SecurityParameters));
+      this->_write_state.entity = entity;
+      this->_write_state.prf_algorithm = TLS::PRFAlgorithm::TLS_PRF_SHA256;
+      this->_write_state.compression_algorithm = TLS::CompressionMethod::NONE;
+      TLS::cipher_suite(suite, this->_write_state);
 
-      std::memcpy(this->_current_state.master_secret, master_secret, TLS::MASTER_SECRET_LENGTH);
-      std::memset(this->_current_state.client_random, 0xA5, TLS::RANDOM_LENGTH);
-      std::memset(this->_current_state.server_random, 0x5A, TLS::RANDOM_LENGTH);
+      std::memcpy(this->_write_state.master_secret, master_secret, TLS::MASTER_SECRET_LENGTH);
+      std::memset(this->_write_state.client_random, 0xA5, TLS::RANDOM_LENGTH);
+      std::memset(this->_write_state.server_random, 0x5A, TLS::RANDOM_LENGTH);
 
-      const TLS::SecurityParameters& p = this->_current_state;
+      // Both directions are settled here, which is the state a finished
+      // handshake leaves them in.
+      this->_read_state = this->_write_state;
+
+      const TLS::SecurityParameters& p = this->_write_state;
       this->client_write_MAC_key = new uint8_t[p.mac_key_length ? p.mac_key_length : 1];
       this->server_write_MAC_key = new uint8_t[p.mac_key_length ? p.mac_key_length : 1];
       this->client_write_key     = new uint8_t[p.enc_key_length ? p.enc_key_length : 1];
@@ -54,7 +58,7 @@ namespace
       this->client_write_IV      = new uint8_t[p.fixed_iv_length ? p.fixed_iv_length : 1];
       this->server_write_IV      = new uint8_t[p.fixed_iv_length ? p.fixed_iv_length : 1];
 
-      TLS::calculate_keys(this->_current_state,
+      TLS::calculate_keys(this->_write_state,
 			  this->client_write_MAC_key, this->server_write_MAC_key,
 			  this->client_write_key,     this->server_write_key,
 			  this->client_write_IV,      this->server_write_IV);

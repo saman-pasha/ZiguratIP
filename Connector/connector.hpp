@@ -8,6 +8,7 @@
 #include "binarystream.hpp"
 #include "typevector.hpp"
 #include "isolationlevel.hpp"
+#include "tls.hpp"
 
 namespace Zigurat
 {
@@ -40,8 +41,15 @@ namespace Zigurat
 
   public:
     Connector();
+
+    // Connects the way home/etc/connector.conf says to, secure or not.
     void open();
+
+    // A plain connection, and an authenticated encrypted one. The second needs
+    // this client's own certificate and the authority that must have signed the
+    // server's, the same three files a server is configured with.
     void open(std::string, std::string, bool = true, int = 0);
+    void open(const TLS::HandshakeParameters&, std::string, std::string, bool = true, int = 0);
     bool is_open();
     void close();
     size_t transaction_id();

@@ -8,6 +8,7 @@ SOURCES := shared.cpp \
 	loadmemory.cpp \
 	loadlibrary.cpp \
 	loadcompiler.cpp \
+	loadsecurity.cpp \
 	loadzigurat.cpp \
 	loadzeytun.cpp \
 	main_ziguratip.cpp

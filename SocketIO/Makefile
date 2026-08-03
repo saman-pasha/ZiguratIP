@@ -14,7 +14,8 @@ HEADERS := socketioexception.hpp \
 	tlsexception.hpp \
 	tls.hpp \
 	tlsbuf.hpp \
-	tlsstream.hpp
+	tlsstream.hpp \
+	tlsserver.hpp
 
 SOURCES := socket.cpp \
 	socketbuf.cpp \
@@ -26,7 +27,8 @@ SOURCES := socket.cpp \
 	ipcserver.cpp \
 	tls.cpp \
 	tlsbuf.cpp \
-	tlsstream.cpp
+	tlsstream.cpp \
+	tlsserver.cpp
 
 LIBS := -lCore -lStreamIO -lThreading
 
