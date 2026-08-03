@@ -44,6 +44,21 @@ namespace Zigurat
     static void KeyExpansion(key_t, schedule_t);
     static void InverseCipher(block_t, schedule_t, block_t);
     static void InverseCipher(std::istream&, schedule_t, std::ostream&);
+
+    // Cipher block chaining. The stream overloads above are ECB -- each block is
+    // enciphered on its own, so equal plain text blocks give equal cipher text
+    // blocks and the structure of the data shows through. They stay as they are
+    // because X509 encrypts private key files with them and those files have to
+    // keep opening; anything new should chain.
+    //
+    // The input must already be a whole number of blocks: padding is the
+    // caller's business, since only the caller knows the scheme its format
+    // expects. The IV is BLOCK_SIZE octets and is not written to the output --
+    // send it alongside the cipher text.
+    static const int BLOCK_SIZE = WORD_SIZE * Nb;
+
+    static void CipherCBC(std::istream&, schedule_t, const uint8_t*, std::ostream&);
+    static void InverseCipherCBC(std::istream&, schedule_t, const uint8_t*, std::ostream&);
   };
 
   typedef Zigurat::AES<4, 4, 10> AES128;

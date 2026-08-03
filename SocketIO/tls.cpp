@@ -1,4 +1,5 @@
 #include "tls.hpp"
+#include <vector>
 #include "tlsexception.hpp"
 #include "shahelper.hpp"
 #include <cstring>
@@ -33,22 +34,43 @@ namespace Zigurat
   const TLS::SignatureAndHashAlgorithm TLS::SIG_RSA_SHA384 = {HashAlgorithm::SHA384, SignatureAlgorithm::RSA};
   const TLS::SignatureAndHashAlgorithm TLS::SIG_RSA_SHA512 = {HashAlgorithm::SHA512, SignatureAlgorithm::RSA};
 
+  // RFC 5246 5, P_hash:
+  //
+  //     A(0) = seed
+  //     A(i) = HMAC(secret, A(i-1))
+  //     P_hash = HMAC(secret, A(1) + seed) + HMAC(secret, A(2) + seed) + ...
+  //
+  // Two things were wrong here. The scratch buffer was declared uint8_t
+  // buffer[length] with length still zero, so every HMAC wrote thirty two octets
+  // into a nothing-sized stack array -- deriving keys corrupted the stack of
+  // whoever asked for them. And the construction was not P_hash: it chained on
+  // the output block rather than on A(i), and never appended the seed, so the
+  // result was neither the PRF the specification defines nor a sound one.
   void TLS::P_SHA256(const uint8_t* secret, size_t secret_length,
 		     const uint8_t* seed,   size_t seed_length,
 		           uint8_t* digest, size_t digest_length)
   {
-    size_t  hash_size = SHA::size(SHA::SHA256);
-    size_t  length = 0;
-    uint8_t buffer[length];
-    do {
-      if (length == 0)
-	SHA::hmac(SHA::SHA256, secret, secret_length, seed, seed_length, buffer);
-      else
-	SHA::hmac(SHA::SHA256, secret, secret_length, digest + length - hash_size, hash_size, buffer);
-	
-      std::memcpy(digest + length, buffer, Utility::min(hash_size, digest_length - length)); 
-      length += hash_size;
-    } while (length < digest_length);
+    const size_t hash_size = SHA::size(SHA::SHA256);
+
+    std::vector<uint8_t> a(seed, seed + seed_length);          // A(0) = seed
+    std::vector<uint8_t> input(hash_size + seed_length);
+    std::vector<uint8_t> block(hash_size);
+    std::vector<uint8_t> next(hash_size);
+
+    size_t produced = 0;
+    while (produced < digest_length) {
+
+      SHA::hmac(SHA::SHA256, secret, secret_length, a.data(), a.size(), next.data());
+      a.assign(next.begin(), next.end());                      // A(i)
+
+      std::memcpy(input.data(), a.data(), hash_size);
+      std::memcpy(input.data() + hash_size, seed, seed_length);
+      SHA::hmac(SHA::SHA256, secret, secret_length, input.data(), input.size(), block.data());
+
+      const size_t take = Utility::min(hash_size, digest_length - produced);
+      std::memcpy(digest + produced, block.data(), take);
+      produced += take;
+    }
   }
 
   void TLS::PRF(PRFAlgorithm algorithm,

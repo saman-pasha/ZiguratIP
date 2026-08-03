@@ -11,6 +11,7 @@ HEADERS := socketioexception.hpp \
 	ipcbuf.hpp \
 	ipcstream.hpp \
 	ipcserver.hpp \
+	tlsexception.hpp \
 	tls.hpp \
 	tlsbuf.hpp \
 	tlsstream.hpp

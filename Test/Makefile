@@ -8,6 +8,7 @@ SOURCES := main_test.cpp \
 	test_core.cpp \
 	test_streamio.cpp \
 	test_socketio.cpp \
+	test_tls.cpp \
 	test_threading.cpp \
 	test_cryptography.cpp \
 	test_encoding.cpp \

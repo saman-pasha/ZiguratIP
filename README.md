@@ -108,7 +108,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 223 cases
+Starts a server, runs the full suite against it, stops it again. 228 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -397,8 +397,22 @@ same convention. Vendored zlib is C and keeps its own `.h` names.
 The server runs, serves both protocols, compiles and executes Parsi, and the
 suite passes. Some things are known to be incomplete:
 
-- **TLS** is drafted but not finished; `tlsclient.cpp` and `tlsserver.cpp` are
-  empty. Both servers are plaintext.
+- **TLS is drafted, not finished.** The record layer works and is covered by
+  `Test/test_tls.cpp`; the handshake stops after ServerHello, so nothing can yet
+  open a secure connection and both servers are plaintext. `tlsclient.cpp` and
+  `tlsserver.cpp` are empty. Still to write: Certificate, CertificateRequest,
+  ServerHelloDone, ClientKeyExchange, CertificateVerify, ChangeCipherSpec,
+  Finished, and chain validation against the owner's CA.
+- **A record of exactly 2048 or 4096 octets fails its MAC.** Those are exact
+  multiples of `tcpbuf`'s 2048 octet buffer. The framing is right at every step
+  -- record length, cipher text length and padding all come out correct -- so the
+  cipher text is being corrupted crossing the transport buffer boundary. 2040 and
+  3000 octet records are fine, and a plain `tcpstream` carries 2048 octets
+  intact in one write, so it is the interleaving of small writes with a large
+  one that breaks it.
+- **Closing a connection whose peer has already gone does not return.** The
+  losing end tries to write its own `close_notify` to a socket with nobody on
+  the other side, and the write is retried rather than failing.
 - **The CA issues X.509 v1 only.** Certificates and requests are
   OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
   `openssl req -verify` accepts its signing requests — but there is no extension

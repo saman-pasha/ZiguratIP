@@ -4,6 +4,7 @@
 
 #include "tcpstream.hpp"
 #include "tls.hpp"
+#include "bufferstream.hpp"
 
 namespace Zigurat
 {
@@ -19,7 +20,15 @@ namespace Zigurat
 
     TLS::ProtocolVersion     _protocol_version = TLS::VERSION_1_2;
     TLS::HandshakeParameters _handshake_params;
-    uint64_t                 _sequence_number = 0;
+
+    // One counter per direction. A single shared counter was incremented by
+    // both the sender and the receiver, so the two ends disagreed about the
+    // sequence number the moment traffic stopped being strictly alternating,
+    // and every MAC after that point failed. Each is reset when the cipher
+    // state changes, which is what a ChangeCipherSpec means.
+    uint64_t                 _read_sequence_number = 0;
+    uint64_t                 _write_sequence_number = 0;
+
     TLS::SecurityParameters  _current_state, _pending_state;
 
     uint8_t *client_write_MAC_key;
@@ -28,6 +37,15 @@ namespace Zigurat
     uint8_t *server_write_key;
     uint8_t *client_write_IV;
     uint8_t *server_write_IV;
+
+    // Every handshake message that crosses the connection, in order and exactly
+    // as it appeared, header included. Finished proves both ends saw the same
+    // conversation, and CertificateVerify signs it, so it has to be the bytes
+    // rather than a re-encoding of them.
+    bufferstream _transcript;
+
+    void _transcribe(binarystream&);
+    void _transcript_hash(uint8_t*);
 
     void _send_record(TLS::Record&);
     void _recv_record(TLS::Record&);

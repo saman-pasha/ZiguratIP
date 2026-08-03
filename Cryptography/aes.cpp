@@ -1,4 +1,5 @@
 #include "aes.hpp"
+#include "cryptographyexception.hpp"
 #include <cstring>
 
 
@@ -292,6 +293,56 @@ namespace Zigurat
       }
       AES<Nk, Nb, Nr>::InverseCipher(buffer_in, w, buffer_out);
       out.write((char*)buffer_out, sizeof(BLOCK));
+    }
+  }
+
+  template <int Nk, int Nb, int Nr>
+  void AES<Nk, Nb, Nr>::CipherCBC(std::istream& in, schedule_t w, const uint8_t* iv, std::ostream& out)
+  {
+    block_t buffer_in, buffer_out;
+    uint8_t chain[AES::BLOCK_SIZE];
+    std::memcpy(chain, iv, AES::BLOCK_SIZE);
+
+    for (;;) {
+      in.read((char*)buffer_in, sizeof(block_t));
+      const size_t length = (size_t)in.gcount();
+      if (length == 0) break;
+      if (length < sizeof(block_t))
+	throw CryptographyException("cipher block chaining needs whole blocks");
+
+      for (int i = 0; i < AES::BLOCK_SIZE; i++)
+	((uint8_t*)buffer_in)[i] ^= chain[i];
+
+      AES<Nk, Nb, Nr>::Cipher(buffer_in, w, buffer_out);
+      out.write((char*)buffer_out, sizeof(block_t));
+      std::memcpy(chain, buffer_out, AES::BLOCK_SIZE);
+    }
+  }
+
+  template <int Nk, int Nb, int Nr>
+  void AES<Nk, Nb, Nr>::InverseCipherCBC(std::istream& in, schedule_t w, const uint8_t* iv, std::ostream& out)
+  {
+    block_t buffer_in, buffer_out;
+    uint8_t chain[AES::BLOCK_SIZE];
+    uint8_t next[AES::BLOCK_SIZE];
+    std::memcpy(chain, iv, AES::BLOCK_SIZE);
+
+    for (;;) {
+      in.read((char*)buffer_in, sizeof(block_t));
+      const size_t length = (size_t)in.gcount();
+      if (length == 0) break;
+      if (length < sizeof(block_t))
+	throw CryptographyException("cipher block chaining needs whole blocks");
+
+      std::memcpy(next, buffer_in, AES::BLOCK_SIZE);   // the chain for the block after this one
+
+      AES<Nk, Nb, Nr>::InverseCipher(buffer_in, w, buffer_out);
+
+      for (int i = 0; i < AES::BLOCK_SIZE; i++)
+	((uint8_t*)buffer_out)[i] ^= chain[i];
+
+      out.write((char*)buffer_out, sizeof(block_t));
+      std::memcpy(chain, next, AES::BLOCK_SIZE);
     }
   }
 

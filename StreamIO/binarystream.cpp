@@ -93,9 +93,14 @@ namespace Zigurat
     return *this;
   }
 
+  // The chunk size was static, so it was shared by every stream in the process
+  // and only ever shrank: one small read left it small for good, and from then
+  // on every read_exact anywhere crawled in chunks of that size. A run of them
+  // on a socket then had every chance of seeing a momentary end of input and
+  // returning short, which reads as truncated data rather than as an error.
   std::streamsize binarystream::read_exact(char_type* s, std::streamsize n)
   {
-    static std::streamsize prefer_length = 1024;
+    std::streamsize prefer_length = 1024;
     std::streamsize offset = 0;
     while (!this->eof() && offset < n) {
       prefer_length = std::min(prefer_length, n - offset);
@@ -107,7 +112,7 @@ namespace Zigurat
   
   std::streamsize binarystream::read_exact(std::ostream& output, std::streamsize n)
   {
-    static std::streamsize prefer_length = 1024;
+    std::streamsize prefer_length = 1024;
     std::streamsize offset = 0;
     while (!this->eof() && offset < n) {
       prefer_length = std::min(prefer_length, n - offset);

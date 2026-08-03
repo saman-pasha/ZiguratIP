@@ -6,6 +6,7 @@
 #include "tlsexception.hpp"
 #include "zlibhelper.hpp"
 #include "aes.hpp"
+#include "shahelper.hpp"
 #include <cassert>
 
 
@@ -48,12 +49,32 @@ namespace Zigurat
     return *this;
   }
 
+  void tlsbuf::_transcribe(binarystream& message)
+  {
+    const std::streamsize length = message.length();
+    message.read(this->_transcript, 0, length);
+  }
+
+  // SHA-256 over everything said so far. TLS 1.2 ties the digest to the cipher
+  // suite's PRF hash, and every suite here uses SHA-256.
+  void tlsbuf::_transcript_hash(uint8_t* digest)
+  {
+    const std::streamsize length = this->_transcript.length();
+    bufferstream copy;
+    this->_transcript.read(copy, 0, length);
+
+    uint8_t* bytes = new uint8_t[(size_t)(length > 0 ? length : 1)];
+    copy.read((char*)bytes, length);
+    SHA::checksum(SHA::SHA256, bytes, (size_t)length, digest);
+    delete[] bytes;
+  }
+
   void tlsbuf::_send_record(TLS::Record &record)
   {
     if (record.length > tlsbuf::BUFFER_SIZE) throw TLSException("invalid fragment length");
     
     TLS::SecurityParameters &params = this->_current_state;
-    uint64_t        sequence_number = this->_sequence_number++;
+    uint64_t        sequence_number = this->_write_sequence_number++;
       
     this->_tcpstream.write_std_ubyte((uint8_t)record.type);
     this->_tcpstream.write_std_ubyte(record.version.major);
@@ -92,25 +113,31 @@ namespace Zigurat
 
       if (params.cipher_type == TLS::CipherType::BLOCK) {
 
-	bufferstream output;
-	  
-	uint8_t iv[params.record_iv_length];
-	TLS::IV(iv, params.record_iv_length);
-	output.write((char*)iv, params.record_iv_length);
-	  
-	compressed.read(output, compressed_length);
+	// plain = compressed || MAC || padding, padded so the whole of it is a
+	// whole number of blocks, then chained under a fresh IV that goes out in
+	// front of it in the clear. The IV is not enciphered and is not part of
+	// what the MAC covers.
+	bufferstream plain;
+
+	compressed.read(plain, compressed_length);
 
 	uint8_t mac[params.mac_length];
+	compressed.seekg(0, std::ios_base::beg);
 	TLS::MAC(params.mac_algorithm,
 		 (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_MAC_key : this->client_write_MAC_key,
 		 params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
-	output.write((char*)mac, params.mac_length);
+	plain.write((char*)mac, params.mac_length);
 
-	uint8_t padding_length = params.record_iv_length + compressed_length + params.mac_length + sizeof(uint8_t);
-	padding_length = padding_length % params.block_length;
-	output.fill_n(padding_length + 1, padding_length);
+	std::streamsize unpadded = compressed_length + params.mac_length + sizeof(uint8_t);
+	uint8_t padding_length = (uint8_t)((params.block_length - (unpadded % params.block_length)) % params.block_length);
+	plain.fill_n(padding_length + 1, padding_length);
 
-	this->_tcpstream.write_std_ushort(output.tellp());
+	uint8_t iv[params.record_iv_length];
+	TLS::IV(iv, params.record_iv_length);
+
+	const std::streamsize plain_length = plain.length();
+	this->_tcpstream.write_std_ushort((uint16_t)(params.record_iv_length + plain_length));
+	this->_tcpstream.write((char*)iv, params.record_iv_length);
 
 	if (params.enc_key_length == 16) {
 
@@ -118,7 +145,7 @@ namespace Zigurat
 	  std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_key : this->client_write_key, params.enc_key_length);
 	  AES128::schedule_t expanded_key;
 	  AES128::KeyExpansion(write_key, expanded_key);
-	  AES128::Cipher(output, expanded_key, this->_tcpstream);
+	  AES128::CipherCBC(plain, expanded_key, iv, this->_tcpstream);
 
 	} else if (params.enc_key_length == 32) {
 
@@ -126,8 +153,8 @@ namespace Zigurat
 	  std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_key : this->client_write_key, params.enc_key_length);
 	  AES256::schedule_t expanded_key;
 	  AES256::KeyExpansion(write_key, expanded_key);
-	  AES256::Cipher(output, expanded_key, this->_tcpstream);
-	  
+	  AES256::CipherCBC(plain, expanded_key, iv, this->_tcpstream);
+
 	} else {
 	  throw TLSException("unsupported encryption key length");
 	}
@@ -148,7 +175,7 @@ namespace Zigurat
     
     do {
 
-      sequence_number = this->_sequence_number++;
+      sequence_number = this->_read_sequence_number++;
       
       record.type = (TLS::ContentType)this->_tcpstream.read_std_ubyte();
       record.version = {this->_tcpstream.read_std_ubyte(), this->_tcpstream.read_std_ubyte()};
@@ -181,7 +208,15 @@ namespace Zigurat
 
 	if (params.cipher_type == TLS::CipherType::BLOCK) {
 
-	  uint16_t cipher_text_length = this->_tcpstream.read_std_ushort();
+	  // The IV came in front, in the clear, and is not part of the cipher text.
+	  uint16_t record_length = this->_tcpstream.read_std_ushort();
+	  if (record_length < params.record_iv_length + params.block_length)
+	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECODE_ERROR);
+
+	  uint8_t iv[params.record_iv_length];
+	  this->_tcpstream.read_exact((char*)iv, params.record_iv_length);
+
+	  const uint16_t cipher_text_length = record_length - params.record_iv_length;
 	  bufferstream cipher_text;
 	  this->_tcpstream.read_exact(cipher_text, cipher_text_length);
 
@@ -192,7 +227,7 @@ namespace Zigurat
 	    std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_key : this->server_write_key, params.enc_key_length);
 	    AES128::schedule_t expanded_key;
 	    AES128::KeyExpansion(write_key, expanded_key);
-	    AES128::InverseCipher(cipher_text, expanded_key, input);
+	    AES128::InverseCipherCBC(cipher_text, expanded_key, iv, input);
 
 	  } else if (params.enc_key_length == 32) {
 
@@ -200,25 +235,25 @@ namespace Zigurat
 	    std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_key : this->server_write_key, params.enc_key_length);
 	    AES256::schedule_t expanded_key;
 	    AES256::KeyExpansion(write_key, expanded_key);
-	    AES256::InverseCipher(cipher_text, expanded_key, input);
-	  
+	    AES256::InverseCipherCBC(cipher_text, expanded_key, iv, input);
+
 	  } else {
 	    throw TLSException("unsupported encryption key length");
 	  }
 
-	  uint8_t padding_length = input.at(cipher_text_length - 1);
-	
-	  input.ignore(params.record_iv_length);
+	  const uint8_t padding_length = (uint8_t)input.at(cipher_text_length - 1);
+	  if (cipher_text_length < params.mac_length + padding_length + 1)
+	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_RECORD_MAC);
 
-	  uint16_t compressed_length = cipher_text_length - params.mac_length - padding_length - 1;
+	  compressed_length = cipher_text_length - params.mac_length - padding_length - 1;
 	  input.read(compressed, compressed_length);
 
-	  uint8_t mac[params.mac_length];	
+	  uint8_t mac[params.mac_length];
 	  TLS::MAC(params.mac_algorithm,
 		   (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_MAC_key : this->server_write_MAC_key,
 		   params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
 	  compressed.seekg(0, std::ios_base::beg);
-	
+
 	  uint8_t record_mac[params.mac_length];
 	  input.read((char*)record_mac, params.mac_length);
 
@@ -290,20 +325,26 @@ namespace Zigurat
       throw TLSException("fatal alert " + std::to_string((uint8_t)description));
   }
 
+  // The four octet header -- one of type, three of length -- is part of what
+  // goes on the wire, so the fragmenting below counts it. Measuring against
+  // handshake.length alone left the last four octets of every message unsent.
   void tlsbuf::_send_handshake(TLS::Handshake& handshake)
   {
     bufferstream plain_text;
     plain_text.write_std_ubyte((uint8_t)handshake.msg_type);
     TLS::uint24(handshake.length, plain_text);
-    plain_text.write(handshake.body, handshake.length);
-    
+    handshake.body.read(plain_text, 0, handshake.length);
+
+    this->_transcribe(plain_text);
+
+    const std::streamsize total = plain_text.length();
     std::streamsize count = 0;
     TLS::Record     record {TLS::ContentType::HANDSHAKE, this->_protocol_version, 0, plain_text};
     do {
-      record.length = std::min(handshake.length - count, this->BUFFER_SIZE);
+      record.length = std::min(total - count, this->BUFFER_SIZE);
       count        += record.length;
       this->_send_record(record);
-    } while (count < handshake.length);
+    } while (count < total);
   }
 
   void tlsbuf::_recv_handshake(TLS::Handshake& handshake)
@@ -315,14 +356,27 @@ namespace Zigurat
 
     handshake.msg_type = (TLS::HandshakeType)plain_text.read_std_ubyte();
     handshake.length   = TLS::uint24(plain_text);
-    std::streamsize count = record.length - sizeof(uint8_t) + (sizeof(uint8_t) * 3);
-    handshake.body.write(plain_text, count);
+
+    // What the first record carried beyond the four octet header. This was
+    // adding the header rather than subtracting it, so the count ran two octets
+    // over the body on every message and a fragmented one was never reassembled.
+    std::streamsize count = record.length - (sizeof(uint8_t) * 4);
+    plain_text.read(handshake.body, count);
+
     while (count < handshake.length) {
       this->_recv_record(record);
       assert(record.type == TLS::ContentType::HANDSHAKE);
-      handshake.body.write(plain_text, record.length);
+      plain_text.read(handshake.body, record.length);
       count += record.length;
     }
+
+    // The transcript is the messages as they appeared on the wire, header and
+    // all, because that is what Finished and CertificateVerify sign over.
+    bufferstream transcribed;
+    transcribed.write_std_ubyte((uint8_t)handshake.msg_type);
+    TLS::uint24(handshake.length, transcribed);
+    handshake.body.read(transcribed, 0, handshake.length);
+    this->_transcribe(transcribed);
   }
 
   void tlsbuf::_server_hello()
@@ -351,10 +405,13 @@ namespace Zigurat
     client_body.ignore(client_body.read_std_ubyte());
     server_body.write_std_ubyte(0);                     // session_id 0 -> no resumption
 
+    // Read from client_body, write into server_body. These were reading the
+    // client's offer out of the reply being built, which is empty at this point,
+    // so no cipher suite and no compression method could ever be agreed.
     bool cipher_suite_found = false;
-    uint16_t cipher_suites_count = server_body.read_std_ushort() / sizeof(TLS::CipherSuite);
+    uint16_t cipher_suites_count = client_body.read_std_ushort() / sizeof(TLS::CipherSuite);
     for (uint16_t i = 0; i < cipher_suites_count; i++) {
-      TLS::CipherSuite client_suite {server_body.read_std_ubyte(), server_body.read_std_ubyte()};
+      TLS::CipherSuite client_suite {client_body.read_std_ubyte(), client_body.read_std_ubyte()};
       for (TLS::CipherSuite& server_suite : this->_handshake_params.cipher_suites) {
 	if (client_suite.revision == server_suite.revision && client_suite.suite_id == server_suite.suite_id) {
 	  TLS::cipher_suite(server_suite, this->_pending_state);
@@ -373,7 +430,7 @@ namespace Zigurat
     bool compression_found = false;
     uint8_t client_compressions_count = client_body.read_std_ubyte();
     for (uint8_t i = 0; i < client_compressions_count; i++) {
-      TLS::CompressionMethod client_compression = (TLS::CompressionMethod)server_body.read_std_ubyte();
+      TLS::CompressionMethod client_compression = (TLS::CompressionMethod)client_body.read_std_ubyte();
       for (TLS::CompressionMethod server_compression : this->_handshake_params.compression_methods) {
 	if (client_compression == server_compression) {
 	  this->_pending_state.compression_algorithm = server_compression;
@@ -382,7 +439,7 @@ namespace Zigurat
 	  break;
 	}
       }
-      if (cipher_suite_found) break;
+      if (compression_found) break;
     }
     if (!compression_found) {
       this->_pending_state.compression_algorithm = TLS::CompressionMethod::NONE;
@@ -612,7 +669,17 @@ namespace Zigurat
 
   tlsbuf* tlsbuf::close()
   {
-    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::CLOSE_NOTIFY);
+    // close_notify is a warning, not a failure. Sending it at FATAL made _alert
+    // throw on the way out of every clean shutdown, so closing a healthy
+    // connection raised an exception. A peer that has already gone is not an
+    // error either -- there is nobody left to tell.
+    if (this->_tcpstream.is_open()) {
+      try {
+	this->_alert(TLS::AlertLevel::WARNING, TLS::AlertDescription::CLOSE_NOTIFY);
+      } catch (...) {
+      }
+    }
+
     this->_tcpstream.close();
     return this;
   }
