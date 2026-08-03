@@ -281,6 +281,20 @@ ZTEST(Grammar, select_assigns_to_a_variable)
   ZCHECK(!clause("SELECT total = FROM t;"));
 }
 
+// TRUNCATE names a table and nothing else -- it does not choose between rows,
+// so there is no WHERE to give it.
+ZTEST(Grammar, truncate_statement)
+{
+  ZCHECK(clause("TRUNCATE t;"));
+  ZCHECK(clause("TRUNCATE demo::sales;"));
+  ZCHECK(clause("TRUNCATE a::b::c;"));
+
+  ZCHECK(!clause("TRUNCATE;"));                       // needs a table
+  ZCHECK(!clause("TRUNCATE t"));                      // needs the terminator
+  ZCHECK(!clause("TRUNCATE t WHERE id == 1;"));       // takes no condition
+  ZCHECK(!clause("TRUNCATE FROM t;"));                // and no FROM
+}
+
 ZTEST(Grammar, insert_statement)
 {
   ZCHECK(clause("INSERT INTO t VALUES (1, 'a');"));

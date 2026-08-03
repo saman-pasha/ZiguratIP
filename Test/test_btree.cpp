@@ -20,6 +20,7 @@
 #include "btreeindex.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -150,6 +151,12 @@ namespace
   // keeps the key inside a Short while leaving every id distinct at the sizes
   // the suite uses by default.
   const int16_t BUCKET_MODULUS = 30011;   // prime, just under 2^15
+
+  int64_t file_size(const std::string& path)
+  {
+    std::ifstream probe(path.c_str(), std::ios::binary | std::ios::ate);
+    return probe.good() ? (int64_t)probe.tellg() : -1;
+  }
 
   // Deterministic but not sorted: consecutive ids must not arrive in key order,
   // or the tree would only ever be appended to on one side.
@@ -643,4 +650,220 @@ ZTEST(BTree, the_index_survives_a_reopen)
 
   ZCHECK_EQ((int64_t)run(Item::IDX_ID, &BTreeIndex<Item, Long>::cursor_equal, n / 2).size(),
 	    (int64_t)1);
+}
+
+
+// A rolled back insert leaves nothing behind: _rollback_pointer flags the row
+// deleted without unmapping it, but the index's own bucket entry was written in
+// the same transaction and is rolled back with it. That is what makes reclaiming
+// a dead row's chunks safe -- no index is left pointing at them.
+ZTEST(BTree, a_rolled_back_insert_is_invisible_to_the_index)
+{
+  Fixture fixture("btree-rollback");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  fixture.memory()->begin_transaction();
+  Item keeper(1, "alpha", 10, 1);
+  fixture.memory()->online_insert(keeper);
+  fixture.memory()->commit_transaction();
+  fixture.memory()->begin_transaction();
+
+  Item doomed(2, "beta", 20, 2);
+  fixture.memory()->online_insert(doomed);
+  fixture.memory()->rollback_transaction();
+  fixture.memory()->begin_transaction();
+
+  int64_t through_index = 0;
+  Item::IDX_ID->cursor([&through_index] (Item&) -> bool { through_index++; return true; });
+  ZCHECK_EQ(through_index, (int64_t)1);
+
+  int64_t through_scan = 0;
+  fixture.memory()->cursor<Item>([&through_scan] (Item&) -> bool { through_scan++; return true; });
+  ZCHECK_EQ(through_scan, (int64_t)1);
+
+  ZCHECK_EQ((int64_t)run(Item::IDX_ID, &BTreeIndex<Item, Long>::cursor_equal, 2).size(), (int64_t)0);
+}
+
+
+// --- TRUNCATE ---------------------------------------------------------------
+
+// Deleted rows keep their chunks so the store can be read back at an earlier
+// point in time. truncate gives that history up for the space.
+ZTEST(BTree, truncate_reclaims_the_rows_delete_left_behind)
+{
+  Fixture fixture("btree-truncate");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 200;
+  fixture.load(n);
+
+  std::vector<Item> doomed;
+  Item::IDX_ID->cursor_less_than_equal(Long(50), [&doomed] (Item& row) -> bool {
+      doomed.push_back(row);
+      return true;
+    });
+  ZCHECK_EQ((int64_t)doomed.size(), (int64_t)50);
+
+  for (size_t i = 0; i < doomed.size(); i++)
+    fixture.memory()->online_delete(doomed[i]);
+  fixture.memory()->commit_transaction();
+  fixture.memory()->begin_transaction();
+
+  const size_t reclaimed = fixture.memory()->truncate<Item>();
+  ZCHECK_EQ((int64_t)reclaimed, (int64_t)50);
+
+  // The rows that were still alive are untouched, through the index and through
+  // a scan, and the tree still answers for them.
+  int64_t through_index = 0;
+  Item::IDX_ID->cursor([&through_index] (Item&) -> bool { through_index++; return true; });
+  ZCHECK_EQ(through_index, n - 50);
+
+  int64_t through_scan = 0;
+  fixture.memory()->cursor<Item>([&through_scan] (Item&) -> bool { through_scan++; return true; });
+  ZCHECK_EQ(through_scan, n - 50);
+
+  ZCHECK_EQ((int64_t)run(Item::IDX_ID, &BTreeIndex<Item, Long>::cursor_equal, 51).size(), (int64_t)1);
+  ZCHECK_EQ((int64_t)run(Item::IDX_ID, &BTreeIndex<Item, Long>::cursor_equal, 50).size(), (int64_t)0);
+
+  // Nothing left to reclaim the second time.
+  ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), (int64_t)0);
+}
+
+// A live row is never touched, however many times it runs.
+ZTEST(BTree, truncate_leaves_living_rows_alone)
+{
+  Fixture fixture("btree-truncate-live");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 120;
+  fixture.load(n);
+
+  ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), (int64_t)0);
+
+  int64_t counted = 0;
+  Item::IDX_ID->cursor([&counted] (Item&) -> bool { counted++; return true; });
+  ZCHECK_EQ(counted, n);
+
+  // And the freed space is reusable: inserting after a truncate works.
+  fixture.memory()->begin_transaction();
+  Item fresh(n + 1, "alpha", 5, (int16_t)(n + 1));
+  ZCHECK_NOTHROW(fixture.memory()->online_insert(fresh));
+  fixture.memory()->commit_transaction();
+  fixture.memory()->begin_transaction();
+
+  ZCHECK_EQ((int64_t)run(Item::IDX_ID, &BTreeIndex<Item, Long>::cursor_equal, n + 1).size(), (int64_t)1);
+}
+
+// The point of reclaiming: the space goes back to the allocator, so reloading
+// the same volume of rows reuses the pages instead of extending the store. The
+// control is the same run without the truncate.
+//
+// The indexes are detached for this one, because they keep their own garbage
+// under their own hash keys and truncating a table does not touch it. Leaving
+// them attached still shows the effect -- the store grows half as much -- but
+// half of what is measured is then index churn rather than the thing under test.
+ZTEST(BTree, truncate_returns_pages_to_the_allocator)
+{
+  const int64_t n = 400;
+
+  int64_t growth[2] = {0, 0};
+
+  for (int truncating = 0; truncating < 2; truncating++) {
+    Fixture fixture(truncating ? "btree-defrag-yes" : "btree-defrag-no");
+    if (!fixture.ready()) { ZCHECK(false); return; }
+
+    BTreeIndex<Item, Long>*         kept_id       = Item::IDX_ID;
+    BTreeIndex<Item, String>*       kept_category = Item::IDX_CATEGORY;
+    BTreeIndex<Item, String, Long>* kept_composite = Item::IDX_CATEGORY_SCORE;
+    BTreeIndex<Item, Short>*        kept_bucket   = Item::IDX_BUCKET;
+
+    Item::IDX_ID = nullptr;
+    Item::IDX_CATEGORY = nullptr;
+    Item::IDX_CATEGORY_SCORE = nullptr;
+    Item::IDX_BUCKET = nullptr;
+
+    // Round one, then delete every row of it.
+    std::vector<Item> rows = fixture.load(n);
+    for (size_t i = 0; i < rows.size(); i++)
+      fixture.memory()->online_delete(rows[i]);
+    fixture.memory()->commit_transaction();
+    fixture.memory()->begin_transaction();
+
+    const int64_t loaded = file_size(fixture.store.data_path);
+
+    if (truncating) {
+      ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), n);
+      // Truncating does not shrink the file. The pages stay where they are and
+      // become available again, which is what the reload below shows.
+      ZCHECK_EQ(file_size(fixture.store.data_path), loaded);
+    }
+
+    // Round two, into whatever round one gave back.
+    fixture.load(n);
+    growth[truncating] = file_size(fixture.store.data_path) - loaded;
+
+    int64_t counted = 0;
+    fixture.memory()->cursor<Item>([&counted] (Item&) -> bool { counted++; return true; });
+    ZCHECK_EQ(counted, n);
+
+    Item::IDX_ID = kept_id;
+    Item::IDX_CATEGORY = kept_category;
+    Item::IDX_CATEGORY_SCORE = kept_composite;
+    Item::IDX_BUCKET = kept_bucket;
+  }
+
+  // Without the truncate, round two has to be allocated fresh. With it, the
+  // rows land back in the pages round one gave up and the store does not move.
+  ZCHECK(growth[0] > 0);
+  ZCHECK_EQ(growth[1], (int64_t)0);
+}
+
+// Only a committed delete is reclaimable. A delete that is still open could
+// roll back, and handing its chunks to the allocator would leave the rollback
+// nothing to restore -- so a truncate in the same transaction as the delete
+// finds nothing to do.
+ZTEST(BTree, truncate_ignores_deletes_that_are_still_open)
+{
+  Fixture fixture("btree-truncate-open");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 60;
+  std::vector<Item> rows = fixture.load(n);
+
+  for (size_t i = 0; i < 20; i++)
+    fixture.memory()->online_delete(rows[i]);
+
+  // Same transaction as the delete: nothing has settled yet.
+  ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), (int64_t)0);
+
+  fixture.memory()->commit_transaction();
+  fixture.memory()->begin_transaction();
+
+  // Now it has.
+  ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), (int64_t)20);
+
+  int64_t counted = 0;
+  fixture.memory()->cursor<Item>([&counted] (Item&) -> bool { counted++; return true; });
+  ZCHECK_EQ(counted, n - 20);
+}
+
+// And a rolled back delete keeps its row, which truncate must not take.
+ZTEST(BTree, truncate_keeps_a_row_whose_delete_was_rolled_back)
+{
+  Fixture fixture("btree-truncate-rollback");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 40;
+  std::vector<Item> rows = fixture.load(n);
+
+  for (size_t i = 0; i < 10; i++)
+    fixture.memory()->online_delete(rows[i]);
+  fixture.memory()->rollback_transaction();
+  fixture.memory()->begin_transaction();
+
+  ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), (int64_t)0);
+
+  int64_t counted = 0;
+  fixture.memory()->cursor<Item>([&counted] (Item&) -> bool { counted++; return true; });
+  ZCHECK_EQ(counted, n);
 }

@@ -442,6 +442,94 @@ namespace Zigurat
     }
   }
 
+  // Every row of one table that is deleted and settled: committed as DELETED,
+  // with no live transaction holding it. The walk is the one _cursor makes over
+  // the hexmap, without the isolation rules -- those exist to hide dead rows,
+  // and this is the one caller that is looking for them.
+  void Memory::_dead_pointers(hashkey_ptr hash_key, std::list<Pointer>& dead)
+  {
+    uint8_t hex_byte = 0;
+
+    auto pair_iter = this->_page_list.equal_range(hash_key);
+    for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
+
+      hashkey_ptr page_hashkey = iter->first;
+      int64_t page_address = iter->second;
+      int64_t i = PAGEFILE_CONTROL_COUNT;
+
+      while (i < this->_hbpp) {
+
+	int64_t hexmap_address = this->_pointer_hexmap_address(page_address) + i;
+	int64_t pointer_address = hexmap_address * CHUNK_SIZE;
+
+	this->_hexmap_io.seekg(hexmap_address, std::ios::beg);
+
+	this->_hexmap_io.read_std_ubyte(hex_byte);
+	RowState online_state = (RowState)(hex_byte & (uint8_t)12);
+	RowLock  online_lock  = (RowLock)(hex_byte & (uint8_t)3);
+
+	this->_hexmap_io.read_std_ubyte(hex_byte);
+	RowState offline_state = (RowState)(hex_byte & (uint8_t)12);
+
+	this->_hexmap_io.seekg(CONTROL_COUNT - 2, std::ios::cur);
+
+	i += CONTROL_COUNT;
+	for (int64_t pointer_size = 0; i < this->_hbpp; pointer_size += CHUNK_SIZE) {
+
+	  this->_hexmap_io.read_std_ubyte(hex_byte);
+	  i++;
+
+	  if ( hex_byte != CONTROL_STANDALONE_CHUNK && (hex_byte & (uint8_t)64) == 64 ) { // last chunk is standalone
+	    if ( hex_byte != CONTROL_CHUNK && (hex_byte & (uint8_t)128) == 128 ) {        // last chunk is data
+
+	      pointer_size += (hex_byte & (uint8_t)31);
+
+	      // Settled means the delete is committed and nobody is mid-flight on
+	      // the row. A row a live transaction still holds is left where it is.
+	      if (offline_state == RowState::DELETED
+		  && online_state == RowState::NONE
+		  && online_lock == RowLock::NONE) {
+		dead.push_back(Pointer(page_hashkey, pointer_address, pointer_size));
+	      }
+	    }
+	    break;
+	  }
+	}
+      }
+    }
+  }
+
+  // What DELETE leaves behind. A deleted row keeps its chunks so the store can
+  // still be read at an earlier point in time, and nothing reclaims them --
+  // _rollback_pointer says as much. This is the operation that gives up that
+  // history in exchange for the space: it frees every settled dead row of one
+  // table, and _free coalesces each one with the free space beside it, so a page
+  // that ends up empty goes back to the allocator to be used by any table.
+  size_t Memory::truncate(hashkey_ptr hash_key)
+  {
+    if (this->_watcher) {
+      this->dba_watch("Truncate: (hash_key)");
+    }
+
+    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
+    std::lock_guard<std::mutex> data_lock(this->_data_access);
+
+    // Collected in full before anything is freed: _free rewrites the hexmap and
+    // moves entries between the page and free lists, which is exactly what the
+    // walk above is reading.
+    std::list<Pointer> dead;
+    this->_dead_pointers(hash_key, dead);
+
+    for (const Pointer& pointer : dead) {
+      this->_free(pointer);
+    }
+
+    this->_hexmap_io.flush();
+    this->_data_io.flush();
+
+    return dead.size();
+  }
+
   void Memory::_free_key(hashkey_ptr hash_key)
   {
     std::lock_guard<std::mutex> page_list_lock(this->_page_list_access);

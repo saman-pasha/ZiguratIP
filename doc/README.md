@@ -40,6 +40,7 @@ client interfaces. Converted from the ziguratip.com documentation.
 - [INSERT](insert.md)
 - [UPDATE](update.md)
 - [DELETE](delete.md)
+- [TRUNCATE](truncate.md)
 - [TRANSACTION](transaction.md)
 
 ## Web pages (Zeytun)

@@ -115,6 +115,7 @@ namespace Zigurat
     int64_t _free_next_count();
     void _free(const Pointer&);
     void _free_key(hashkey_ptr);
+    void _dead_pointers(hashkey_ptr, std::list<Pointer>&);
     
     // Transaction ACID
     void _dump_control(const Pointer&, const Control&);
@@ -185,6 +186,11 @@ namespace Zigurat
     template <typename T> void online_insert(T&);
     template <typename T> void online_update(T&, T&);
     template <typename T> void online_delete(T&);
+
+    // Reclaims the space of every settled deleted row of one table and hands
+    // whole freed pages back to the allocator. Returns how many rows went.
+    size_t truncate(hashkey_ptr);
+    template <typename T> size_t truncate();
 
     // Database Administration helpers
     void dba_pagefiles(binarystream&);
@@ -355,6 +361,12 @@ namespace Zigurat
     
     this->_hexmap_io.flush();
     this->_data_io.flush();
+  }
+
+  template <typename T>
+  size_t Memory::truncate()
+  {
+    return this->truncate(T::hash_key);
   }
 
   template <typename T>

@@ -107,6 +107,7 @@ namespace Zigurat
     void _update(const Expression&, std::stringstream&, int);
     void _delete_content(const Expression&, std::stringstream&, int);
     void _delete(const Expression&, std::stringstream&, int);
+    void _truncate(const Expression&, std::stringstream&, int);
 
     void _include(const Expression&);
     void _link(const Expression&);

@@ -248,6 +248,8 @@ namespace Zigurat
       this->_update(ast, code, lvl);
     } else if (ast.token.value == "DELETE") {
       this->_delete(ast, code, lvl);
+    } else if (ast.token.value == "TRUNCATE") {
+      this->_truncate(ast, code, lvl);
     } else {
       throw CompileException("unknown clause", ast);
     }

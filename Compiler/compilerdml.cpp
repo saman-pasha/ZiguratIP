@@ -221,6 +221,19 @@ namespace Zigurat
     code << tab << "Globals::memory()->online_delete(" << name << ");" << std::endl;
   }
 
+  // TRUNCATE names a table and nothing else: no WHERE, because it does not
+  // choose between rows. It reclaims what DELETE left behind -- the rows that
+  // are committed as deleted and are still holding their chunks so the store can
+  // be read at an earlier point in time -- and hands whole freed pages back to
+  // the allocator. Live rows are untouched, and so is any row a running
+  // transaction still holds.
+  void Compiler::_truncate(const Expression& ast, std::stringstream& code, int lvl)
+  {
+    std::string tab(lvl, '\t');
+    code << tab << "Globals::memory()->truncate< " << this->_type_name(ast.args[0]) << " >();"
+	 << std::endl;
+  }
+
   void Compiler::_delete(const Expression& ast, std::stringstream& code, int lvl)
   {
     const Expression& from = ast.args[0];
