@@ -11,6 +11,10 @@
 #include "tls.hpp"
 #include "tlsexception.hpp"
 #include "bufferstream.hpp"
+#include "tlsstream.hpp"
+#include "utility.hpp"
+#include <thread>
+#include <fstream>
 #include <cstring>
 #include <string>
 #include <sys/socket.h>
@@ -313,4 +317,157 @@ ZTEST(TLS, record_ivs_do_not_repeat)
   for (size_t k = 1; k < seen[0].size(); k++)
     if (seen[0][k] != seen[0][0]) varied = true;
   ZCHECK(varied);
+}
+
+
+// ---------------------------------------------------------------------------
+// The handshake
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  std::string cert_file(const std::string& name)
+  {
+    std::string found = Utility::config_path("cert/" + name);
+    if (found.size() > 0) return found;
+
+    const char* candidates[] = {"home/etc/cert/", "../home/etc/cert/"};
+    for (int i = 0; i < 2; i++) {
+      std::ifstream probe(std::string(candidates[i]) + name);
+      if (probe.good()) return std::string(candidates[i]) + name;
+    }
+    return "";
+  }
+
+  // The shipped sample is self signed, so it is its own authority: an end can
+  // present it and it validates against itself. That exercises every step of the
+  // exchange without spending half a minute generating key pairs.
+  TLS::HandshakeParameters sample_parameters()
+  {
+    TLS::HandshakeParameters params;
+    params.protocol_version = TLS::VERSION_1_2;
+    params.cipher_suites.push_back(TLS::TLS_RSA_WITH_AES_256_CBC_SHA256);
+    params.compression_methods.push_back(TLS::CompressionMethod::NONE);
+
+    params.credentials.certificate = cert_file("dont-use-certificate.crt");
+    params.credentials.private_key = cert_file("dont-use-private.key");
+    params.credentials.authority   = cert_file("dont-use-certificate.crt");
+    return params;
+  }
+}
+
+// Both ends prove themselves, agree a secret neither sent, and then talk. The
+// server is driven on its own thread because a handshake is a conversation --
+// each end blocks waiting for the other.
+ZTEST(TLS, a_handshake_authenticates_both_ends_and_carries_data)
+{
+  TLS::HandshakeParameters params = sample_parameters();
+  if (params.credentials.certificate.empty()) { ZCHECK(false); return; }
+
+  Pair pair;
+  if (!pair.ready) { ZCHECK(false); return; }
+
+  std::string server_error, server_saw, server_peer;
+
+  std::thread listener([&] () {
+      try {
+	tlsstream server;
+	server.open(TLS::ConnectionEnd::SERVER, params, pair.ends[1], true, 0);
+
+	std::string line;
+	std::getline(server, line);
+	server_saw = line;
+	server_peer = dynamic_cast<tlsbuf*>(server.rdbuf())->peer_subject();
+
+	server << "and to you" << std::endl;
+	server.flush();
+      } catch (const std::exception& error) {
+	server_error = error.what();
+      } catch (...) {
+	server_error = "unknown";
+      }
+    });
+
+  std::string client_error, client_saw, client_peer;
+  try {
+    tlsstream client;
+    client.open(TLS::ConnectionEnd::CLIENT, params, pair.ends[0], true, 0);
+
+    client_peer = dynamic_cast<tlsbuf*>(client.rdbuf())->peer_subject();
+
+    client << "good day" << std::endl;
+    client.flush();
+
+    std::string line;
+    std::getline(client, line);
+    client_saw = line;
+  } catch (const std::exception& error) {
+    client_error = error.what();
+  } catch (...) {
+    client_error = "unknown";
+  }
+
+  listener.join();
+
+  ZCHECK_STR(server_error, "");
+  ZCHECK_STR(client_error, "");
+
+  // Each end learned who the other is, from the certificate it presented.
+  ZCHECK(server_peer.find("CN=ZiguratIP") != std::string::npos);
+  ZCHECK(client_peer.find("CN=ZiguratIP") != std::string::npos);
+
+  // And the data went through the encrypted records.
+  ZCHECK_STR(server_saw, "good day");
+  ZCHECK_STR(client_saw, "and to you");
+}
+
+// The whole point of the arrangement: an end that cannot vouch for its peer does
+// not let it in, and both sides come apart cleanly when that happens rather than
+// hanging or dying. The authority here is a public key file, which is a well
+// formed DER object and not a certificate -- reading a tbsCertificate out of it
+// used to walk past the buffer and take the process down with a bus error.
+ZTEST(TLS, a_peer_that_cannot_be_vouched_for_is_refused)
+{
+  TLS::HandshakeParameters client_params = sample_parameters();
+  if (client_params.credentials.certificate.empty()) { ZCHECK(false); return; }
+
+  TLS::HandshakeParameters server_params = sample_parameters();
+  server_params.credentials.authority = cert_file("dont-use-public.key");
+
+  Pair pair;
+  if (!pair.ready) { ZCHECK(false); return; }
+
+  std::string server_error;
+  std::thread listener([&] () {
+      try {
+	tlsstream server;
+	server.open(TLS::ConnectionEnd::SERVER, server_params, pair.ends[1], true, 0);
+	server_error = "";                       // completed, which it must not
+      } catch (const std::exception& error) {
+	server_error = error.what();
+      } catch (...) {
+	server_error = "unknown";
+      }
+    });
+
+  std::string client_error;
+  try {
+    tlsstream client;
+    client.open(TLS::ConnectionEnd::CLIENT, client_params, pair.ends[0], true, 0);
+    client_error = "";
+  } catch (const std::exception& error) {
+    client_error = error.what();
+  } catch (...) {
+    client_error = "unknown";
+  }
+
+  listener.join();   // reaching this at all is half the point
+
+  // The server is the end that judges, so it is the end that must refuse, and
+  // it must say why rather than falling over.
+  ZCHECK(!server_error.empty());
+  ZCHECK(server_error.find("tbsCertificate") != std::string::npos);
+
+  // And the client is told, rather than being left waiting.
+  ZCHECK(!client_error.empty());
 }

@@ -274,3 +274,92 @@ ZTEST(Cryptography, a_message_signed_with_a_key_verifies_against_its_certificate
   tampered.write("a handshake transcript would go HERE", 35);
   ZCHECK(!X509::verify(crt_again, "SHA-256", tampered, signature));
 }
+
+// Key transport: a secret encrypted to the key a certificate names, recovered
+// with the private half. This is how a handshake moves its pre master secret.
+ZTEST(Cryptography, a_secret_encrypted_to_a_certificate_comes_back_with_the_key)
+{
+  const std::string crt_path = certificate_file("dont-use-certificate.crt");
+  const std::string key_path = certificate_file("dont-use-private.key");
+  if (crt_path.empty() || key_path.empty()) { ZCHECK(false); return; }
+
+  // 48 octets, the width of a TLS pre master secret.
+  uint8_t secret[48];
+  for (size_t i = 0; i < sizeof(secret); i++) secret[i] = (uint8_t)(i * 5 + 3);
+
+  bufferstream plain, cipher;
+  plain.write((char*)secret, (std::streamsize)sizeof(secret));
+
+  filestream crt(crt_path, std::ios::in | std::ios::binary);
+  ZCHECK_NOTHROW(X509::encrypt(crt, plain, cipher));
+  ZCHECK(cipher.length() == 256);            // the width of a 2048 bit modulus
+
+  filestream key(key_path, std::ios::in | std::ios::binary);
+  bufferstream recovered;
+  ZCHECK_NOTHROW(X509::decrypt(key, "", cipher, recovered));
+
+  ZCHECK_EQ((int64_t)recovered.length(), (int64_t)sizeof(secret));
+  uint8_t got[48];
+  recovered.read((char*)got, 0, (std::streamsize)sizeof(got));
+  ZCHECK(std::memcmp(secret, got, sizeof(secret)) == 0);
+
+  // The same secret encrypted twice does not give the same cipher text --
+  // PKCS #1 v1.5 padding is randomised, and a fixed one would leak.
+  bufferstream plain_again, cipher_again;
+  plain_again.write((char*)secret, (std::streamsize)sizeof(secret));
+  filestream crt_again(crt_path, std::ios::in | std::ios::binary);
+  X509::encrypt(crt_again, plain_again, cipher_again);
+
+  std::string first((size_t)cipher.length(), 0), second((size_t)cipher_again.length(), 0);
+  cipher.read(&first[0], 0, cipher.length());
+  cipher_again.read(&second[0], 0, cipher_again.length());
+  ZCHECK(first != second);
+}
+
+// A certificate whose signature does not check out is not one this authority
+// issued. This is what a TLS peer is held to.
+ZTEST(Cryptography, a_tampered_certificate_fails_validation)
+{
+  const std::string path = certificate_file("dont-use-certificate.crt");
+  if (path.empty()) { ZCHECK(false); return; }
+
+  filestream crt(path, std::ios::in | std::ios::binary);
+  bufferstream puk_info, authority_key;
+  X509::certificate_public_key(crt, puk_info);
+  DER::encode_sequence(authority_key, puk_info);
+
+  // The genuine article passes.
+  filestream original(path, std::ios::in | std::ios::binary);
+  ZCHECK_NOTHROW(X509::validate_by_puk(authority_key, original));
+
+  // One octet turned over in the body, and it must not.
+  std::ifstream source(path, std::ios::binary);
+  std::string bytes((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  ZCHECK(bytes.size() > 200);
+  bytes[bytes.size() / 2] = (char)(bytes[bytes.size() / 2] ^ 0x40);
+
+  bufferstream tampered, key_again;
+  tampered.write(bytes.data(), (std::streamsize)bytes.size());
+  authority_key.read(key_again, 0, authority_key.length());
+
+  bool refused = false;
+  try { X509::validate_by_puk(key_again, tampered); }
+  catch (...) { refused = true; }
+  ZCHECK(refused);
+}
+
+// A structure that is not a certificate at all must be refused, not walked off
+// the end of. A peer presents its own certificate, so these bytes are hostile
+// input; this used to be a bus error.
+ZTEST(Cryptography, a_non_certificate_is_refused_rather_than_crashing)
+{
+  const std::string path = certificate_file("dont-use-public.key");
+  if (path.empty()) { ZCHECK(false); return; }
+
+  filestream not_a_certificate(path, std::ios::in | std::ios::binary);
+  bufferstream puk_info;
+  ZCHECK_THROWS(X509::certificate_public_key(not_a_certificate, puk_info));
+
+  filestream again(path, std::ios::in | std::ios::binary);
+  ZCHECK_THROWS(X509::certificate_subject(again));
+}

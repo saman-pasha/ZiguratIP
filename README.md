@@ -109,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 233 cases
+Starts a server, runs the full suite against it, stops it again. 238 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -398,12 +398,16 @@ same convention. Vendored zlib is C and keeps its own `.h` names.
 The server runs, serves both protocols, compiles and executes Parsi, and the
 suite passes. Some things are known to be incomplete:
 
-- **TLS is drafted, not finished.** The record layer works and is covered by
-  `Test/test_tls.cpp`; the handshake stops after ServerHello, so nothing can yet
-  open a secure connection and both servers are plaintext. `tlsclient.cpp` and
-  `tlsserver.cpp` are empty. Still to write: Certificate, CertificateRequest,
-  ServerHelloDone, ClientKeyExchange, CertificateVerify, ChangeCipherSpec,
-  Finished, and chain validation against the owner's CA.
+- **TLS handshakes but is not wired in.** `tlsstream` opens a mutually
+  authenticated, encrypted connection between two ZiguratIP ends: both present a
+  certificate, each checks the other against the configured authority, and the
+  peer's distinguished name is available through `tlsbuf::peer_subject`. Neither
+  server offers it yet -- Zigurat on 2160 and Zeytun on 2190 are still plaintext,
+  and the connector has no client configuration -- and `tlsclient.cpp` and
+  `tlsserver.cpp` are still empty. The wire format is ZiguratIP's own: it is
+  shaped like TLS 1.2 and is not interoperable with one, so a browser cannot
+  speak it. It has had no adversarial review; treat it as a closed-network
+  measure, not as hardened transport security.
 - **The CA issues X.509 v1 only.** Certificates and requests are
   OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
   `openssl req -verify` accepts its signing requests — but there is no extension

@@ -4,6 +4,7 @@
 
 #include "binarystream.hpp"
 #include <vector>
+#include <string>
 
 namespace Zigurat
 {
@@ -222,6 +223,19 @@ namespace Zigurat
       uint8_t      *extension_data;                 // <0..2^16-1>
     };
 
+    // What an end proves itself with, and what it will believe about the other.
+    // A ZiguratIP connection is a closed PKI: there is no trust store and no
+    // chain to walk, just the one certificate the owner of the server issues to
+    // everyone allowed to talk to it. A peer presenting anything that authority
+    // did not sign is refused.
+    struct Credentials
+    {
+      std::string certificate;        // this end's own certificate, DER or PEM
+      std::string private_key;        // and the key it belongs to
+      std::string private_key_cipher; // its pass phrase, empty if there is none
+      std::string authority;          // the certificate that must have signed the peer's
+    };
+
     struct HandshakeParameters
     {
       ProtocolVersion                protocol_version;
@@ -229,6 +243,7 @@ namespace Zigurat
       std::vector<CipherSuite>       cipher_suites;
       std::vector<CompressionMethod> compression_methods;
       std::vector<Extension>         extensions;
+      Credentials                    credentials;
     };
 
     // Change Cipher Specs Message

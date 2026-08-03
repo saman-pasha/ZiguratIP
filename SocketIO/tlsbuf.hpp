@@ -31,12 +31,12 @@ namespace Zigurat
 
     TLS::SecurityParameters  _current_state, _pending_state;
 
-    uint8_t *client_write_MAC_key;
-    uint8_t *server_write_MAC_key;
-    uint8_t *client_write_key;
-    uint8_t *server_write_key;
-    uint8_t *client_write_IV;
-    uint8_t *server_write_IV;
+    uint8_t *client_write_MAC_key = nullptr;
+    uint8_t *server_write_MAC_key = nullptr;
+    uint8_t *client_write_key     = nullptr;
+    uint8_t *server_write_key     = nullptr;
+    uint8_t *client_write_IV      = nullptr;
+    uint8_t *server_write_IV      = nullptr;
 
     // Every handshake message that crosses the connection, in order and exactly
     // as it appeared, header included. Finished proves both ends saw the same
@@ -53,10 +53,33 @@ namespace Zigurat
     void _send_handshake(TLS::Handshake&);
     void _recv_handshake(TLS::Handshake&);
 
+    // Who the peer turned out to be, once its certificate has been checked
+    // against the authority. Nothing is keyed on it yet; it is what a permission
+    // would be decided from.
+    std::string _peer_subject;
+
+    void _credential(const std::string&, binarystream&);
+    void _check_peer_certificate(binarystream&);
+
+    void _send_certificate();
+    void _recv_certificate(binarystream&);
+    void _send_change_cipher_spec();
+    void _recv_change_cipher_spec();
+    void _derive_keys(binarystream&);
+    void _send_finished(const char*);
+    void _recv_finished(const char*);
+
     void _server_hello();
     void _server_handshake();
     void _client_hello();
     void _client_handshake();
+
+  public:
+    // The distinguished name on the peer's certificate. Empty until the
+    // handshake has finished and the certificate has been accepted.
+    const std::string& peer_subject() const;
+
+  protected:
 
   public:    
     tlsbuf();

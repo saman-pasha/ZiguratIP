@@ -52,6 +52,12 @@ namespace Zigurat
     static void sign  (binarystream&, std::string, std::string, binarystream&, binarystream&);
     static bool verify(binarystream&, std::string, binarystream&, binarystream&);
 
+    // RSA key transport: encrypt to the key a certificate names, decrypt with
+    // the private half. What a handshake moves a pre master secret with. The
+    // plain text has to fit the modulus with room for PKCS #1 padding.
+    static void encrypt(binarystream&, binarystream&, binarystream&);
+    static void decrypt(binarystream&, std::string, binarystream&, binarystream&);
+
   };
 
 }

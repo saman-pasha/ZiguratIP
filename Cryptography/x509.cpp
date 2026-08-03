@@ -1,4 +1,5 @@
 #include "x509.hpp"
+#include <vector>
 #include "cte.hpp"
 #include "der.hpp"
 #include "rsa.hpp"
@@ -802,12 +803,23 @@ namespace Zigurat
     bufferstream tbs;
     DER::decode_sequence(certificate, tbs);
 
-    for (int i = 0; i < index; i++) {
+    // Every step is checked against what is left. The bytes come off the wire --
+    // a peer presents its own certificate -- so a structure that is not a
+    // certificate at all, or is truncated, has to be refused rather than walked
+    // off the end of. Handing this a public key file used to reach past the
+    // buffer and take the process down with a bus error.
+    for (int i = 0; i <= index; i++) {
+
+      if (tbs.tellg() >= tbs.length())
+	throw CertificateException("certificate ends before element "
+				   + std::to_string(index) + " of tbsCertificate");
+
       bufferstream skipped;
-      DER::decode_tlv(tbs, skipped);
+      DER::decode_tlv(tbs, (i == index) ? element : skipped);
     }
 
-    DER::decode_tlv(tbs, element);
+    if (element.length() == 0)
+      throw CertificateException("empty element " + std::to_string(index) + " of tbsCertificate");
   }
 
   void X509::certificate_public_key(binarystream& crt_stream, binarystream& puk_info)
@@ -927,6 +939,58 @@ namespace Zigurat
       return false;
     }
     return true;
+  }
+
+  void X509::encrypt(binarystream& crt_stream, binarystream& plain, binarystream& cipher)
+  {
+    bufferstream puk_info;
+    X509::certificate_public_key(crt_stream, puk_info);
+
+    bufferstream algorithm_id, bit_string, puk;
+    DER::decode_sequence(puk_info, algorithm_id);
+    DER::decode_bit_string(puk_info, bit_string);
+    DER::decode_sequence(bit_string, puk);
+
+    typename RSA::mod_t n = DER::decode_integer(puk);
+    typename RSA::mod_t e = DER::decode_integer(puk);
+
+    const size_t k = (size_t)n.length(false);
+    RSA engine(k * 8, SHA::SHA256);
+
+    const std::streamsize length = plain.length();
+    std::vector<uint8_t> message((size_t)(length > 0 ? length : 1));
+    plain.read((char*)message.data(), 0, length);
+
+    std::vector<uint8_t> encrypted(k);
+    engine.RSAES_PKCS1_V1_5_Encrypt(n, e, message.data(), (int64_t)length, encrypted.data());
+
+    cipher.write((char*)encrypted.data(), (std::streamsize)k);
+  }
+
+  void X509::decrypt(binarystream& pik_stream, std::string cipher_key,
+		     binarystream& cipher, binarystream& plain)
+  {
+    bufferstream pik_info, pik_algorithm_id, pik;
+    X509::_load_pik_info(pik_stream, cipher_key, pik_info);
+    X509::_extract_pik_info(pik_info, pik_algorithm_id, pik);
+
+    DER::decode_integer(pik);                       // version
+    typename RSA::mod_t n = DER::decode_integer(pik);
+    typename RSA::mod_t e = DER::decode_integer(pik);
+    typename RSA::mod_t d = DER::decode_integer(pik);
+
+    const size_t k = (size_t)n.length(false);
+    RSA engine(k * 8, SHA::SHA256);
+
+    std::vector<uint8_t> encrypted(k);
+    if (cipher.read((char*)encrypted.data(), 0, (std::streamsize)k).gcount() != (std::streamsize)k)
+      throw CertificateException("cipher text is not the width of the modulus");
+
+    std::vector<uint8_t> message(k);
+    const int64_t length = engine.RSAES_PKCS1_V1_5_Decrypt(n, d, encrypted.data(), message.data());
+    if (length < 0) throw CertificateException("decryption failed");
+
+    plain.write((char*)message.data(), (std::streamsize)length);
   }
 
   void X509::validate_by_puk(binarystream& puk_stream, binarystream& crt_stream)

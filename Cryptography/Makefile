@@ -2,6 +2,13 @@
 PROJECT := Cryptography
 TYPE := Library
 
+# AES rounds, the SHA cores and RSA's modular arithmetic run in the innermost loops of
+# everything, so this library is optimised even in a debug build. Unrolling
+# is what the word-at-a-time loops want; there is deliberately no
+# -ffast-math, which only relaxes floating point and this code is integer
+# throughout.
+OPTIMIZE := -O3 -funroll-loops
+
 HEADERS := sha-private.hpp \
 	sha.hpp \
 	shahelper.hpp \

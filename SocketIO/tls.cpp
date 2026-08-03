@@ -222,14 +222,15 @@ namespace Zigurat
     stream.write((char*)&uint24, 3);
   }
 
+  // The three octets are big endian, so they have to be shifted back into place.
+  // Without the shifts this ORed them together: 977 came back as 0x00|0x03|0xD1,
+  // which is 211. Anything short enough to fit its low octet -- a hello, an
+  // empty ServerHelloDone -- read correctly, and a certificate did not.
   uint32_t TLS::uint24(binarystream& stream)
   {
     uint8_t uint24[3];
     stream.read((char*)&uint24, 3);
-    uint32_t d = uint24[0];
-    d |= uint24[1];
-    d |= uint24[2];
-    return d;
+    return ((uint32_t)uint24[0] << 16) | ((uint32_t)uint24[1] << 8) | (uint32_t)uint24[2];
   }
 
   void TLS::cipher_suite(const CipherSuite& suite, SecurityParameters& params)

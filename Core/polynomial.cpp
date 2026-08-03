@@ -340,24 +340,51 @@ namespace Zigurat
     return out;
   }
 
+  // Square and multiply, right to left.
+  //
+  // This used to recurse once per bit of the exponent -- two thousand and forty
+  // eight frames deep for an RSA-2048 key, each holding several copies of a
+  // number that size -- and it halved the exponent with a full division by two
+  // at every level. Division is the most expensive thing here by a wide margin,
+  // and halving is not division.
+  //
+  // The exponent is now read a bit at a time straight out of its words, so it is
+  // never copied or shifted at all. operator>> is deliberately not used for
+  // this: it shifts by whole words, which is what BigInt::div wants of it, and
+  // using it here would step over thirty two bits at a time.
   Polynomial Polynomial::mod_pow(const Polynomial& base, const Polynomial& exponent, const Polynomial& divisor)
   {
-    if (exponent.is_zero()) return Polynomial::ONE;
+    static const size_t WORD_BITS = sizeof(Polynomial::word_t) * 8;
 
-    Polynomial remainder;
-    if (exponent == Polynomial::ONE) {
-      Polynomial::div(base, divisor, &remainder);
-      return remainder;
+    // The significant bits of the exponent, ignoring any leading zero words.
+    size_t words = exponent._length;
+    while (words > 0 && exponent._data[words - 1] == 0) words--;
+    if (words == 0) return Polynomial::ONE;
+
+    size_t bits = words * WORD_BITS;
+    while (bits > 1 && ((exponent._data[(bits - 1) / WORD_BITS] >> ((bits - 1) % WORD_BITS)) & 0x01) == 0)
+      bits--;
+
+    Polynomial result = Polynomial::ONE;
+    Polynomial factor;
+    Polynomial::div(base, divisor, &factor);        // base mod divisor, once
+
+    for (size_t i = 0; i < bits; i++) {
+
+      if ((exponent._data[i / WORD_BITS] >> (i % WORD_BITS)) & 0x01) {
+	Polynomial remainder;
+	Polynomial::div(result * factor, divisor, &remainder);
+	result = remainder;
+      }
+
+      if (i + 1 < bits) {                           // no need to square past the top bit
+	Polynomial remainder;
+	Polynomial::div(factor * factor, divisor, &remainder);
+	factor = remainder;
+      }
     }
 
-    Polynomial tmp;
-    tmp = Polynomial::mod_pow(base, Polynomial::div(exponent, Polynomial::TWO, nullptr), divisor);
-    tmp = tmp * tmp;
-    if (exponent.is_odd() & 0x01) {
-      tmp = tmp * base;
-    }
-    Polynomial::div(tmp, divisor, &remainder); 
-    return remainder;
+    return result;
   }
 
   bool Polynomial::operator==(const Polynomial& other) const
