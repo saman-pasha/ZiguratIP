@@ -27,7 +27,8 @@ namespace Zigurat
   const TLS::CipherSuite TLS::TLS_RSA_WITH_AES_128_CBC_SHA    = {0x00,0x2F};
   const TLS::CipherSuite TLS::TLS_RSA_WITH_AES_256_CBC_SHA    = {0x00,0x35};
   const TLS::CipherSuite TLS::TLS_RSA_WITH_AES_128_CBC_SHA256 = {0x00,0x3C};
-  const TLS::CipherSuite TLS::TLS_RSA_WITH_AES_256_CBC_SHA256 = {0x00,0x3D};      
+  const TLS::CipherSuite TLS::TLS_RSA_WITH_AES_256_CBC_SHA256 = {0x00,0x3D};
+  const TLS::CipherSuite TLS::TLS_EMPTY_RENEGOTIATION_INFO_SCSV = {0x00,0xFF};      
 
   const TLS::SignatureAndHashAlgorithm TLS::SIG_RSA_SHA1   = {HashAlgorithm::SHA1,   SignatureAlgorithm::RSA};
   const TLS::SignatureAndHashAlgorithm TLS::SIG_RSA_SHA224 = {HashAlgorithm::SHA224, SignatureAlgorithm::RSA};

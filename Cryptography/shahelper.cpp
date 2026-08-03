@@ -62,7 +62,7 @@ namespace Zigurat
     return Utility::octet_as_hex(digest_buffer, digest_length);
   }
 
-  void SHA::hmac(Version version, const uint8_t* text, size_t text_len, const uint8_t* key, size_t key_len, uint8_t* digest)
+  void SHA::hmac(Version version, const uint8_t* key, size_t key_len, const uint8_t* text, size_t text_len, uint8_t* digest)
   {
     switch (version) {
     case SHA::Version::SHA1:   ::hmac(SHAversion::SHA1  , text, text_len, key, key_len, digest); break;
@@ -74,18 +74,18 @@ namespace Zigurat
     }
   }
 
-  void SHA::hmac(Version version, std::istream& text, size_t text_length, std::istream& key, size_t key_length, std::ostream& digest)
+  void SHA::hmac(Version version, std::istream& key, size_t key_length, std::istream& text, size_t text_length, std::ostream& digest)
   {
-    uint8_t text_buffer[text_length];
-    text.read((char*)text_buffer, text_length);
-
     uint8_t key_buffer[key_length];
     key.read((char*)key_buffer, key_length);
 
+    uint8_t text_buffer[text_length];
+    text.read((char*)text_buffer, text_length);
+
     size_t  digest_length = SHA::size(version);
     uint8_t digest_buffer[digest_length];
-  
-    SHA::hmac(version, text_buffer, text_length, key_buffer, key_length, digest_buffer);
+
+    SHA::hmac(version, key_buffer, key_length, text_buffer, text_length, digest_buffer);
 
     digest.write((char*)digest_buffer, digest_length);
   }

@@ -186,12 +186,25 @@ can pass `TLS::HandshakeParameters` to the secure overload instead.
 
 ## What this is not
 
-**This is ZiguratIP's own secure channel, not TLS.** It is shaped like TLS 1.2
-and uses the same record layer, handshake sequence and key derivation, but it is
-not interoperable: `openssl s_client` cannot speak to it, and neither can a
-browser. Turning on `HTTP/TLS_MODE` secures Zeytun for ZiguratIP clients and
-makes it unreachable from an ordinary browser. If you need a browser to reach
-Zeytun over HTTPS, put a reverse proxy in front of it and leave `TLS_MODE` off.
+**It is TLS 1.2, but only with RSA key exchange.** The handshake is verified
+against OpenSSL: `openssl s_client -tls1_2 -cipher AES256-SHA256` completes a
+mutually authenticated connection and reports `Verify return code: 0 (ok)`. What
+is missing is everything modern: no elliptic curve key exchange, no AEAD suites,
+no session resumption, no renegotiation. Browsers dropped static RSA key
+exchange years ago, so turning on `HTTP/TLS_MODE` secures Zeytun for
+OpenSSL-based clients and makes it unreachable from an ordinary browser. If you
+need a browser to reach Zeytun over HTTPS, put a reverse proxy in front of it
+and leave `TLS_MODE` off.
+
+To connect with OpenSSL, note that its default security level rejects these
+suites; `@SECLEVEL=0` is needed to try them:
+
+```bash
+openssl s_client -connect localhost:2160 -tls1_2 -cipher 'AES256-SHA256@SECLEVEL=0' -cert client.pem -key client-key.pem -CAfile authority.pem
+```
+
+Its `-cert` and `-key` want PEM, which `openssl x509` and `openssl pkey` convert
+the `ca` tool's DER output into.
 
 **It has had no adversarial review.** The cryptography underneath is ZiguratIP's
 own — its RSA, AES, SHA and PRF, not a vetted library. Timing behaviour has not

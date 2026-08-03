@@ -214,8 +214,13 @@ namespace Zigurat
     
     enum class ExtensionType : uint16_t
     {
-      SIGNATURE_ALGORITHMS = 13
+      SIGNATURE_ALGORITHMS = 13,
+      RENEGOTIATION_INFO   = 0xFF01      // RFC 5746
     };
+
+    // RFC 5746 signals a peer that understands secure renegotiation, either as
+    // the extension above or as this pseudo cipher suite in the offer.
+    static const CipherSuite TLS_EMPTY_RENEGOTIATION_INFO_SCSV;
 
     struct Extension
     {

@@ -109,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 238 cases
+Starts a server, runs the full suite against it, stops it again. 239 cases
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -399,15 +399,20 @@ same convention. Vendored zlib is C and keeps its own `.h` names.
 The server runs, serves both protocols, compiles and executes Parsi, and the
 suite passes. Some things are known to be incomplete:
 
-- **TLS is ZiguratIP's own, not an interoperable one.** Both servers can require
-  every client to hold a certificate the configured authority issued, and the
-  connector can present one -- see [doc/security.md](doc/security.md). The wire
-  format is shaped like TLS 1.2 but is not compatible with it, so `openssl
-  s_client` and browsers cannot speak it; putting Zeytun behind `TLS_MODE: TRUE`
-  makes it unreachable from a browser. The cryptography underneath is
-  ZiguratIP's own and has had no adversarial review, and the MAC comparison is
-  not constant time. Treat it as a closed-network measure, not as transport
-  security against a capable attacker.
+- **TLS is TLS 1.2, verified against OpenSSL, but only with RSA key exchange.**
+  Both servers can require every client to hold a certificate the configured
+  authority issued, and the connector can present one — see
+  [doc/security.md](doc/security.md). `openssl s_client` completes a mutually
+  authenticated handshake against it and agrees the chain: `Cipher is
+  AES256-SHA256`, `Verify return code: 0 (ok)`. What is missing is everything
+  modern — no elliptic curve key exchange, no AEAD suites, no session
+  resumption, no renegotiation — and browsers dropped static RSA key exchange
+  years ago, so `HTTP/TLS_MODE: TRUE` is reachable from OpenSSL-based clients
+  but not from a browser; put a reverse proxy in front if you need one. The
+  cryptography underneath is ZiguratIP's own and has had no adversarial review,
+  and the MAC comparison is not constant time. A closed-network measure, not
+  transport security against a capable attacker.
+
 - **The CA issues X.509 v1 only.** Certificates and requests are
   OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
   `openssl req -verify` accepts its signing requests — but there is no extension
@@ -433,23 +438,6 @@ suite passes. Some things are known to be incomplete:
   on `Connector::auto_commit(true)`; both are verified to persist.
 - **`ZLib::compress` only implements DEFLATE**; the `ZLIB` and `GZIP` wrappers
   throw.
-- **`nbostream` and `hbostream` are identical** — the "network byte order"
-  stream does not byte swap, so every multi-octet field written to a `tcpstream`
-  or a `tlsstream` goes out in host order. Both ends of every ZiguratIP
-  connection have the same defect and therefore agree, which is why nothing has
-  noticed. It is also what stops the TLS handshake from being readable by
-  another implementation: `openssl s_client` reads the two octet cipher suite
-  list length `00 02` as 512. Fixing it changes the wire format of the Zigurat
-  binary protocol; nothing on disk is affected, because the page store and every
-  buffer use `hbostream` deliberately.
-
-The CA material under `home/etc/cert` is a sample, named `dont-use-*` for the
-obvious reason: its private key is in this repository and is therefore public.
-Generate your own with `ca keygen` for anything real — see
-[home/etc/cert/README.md](home/etc/cert/README.md).
-
----
-
 ## Licence
 
 [GNU General Public License v3](LICENSE). You may use, study, share and modify

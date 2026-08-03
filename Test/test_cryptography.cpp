@@ -102,23 +102,60 @@ ZTEST(Cryptography, stream_digest_matches_the_buffer_digest)
 
 // RFC 4231 test case 1 (and the RFC 2202 SHA-1 equivalent). Note the argument
 // order is (text, key), following the IETF reference implementation.
+// RFC 4231, and RFC 2202 for SHA-1. The argument order is the point as much as
+// the arithmetic: HMAC(key, message) is not HMAC(message, key), and every TLS
+// caller was passing them the other way round because the signature invited it.
 ZTEST(Cryptography, hmac_known_answers)
 {
-  uint8_t key[20];
-  std::memset(key, 0x0b, sizeof(key));
-  const std::string data = "Hi There";
+  // Case 1: a 20 octet key of 0x0b over "Hi There".
+  {
+    uint8_t key[20];
+    std::memset(key, 0x0b, sizeof(key));
+    const std::string data = "Hi There";
 
-  uint8_t mac256[32];
-  std::memset(mac256, 0, sizeof(mac256));
-  SHA::hmac(SHA::SHA256, (const uint8_t*)data.c_str(), data.size(), key, sizeof(key), mac256);
-  ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac256, 32)),
-	     "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    uint8_t mac256[32];
+    SHA::hmac(SHA::SHA256, key, sizeof(key), (const uint8_t*)data.c_str(), data.size(), mac256);
+    ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac256, 32)),
+	       "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
 
-  uint8_t mac1[20];
-  std::memset(mac1, 0, sizeof(mac1));
-  SHA::hmac(SHA::SHA1, (const uint8_t*)data.c_str(), data.size(), key, sizeof(key), mac1);
-  ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac1, 20)),
-	     "b617318655057264e28bc0b6fb378c8ef146be00");
+    uint8_t mac1[20];
+    SHA::hmac(SHA::SHA1, key, sizeof(key), (const uint8_t*)data.c_str(), data.size(), mac1);
+    ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac1, 20)),
+	       "b617318655057264e28bc0b6fb378c8ef146be00");
+  }
+
+  // Case 2: a key shorter than the block, and a longer message.
+  {
+    const std::string key = "Jefe";
+    const std::string data = "what do ya want for nothing?";
+    uint8_t mac[32];
+    SHA::hmac(SHA::SHA256, (const uint8_t*)key.c_str(), key.size(),
+	      (const uint8_t*)data.c_str(), data.size(), mac);
+    ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac, 32)),
+	       "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+  }
+
+  // Case 3: 50 octets of 0xdd under a 20 octet key of 0xaa.
+  {
+    uint8_t key[20], data[50];
+    std::memset(key, 0xaa, sizeof(key));
+    std::memset(data, 0xdd, sizeof(data));
+    uint8_t mac[32];
+    SHA::hmac(SHA::SHA256, key, sizeof(key), data, sizeof(data), mac);
+    ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac, 32)),
+	       "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+  }
+
+  // Case 6: a key longer than the 64 octet block, which has to be hashed first.
+  {
+    uint8_t key[131];
+    std::memset(key, 0xaa, sizeof(key));
+    const std::string data = "Test Using Larger Than Block-Size Key - Hash Key First";
+    uint8_t mac[32];
+    SHA::hmac(SHA::SHA256, key, sizeof(key), (const uint8_t*)data.c_str(), data.size(), mac);
+    ZCHECK_STR(Utility::to_lower(Utility::octet_as_hex(mac, 32)),
+	       "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+  }
 }
 
 ZTEST(Cryptography, unknown_digest_version_is_rejected)

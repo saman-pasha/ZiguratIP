@@ -4,7 +4,7 @@
 
 #include "tcpstream.hpp"
 #include "tls.hpp"
-#include "bufferstream.hpp"
+#include "networkstream.hpp"
 
 namespace Zigurat
 {
@@ -48,7 +48,7 @@ namespace Zigurat
     // as it appeared, header included. Finished proves both ends saw the same
     // conversation, and CertificateVerify signs it, so it has to be the bytes
     // rather than a re-encoding of them.
-    bufferstream _transcript;
+    networkstream _transcript;
 
     void _transcribe(binarystream&);
     void _transcript_hash(uint8_t*);

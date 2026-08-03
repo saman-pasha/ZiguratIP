@@ -1,7 +1,7 @@
 #include "tlsbuf.hpp"
 #include <cstring>
 #include "utility.hpp"
-#include "bufferstream.hpp"
+#include "networkstream.hpp"
 #include "arraystream.hpp"
 #include "tlsexception.hpp"
 #include "zlibhelper.hpp"
@@ -75,7 +75,7 @@ namespace Zigurat
   void tlsbuf::_transcript_hash(uint8_t* digest)
   {
     const std::streamsize length = this->_transcript.length();
-    bufferstream copy;
+    networkstream copy;
     this->_transcript.read(copy, 0, length);
 
     uint8_t* bytes = new uint8_t[(size_t)(length > 0 ? length : 1)];
@@ -95,7 +95,7 @@ namespace Zigurat
     this->_tcpstream.write_std_ubyte(record.version.major);
     this->_tcpstream.write_std_ubyte(record.version.minor);
 
-    bufferstream compressed;
+    networkstream compressed;
     switch (params.compression_algorithm) {
     case TLS::CompressionMethod::NONE:
       record.fragment.read(compressed, record.length);
@@ -132,7 +132,7 @@ namespace Zigurat
 	// whole number of blocks, then chained under a fresh IV that goes out in
 	// front of it in the clear. The IV is not enciphered and is not part of
 	// what the MAC covers.
-	bufferstream plain;
+	networkstream plain;
 
 	compressed.read(plain, compressed_length);
 
@@ -206,7 +206,7 @@ namespace Zigurat
       record.version = {this->_tcpstream.read_std_ubyte(), this->_tcpstream.read_std_ubyte()};
 
       uint16_t compressed_length;
-      bufferstream compressed;
+      networkstream compressed;
       if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::NONE) {
 
 	// read_exact, not read: a record is whatever length its header says, and
@@ -248,10 +248,10 @@ namespace Zigurat
 	  this->_tcpstream.read_exact((char*)iv, params.record_iv_length);
 
 	  const uint16_t cipher_text_length = record_length - params.record_iv_length;
-	  bufferstream cipher_text;
+	  networkstream cipher_text;
 	  this->_tcpstream.read_exact(cipher_text, cipher_text_length);
 
-	  bufferstream input;
+	  networkstream input;
 	  if (params.enc_key_length == 16) {
 
 	    AES128::key_t write_key;
@@ -368,7 +368,7 @@ namespace Zigurat
 
   void tlsbuf::_alert(TLS::AlertLevel level, TLS::AlertDescription description)
   {
-    bufferstream plain_text;
+    networkstream plain_text;
     plain_text.write_std_ubyte((uint8_t)level);
     plain_text.write_std_ubyte((uint8_t)description);
     
@@ -385,7 +385,7 @@ namespace Zigurat
   // handshake.length alone left the last four octets of every message unsent.
   void tlsbuf::_send_handshake(TLS::Handshake& handshake)
   {
-    bufferstream plain_text;
+    networkstream plain_text;
     plain_text.write_std_ubyte((uint8_t)handshake.msg_type);
     TLS::uint24(handshake.length, plain_text);
     handshake.body.read(plain_text, 0, handshake.length);
@@ -404,7 +404,7 @@ namespace Zigurat
 
   void tlsbuf::_recv_handshake(TLS::Handshake& handshake)
   {
-    bufferstream plain_text;
+    networkstream plain_text;
     TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, plain_text};
     this->_recv_record(record);
 
@@ -433,7 +433,7 @@ namespace Zigurat
 
     // The transcript is the messages as they appeared on the wire, header and
     // all, because that is what Finished and CertificateVerify sign over.
-    bufferstream transcribed;
+    networkstream transcribed;
     transcribed.write_std_ubyte((uint8_t)handshake.msg_type);
     TLS::uint24(handshake.length, transcribed);
     handshake.body.read(transcribed, 0, handshake.length);
@@ -462,7 +462,7 @@ namespace Zigurat
   // owner's authority signed this certificate or the peer has no business here.
   void tlsbuf::_check_peer_certificate(binarystream& certificate)
   {
-    bufferstream authority, puk_info, authority_key;
+    networkstream authority, puk_info, authority_key;
     this->_credential(this->_handshake_params.credentials.authority, authority);
 
     try {
@@ -472,7 +472,7 @@ namespace Zigurat
       throw TLSException(std::string("cannot read the certificate authority: ") + error.what());
     }
 
-    bufferstream to_validate;
+    networkstream to_validate;
     certificate.read(to_validate, 0, certificate.length());
 
     try {
@@ -483,14 +483,14 @@ namespace Zigurat
       this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNKNOWN_CA);
     }
 
-    bufferstream for_subject;
+    networkstream for_subject;
     certificate.read(for_subject, 0, certificate.length());
     this->_peer_subject = X509::certificate_subject(for_subject);
   }
 
   void tlsbuf::_send_certificate()
   {
-    bufferstream certificate, body;
+    networkstream certificate, body;
     this->_credential(this->_handshake_params.credentials.certificate, certificate);
 
     // certificate_list: one entry, since the peer already holds the authority.
@@ -505,7 +505,7 @@ namespace Zigurat
 
   void tlsbuf::_recv_certificate(binarystream& certificate)
   {
-    bufferstream body;
+    networkstream body;
     TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
     this->_recv_handshake(message);
 
@@ -522,7 +522,7 @@ namespace Zigurat
 
   void tlsbuf::_send_change_cipher_spec()
   {
-    bufferstream body;
+    networkstream body;
     body.write_std_ubyte((uint8_t)TLS::CipherSpecType::CHANGE_CIPHER_SPEC);
 
     TLS::Record record {TLS::ContentType::CHANGE_CIPHER_SPEC, this->_protocol_version, 1, body};
@@ -536,7 +536,7 @@ namespace Zigurat
 
   void tlsbuf::_recv_change_cipher_spec()
   {
-    bufferstream body;
+    networkstream body;
     TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, body};
     this->_recv_record(record);
 
@@ -597,7 +597,7 @@ namespace Zigurat
     uint8_t digest[SHA::size(SHA::SHA256)];
     this->_transcript_hash(digest);          // before this message joins it
 
-    bufferstream body;
+    networkstream body;
     uint8_t verify_data[12];
     TLS::PRF(this->_pending_state.prf_algorithm,
 	     this->_pending_state.master_secret, TLS::MASTER_SECRET_LENGTH,
@@ -616,7 +616,7 @@ namespace Zigurat
     uint8_t digest[SHA::size(SHA::SHA256)];
     this->_transcript_hash(digest);          // before the incoming message joins it
 
-    bufferstream body;
+    networkstream body;
     TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
     this->_recv_handshake(message);
 
@@ -641,7 +641,7 @@ namespace Zigurat
 
   void tlsbuf::_server_hello()
   {
-    bufferstream client_body, server_body;
+    networkstream client_body, server_body;
     TLS::Handshake client_hello {(TLS::HandshakeType)0, 0, client_body};
     this->_recv_handshake(client_hello);
     if (client_hello.msg_type != TLS::HandshakeType::CLIENT_HELLO)
@@ -680,6 +680,14 @@ namespace Zigurat
       TLS::CipherSuite suite {client_body.read_std_ubyte(), client_body.read_std_ubyte()};
       offered_suites.push_back(suite);
     }
+
+    // RFC 5746: a peer may signal secure renegotiation as a pseudo suite in the
+    // offer rather than as an extension.
+    bool peer_signalled_renegotiation = false;
+    for (TLS::CipherSuite& suite : offered_suites)
+      if (suite.revision == TLS::TLS_EMPTY_RENEGOTIATION_INFO_SCSV.revision
+	  && suite.suite_id == TLS::TLS_EMPTY_RENEGOTIATION_INFO_SCSV.suite_id)
+	peer_signalled_renegotiation = true;
 
     const uint8_t compressions_count = client_body.read_std_ubyte();
     std::vector<TLS::CompressionMethod> offered_compressions;
@@ -753,6 +761,9 @@ namespace Zigurat
 	  peer_named_algorithms = true;
 	  peer_signs_with_sha256 =
 	    TLS::accepts_signature_algorithm(client_body, data_length, TLS::SIG_RSA_SHA256);
+	} else if ((TLS::ExtensionType)extension_type == TLS::ExtensionType::RENEGOTIATION_INFO) {
+	  peer_signalled_renegotiation = true;
+	  client_body.ignore(data_length);
 	} else {
 	  client_body.ignore(data_length);
 	}
@@ -767,6 +778,21 @@ namespace Zigurat
     // would turn a stricter check into a worse error message further on.
     if (peer_named_algorithms && !peer_signs_with_sha256)
       this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
+
+    // RFC 5746 5: a peer that asked about secure renegotiation has to be
+    // answered, and for a first handshake the answer is an empty
+    // renegotiated_connection. A peer that did not ask gets no extensions block
+    // at all, which is what this end's own client expects. Renegotiation itself
+    // is not offered -- this only states, truthfully, that nothing was renegotiated.
+    if (peer_signalled_renegotiation) {
+      networkstream extensions;
+      extensions.write_std_ushort((uint16_t)TLS::ExtensionType::RENEGOTIATION_INFO);
+      extensions.write_std_ushort(1);                 // extension_data length
+      extensions.write_std_ubyte(0);                  // renegotiated_connection: empty
+
+      server_body.write_std_ushort((uint16_t)extensions.length());
+      extensions.read(server_body, 0, extensions.length());
+    }
 
     TLS::Handshake server_hello {TLS::HandshakeType::SERVER_HELLO, server_body.tellp(), server_body};
     this->_send_handshake(server_hello);
@@ -797,7 +823,7 @@ namespace Zigurat
     {
       // CertificateRequest. One type, RSA signing, and no acceptable authority
       // named -- there is only ever one, and the peer already has it.
-      bufferstream body;
+      networkstream body;
       body.write_std_ubyte(1);                        // certificate_types
       body.write_std_ubyte((uint8_t)TLS::ClientCertificateType::RSA_SIGN);
 
@@ -814,29 +840,29 @@ namespace Zigurat
     }
 
     {
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {TLS::HandshakeType::SERVER_HELLO_DONE, 0, body};
       this->_send_handshake(message);
     }
 
-    bufferstream peer_certificate;
+    networkstream peer_certificate;
     this->_recv_certificate(peer_certificate);
     this->_check_peer_certificate(peer_certificate);
 
     // ClientKeyExchange: the pre master secret, encrypted to this server's key.
-    bufferstream pre_master_secret;
+    networkstream pre_master_secret;
     {
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::CLIENT_KEY_EXCHANGE)
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
 
       const uint16_t length = body.read_std_ushort();
-      bufferstream encrypted;
+      networkstream encrypted;
       body.read(encrypted, length);
 
-      bufferstream key;
+      networkstream key;
       this->_credential(this->_handshake_params.credentials.private_key, key);
       try {
 	X509::decrypt(key, this->_handshake_params.credentials.private_key_cipher,
@@ -852,10 +878,10 @@ namespace Zigurat
     {
       // Captured before the message joins the transcript, because what it signs
       // is everything that came before it.
-      bufferstream signed_messages;
+      networkstream signed_messages;
       this->_transcript_bytes(signed_messages);
 
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::CERTIFICATE_VERIFY)
@@ -869,7 +895,7 @@ namespace Zigurat
 
       const uint16_t length = body.read_std_ushort();
 
-      bufferstream signature, certificate;
+      networkstream signature, certificate;
       body.read(signature, length);
       peer_certificate.read(certificate, 0, peer_certificate.length());
 
@@ -888,7 +914,7 @@ namespace Zigurat
 
   void tlsbuf::_client_hello()
   {
-    bufferstream client_body;
+    networkstream client_body;
 
     this->_pending_state.entity = this->_write_state.entity;
 
@@ -917,7 +943,7 @@ namespace Zigurat
     // key type, which is not what this end signs CertificateVerify with. It goes
     // out unconditionally.
     {
-      bufferstream extension, extensions;
+      networkstream extension, extensions;
 
       std::vector<TLS::SignatureAndHashAlgorithm> algorithms;
       algorithms.push_back(TLS::SIG_RSA_SHA256);
@@ -944,7 +970,7 @@ namespace Zigurat
 
     // ServerHello, and the state it settled on.
     {
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::SERVER_HELLO)
@@ -964,13 +990,13 @@ namespace Zigurat
       this->_pending_state.compression_algorithm = (TLS::CompressionMethod)body.read_std_ubyte();
     }
 
-    bufferstream peer_certificate;
+    networkstream peer_certificate;
     this->_recv_certificate(peer_certificate);
     this->_check_peer_certificate(peer_certificate);
 
     // CertificateRequest, then ServerHelloDone.
     {
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::CERTIFICATE_REQUEST)
@@ -991,7 +1017,7 @@ namespace Zigurat
 	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
     }
     {
-      bufferstream body;
+      networkstream body;
       TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
       this->_recv_handshake(message);
       if (message.msg_type != TLS::HandshakeType::SERVER_HELLO_DONE)
@@ -1002,7 +1028,7 @@ namespace Zigurat
 
     // The pre master secret: the version this end offered, then 46 random
     // octets, encrypted to the key the server's certificate names.
-    bufferstream pre_master_secret;
+    networkstream pre_master_secret;
     {
       pre_master_secret.write_std_ubyte(this->_handshake_params.protocol_version.major);
       pre_master_secret.write_std_ubyte(this->_handshake_params.protocol_version.minor);
@@ -1010,12 +1036,12 @@ namespace Zigurat
       TLS::IV(random, sizeof(random));
       pre_master_secret.write((char*)random, (std::streamsize)sizeof(random));
 
-      bufferstream to_encrypt, encrypted, certificate;
+      networkstream to_encrypt, encrypted, certificate;
       pre_master_secret.read(to_encrypt, 0, pre_master_secret.length());
       peer_certificate.read(certificate, 0, peer_certificate.length());
       X509::encrypt(certificate, to_encrypt, encrypted);
 
-      bufferstream body;
+      networkstream body;
       body.write_std_ushort((uint16_t)encrypted.length());
       encrypted.read(body, 0, encrypted.length());
 
@@ -1029,13 +1055,13 @@ namespace Zigurat
       // The handshake messages themselves. Signing their digest instead put a
       // second SHA-256 inside the signature, which both ends agreed on and no
       // other implementation would.
-      bufferstream key, to_sign, signature;
+      networkstream key, to_sign, signature;
       this->_credential(this->_handshake_params.credentials.private_key, key);
       this->_transcript_bytes(to_sign);
       X509::sign(key, this->_handshake_params.credentials.private_key_cipher,
 		 "SHA-256", to_sign, signature);
 
-      bufferstream body;
+      networkstream body;
       body.write_std_ubyte((uint8_t)TLS::HashAlgorithm::SHA256);
       body.write_std_ubyte((uint8_t)TLS::SignatureAlgorithm::RSA);
       body.write_std_ushort((uint16_t)signature.length());
@@ -1201,7 +1227,7 @@ namespace Zigurat
   {
     if (this->_write_state.entity == TLS::ConnectionEnd::CLIENT) throw TLSException("only server could start renegotiation process");
 
-    bufferstream plain_text;
+    networkstream plain_text;
     plain_text.write_std_ubyte((uint8_t)TLS::HandshakeType::HELLO_REQUEST);
     plain_text.fill_n(3, 0x00);
     
