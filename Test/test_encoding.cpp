@@ -5,6 +5,8 @@
 #include "base64.hpp"
 #include "base64url.hpp"
 #include "cte.hpp"
+#include "der.hpp"
+#include "bigint.hpp"
 #include "bufferstream.hpp"
 #include "utility.hpp"
 #include <cstring>
@@ -109,4 +111,67 @@ ZTEST(Encoding, binary_data_survives_base64)
 
   const std::string encoded = Base64::encode(binary);
   ZCHECK_STR(Base64::decode(encoded), binary);
+}
+
+
+// ---------------------------------------------------------------------------
+// DER, as other implementations read it
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The encoded INTEGER as hex, so a wrong length or a stray pad byte shows up
+  // in the failure message rather than as a silent mismatch.
+  std::string der_integer(const BigInt& value)
+  {
+    bufferstream out;
+    DER::encode_integer(out, value);
+    std::string hex;
+    for (std::streamsize i = 0; i < out.length(); i++) {
+      static const char* digits = "0123456789ABCDEF";
+      const uint8_t byte = (uint8_t)out.at(i);
+      hex += digits[byte >> 4];
+      hex += digits[byte & 0x0F];
+    }
+    return hex;
+  }
+}
+
+// X.690 8.3.2: the shortest form, with a leading 00 only where the next octet
+// would otherwise read as negative. BigInt works in 32 bit words and used to
+// hand the padding straight through -- 1001 went out as 00 00 03 E9, and
+// OpenSSL called it a BAD INTEGER and refused the whole certificate.
+ZTEST(Encoding, der_integers_are_minimally_encoded)
+{
+  ZCHECK_STR(der_integer(BigInt(1)), "020101");
+  ZCHECK_STR(der_integer(BigInt(127)), "02017F");
+  ZCHECK_STR(der_integer(BigInt(1001)), "020203E9");
+  ZCHECK_STR(der_integer(BigInt(65537)), "0203010001");        // the usual RSA exponent
+
+  // 128 needs the sign octet: 80 alone would read as negative.
+  ZCHECK_STR(der_integer(BigInt(128)), "02020080");
+  ZCHECK_STR(der_integer(BigInt(255)), "020200FF");
+  ZCHECK_STR(der_integer(BigInt(256)), "02020100");
+}
+
+// The other half of the same fix: a minimal integer is rarely a whole number of
+// words, and the octet constructor used to read four bytes at a time from the
+// front of the array. Anything not filling the last word was dropped.
+ZTEST(Encoding, bigints_survive_octet_lengths_that_are_not_whole_words)
+{
+  const uint64_t values[] = {1, 127, 128, 255, 256, 1001, 65537, 16777216, 4294967296ULL};
+
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    bufferstream encoded;
+    DER::encode_integer(encoded, BigInt(values[i]));
+
+    DER::Integer decoded = DER::decode_integer(encoded);
+    ZCHECK_EQ((uint64_t)decoded, values[i]);
+
+    // And through BigInt, which is the path an RSA modulus takes.
+    const BigInt round_trip = decoded.operator BigInt();
+    bufferstream again;
+    DER::encode_integer(again, round_trip);
+    ZCHECK_EQ(again.length(), encoded.length());
+  }
 }

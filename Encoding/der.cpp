@@ -476,16 +476,25 @@ namespace Zigurat
 
   void DER::encode_integer(binarystream& stream, binarystream& integer)
   {
-    // NOTE: BigInt hands over whole machine words, so this emits a word padded
-    // INTEGER (12345 becomes 00 00 30 39) rather than the minimal encoding
-    // X.690 8.3.2 requires. DER::decode_integer expects the same padding, so
-    // the pair round trips; it is only the on-the-wire form that other X.509
-    // implementations reject. Trimming here alone breaks RSA key decoding --
-    // the decoder has to learn arbitrary lengths at the same time.
+    // BigInt hands over whole machine words, so what arrives here is padded to a
+    // word boundary: 12345 as 00 00 30 39, and an RSA modulus with four leading
+    // zeros. X.690 8.3.2 wants the shortest form -- no leading 00 unless the
+    // next octet would otherwise read as negative -- and OpenSSL rejects a
+    // certificate outright over it. Trim on the way out.
+    const size_t length = integer.length();
+    bufferstream octets;
+    integer.read(octets, 0, length);
+
+    size_t begin = 0;
+    while (begin + 1 < length
+	   && octets.at(begin) == 0x00
+	   && (octets.at(begin + 1) & 0x80) == 0x00) {
+      begin++;
+    }
+
     stream.put((uint8_t)DER::INTEGER);
-    size_t length = integer.length();
-    DER::encode_length(stream, length);
-    integer.read(stream, 0, length);
+    DER::encode_length(stream, length - begin);
+    octets.read(stream, begin, length - begin);
   }
 
   void DER::encode_integer(binarystream& stream, const BigInt& number)

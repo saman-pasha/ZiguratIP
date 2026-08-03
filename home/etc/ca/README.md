@@ -5,8 +5,16 @@ the `ca` examples run against a working default without anyone having to
 generate a key first.
 
 - `dont-use-private.key` — an unencrypted RSA private key
-- `dont-use-public.key` — its public half
-- `dont-use-certificate.crt` — an empty placeholder
+- `dont-use-public.key` — its public half, a DER `SubjectPublicKeyInfo`
+- `dont-use-certificate.crt` — a self-signed certificate for the key, DER
+
+All three read cleanly in OpenSSL, so a certificate issued against these
+defaults can be checked with something other than `ca`:
+
+```bash
+openssl x509 -in dont-use-certificate.crt -inform DER -out ca.pem
+openssl verify -CAfile ca.pem your-certificate.pem
+```
 
 The private key is public: it is in this repository, and in every clone and
 every fork of it. Anything signed with it can be forged by anyone. It is not a

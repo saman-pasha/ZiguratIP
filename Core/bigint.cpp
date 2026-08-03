@@ -52,19 +52,31 @@ namespace Zigurat
     this->_sign = false;
   }
 
+  // Big-endian octets of any length. The words are filled from the least
+  // significant end, so a 3 or 257 octet integer is as good as a 4 octet one:
+  // this used to read whole words from the front, which walked off the end of a
+  // short array and silently dropped whatever did not fill the last word. DER
+  // integers are minimally encoded and rarely a multiple of the word size, so
+  // nothing decoded from one could be trusted until this did.
   BigInt::BigInt(const uint8_t* octet, size_t length, bool sign)
-    : _a(length / sizeof(word_t))
+    : _a((int)((length + sizeof(word_t) - 1) / sizeof(word_t)))
   {
-    word_t w = 0;
-    for (size_t i = 0; i < length; i += sizeof(word_t)) {
-      for (size_t j = 0; j < sizeof(word_t); j++) {
+    const size_t words = (length + sizeof(word_t) - 1) / sizeof(word_t);
+
+    for (size_t i = 0; i < words; i++) {
+      const size_t end = length - (i * sizeof(word_t));
+      const size_t begin = (end > sizeof(word_t)) ? end - sizeof(word_t) : 0;
+
+      word_t w = 0;
+      for (size_t j = begin; j < end; j++) {
 	w <<= 8;
-	w |= octet[i + j];
+	w |= octet[j];
       }
-      this->_a[ ((length - i) / sizeof(word_t)) - 1 ] = w;
+      this->_a[i] = w;
     }
-    if (sign && (this->_a[(length / sizeof(word_t)) - 1] & NEG_VAL)) {
-      this->_a[(length / sizeof(word_t)) - 1] &= POS_VAL;
+
+    if (words > 0 && sign && (this->_a[words - 1] & NEG_VAL)) {
+      this->_a[words - 1] &= POS_VAL;
       this->_sign = true;
     } else {
       this->_sign = false;

@@ -398,10 +398,18 @@ suite passes. Some things are known to be incomplete:
 
 - **TLS** is drafted but not finished; `tlsclient.cpp` and `tlsserver.cpp` are
   empty. Both servers are plaintext.
-- **X.509 output is not interoperable.** The CA round-trips with itself, but
-  `BigInt` emits word-padded DER integers where the spec wants minimal-length
-  encoding, and certificates omit the `[0] EXPLICIT Version` field, so OpenSSL
-  rejects them.
+- **The CA issues X.509 v1 only.** Certificates and requests are
+  OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
+  `openssl req -verify` accepts its signing requests — but there is no extension
+  encoding yet, so no `basicConstraints`, `keyUsage` or subject alternative
+  name. RFC 5280 has a certificate without extensions be v1, which is what these
+  are, and the `[0] EXPLICIT Version` field belongs to v3 and is correctly
+  absent. A v1 certificate is fine as an explicitly trusted anchor and is
+  refused by anything that wants a real chain.
+- **`keygen` does not force the modulus width.** `RSA-2048` produces a modulus
+  of 2047 or 2048 bits depending on the primes it lands on, because the top bits
+  of *p* and *q* are not fixed. Interoperable either way, just not the width that
+  was asked for.
 - **The system catalogue objects do not build.** `System` holds the
   built-in objects written in Parsi itself — `Session`, `Connector`, the RPC
   console and the memory viewer among them — but 9 of the 12 are written

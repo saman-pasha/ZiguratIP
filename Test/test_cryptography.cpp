@@ -1,5 +1,6 @@
 #include "ztest.hpp"
 #include "shahelper.hpp"
+#include "rsa.hpp"
 #include "utility.hpp"
 #include "bufferstream.hpp"
 #include <cstring>
@@ -118,4 +119,61 @@ ZTEST(Cryptography, hmac_known_answers)
 ZTEST(Cryptography, unknown_digest_version_is_rejected)
 {
   ZCHECK_THROWS(SHA::size((SHA::Version)999));
+}
+
+
+// ---------------------------------------------------------------------------
+// PKCS #1 v1.5 signature encoding
+// ---------------------------------------------------------------------------
+
+// RFC 8017 9.2 spells the DigestInfo prefixes out byte for byte, and they carry
+// the OID of the HASH. These used to hold 1.2.840.113549.1.1.x -- the
+// sha256WithRSAEncryption family, which belongs in a certificate's
+// signatureAlgorithm field. Both OIDs are nine octets, so the block was the
+// right shape and verified against itself; every other implementation read the
+// DigestInfo, failed to recognise it, and rejected the signature.
+ZTEST(Cryptography, pkcs1_v1_5_digest_info_carries_the_hash_oid)
+{
+  struct Case
+  {
+    SHA::Version version;
+    size_t       prefix_length;
+    const char*  prefix;      // hex, from RFC 8017 9.2
+  };
+
+  static const Case cases[] = {
+    {SHA::SHA1,   15, "3021300906052B0E03021A05000414"},
+    {SHA::SHA224, 19, "302D300D06096086480165030402040500041C"},
+    {SHA::SHA256, 19, "3031300D060960864801650304020105000420"},
+    {SHA::SHA384, 19, "3041300D060960864801650304020205000430"},
+    {SHA::SHA512, 19, "3051300D060960864801650304020305000440"}
+  };
+
+  const uint8_t message[] = {'a', 'b', 'c'};
+
+  for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+    RSA rsa(2048, cases[c].version);
+
+    uint8_t block[256];
+    std::memset(block, 0, sizeof(block));
+    ZCHECK_NOTHROW(rsa.EMSA_PKCS1_V1_5_Encode(message, sizeof(message), sizeof(block), block));
+
+    // 00 01 then padding, so the DigestInfo begins after the 00 separator.
+    ZCHECK_EQ((int)block[0], 0);
+    ZCHECK_EQ((int)block[1], 1);
+
+    size_t at = 2;
+    while (at < sizeof(block) && block[at] == 0xFF) at++;
+    ZCHECK(at > 10);                       // at least 8 octets of padding
+    ZCHECK_EQ((int)block[at], 0);
+    at++;
+
+    static const char* digits = "0123456789ABCDEF";
+    std::string prefix;
+    for (size_t i = 0; i < cases[c].prefix_length && at + i < sizeof(block); i++) {
+      prefix += digits[block[at + i] >> 4];
+      prefix += digits[block[at + i] & 0x0F];
+    }
+    ZCHECK_STR(prefix, cases[c].prefix);
+  }
 }
