@@ -58,6 +58,43 @@ echo
 "$HOME_DIR/bin/Test" "$@"
 STATUS=$?
 
+# Zeytun's keep-alive, against the live server. The unit suites cannot see this:
+# it only shows when a second request goes down a connection the first one used,
+# and the server used to answer that one 400 because it read the request line as
+# a header. Everything a proxy does rests on it.
+echo
+echo "checking keep-alive on one connection"
+if python3 - <<'KEEPALIVE'
+import socket, sys
+try:
+    s = socket.create_connection(("127.0.0.1", 2190), timeout=10)
+    f = s.makefile("rb")
+    for n in range(3):
+        s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:2190\r\n\r\n")
+        status = f.readline().decode().strip()
+        if not status.startswith("HTTP/1.1 200"):
+            print("  request %d on the same connection: %r" % (n + 1, status))
+            sys.exit(1)
+        length = 0
+        while True:
+            line = f.readline().decode().strip()
+            if line == "":
+                break
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1])
+        f.read(length)
+    s.close()
+except Exception as error:
+    print("  %s: %s" % (type(error).__name__, error))
+    sys.exit(1)
+KEEPALIVE
+then
+  echo "  three requests on one connection: ok"
+else
+  echo "  keep-alive FAILED"
+  STATUS=1
+fi
+
 echo
 echo "server transcript:"
 sed -n '/Transaction Opened/,$p' "$LOG" | head -20

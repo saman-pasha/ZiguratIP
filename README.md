@@ -109,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 239 cases
+Starts a server, runs the full suite against it, stops it again. 239 cases and a keep-alive check
 covering every library, the Parsi grammar, and the storage engine's ACID,
 isolation, concurrency and durability behaviour.
 
@@ -289,7 +289,9 @@ does not currently compile.
 
 Full reference in [`doc`](doc/README.md):
 
-- [Installation](doc/installation.md) ·
+- [**Tutorial**](doc/tutorial.md) — building, deploying, configuring, securing,
+  putting Zeytun behind a proxy, and running the samples ·
+  [Installation](doc/installation.md) ·
   [Configuration](doc/configuration.md) ·
   [Server security](doc/security.md) ·
   [Connector](doc/connector.md) ·

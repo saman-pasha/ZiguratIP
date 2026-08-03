@@ -85,12 +85,31 @@ namespace Zigurat
 	  response->set_header("Server", "Zeytun/0.0 (ZiguratIP; " + Utility::os_name() + ")");
 	  if (blocking_mode) {
 	    response->set_header("Connection", "keep-alive");
-	    response->set_header("Keep-Alive", "timeout:" + std::to_string(timeout));
+	    // "timeout=N", with an equals sign. RFC 7230's parameter grammar --
+	    // and every proxy's parser -- reads name=value; "timeout:60" is not a
+	    // parameter at all, so a proxy pooling this connection had nothing to
+	    // go on and fell back to a guess of its own.
+	    response->set_header("Keep-Alive", "timeout=" + std::to_string(timeout));
 	  } else {
 	    response->set_header("Connection", "close");
 	  }
 
 	  // RESET FOR NEW PIPE
+	  //
+	  // The request line is only read when method is empty -- that is how the
+	  // loop tells it from a header line -- so leaving method set meant the
+	  // next request's "GET /page HTTP/1.1" was taken for a header, found to
+	  // have no colon in it, and answered 400. Every connection therefore
+	  // served exactly one request, however loudly the response advertised
+	  // keep-alive. Browsers hid it by opening a fresh connection each time; a
+	  // proxy that pools them saw a 502 on every reuse.
+	  method.clear();
+	  uri.clear();
+	  protocol.clear();
+	  host.clear();
+	  port.clear();
+	  content_length = 0;
+
 	  headers.clear();
 	  content = nullptr;
 

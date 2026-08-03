@@ -5,6 +5,7 @@ client interfaces. Converted from the ziguratip.com documentation.
 
 ## Getting started
 
+- [**Tutorial**](tutorial.md) — clone to secured installation, start here
 - [Installation](installation.md)
 - [Configuration](configuration.md)
 - [Locales](locales.md)
