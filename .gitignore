@@ -17,7 +17,12 @@ home/tmp/*
 home/catalog/*
 home/log/*
 
+# Who may connect to this particular installation. Deployment state, and the
+# certificates in it belong to real people.
+home/etc/users/*
+
 !home/*/.gitkeep
+!home/etc/*/.gitkeep
 
 # --- object and intermediate files ------------------------------------------
 *.o
@@ -104,7 +109,7 @@ zlib/Makefile.bak
 # The shipped CA material is a sample, named so that nobody mistakes it for
 # something usable. It is deliberately tracked so the ca examples run out of
 # the box; generate your own with "ca keygen" for anything real.
-!home/etc/ca/dont-use-*.key
+!home/etc/cert/dont-use-*.key
 
 # --- editors and platforms --------------------------------------------------
 .DS_Store

@@ -21,7 +21,8 @@ SOURCES := main_test.cpp \
 	test_isolation.cpp \
 	test_concurrency.cpp \
 	test_zeytun.cpp \
-	test_grammar.cpp
+	test_grammar.cpp \
+	test_permissions.cpp
 
 LIBS := -lStreamIO \
 	-lType \

@@ -136,18 +136,30 @@ namespace Zigurat
     }
   }
 
+  // A tlsstream is not a tcpstream -- it holds one, inside its buffer -- so a
+  // cast to tcpstream comes back null for a secure connection. Asking for one
+  // kind and assuming the answer meant is_open() always said false over TLS,
+  // and made close() dereference null: every program that opened a secure
+  // connection died on the way out, in the Connector's own destructor.
   bool Connector::is_open()
   {
     // open() asks this before there is a stream at all, so the null case has to
     // answer rather than dereference.
-    tcpstream* stream = dynamic_cast<tcpstream*>(this->_stream);
-    return (stream != nullptr) && stream->is_open();
+    if (tcpstream* plain = dynamic_cast<tcpstream*>(this->_stream))
+      return plain->is_open();
+    if (tlsstream* secure = dynamic_cast<tlsstream*>(this->_stream))
+      return secure->is_open();
+    return false;
   }
 
   void Connector::close()
   {
     if (this->_stream != nullptr) {
-      dynamic_cast<tcpstream*>(this->_stream)->close();
+      if (tcpstream* plain = dynamic_cast<tcpstream*>(this->_stream))
+	plain->close();
+      else if (tlsstream* secure = dynamic_cast<tlsstream*>(this->_stream))
+	secure->close();
+
       delete this->_stream;
       this->_stream = nullptr;
     }

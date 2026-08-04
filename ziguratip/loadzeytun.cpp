@@ -77,6 +77,7 @@ namespace
       }
 
       Session::RELEASE();
+      Globals::clear_peer();
       Globals::set_echo_stream(nullptr);
       Globals::set_client_stream(nullptr);
     }
@@ -90,6 +91,13 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
   std::unique_ptr<HTTPResponse> response_deleter(response);
 
   Globals::set_client_stream(client);
+
+  // Over a secure connection the visitor is whoever their certificate says, on
+  // every request, with no cookie and no login: HTTP is stateless and so is
+  // this. The worker threads are pooled, so RequestScope unbinds it again on
+  // the way out. A plain connection has no peer, and nothing is enforced.
+  if (tlsstream* secure = dynamic_cast<tlsstream*>(client))
+    Globals::set_peer(secure->peer_subject(), secure->peer_permissions());
 
   std::unique_ptr<textstream> echo_deleter(new textstream);
 
@@ -157,6 +165,21 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
 
       if (!handle)
 	throw HTTPException("404 Not Found");
+
+      // A page is not something a certificate can name -- Zeytun decides which
+      // URLs it serves -- so what is checked is what the page reaches: the
+      // tables and procedures it requires.
+      //
+      // Over HTTP that is a 403, not a server error: the request was
+      // understood and refused. Which object was refused goes to the log, not
+      // to the visitor, who has no business learning what the page touches.
+      try {
+	require_objects(handle);
+      } catch (const ZiguratException& refused) {
+	std::cout << "Zeytun: refusing '" << name << "': " << refused.message() << std::endl;
+	if (library_cache_mode != LibraryPool::NONE) library_pool.close(handle);
+	throw HTTPException("403 Forbidden");
+      }
 
       NEW_PAGE new_sym = (NEW_PAGE)library_pool.symbol(handle, "new_page");
       DELETE_PAGE del_sym = (DELETE_PAGE)library_pool.symbol(handle, "delete_page");
@@ -299,6 +322,13 @@ void load_zeytun(const Configuration& conf)
       throw ZiguratIPException("invalid value for '/HTTP/TLS_MODE'");
   }
   std::cout << "Zeytun TLS mode: '" << ((http_tls_mode) ? "TRUE" : "FALSE") << "'" << std::endl;
+
+  // As on the binary protocol: a visitor with no certificate has nothing to be
+  // judged on, so permissions without TLS enforce nothing here either. Worth
+  // saying, because a reverse proxy in front makes this the ordinary setup.
+  if (Globals::permissions_mode() && !http_tls_mode)
+    std::cout << "Zeytun: SECURITY/PERMISSIONS_MODE is on but HTTP/TLS_MODE is not,"
+	      << " so every page is served to anybody who asks" << std::endl;
 
   // Before announcing readiness, so a misconfigured secure server fails to start
   // rather than starting insecure.

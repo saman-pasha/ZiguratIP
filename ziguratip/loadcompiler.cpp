@@ -67,6 +67,13 @@ void load_compiler(const Configuration &config)
   parser.configure(patterns_file, parser_trace);
   compiler.configure(cpp, cpp_flags, ld_flags, catalog_path, include_path, obj_path, lib_path, tmp_path, ld_path, trace_mode);
 
+  // Declaring is the strongest thing a client can do: whoever writes a
+  // procedure writes what it reaches. So a declaration takes permission for
+  // the object being declared and for everything it requires -- otherwise a
+  // caller allowed one schema could compile a procedure that reads another,
+  // and calling it would be entirely in order.
+  compiler.permission(Globals::require_permission);
+
   // Both are reached through Globals by the compile function of the binary
   // protocol, and registering them is what makes that pointer non-null. Without
   // this the first Connector::compile dereferenced null and took the server down

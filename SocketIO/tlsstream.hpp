@@ -25,6 +25,12 @@ namespace Zigurat
     bool is_open() const;
     void close();
 
+    // Who the other end proved itself to be, and what its certificate says it
+    // may do. Both are settled during the handshake, so both are ready before
+    // anything is read or written.
+    const std::string& peer_subject() const;
+    const std::vector<std::string>& peer_permissions() const;
+
     void swap(tlsstream&);
 
     virtual ~tlsstream();

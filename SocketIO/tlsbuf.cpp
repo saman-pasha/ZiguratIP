@@ -445,6 +445,11 @@ namespace Zigurat
     return this->_peer_subject;
   }
 
+  const std::vector<std::string>& tlsbuf::peer_permissions() const
+  {
+    return this->_peer_permissions;
+  }
+
   // A credential named in the parameters, read off disk into memory. Each is
   // opened fresh every time it is needed: X509 consumes the stream it is given,
   // and the handshake needs some of them more than once.
@@ -486,6 +491,19 @@ namespace Zigurat
     networkstream for_subject;
     certificate.read(for_subject, 0, certificate.length());
     this->_peer_subject = X509::certificate_subject(for_subject);
+
+    // What the issuer wrote into this particular certificate. A subject may
+    // hold several, each granting something different, so this has to come off
+    // the one that opened the connection rather than off anything kept here.
+    networkstream for_permissions;
+    certificate.read(for_permissions, 0, certificate.length());
+    this->_peer_permissions = X509::certificate_permissions(for_permissions);
+
+    // The authority's signature says the peer is genuine, not that it is still
+    // welcome. Whoever installed a policy gets the last word.
+    if (this->_handshake_params.authorize
+	&& !this->_handshake_params.authorize(this->_peer_subject))
+      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::ACCESS_DENIED);
   }
 
   void tlsbuf::_send_certificate()
@@ -816,6 +834,7 @@ namespace Zigurat
   {
     this->_transcript.string("");
     this->_peer_subject.clear();
+    this->_peer_permissions.clear();
 
     this->_server_hello();
     this->_send_certificate();
@@ -965,6 +984,7 @@ namespace Zigurat
   {
     this->_transcript.string("");
     this->_peer_subject.clear();
+    this->_peer_permissions.clear();
 
     this->_client_hello();
 

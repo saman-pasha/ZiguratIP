@@ -48,6 +48,16 @@ namespace Zigurat
   {
     return dynamic_cast<tlsbuf*>(this->rdbuf())->is_open();
   }
+
+  const std::string& tlsstream::peer_subject() const
+  {
+    return dynamic_cast<tlsbuf*>(this->rdbuf())->peer_subject();
+  }
+
+  const std::vector<std::string>& tlsstream::peer_permissions() const
+  {
+    return dynamic_cast<tlsbuf*>(this->rdbuf())->peer_permissions();
+  }
   
   void tlsstream::close()
   {

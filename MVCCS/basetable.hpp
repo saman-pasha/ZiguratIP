@@ -4,6 +4,7 @@
 
 #include "pointer.hpp"
 #include <string>
+#include <vector>
 
 namespace Zigurat
 {
@@ -12,6 +13,12 @@ namespace Zigurat
   {
   public:
     static std::string name;
+
+    // The same name split into the levels a permission is written in: the
+    // schema, then the object. Every generated table and sequence shadows this
+    // with its own, exactly as it does with name.
+    static std::vector<std::string> path;
+
     static hashkey_t hash_key;
     Pointer pointer;
     BaseTable();

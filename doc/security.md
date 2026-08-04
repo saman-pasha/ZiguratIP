@@ -26,12 +26,12 @@ present theirs, and both check the other against the authority's certificate.
 
 A client with no certificate cannot connect. Nor can one holding a certificate
 some other authority issued: it is refused during the handshake, with
-`UNKNOWN_CA`, before it can send a request. Membership is the whole access
-control — there is no password anywhere in this.
+`UNKNOWN_CA`, before it can send a request. Membership is the price of
+admission — there is no password anywhere in this.
 
-The handshake carries the peer's distinguished name through to the server, where
-`tlsbuf::peer_subject()` returns it. Nothing is keyed on it yet. That is the
-natural place for per-subject permissions to attach later.
+Beyond membership, ZiguratIP can key what a connection may reach on the
+certificate it presented. That is [Permissions](#permissions), and it is off
+until you turn it on.
 
 ## Issuing the certificates
 
@@ -171,15 +171,172 @@ and a secure server do not negotiate, they fail.
 A program that passes a host and a service to `open()` ignores this file, and
 can pass `TLS::HandshakeParameters` to the secure overload instead.
 
+## Permissions
+
+Membership says a client may connect. Permissions say what it may then reach.
+
+The rule that shapes everything below: **the server stores nothing about its
+users.** There is no account, no grant table, no row anywhere naming a person.
+What a connection may do is written into the certificate that opened it, by
+you, at the moment you issued it. The server reads it off the handshake and
+keeps none of it. Nothing to migrate, nothing to back up, and nothing a restore
+can quietly bring back to life.
+
+Two things are kept on the server, and only two:
+
+- `SECURITY/PERMISSIONS_MODE`, one switch, off by default.
+- `SECURITY/USERS_PATH`, a directory holding one file per subject that may
+  connect. Its name is the subject, which is the part that matters; its content
+  is whichever certificate that subject was registered with, kept so the
+  directory can be read by a person rather than just tested by the server.
+
+```
+PERMISSIONS_MODE: TRUE
+```
+
+With it off, everything in this section is inert: a connection is still
+encrypted and both ends still check the authority, but which certificate the
+client presented decides nothing and the users directory is not read. With it
+on, a client must pass both tests — registered, and permitted.
+
+It needs TLS to mean anything. A plain connection presents no certificate, so
+there is nothing to judge it on and it reaches everything. Turning permissions
+on without turning `SERVER/TLS_MODE` or `HTTP/TLS_MODE` on enforces nothing at
+all on that port, and the server says so at startup. That matters most for
+Zeytun behind a reverse proxy, which is the ordinary way to run it: the proxy
+terminates TLS, Zeytun sees plain HTTP, and no page is permission-checked.
+
+### What a permission is
+
+A path. The schema levels, then the object name, written the way Parsi writes
+it:
+
+| Permission | Reaches |
+|---|---|
+| `DEMO` | every table and procedure in the `DEMO` schema |
+| `DEMO::AUTHORS` | that one object |
+| `*` | everything |
+| *(none)* | nothing |
+
+A permission covers what it names and everything under it, so a schema is one
+entry rather than a list. Matching ignores case, because Parsi does.
+
+**A certificate naming no permissions reaches nothing.** An issuer grants by
+naming; leaving the extension out cannot mean "everything", or every
+certificate issued before this existed would be a master key.
+
+Only **tables, sequences and procedures** can appear in a permission. Pages
+cannot: a page is a URL that Zeytun decides to serve, not a name you can grant.
+What is checked for a page is what the page *requires* — so a visitor loading
+`/catalog.zt`, which requires `demo::books` and `demo::authors`, needs those
+two. Requiring a procedure instead stops there: the procedure answers for what
+it touches, which is what makes granting a procedure worth doing.
+
+### Issuing a certificate that grants something
+
+`--permission` on `ca issue`, as many times as you need. It is what makes the
+certificate v3.
+
+```bash
+ca issue --serial=3 --issuer=authority.conf --issuer-pik=authority.key --csr=alice.csr --hash=SHA-256 --encoding=DER --permission=DEMO --certificate=alice-demo.crt
+```
+
+One subject may hold several, each granting something different — a full-schema
+certificate for the nightly job, a single-table one for the reporting box. They
+are the same subject and only one of them has to be registered. Which
+certificate opens a connection is what decides that connection.
+
+### The users directory
+
+A file here is a subject's right to connect. `ca put` writes one, `ca off`
+removes it, `ca users` lists them.
+
+```bash
+ca put --certificate=alice-demo.crt
+```
+
+```bash
+ca users
+```
+
+```bash
+ca off --subject-name="C=US, O=Acme, CN=alice"
+```
+
+Removing the file refuses **every** certificate that subject holds, at the
+handshake, with `ACCESS_DENIED` — before a request can be sent. That is the
+revocation this design has: there is no CRL and no OCSP, but there is one file
+to delete, and it takes effect on the next connection.
+
+It is also the *only* revocation. There is no way to withdraw one of a
+subject's certificates and leave the others working: the register is keyed on
+the subject, not on the certificate. If one leaks, un-register the subject,
+issue it a fresh set, and register it again. That is a reason to keep the
+number of certificates per subject small.
+
+`ca off` also accepts `--certificate=` and reads the subject out of it, which is
+easier than typing a distinguished name.
+
+The directory defaults to `$ZIGURATIP_HOME/etc/users`; `SECURITY/USERS_PATH`
+moves it. Subjects are filed under their full distinguished name, percent
+encoded so that a name carrying a slash or a pair of dots is still one file in
+one directory:
+
+```
+C=US%2C%20O=Acme%2C%20CN=alice
+```
+
+### Where it is enforced
+
+At three points, all of them before anything runs:
+
+1. **The handshake.** An unregistered subject is refused with `ACCESS_DENIED`.
+2. **Calling.** `Connector::call("demo::add_author")` needs permission for
+   `DEMO::ADD_AUTHOR`. Loading `/catalog.zt` needs permission for what that
+   page requires.
+3. **Compiling.** Declaring an object needs permission for the object being
+   declared *and* for everything it requires. Without that, a client allowed
+   one schema could compile a procedure that reads another and then call it
+   entirely in order.
+
+Each compiled object carries its own answer: the library exports
+`objects()`, listing what running it lets a caller reach, and the server reads
+that off the loaded code rather than working it out from a catalogue. The
+answer cannot drift from the code it describes. A library compiled before this
+existed has no such symbol and is refused with *compiled before permissions
+existed; recompile it*.
+
+The same object's qualified name is available as a path — `DEMO::AUTHORS::path`
+is `{"DEMO", "AUTHORS"}` — and as `PATH:` in its catalogue entry.
+
+Who the caller is reaches generated code as `Globals::peer_subject()` and
+`Globals::peer_permissions()`, on both protocols, whether or not
+`PERMISSIONS_MODE` is on. Parsi has no keyword for it yet: that would come
+through a `System` object, and those do not currently build.
+
+### Turning it on
+
+Order matters, because an empty users directory refuses everybody:
+
+1. Issue certificates with the permissions you mean, as above.
+2. `ca put` each one. `ca users` to check.
+3. Set `PERMISSIONS_MODE: TRUE` and restart.
+
+The server says what it found on startup — how many subjects are registered,
+and loudly if that is none.
+
 ## Keeping it in order
 
 - **The authority's private key is the whole system.** Anyone holding it can
   issue a certificate that your servers will accept. Keep it off the servers.
 - **Certificates expire.** `ca issue` takes `--from` and `--to`; the default is
   one year. An expired certificate stops connections dead, so track the dates.
-- **There is no revocation.** Nothing here reads a CRL or speaks OCSP. To
-  withdraw access you re-issue the authority and everything under it. Keep the
-  number of clients small enough that this is bearable.
+- **There is no revocation list.** Nothing here reads a CRL or speaks OCSP.
+  With permissions on, `ca off` is the withdrawal: the subject stops being able
+  to connect on its next attempt. With permissions off there is nothing keyed
+  on the subject, so withdrawing access means re-issuing the authority and
+  everything under it — keep the number of clients small enough that this is
+  bearable, or turn permissions on.
 - **Never commit a private key.** `.gitignore` refuses `*.key` and `*.pem` for
   that reason. The one exception is the deliberately useless `dont-use-*`
   sample.

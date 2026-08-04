@@ -58,6 +58,12 @@ END
 
 Calls a remote procedure.
 Procedure parameters should be sent by WRITE function.
+
+Over a secure connection with the server's `SECURITY/PERMISSIONS_MODE` on, the
+procedure named here has to be covered by a permission in the certificate this
+connection presented, and so does anything `COMPILE` declares. Nothing is
+configured client side for that: the permissions travel in the certificate. See
+[security.md](security.md#permissions).
 All IN or INOUT parameters should be sent and OUT parameters must not be sent.
 
 ## WRITE<T>(T) RETURNS Void

@@ -10,7 +10,8 @@ client interfaces. Converted from the ziguratip.com documentation.
 - [Configuration](configuration.md)
 - [Locales](locales.md)
 - [Connector](connector.md)
-- [Server security](security.md)
+- [Server security](security.md) — certificates, and the
+  [permissions](security.md#permissions) they carry
 - [C++ API](cpp.md)
 
 ## The Parsi language

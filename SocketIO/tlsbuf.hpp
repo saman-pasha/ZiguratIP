@@ -61,9 +61,11 @@ namespace Zigurat
     void _recv_handshake(TLS::Handshake&);
 
     // Who the peer turned out to be, once its certificate has been checked
-    // against the authority. Nothing is keyed on it yet; it is what a permission
-    // would be decided from.
-    std::string _peer_subject;
+    // against the authority, and what that certificate says it may do. The
+    // permissions are the issuer's assertion travelling with the connection --
+    // this end stores nothing about the peer and looks nothing up to learn them.
+    std::string              _peer_subject;
+    std::vector<std::string> _peer_permissions;
 
     void _credential(const std::string&, binarystream&);
     void _check_peer_certificate(binarystream&);
@@ -85,6 +87,11 @@ namespace Zigurat
     // The distinguished name on the peer's certificate. Empty until the
     // handshake has finished and the certificate has been accepted.
     const std::string& peer_subject() const;
+
+    // What that certificate says its holder may do. Empty for a certificate
+    // carrying no permissions extension, which means it may do nothing: an
+    // issuer grants by naming, never by omitting.
+    const std::vector<std::string>& peer_permissions() const;
 
   protected:
 

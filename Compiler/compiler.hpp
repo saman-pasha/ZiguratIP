@@ -34,6 +34,18 @@ namespace Zigurat
 
   public:
     typedef std::vector<std::string> (*links_t) (void);
+
+    // Asked whether the caller may declare something, once for each named
+    // object a declaration reaches. It refuses by throwing. Left unset --
+    // which is how the offline "parsi" tool leaves it -- nothing is asked and
+    // nothing is refused, because there is no caller to refuse.
+    //
+    // The policy lives outside the compiler on purpose: what a certificate
+    // grants is the server's business, and code generation should not have to
+    // know that certificates exist.
+    typedef std::function<void (const std::string&)> permit_t;
+    void permission(permit_t);
+
     //                  columns                   columns types             index type   index name  unique
     typedef std::tuple< std::vector<std::string>, std::vector<std::string>, std::string, std::string, bool> index_desc_t;
     Compiler();
@@ -67,8 +79,17 @@ namespace Zigurat
 				      "Configuration", "Threading", "SocketIO",
 				      "MVCCS", "HTTP", "pthread"};
 
-    void _build(std::string, std::list<std::string>&, 
-		std::stringstream&, std::stringstream&, std::stringstream&, const Expression&);
+    permit_t _permit;
+
+    void _build(std::string, std::list<std::string>&,
+		std::stringstream&, std::stringstream&, std::stringstream&, const Expression&,
+		const std::string&, bool);
+
+    // The named objects a unit reaches without passing through another named
+    // one. A table, a sequence and a procedure are named, so theirs is just
+    // themselves. A page, a class, a type and an enum are not -- nobody can be
+    // granted one -- so theirs is whatever their REQUIRES reach.
+    std::vector<std::string> _reachable(std::list<std::string>&, const Expression&);
 
     void _clause(const Expression&, std::stringstream&, int);
     void _suite(const Expression&);

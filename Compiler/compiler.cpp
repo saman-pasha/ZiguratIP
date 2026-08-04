@@ -88,9 +88,58 @@ namespace Zigurat
     this->_suite(ast);
   }
 
-  void Compiler::_build(std::string name, std::list<std::string>& requires, 
-			std::stringstream& head, std::stringstream& impl, std::stringstream& conf, const Expression& expr)
+  void Compiler::permission(Compiler::permit_t permit)
   {
+    this->_permit = permit;
+  }
+
+  // Reading a required object's own answer, rather than working it out again,
+  // is what makes this stop at the first named object: a page that requires a
+  // page that requires a table sees the table, and a page that requires a
+  // procedure sees the procedure and not what the procedure touches.
+  std::vector<std::string> Compiler::_reachable(std::list<std::string>& requires, const Expression& expr)
+  {
+    std::set<std::string> reached;
+    for (std::string& lib : requires) {
+#if defined(_WIN32) || defined(_WIN64)
+      auto ldhandle = LibraryLoader::handle("\"" + this->_ld_path + lib + ".dll\"");
+#else
+      auto ldhandle = LibraryLoader::handle(this->_ld_path + "lib" + lib + ".so");
+#endif
+      try {
+	auto symobjects = (Compiler::links_t)LibraryLoader::symbol(ldhandle, "objects");
+	for (const std::string& object : symobjects())
+	  reached.insert(object);
+      } catch (const std::exception&) {
+	LibraryLoader::close(ldhandle);
+	throw CompileException("'" + lib + "' was compiled before permissions existed; recompile it", expr);
+      }
+      LibraryLoader::close(ldhandle);
+    }
+
+    return std::vector<std::string>(reached.begin(), reached.end());
+  }
+
+  void Compiler::_build(std::string name, std::list<std::string>& requires,
+			std::stringstream& head, std::stringstream& impl, std::stringstream& conf, const Expression& expr,
+			const std::string& type_name, bool named)
+  {
+    // The named objects this declaration's REQUIRES reach. Declaring something
+    // takes permission for all of them, plus for the declaration itself when it
+    // is a name a certificate can carry.
+    const std::vector<std::string> required = this->_reachable(requires, expr);
+
+    if (this->_permit) {
+      if (named) this->_permit(type_name);
+      for (const std::string& object : required) this->_permit(object);
+    }
+
+    // A named object answers for itself: whoever holds permission for it is
+    // entitled to whatever it does. A page cannot be named in a permission, so
+    // it answers with what it requires instead.
+    const std::vector<std::string> reachable = (named)
+      ? std::vector<std::string>{ type_name } : required;
+
     std::string head_file_path = this->_ld_path + name + ".hpp";
     std::string impl_file_path = this->_tmp_path + name + ".cpp";
     std::string conf_file_path = this->_catalog_path + name + ".conf";
@@ -160,6 +209,15 @@ namespace Zigurat
 
     if (has_link)
       impl_file.seekp(-2, std::ios::cur);
+    impl_file << "}; }" << std::endl;
+
+    // What a caller has to be allowed before this may run. The server reads it
+    // off the loaded library rather than working it out from the catalogue, so
+    // the answer travels with the code it describes and cannot drift from it.
+    head_file << "extern \"C\" std::vector<std::string> objects();" << std::endl;
+    impl_file << "extern \"C\" std::vector<std::string> objects() { return {";
+    for (size_t i = 0; i < reachable.size(); i++)
+      impl_file << ((i > 0) ? ", " : "") << "\"" << reachable[i] << "\"";
     impl_file << "}; }" << std::endl;
 
     head_file.close();

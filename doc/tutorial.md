@@ -74,7 +74,11 @@ make -C Test && Test/run-e2e.sh
 
 That starts a server, runs every suite against it including the live Connector
 round trip and a keep-alive check, and stops it again. Expect
-`239 cases, 1021 checks, result: PASS`.
+`256 cases, 1109 checks, result: PASS`.
+
+Once the demo is compiled — step 5 below — `Test/run-permissions-e2e.sh` adds
+the certificate side: it issues several certificates granting different things
+and checks what each one can reach, over both protocols.
 
 ## 3. Deploying
 
@@ -206,7 +210,8 @@ Full reference: [configuration.md](configuration.md).
 ## 7. Securing it with the CA
 
 ZiguratIP can require every client to hold a certificate you issued. There is no
-password anywhere in it: membership is the access control.
+password anywhere in it: membership is the price of admission, and the
+certificate can carry what its holder may reach as well.
 
 [security.md](security.md) is the reference and covers this in more detail. In
 short, you issue an authority, then a certificate for each end.
@@ -287,6 +292,49 @@ AUTHORITY:    authority.crt
 
 A client with no certificate, or one some other authority issued, is refused
 during the handshake with `UNKNOWN_CA` — before it can send a request.
+
+### Deciding what each client may reach
+
+Membership lets a client in. Permissions say what it may then touch, and they
+are written into the certificate rather than kept on the server — there is no
+account and no grant table anywhere in ZiguratIP.
+
+Issue with `--permission`, as many as you need. A schema covers everything in
+it; a qualified name covers one table or procedure; `*` covers the lot:
+
+```bash
+ca issue --serial=3 --issuer=authority.conf --issuer-pik=authority.key --csr=client.csr --hash=SHA-256 --encoding=DER --permission=DEMO --certificate=client.crt
+```
+
+Then say the subject may connect at all. That is one file in a directory, and
+it is the only thing the server keeps:
+
+```bash
+ca put --certificate=client.crt
+```
+
+```bash
+ca users
+```
+
+Turn it on once at least one subject is registered — with nobody registered,
+every connection is refused:
+
+```
+SECURITY:
+	PERMISSIONS_MODE: TRUE
+```
+
+To withdraw access, take the subject off the register. Every certificate it
+holds stops working on the next connection:
+
+```bash
+ca off --certificate=client.crt
+```
+
+[security.md](security.md#permissions) has the whole of it — what a permission
+matches, why pages are not in the model, and why declaring an object needs
+permission for everything it requires.
 
 ## 8. Putting Zeytun behind nginx or Apache
 

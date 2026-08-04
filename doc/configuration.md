@@ -106,6 +106,52 @@ Defines limit the number of concurrent clients connections or transactions.
 
 Defines timeout of idle or half-closed state connections.
 
+## SERVER/TLS_MODE
+
+Requires every client of the binary protocol to present a certificate the
+SECURITY authority issued, and encrypts the connection. TCP only. A server told
+to be secure that cannot read its certificate refuses to start rather than
+listening in the clear. See [security.md](security.md).
+
+## SECURITY/CERTIFICATE_PATH
+
+Where the certificate files live. A bare file name in the settings below is
+looked for here; an absolute path is taken as given. Defaults to
+ZIGURATIP_HOME/etc/cert.
+
+## SECURITY/CERTIFICATE
+
+This installation's own certificate, presented by both servers and issued by
+the authority below.
+
+## SECURITY/PRIVATE_KEY
+
+The key that certificate belongs to.
+
+## SECURITY/PRIVATE_KEY_CIPHER
+
+Its pass phrase, if the key file is encrypted. Empty otherwise.
+
+## SECURITY/AUTHORITY
+
+The certificate that must have signed a peer's, and so the whole of who may
+connect. Both servers and the connector name the same one.
+
+## SECURITY/PERMISSIONS_MODE
+
+TRUE keys what a connection may reach on the certificate that opened it: the
+subject has to be registered in USERS_PATH, and every table and procedure the
+request touches has to be covered by a permission the issuer wrote into that
+certificate. FALSE, the default, leaves the connection encrypted and
+authenticated but enforces nothing beyond that. See
+[security.md](security.md#permissions).
+
+## SECURITY/USERS_PATH
+
+The directory of subjects that may connect: one file per subject, named after
+it. Managed with `ca put`, `ca off` and `ca users`. Defaults to
+ZIGURATIP_HOME/etc/users. Read only when PERMISSIONS_MODE is TRUE.
+
 ## HTTP/PORT
 
 Defines the port number of HTTP Server. Maybe 80 or 2190 like zigo.
@@ -125,6 +171,13 @@ Enables persistent connection or keep-alive.
 ## HTTP/ASYNCHRONOUS_MODE
 
 Enables pipelining.
+
+## HTTP/TLS_MODE
+
+The same as SERVER/TLS_MODE, for Zeytun. Note that this is TLS 1.2 with static
+RSA key exchange only, which browsers no longer accept: turning it on secures
+Zeytun for OpenSSL-based clients and makes it unreachable from a browser. Put a
+reverse proxy in front and leave this off if a browser has to reach it.
 
 ## HTTP/MAX_URL_LENGTH
 

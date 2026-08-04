@@ -109,9 +109,18 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 242 cases and a keep-alive check
-covering every library, the Parsi grammar, and the storage engine's ACID,
-isolation, concurrency and durability behaviour.
+Starts a server, runs the full suite against it, stops it again. 256 cases and a
+keep-alive check covering every library, the Parsi grammar, and the storage
+engine's ACID, isolation, concurrency and durability behaviour.
+
+```bash
+./Test/run-permissions-e2e.sh
+```
+
+Issues certificates granting different things, starts a secure server on its own
+ports, and checks that each one reaches what it should and nothing else — over
+both protocols, and with the switch off as well as on. Needs `demo/build.sh` to
+have run.
 
 ---
 
@@ -416,14 +425,15 @@ suite passes. Some things are known to be incomplete:
   and the MAC comparison is not constant time. A closed-network measure, not
   transport security against a capable attacker.
 
-- **The CA issues X.509 v1 only.** Certificates and requests are
+- **The CA encodes one extension, and no others.** Certificates and requests are
   OpenSSL-compatible — `openssl verify` accepts a chain issued by `ca`, and
-  `openssl req -verify` accepts its signing requests — but there is no extension
-  encoding yet, so no `basicConstraints`, `keyUsage` or subject alternative
-  name. RFC 5280 has a certificate without extensions be v1, which is what these
-  are, and the `[0] EXPLICIT Version` field belongs to v3 and is correctly
-  absent. A v1 certificate is fine as an explicitly trusted anchor and is
-  refused by anything that wants a real chain.
+  `openssl req -verify` accepts its signing requests. `ca issue --permission`
+  writes what its holder may reach into a private extension, which makes the
+  certificate v3; without it the certificate is v1, which is what RFC 5280 says
+  a certificate with no extensions is. The standard extensions are still
+  missing: no `basicConstraints`, `keyUsage` or subject alternative name. Such a
+  certificate is fine as an explicitly trusted anchor and is refused by anything
+  that wants a real chain.
 - **`keygen` does not force the modulus width.** `RSA-2048` produces a modulus
   of 2047 or 2048 bits depending on the primes it lands on, because the top bits
   of *p* and *q* are not fixed. Interoperable either way, just not the width that

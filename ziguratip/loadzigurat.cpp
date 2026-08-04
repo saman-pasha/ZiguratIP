@@ -95,6 +95,8 @@ void handle_client()
 	auto handle = library_pool.handle(func_name);
 	auto symbol = (void (*)(void))library_pool.symbol(handle, "call");
 
+	require_objects(handle);
+
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);
 	
 	symbol();
@@ -197,23 +199,58 @@ void handle_client()
   std::cout << "Transaction Closed " << Globals::memory()->transaction_id() << std::endl;
 }
 
+namespace
+{
+  // The worker threads are pooled, so what a connection binds to its thread has
+  // to be unbound again on the way out -- the stream is about to be destroyed,
+  // and the next connection served by this thread would otherwise inherit a
+  // pointer to it. Whether anything reads it before rebinding is not the point:
+  // a pointer to a destroyed stream should not survive the stream, and a call
+  // through one lands wherever its vtable used to be. Zeytun has always done
+  // this in RequestScope; the binary protocol never did.
+  struct ConnectionScope
+  {
+    ~ConnectionScope()
+    {
+      Globals::clear_peer();
+      Globals::set_client_stream(nullptr);
+    }
+  };
+}
+
 void zigurat_tcp_handler(Socket::handle_t client_handle)
 {
+  ConnectionScope scope;
   std::unique_ptr<tcpstream> client_stream_deleter(new tcpstream(client_handle, server_blocking_mode, server_timeout));
   Globals::set_client_stream(client_stream_deleter.get());
   handle_client();
 }
 
-// The peer has already presented a certificate the authority issued by the time
-// this is called -- TLSServer does not hand over a connection that has not.
+// The peer has already presented a certificate the authority issued, and is
+// registered in the users directory, by the time this is called -- TLSServer
+// does not hand over a connection that is neither.
+//
+// What that certificate grants comes with it. Nothing about the peer is looked
+// up, because nothing about the peer is kept: the connection carries its own
+// authority, and the same subject on a different certificate is a different set
+// of permissions.
 void zigurat_tls_handler(tlsstream& client_stream)
 {
+  ConnectionScope scope;
   Globals::set_client_stream(&client_stream);
+  Globals::set_peer(client_stream.peer_subject(), client_stream.peer_permissions());
+
+  std::cout << "Peer '" << Globals::peer_subject() << "' permitted";
+  for (const std::string& granted : Globals::peer_permissions())
+    std::cout << " '" << granted << "'";
+  std::cout << std::endl;
+
   handle_client();
 }
 
 void zigurat_ipc_handler(Socket::handle_t client_handle)
 {
+  ConnectionScope scope;
   std::unique_ptr<ipcstream> client_stream_deleter(new ipcstream(client_handle, server_blocking_mode, server_timeout));
   Globals::set_client_stream(client_stream_deleter.get());
   handle_client();
@@ -290,6 +327,15 @@ void load_zigurat(const Configuration& conf)
   std::cout << "Server blocking mode: '" << ((server_blocking_mode) ? "TRUE" : "FALSE" ) << "'" << std::endl;
   std::cout << "Server timeout: '" << server_timeout << "'" << std::endl;
   std::cout << "Server TLS mode: '" << ((server_tls_mode) ? "TRUE" : "FALSE") << "'" << std::endl;
+
+  // Permissions are carried by the certificate a connection presents, so a
+  // connection with no certificate has nothing to be judged on and is allowed
+  // everything. That is right, and it is also easy to configure by accident:
+  // turning permissions on without turning TLS on enforces nothing at all.
+  if (Globals::permissions_mode() && !server_tls_mode)
+    std::cout << "Zigurat: SECURITY/PERMISSIONS_MODE is on but SERVER/TLS_MODE is not,"
+	      << " so nothing is enforced on this port -- a plain connection carries"
+	      << " no certificate to judge" << std::endl;
 
   // Before announcing readiness, so a misconfigured secure server fails to start
   // rather than starting insecure.

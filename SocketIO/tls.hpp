@@ -3,6 +3,7 @@
 #define __TLS_HPP__
 
 #include "binarystream.hpp"
+#include <functional>
 #include <vector>
 #include <string>
 
@@ -241,6 +242,17 @@ namespace Zigurat
       std::string authority;          // the certificate that must have signed the peer's
     };
 
+    // A policy the accepting end may install. It is handed the distinguished
+    // name on the peer's certificate, once that certificate has been checked
+    // against the authority, and says whether this peer is allowed at all. The
+    // handshake is refused with ACCESS_DENIED when it says no.
+    //
+    // Left unset, the authority's signature is the whole test -- which is what
+    // it was before there was anywhere to record who may connect. Keeping the
+    // policy out here is deliberate: the record layer should not know what a
+    // user is, only that something decided.
+    typedef std::function<bool (const std::string&)> authorize_t;
+
     struct HandshakeParameters
     {
       ProtocolVersion                protocol_version;
@@ -248,6 +260,7 @@ namespace Zigurat
       std::vector<CipherSuite>       cipher_suites;
       std::vector<CompressionMethod> compression_methods;
       Credentials                    credentials;
+      authorize_t                    authorize;
     };
 
     // Change Cipher Specs Message

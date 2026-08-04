@@ -1033,6 +1033,57 @@ namespace Zigurat
     return name;
   }
 
+  std::string X509::subject_file_name(const std::string& subject)
+  {
+    static const char hex[] = "0123456789ABCDEF";
+
+    std::string encoded;
+    for (unsigned char c : subject) {
+      const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+	|| (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '=';
+      if (plain) {
+	encoded.push_back((char)c);
+      } else {
+	encoded.push_back('%');
+	encoded.push_back(hex[c >> 4]);
+	encoded.push_back(hex[c & 0x0F]);
+      }
+    }
+
+    return encoded;
+  }
+
+  std::string X509::file_name_subject(const std::string& file_name)
+  {
+    auto value([] (char c) -> int {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	return -1;
+      });
+
+    std::string subject;
+    for (size_t i = 0; i < file_name.size(); i++) {
+      if (file_name[i] != '%' || i + 2 >= file_name.size()) {
+	subject.push_back(file_name[i]);
+	continue;
+      }
+
+      const int high = value(file_name[i + 1]), low = value(file_name[i + 2]);
+      if (high < 0 || low < 0) {
+	// Not an escape after all, whatever it looked like. Left as written
+	// rather than guessed at, so a hand made file name still round trips.
+	subject.push_back(file_name[i]);
+	continue;
+      }
+
+      subject.push_back((char)((high << 4) | low));
+      i += 2;
+    }
+
+    return subject;
+  }
+
   void X509::sign(binarystream& pik_stream, std::string cipher_key, std::string hash,
 		  binarystream& message, binarystream& signature)
   {

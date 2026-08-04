@@ -49,6 +49,14 @@ namespace Zigurat
     static void        certificate_public_key(binarystream&, binarystream&);
     static std::string certificate_subject(binarystream&);
 
+    // How a distinguished name is written down as one file name, and read back.
+    // A DN carries commas, spaces and equals signs, and nothing stops it
+    // carrying a slash or a dot -- so everything outside a plain set is percent
+    // encoded. The result stays legible, "CN=alice,%20O=Acme", and can never
+    // name anything outside the directory it is written in.
+    static std::string subject_file_name(const std::string&);
+    static std::string file_name_subject(const std::string&);
+
     // What the holder of this certificate may do, as the issuer wrote it. The
     // strings mean nothing here -- they are matched by whoever cares. An empty
     // list comes back for a certificate carrying no such extension, which is

@@ -8,6 +8,37 @@
 namespace Zigurat
 {
 
+  // An object's qualified name split the way a permission is written: the
+  // schema levels first, the object name last. "DEMO::AUTHORS" becomes
+  // {"DEMO", "AUTHORS"}, and a permission covers the object when it is a
+  // prefix of that.
+  static std::vector<std::string> name_path(const std::string& type_name)
+  {
+    std::vector<std::string> path;
+
+    size_t begin = 0;
+    while (begin <= type_name.size()) {
+      size_t end = type_name.find("::", begin);
+      if (end == std::string::npos) end = type_name.size();
+      const std::string level = type_name.substr(begin, end - begin);
+      if (!level.empty()) path.push_back(level);
+      if (end == type_name.size()) break;
+      begin = end + 2;
+    }
+
+    return path;
+  }
+
+  // PATH: in the catalogue entry, so the same answer is readable without
+  // loading the object.
+  static void path_conf(std::stringstream& conf, const std::string& tab1, const std::string& tab2,
+			const std::string& type_name)
+  {
+    conf << tab1 << "PATH:" << std::endl;
+    for (const std::string& level : name_path(type_name))
+      conf << tab2 << "LEVEL: " << level << std::endl;
+  }
+
   void Compiler::_include(const Expression& ast)
   {
     this->_includes.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
@@ -170,6 +201,7 @@ namespace Zigurat
     head << "public:" << std::endl;
     head << TAB1 << "using Zigurat::BaseTable::BaseTable;" << std::endl;
     head << TAB1 << "static std::string name;" << std::endl;
+    head << TAB1 << "static std::vector<std::string> path;" << std::endl;
     head << TAB1 << "static Zigurat::hashkey_t hash_key;" << std::endl;
     head << TAB1 << name << "();" << std::endl;
     
@@ -226,6 +258,13 @@ namespace Zigurat
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
     impl << "std::string " << name << "::name = \"" << type_name << "\";" << std::endl;
+    impl << "std::vector<std::string> " << name << "::path = {";
+    {
+      const std::vector<std::string> path = name_path(type_name);
+      for (size_t i = 0; i < path.size(); i++)
+	impl << ((i > 0) ? ", " : "") << "\"" << path[i] << "\"";
+    }
+    impl << "};" << std::endl;
     impl << "Zigurat::hashkey_t " << name << "::hash_key = {";
     for (size_t i = 0; i < hash_key.size(); i+=2)
       impl << "0x" << hash_key[i] << hash_key[i + 1] << ',';
@@ -377,6 +416,7 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "REQUIRES:" << std::endl;
@@ -419,7 +459,7 @@ namespace Zigurat
 	conf << TAB4 << "TYPE: " << type << std::endl;
     }
         
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, true);
   }
 
   void Compiler::_parameters_head(const Expression& ast, std::stringstream& code, int lvl)
@@ -640,6 +680,7 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "PARAMETER:" << std::endl;
@@ -667,7 +708,7 @@ namespace Zigurat
       conf << TAB2 << "REQUIRE: " << inc << std::endl;
     }
     
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, true);
   }
 
   void Compiler::_class(const Expression& ast, bool is_page)
@@ -923,6 +964,7 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "INHERITS:" << std::endl;
@@ -942,7 +984,7 @@ namespace Zigurat
       }
     }
         
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, false);
   }
 
   void Compiler::_type(const Expression& ast)
@@ -1013,11 +1055,12 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "AS:" << this->_type_name(ast.args[1]) << std::endl;
    
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, false);
   }
 
   void Compiler::_enum(const Expression& ast)
@@ -1064,6 +1107,7 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "ELEMENTS:" << this->_type_name(ast.args[1]) << std::endl;
@@ -1071,7 +1115,7 @@ namespace Zigurat
       conf << TAB2 << "ELEMENT: " << expr.token.value << std::endl;
     }
 
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, false);
   }
 
   void Compiler::_sequence(const Expression& ast)
@@ -1111,6 +1155,7 @@ namespace Zigurat
     head << "public:" << std::endl;
     head << TAB1 << "static const Zigurat::hashkey_t hash_key;" << std::endl;
     head << TAB1 << "static const Zigurat::String NAME;" << std::endl;
+    head << TAB1 << "static const std::vector<std::string> PATH;" << std::endl;
     head << TAB1 << "static const Zigurat::Long FROM;" << std::endl;
     head << TAB1 << "static const Zigurat::Long TO;" << std::endl;
     head << TAB1 << "static const Zigurat::Long STEP;" << std::endl;
@@ -1132,6 +1177,13 @@ namespace Zigurat
     impl.seekp(-1, std::ios::cur);
     impl << TAB1 << "};" << std::endl;
     impl << TAB1 << "const Zigurat::String " << type_name << "::NAME = \"" << type_name << "\";" << std::endl;
+    impl << TAB1 << "const std::vector<std::string> " << type_name << "::PATH = {";
+    {
+      const std::vector<std::string> path = name_path(type_name);
+      for (size_t i = 0; i < path.size(); i++)
+	impl << ((i > 0) ? ", " : "") << "\"" << path[i] << "\"";
+    }
+    impl << "};" << std::endl;
     impl << TAB1 << "const Zigurat::Long " << type_name << "::FROM = ";
     this->_expr.compile(ast.args[offset + 1].args[0], impl);
     impl << ';' << std::endl;
@@ -1162,6 +1214,7 @@ namespace Zigurat
     conf << TAB1 << "DOMAIN: " << this->_domain(ast.args[0]) << std::endl;
     conf << TAB1 << "FULL_NAME: " << full_name << std::endl;
     conf << TAB1 << "TYPE_NAME: " << type_name << std::endl;
+    path_conf(conf, TAB1, TAB2, type_name);
     conf << TAB1 << "GUARD_NAME: " << guard_name << std::endl;
     conf << TAB1 << "HASH_KEY: " << hash_key << std::endl;
     conf << TAB1 << "FROM:"; 
@@ -1174,7 +1227,7 @@ namespace Zigurat
     this->_expr.compile(ast.args[offset + 3].args[0], conf);
     conf << std::endl;
     
-    this->_build(include_name, requires, head, impl, conf, ast);
+    this->_build(include_name, requires, head, impl, conf, ast, type_name, true);
   }
 
 }

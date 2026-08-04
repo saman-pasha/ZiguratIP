@@ -80,6 +80,19 @@ namespace Zigurat
     static std::string to_upper(const std::string&);
     static std::string config_path(std::string);
 
+    // Enough of a filesystem to keep a directory of small files. C++11 has no
+    // <filesystem>, and pulling one in for four calls would cost more than it
+    // saves.
+    static bool file_exists(const std::string&);
+    static bool make_directory(const std::string&);
+    static bool remove_file(const std::string&);
+
+    // The plain names in a directory, without "." and "..", in no useful
+    // order. An unreadable or missing directory yields an empty list rather
+    // than an error: nothing registered and nowhere to register are the same
+    // answer to everyone who asks.
+    static std::vector<std::string> directory_files(const std::string&);
+
     template <typename ..._Args>
     void ignore_pack(_Args&&...) { }
 

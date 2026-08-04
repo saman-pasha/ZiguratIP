@@ -1,18 +1,24 @@
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include "utility.hpp"
 #include <iostream>
 #include <fstream>
 #if defined(_WIN32) || defined(_WIN64)
 #include <winsock.h>
+#include <windows.h>
+#include <direct.h>
 #elif defined(__APPLE__) || defined(__MACH__)
 #include <pwd.h>
 #include <uuid/uuid.h>
+#include <dirent.h>
 #elif defined(__unix) || defined(__unix__)
 #include <pwd.h>
 #include <arpa/inet.h>
+#include <dirent.h>
 #endif
 #include <thread>
 #include <ctime>
@@ -169,6 +175,62 @@ namespace Zigurat
       return etc_path + conf_name;
     }
     return "";
+  }
+
+  bool Utility::file_exists(const std::string& path)
+  {
+    std::ifstream file(path);
+    return file.good();
+  }
+
+  // True when the directory is there afterwards, however it got there. A
+  // caller wants somewhere to write, not the story of who made it.
+  bool Utility::make_directory(const std::string& path)
+  {
+    if (path.empty()) return false;
+
+#if defined(_WIN32) || defined(_WIN64)
+    if (_mkdir(path.c_str()) == 0) return true;
+#else
+    if (::mkdir(path.c_str(), 0700) == 0) return true;
+#endif
+    return errno == EEXIST;
+  }
+
+  bool Utility::remove_file(const std::string& path)
+  {
+    return std::remove(path.c_str()) == 0;
+  }
+
+  std::vector<std::string> Utility::directory_files(const std::string& path)
+  {
+    std::vector<std::string> names;
+    if (path.empty()) return names;
+
+#if defined(_WIN32) || defined(_WIN64)
+    std::string pattern = path;
+    if (pattern.back() != '/' && pattern.back() != '\\') pattern.push_back('\\');
+    pattern += "*";
+
+    WIN32_FIND_DATAA entry;
+    HANDLE search = FindFirstFileA(pattern.c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) return names;
+    do {
+      const std::string name(entry.cFileName);
+      if (name != "." && name != "..") names.push_back(name);
+    } while (FindNextFileA(search, &entry));
+    FindClose(search);
+#else
+    DIR* directory = ::opendir(path.c_str());
+    if (directory == nullptr) return names;
+    while (struct dirent* entry = ::readdir(directory)) {
+      const std::string name(entry->d_name);
+      if (name != "." && name != "..") names.push_back(name);
+    }
+    ::closedir(directory);
+#endif
+
+    return names;
   }
 
   std::size_t Utility::generate_id()

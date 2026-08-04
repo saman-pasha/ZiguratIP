@@ -41,6 +41,9 @@ void csr   (int, char*[]);
 void issue (int, char*[]);
 void pikval(int, char*[]);
 void pukval(int, char*[]);
+void put   (int, char*[]);
+void off   (int, char*[]);
+void users (int, char*[]);
 
 // Where the certificates live. SECURITY/CERTIFICATE_PATH in ziguratip.conf if it
 // is set, otherwise ZIGURATIP_HOME/etc/cert. Everything the tool defaults to --
@@ -67,6 +70,59 @@ static std::string shipped_certificate(const std::string& file_name)
   }
 
   return Zigurat::Utility::config_path("cert/" + file_name);
+}
+
+// Where the register of who may connect lives. A file in here, named after a
+// subject, is the whole of that subject's right to open a session -- so the
+// tool and the server have to agree on the directory as exactly as they agree
+// on the name.
+static std::string users_directory(const std::string& given)
+{
+  std::string path = given;
+
+  if (path.empty()) {
+    std::string conf = Zigurat::Utility::config_path("ziguratip.conf");
+    if (conf.size() > 0) {
+      try {
+	Zigurat::Configuration config(conf);
+	config.get("/SECURITY/USERS_PATH", path);
+      } catch (...) {
+	// An unreadable configuration is not this tool's problem: fall through
+	// to the built in location.
+      }
+    }
+    path = Zigurat::Utility::trim(path);
+  }
+
+  if (path.empty()) path = Zigurat::Utility::config_path("users/");
+
+  if (path.empty()) {
+    std::string home = Zigurat::Utility::env_var("ZIGURATIP_HOME");
+    if (!home.empty()) {
+      if (home.back() != '/') home.push_back('/');
+      path = home + "etc/users/";
+    }
+  }
+
+  if (path.empty())
+    throw CertificateException("no users directory: set SECURITY/USERS_PATH or ZIGURATIP_HOME, "
+			       "or name one with --users");
+
+  if (path.back() != '/') path.push_back('/');
+  return path;
+}
+
+// The subject on a certificate file, which is both who it belongs to and what
+// its entry in the users directory is called.
+static std::string certificate_subject_of(const std::string& certificate_path)
+{
+  std::ifstream certificate_file(certificate_path);
+  if (!certificate_file.good())
+    throw CertificateException("invalid certificate file " + certificate_path);
+
+  bufferstream crt_stream;
+  load_stream(certificate_file, crt_stream);
+  return Zigurat::X509::certificate_subject(crt_stream);
 }
 
 int main(int argc, char* argv[])
@@ -173,6 +229,12 @@ int main(int argc, char* argv[])
     pikval(argc, argv);
   } else if (argc > 1 && std::strcmp(argv[1], "pukval") == 0) {
     pukval(argc, argv);
+  } else if (argc > 1 && std::strcmp(argv[1], "put") == 0) {
+    put(argc, argv);
+  } else if (argc > 1 && std::strcmp(argv[1], "off") == 0) {
+    off(argc, argv);
+  } else if (argc > 1 && std::strcmp(argv[1], "users") == 0) {
+    users(argc, argv);
   } else {
     throw CertificateException("invalid instruction " + std::string(argv[1]));
   }
@@ -201,6 +263,8 @@ void help()
   std::cout << "\t--subject-pik      ::= \"subject private key file\"" << std::endl;
   std::cout << "\t--csr              ::= \"certificate signing request file\"" << std::endl;
   std::cout << "\t--certificate      ::= \"certificate file\"" << std::endl;
+  std::cout << "\t--users            ::= \"directory of registered users\"" << std::endl;
+  std::cout << "\t--subject-name     ::= \"subject distinguished name\" --! for off, instead of a certificate !--" << std::endl;
   std::cout << std::endl;
   std::cout << "Defaults: " << std::endl;
   std::cout << "\t--signature        ::= RSA-2048" << std::endl;
@@ -218,6 +282,7 @@ void help()
   std::cout << "\t--subject-pik      ::= subject.key" << std::endl;
   std::cout << "\t--csr              ::= request.csr" << std::endl;
   std::cout << "\t--certificate      ::= certificate.crt" << std::endl;
+  std::cout << "\t--users            ::= SECURITY/USERS_PATH, else ZIGURATIP_HOME/etc/users" << std::endl;
   std::cout << std::endl;
   std::cout << "Instructions: " << std::endl;
   std::cout << "\t--! Generating a new Private and Public key pair !--" << std::endl;
@@ -234,6 +299,15 @@ void help()
   std::cout << std::endl;
   std::cout << "\t--! Validating an Issued Certificate by issuer public key!--" << std::endl;
   std::cout << "\tpukval --issuer-puk=? --certificate=?" << std::endl;
+  std::cout << std::endl;
+  std::cout << "\t--! Letting a subject connect: one entry per subject, however many certificates it holds !--" << std::endl;
+  std::cout << "\tput --certificate=? --users=?" << std::endl;
+  std::cout << std::endl;
+  std::cout << "\t--! Stopping it: every certificate that subject holds is refused at once !--" << std::endl;
+  std::cout << "\toff --certificate=? --subject-name=\"?\" --users=?" << std::endl;
+  std::cout << std::endl;
+  std::cout << "\t--! Who may connect !--" << std::endl;
+  std::cout << "\tusers --users=?" << std::endl;
   std::cout << std::endl;
 }
 
@@ -550,4 +624,106 @@ void pukval(int argc, char* argv[])
   load_stream(certificate_file, crt_stream);
   X509::validate_by_puk(puk_stream, crt_stream);
   std::cout << "Certificate Validated" << std::endl;  
+}
+
+// ---------------------------------------------------------------------------
+// The users directory
+//
+// One file per subject that may connect, named after the subject and holding
+// the certificate it was registered with. Nothing else is stored anywhere: the
+// server keeps no account, no password and no grant table, so this directory
+// and the certificates in the field are the whole of who may do what.
+//
+// A subject may hold several certificates -- one per schema is the usual
+// reason -- and only one of them needs to be registered here. Which one does
+// not matter: this says the subject is welcome, and the certificate that opens
+// a connection says what that connection may reach. Taking the file away ends
+// them all at once.
+// ---------------------------------------------------------------------------
+
+void put(int argc, char* argv[])
+{
+  std::cout << "User Registering Arguments: " << std::endl;
+
+  Argument args(argc, argv);
+
+  // Certificate File
+  std::string certificate_path(args.get("--certificate"));
+  if (certificate_path.size() == 0) certificate_path = "certificate.crt";
+  std::cout << "            Certificate: " << certificate_path << std::endl;
+
+  const std::string subject = certificate_subject_of(certificate_path);
+  if (subject.empty())
+    throw CertificateException("the certificate " + certificate_path + " names no subject");
+  std::cout << "                Subject: " << subject << std::endl;
+
+  const std::string directory = users_directory(args.get("--users"));
+  std::cout << "        Users Directory: " << directory << std::endl;
+
+  if (!Zigurat::Utility::make_directory(directory))
+    throw CertificateException("cannot use the users directory " + directory);
+
+  const std::string entry = directory + Zigurat::X509::subject_file_name(subject);
+
+  std::ifstream source(certificate_path, std::ios::binary);
+  std::ofstream target(entry, std::ios::binary | std::ios::trunc);
+  if (!target.good())
+    throw CertificateException("cannot write the user entry " + entry);
+  target << source.rdbuf();
+  target.close();
+  source.close();
+
+  std::cout << std::endl;
+  std::cout << "Registered '" << subject << "'" << std::endl;
+}
+
+void off(int argc, char* argv[])
+{
+  std::cout << "User Unregistering Arguments: " << std::endl;
+
+  Argument args(argc, argv);
+
+  // Either name the subject outright, or name a certificate it holds -- any of
+  // them, since they all carry the same subject.
+  std::string subject(args.get("--subject-name"));
+  if (subject.size() == 0) {
+    std::string certificate_path(args.get("--certificate"));
+    if (certificate_path.size() == 0) certificate_path = "certificate.crt";
+    std::cout << "            Certificate: " << certificate_path << std::endl;
+    subject = certificate_subject_of(certificate_path);
+  }
+  std::cout << "                Subject: " << subject << std::endl;
+
+  const std::string directory = users_directory(args.get("--users"));
+  std::cout << "        Users Directory: " << directory << std::endl;
+
+  const std::string entry = directory + Zigurat::X509::subject_file_name(subject);
+  if (!Zigurat::Utility::file_exists(entry))
+    throw CertificateException("'" + subject + "' is not registered");
+
+  if (!Zigurat::Utility::remove_file(entry))
+    throw CertificateException("cannot remove the user entry " + entry);
+
+  std::cout << std::endl;
+  std::cout << "Unregistered '" << subject << "'" << std::endl;
+  std::cout << "Every certificate this subject holds is now refused." << std::endl;
+}
+
+void users(int argc, char* argv[])
+{
+  Argument args(argc, argv);
+
+  const std::string directory = users_directory(args.get("--users"));
+  std::cout << "        Users Directory: " << directory << std::endl;
+  std::cout << std::endl;
+
+  std::vector<std::string> entries = Zigurat::Utility::directory_files(directory);
+  std::sort(entries.begin(), entries.end());
+
+  for (const std::string& entry : entries)
+    std::cout << "\t" << Zigurat::X509::file_name_subject(entry) << std::endl;
+
+  std::cout << std::endl;
+  std::cout << entries.size() << ((entries.size() == 1) ? " user" : " users")
+	    << " may connect" << std::endl;
 }
