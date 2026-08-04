@@ -25,3 +25,22 @@ C++ compiler at run time to build Parsi objects, so if one is not on `PATH`
 then `COMPILER/CPP` has to name it. See the
 [configuration reference](configuration.md); `home/etc/ziguratip.conf`
 documents every setting inline.
+
+## Checking an installation
+
+Each of the four programs describes itself, and none of them needs a working
+installation to do it — which makes `--help` the first thing to reach for when
+something will not start:
+
+```bash
+ziguratip --help    # the one argument it takes, where it looks for its
+                    # configuration file, and every setting with its default
+parsi --help        # what it compiles, where the results go, what it reads
+ca --help           # the eight instructions and their options
+Test --help         # the filter, the environment, and the suites present
+```
+
+`ziguratip` and `parsi` take `--config=<file>` and nothing else. Without it,
+`ziguratip.conf` is looked for under `$ZIGURATIP_HOME/etc`, then
+`~/ZiguratIP/etc`, then `/etc/ZiguratIP` — and the server refuses to start
+rather than guess if none of them has one.

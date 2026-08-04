@@ -15,6 +15,13 @@ BEGIN
     COLUMN name AS String UNIQUE KEY NOT NULL;
 END
 
+SEQUENCE human_resources::employees_id_sequence
+BEGIN
+    FROM 1;
+    TO Long::MAX;
+    STEP 1;
+END
+
 PROCEDURE human_resources::insert_employee(name AS String)
 RETURNS Long
 REQUIRES human_resources::employees
@@ -46,6 +53,11 @@ code is zlib.
 ---
 
 ## Getting started
+
+This section is the reference: what each piece is, where it lives, and what to
+set. If you would rather paste ten commands and end up with the demo running,
+skip to [From nothing to the demo](#from-nothing-to-the-demo-step-by-step) and
+come back.
 
 ### Requirements
 
@@ -135,14 +147,225 @@ up. Also needs `demo/build.sh`.
 > second time and the object binds to that copy instead of the one the server is
 > using. The server notices and refuses the request; restart it.
 
+### Ask a program what it takes
+
+All four accept `--help`, and none of them needs a working installation to
+answer:
+
+```bash
+./home/bin/ziguratip --help   # the one argument, and every setting with its default
+./home/bin/parsi --help       # what it compiles, where it puts it, what it reads
+./home/bin/ca --help          # the eight instructions and their options
+./home/bin/Test --help        # the filter, the environment, and the suites present
+```
+
+`ziguratip` and `parsi` take `--config=<file>` and nothing else: everything else
+is configuration, and their help lists the search order for the file and the
+keys it may contain. `ca` is the exception — it is a command-line tool proper,
+with instructions and options.
+
+---
+
+## From nothing to the demo, step by step
+
+Ten commands, no prior state. The demo is a small book catalogue: two tables
+with indexes, sequences, procedures that write, and pages that read.
+
+### 1. Build
+
+```bash
+git clone <your-fork-url> ZiguratIP
+cd ZiguratIP
+make
+```
+
+`make MODE=Release` optimises everything; `Core` and `Cryptography` are optimised
+either way, because the big-integer arithmetic underneath RSA is seconds
+unoptimised and a fraction of one at `-O3`. Expect 14 libraries and 4 programs
+under `home/`.
+
+### 2. Point the environment at it
+
+```bash
+export ZIGURATIP_HOME=$PWD/home
+export DYLD_LIBRARY_PATH=$ZIGURATIP_HOME/lib    # LD_LIBRARY_PATH on Linux
+```
+
+Both are needed: the first is where the server looks for its configuration and
+resolves every other path from, the second is how the programs find the shared
+libraries. A C++ compiler must stay on `PATH` — Parsi objects are compiled at
+run time, not only at build time.
+
+### 3. Check the build
+
+```bash
+./Test/run-e2e.sh
+```
+
+Starts a server, runs all 257 cases against it, stops it again. Expect
+`result: PASS`. If this fails, nothing below will work.
+
+### 4. Compile the demo
+
+```bash
+./demo/build.sh
+```
+
+Five Parsi files become sixteen shared objects in `home/ld` and sixteen
+catalogue entries in `home/catalog` — tables, sequences, procedures and pages.
+The script starts nothing; it compiles with `parsi` and exits.
+
+### 5. Start the server
+
+```bash
+./home/bin/ziguratip
+```
+
+It prints what it loaded, then listens on **2160** and **2190**. Leave it
+running. It writes `home/data/hexmap` and `home/data/data` on first use and
+keeps them between restarts.
+
+### 6. Seed and browse
+
+In a browser, in this order:
+
+| | |
+|---|---|
+| <http://127.0.0.1:2190/setup.zt> | creates the authors and books rows |
+| <http://127.0.0.1:2190/catalog.zt> | browses them |
+| <http://127.0.0.1:2190/lookup.zt> | queries served from single-column indexes |
+| <http://127.0.0.1:2190/bulk.zt> | loads 500 rows into a second table |
+| <http://127.0.0.1:2190/report.zt> | queries those through a two-column index |
+
+Each page is a compiled Parsi object, and each request is one transaction. With
+`TRACE_MODE: TRUE` the server's terminal shows every one of them opening and
+committing.
+
+### 7. Call a procedure from a client
+
+```bash
+cat > count.cpp <<'EOF'
+#include "connector.hpp"
+#include "typelong.hpp"
+#include <iostream>
+using namespace Zigurat;
+
+int main()
+{
+    Connector db;
+    db.open("127.0.0.1", "2160", true, 10);
+    db.call("demo::count_books");
+
+    Long total(0);
+    for (ResultType r = db.result(); r != ResultType::SUCCESSFUL_DONE; r = db.result()) {
+        if (r == ResultType::CURSOR_OPEN)       db.columns();
+        else if (r == ResultType::RETURN_VALUE) db.fetch(total);
+    }
+    db.commit();
+    std::cout << total.value() << " books" << std::endl;
+    db.close();
+    return 0;
+}
+EOF
+
+c++ -std=c++11 -I$ZIGURATIP_HOME/include count.cpp -o count \
+    -L$ZIGURATIP_HOME/lib -lConnector -lCore -lStreamIO -lType -lSocketIO \
+    -lCryptography -lEncoding -lConfiguration -lThreading -lLibrary -lCompression
+./count
+```
+
+The same procedure the pages call, over the binary protocol. Drain the results
+to `SUCCESSFUL_DONE` or the next request on that connection reads a byte that
+already went past.
+
+### 8. Write something of your own
+
+```bash
+cat > mine.parsi <<'EOF'
+PROCEDURE demo::authors_from(where_from AS String)
+RETURNS Long
+REQUIRES demo::authors
+BEGIN
+    DECLARE found AS Long = 0;
+    SELECT found = found + 1 FROM demo::authors WHERE country == where_from;
+    RETURN found;
+END
+EOF
+
+./home/bin/parsi mine.parsi
+```
+
+The parameter is not called `country`, because `WHERE country == country` would
+compare the column with itself. `SELECT` counts by assigning rather than by
+returning rows — see [SELECT](doc/select.md).
+
+`CACHE_MODE: NONE` is the shipped default, so the server picks it up on the next
+call with no restart. Call it exactly as in step 7.
+
+### 9. Turn on certificates
+
+Nothing so far has required one. Work **outside the repository** — a private key
+does not belong in version control, and the shipped `home/etc/cert/dont-use-*`
+files are a sample everybody who has cloned ZiguratIP also has:
+
+```bash
+mkdir -p ~/zigurat-pki && cd ~/zigurat-pki
+cp $ZIGURATIP_HOME/etc/cert/issuer.conf authority.conf   # then edit COMMON_NAME etc.
+
+CA=$ZIGURATIP_HOME/bin/ca
+$CA keygen --signature=RSA-2048 --private=authority.key --public=authority.pub
+$CA csr    --subject=authority.conf --subject-pik=authority.key --csr=authority.csr
+$CA issue  --serial=1 --issuer=authority.conf --issuer-pik=authority.key \
+           --csr=authority.csr --certificate=authority.crt
+```
+
+The issuer is itself, which is what makes it the root of your small world. Then
+the same three steps for the server and for each client, with the authority as
+the issuer and a fresh `--serial` each time — and, for a client, `ca issue
+--permission=DEMO` to write what it may reach into its certificate. Point
+`SECURITY/CERTIFICATE`, `PRIVATE_KEY` and `AUTHORITY` at the result, set
+`SERVER/TLS_MODE` and `HTTP/TLS_MODE` to `TRUE`, and restart.
+[doc/security.md](doc/security.md) does all of this properly, with the subject
+configuration files spelled out.
+
+### 10. Turn on permissions
+
+```
+SECURITY:
+	PERMISSIONS_MODE: TRUE
+```
+
+Now a connection reaches only what its certificate names, and only if its
+subject is registered:
+
+```bash
+./home/bin/ca put   --certificate=alice-demo.crt   # let a subject connect
+./home/bin/ca users                                # who may connect
+./home/bin/ca off   --subject-name="CN=alice"      # stop them, at once
+```
+
+Verify the whole of it:
+
+```bash
+./Test/run-permissions-e2e.sh
+```
+
+**Deploying it elsewhere.** `home` is the install prefix and the runtime
+directory both, so copying it is the deployment — nothing outside it is needed
+at run time. Set `TRACE_MODE: FALSE` and `LIBRARY/CACHE_MODE: GLOBAL` for
+anything busy, and remember that caching means a recompiled object is ignored
+until the server restarts. [doc/tutorial.md](doc/tutorial.md) covers a real
+installation, including putting Zeytun behind a reverse proxy.
+
 ---
 
 ## Your first application
 
-A worked example with tables, indexes, sequences, procedures and pages lives in
-[`demo/`](demo/README.md) — build it with `demo/build.sh` and browse it at
-<http://127.0.0.1:2190/setup.zt>. The rest of this section covers the same
-ground in miniature.
+The section above gets the demo running. This one is the same ground with the
+reasoning attached — what a page is, why a sequence is declared rather than
+implied, and who owns a transaction — built up one piece at a time. A larger
+worked example with indexes and bulk loading lives in
+[`demo/`](demo/README.md).
 
 ### 1. A page
 
@@ -308,6 +531,213 @@ does not currently compile.
 
 ---
 
+## The Parsi language
+
+Parsi is case-insensitive, and every name is a path: `domain::subdomain::name`.
+The domains are namespaces and are optional — `employees` and
+`human_resources::employees` are both valid names. The same path is what a
+certificate grants access to, and what `REQUIRES` refers to.
+
+### What you can declare
+
+| | |
+|---|---|
+| [`TABLE`](doc/table.md) | Columns with `PRIMARY KEY`, `UNIQUE KEY`, `INDEX` and `NOT NULL`. Each key builds a B-tree in the storage engine. |
+| [`SEQUENCE`](doc/sequence.md) | `FROM`, `TO`, `STEP`. Declared explicitly — a primary key does not imply one. |
+| [`PROCEDURE`](doc/procedure.md) | Typed parameters, `RETURNS`, `REQUIRES`. The unit a client calls and the unit a permission names. |
+| [`CLASS`](doc/class.md) | Fields, methods, constructors and destructors, inheritance, `VIRTUAL` and `OVERRIDE`. |
+| [`TYPE`](doc/type.md) | An alias for another type. |
+| [`ENUM`](doc/enum.md) | A named set of values. |
+| [`PAGE`](doc/page.md) | A class Zeytun serves at a URL. Overrides `PAGE_LOAD()`; sees `request`, `response` and `session`. |
+
+`TABLE`, `SEQUENCE` and `PROCEDURE` are **named objects**: a permission can name
+one, and a caller has to hold it. `CLASS`, `TYPE`, `ENUM` and `PAGE` are not —
+nobody is granted a page, so what is checked is whatever it reaches.
+
+### Statements
+
+[`DECLARE`](doc/declare.md) · [`SET`](doc/set.md) · [`ECHO`](doc/echo.md) ·
+[`IF`](doc/if.md) · [`DO … WHILE` and `WHILE`](doc/do.md) ·
+[`TRY`](doc/try.md) · `THROW` · `RETURN` · [`CALL`](doc/call.md) ·
+[`DEFAULT`](doc/default.md)
+
+Data manipulation is part of the language rather than strings handed to a
+driver: [`SELECT`](doc/select.md) · [`INSERT`](doc/insert.md) ·
+[`UPDATE`](doc/update.md) · [`DELETE`](doc/delete.md) ·
+[`TRUNCATE`](doc/truncate.md) · [`TRANSACTION`](doc/transaction.md)
+
+`SELECT` is a **cursor, not a result set**. Everything between `SELECT` and
+`FROM` runs once per row, and there is nothing to iterate afterwards. An item
+written `variable = expression` assigns instead of emitting, which is how a
+`SELECT` counts or totals:
+
+```parsi
+DECLARE rows AS Long = 0;
+SELECT rows = rows + 1 FROM demo::books WHERE year == 2026;
+```
+
+### Types
+
+Every type is nullable, the way a SQL column is, and carries that as state
+rather than as a separate flag: `Long id(0); id.is_null()`.
+
+| | |
+|---|---|
+| `Bool` | `TRUE` or `FALSE` |
+| `Char` `Byte` `UByte` | 8 bits, signed and unsigned |
+| `Short` `UShort` | at least 16 bits |
+| `Int` `UInt` | at least 32 bits |
+| `Long` `ULong` | at least 64 bits |
+| `Float` `Double` `Real` | 32, 64 and 80-bit floating point |
+| `Timestamp` | a point in time |
+| `String` `Text` | up to 255 and 65,535 characters |
+| `Vector<T>` | up to 4,294,967,295 elements |
+| `Object` | the type of `NULL`, and not a type you declare |
+
+Full reference in [doc/datatypes.md](doc/datatypes.md); operators and precedence
+in [doc/expression.md](doc/expression.md).
+
+### Reaching C++
+
+`INCLUDE` and `LINK` at the top of a file put a header and a library on the
+generated object's compile and link lines, so a Parsi object can use any C++
+library on the machine. [doc/cpp.md](doc/cpp.md) covers the syntax that reaches
+through.
+
+---
+
+## Compiled objects
+
+Parsi is not interpreted and there is no plan cache. Every object becomes a
+shared library, and the server `dlopen`s it.
+
+```
+source.parsi
+   │  Tokenizer          home/etc/patterns.conf — the grammar, read at runtime
+   │  Parser                  so the language is data, not a generated parser
+   ▼
+home/tmp/_NAME_.cpp + .hpp        generated C++, one file per object
+   │  c++ -fPIC -c
+   │  c++ -shared
+   ▼
+home/ld/lib_NAME_.so             plus home/catalog/_NAME_.conf
+```
+
+Each library exports a small, fixed interface:
+
+| | |
+|---|---|
+| `call` | a procedure: reads its arguments off the connection, writes its results back |
+| `new_page` / `delete_page` | a page: constructs it against the request and response |
+| `links` | the link flags anything requiring this object also needs |
+| `objects` | the named objects this one lets a caller reach |
+
+`objects` is what makes permissions enforceable without a grants table: the
+answer travels inside the code it describes and cannot drift from it. A library
+built before it existed is refused rather than waved through.
+
+The catalogue entry beside it records the name, its path, the guard macro, the
+hash key and what it `REQUIRES`, which is how the compiler resolves a dependency
+without reading anyone's source again.
+
+Three ways in: `home/bin/parsi file.parsi` offline, `Connector::compile` over the
+binary protocol, or the compiler page at `/compiler.zt`. All three run the same
+compiler in the same process shape.
+
+> `LIBRARY/CACHE_MODE` decides what happens next. `NONE` re-opens the object on
+> every use, so a recompile takes effect immediately — what you want while
+> developing. `GLOBAL` and `LOCAL` cache it, which is faster and means a
+> recompiled object is ignored until the server restarts.
+
+---
+
+## Transactions and concurrency
+
+Both servers are a thread pool in front of a socket, and both bind what a
+connection is doing to the thread serving it — the client stream, the peer's
+identity, and the transaction all live in thread-local state that is unbound
+again on the way out.
+
+**Zigurat: the transaction belongs to the connection.** One connection holds one
+worker thread for its whole life, so every `call` down that connection is part
+of one transaction. The client ends it — `commit()` makes all of them stand,
+`rollback()` discards all of them, closing without either discards the work.
+`auto_commit(true)` commits after each call instead, and a procedure can end with
+`TRANSACTION COMMIT;` to commit its own — though then the client can no longer
+roll it back.
+
+**Zeytun: one request is one transaction.** It opens one before the page runs,
+commits when the page returns cleanly and rolls back otherwise. Sessions are
+separate and outlive the request.
+
+`SERVER/POOL_SIZE` and `HTTP/POOL_SIZE` are therefore the number of concurrent
+transactions and concurrent requests, five each by default.
+
+---
+
+## The binary protocol
+
+Port 2160. A client sends a function name, then whatever that function reads;
+the server answers with a stream of tagged results the client drains.
+[`Connector`](doc/connector.md) is the C++ client, and there is nothing in it a
+different language could not reimplement.
+
+| function | |
+|---|---|
+| `echo` | round-trips a string; the cheapest liveness check there is |
+| `call` | runs a compiled procedure |
+| `compile` | compiles Parsi source sent inline |
+| `commit` / `rollback` | ends the connection's transaction |
+| `auto_commit` | commit after every call, or not |
+| `isolate` | sets the isolation level for this connection |
+| `dba_pagefiles` / `dba_pointers` | the storage engine's own view of itself |
+| `dba_attach_watcher` / `dba_detach_watcher` | streams engine events to the client |
+| `close` | ends the conversation |
+
+Every answer is a sequence of `ResultType` bytes, and a client that stops reading
+early desynchronises the connection:
+
+| | |
+|---|---|
+| `SUCCESSFUL_DONE` | the end of one answer |
+| `CURSOR_OPEN` `CURSOR_FETCH` `CURSOR_CLOSE` | a `SELECT`, one row at a time |
+| `RETURN_VALUE` | what the procedure returned |
+| `EXCEPTION_THROWN` | a message, and then the connection ends |
+
+---
+
+## Security
+
+Both ports can require every client to present a certificate the configured
+authority issued, and both ends prove themselves: `SERVER/TLS_MODE` and
+`HTTP/TLS_MODE`. The transport is ZiguratIP's own TLS 1.2 with RSA key
+transport — see [Status](#status) for what that is and is not worth.
+
+On top of that sits an access model with **no server-side grant table**:
+
+- **What a client may reach is written into its certificate.** `ca issue
+  --permission=DEMO` grants a schema, `--permission=DEMO::AUTHORS` one object,
+  `*` everything. A certificate naming none reaches nothing. One subject can hold
+  several certificates granting different things, and which one it presents is
+  what decides.
+- **Who may connect at all is a directory.** `SECURITY/USERS_PATH` holds one file
+  per subject; a subject with no file is refused during the handshake, whichever
+  certificate it presents. Removing the file withdraws access at once, and there
+  is nothing else to undo.
+- **Checked in three places:** the handshake, invocation (`call`, and a page by
+  what it requires), and declaration — so a caller allowed one schema cannot
+  compile a procedure that reads another and then legitimately call it.
+
+`SECURITY/PERMISSIONS_MODE` is the one switch for all of it, off by default,
+because half-enforced would be worse than either.
+
+The `ca` tool does the rest: `keygen`, `csr`, `issue`, `pikval`, `pukval`, and
+`put`, `off` and `users` for the directory. Its certificates and requests are
+OpenSSL-compatible. [doc/security.md](doc/security.md) walks through it from an
+empty directory.
+
+---
+
 ## Documentation
 
 Full reference in [`doc`](doc/README.md):
@@ -416,6 +846,89 @@ part of the default build (see [Status](#status)).
 Headers are `.hpp` and implementations `.cpp`, so nothing in the tree is
 mistaken for C. The headers the compiler generates for Parsi objects follow the
 same convention. Vendored zlib is C and keeps its own `.h` names.
+
+### What each library carries
+
+Nothing here wraps a third-party equivalent; each was written for this project,
+which is why the list is as long as it is.
+
+| | |
+|---|---|
+| `Core` | `BigInt` arbitrary-precision arithmetic (what RSA rests on), arrays, polynomials, filesystem and string utilities |
+| `StreamIO` | `binarystream` and `textstream` with typed reads and writes, custom `streambuf`s, byte-order handling |
+| `Type` | the nullable value types, `Vector`, and the type descriptor byte the wire protocol uses |
+| `Encoding` | base16/32/32hex/64/64url, CTE, DER and ASN.1 |
+| `Compression` | DEFLATE over vendored zlib |
+| `Cryptography` | SHA-1/2, HMAC, HKDF, AES, RSA, X.509 certificates and requests |
+| `Configuration` | the indentation-based configuration format, and command-line arguments |
+| `Threading` | the thread pool both servers run on |
+| `SocketIO` | sockets, TCP and IPC streams, and the TLS 1.2 record layer |
+| `Connector` | the client for the binary protocol |
+| `HTTP` | request, response, the server, sessions and MIME types |
+| `MVCCS` | the storage engine: pager, B-trees, transactions, isolation, `Globals` |
+| `Compiler` | tokenizer, the pattern-driven parser, and Parsi to C++ |
+| `Library` | the shared-object loader and the pool that caches handles |
+
+The build order in the top-level `Makefile` is the dependency order:
+`Core → StreamIO → Type → Library → Encoding → Compression → Cryptography →
+Configuration → Threading → SocketIO → Connector → HTTP → MVCCS → Compiler`,
+then the four programs.
+
+### The four programs
+
+| | |
+|---|---|
+| `ziguratip` | the server: both protocols, the storage engine, and the compiler |
+| `parsi` | the compiler on its own, for compiling objects without a server |
+| `ca` | the certificate authority, and the registry of who may connect |
+| `Test` | the suite; `Test/run-*.sh` start a server around it |
+
+All four take `--help`.
+
+---
+
+## Working on ZiguratIP
+
+```bash
+make                  # everything, Debug
+make MODE=Release     # optimised
+make -C MVCCS         # one module
+make clean            # and "make clean -C MVCCS" for one
+```
+
+A module's `Makefile` is four variables and one include:
+
+```make
+PROJECT := MVCCS
+TYPE    := Library          # or Executable
+HEADERS := memory.hpp globals.hpp ...     # copied to home/include
+SOURCES := memory.cpp globals.cpp ...     # compiled into home/obj
+LIBS    := -lCore -lCryptography -lStreamIO
+include ../Makefile.global
+```
+
+`Makefile.global` does the rest: it copies the headers, generates a
+`<Module>-<platform>-<compiler>.depend`, and links either one shared library
+into `home/lib` or one program into `home/bin`. Adding a module is a directory
+with a `Makefile` in that shape and a line in `PROJECTS`. `home/include` is what
+`-I$ZIGURATIP_HOME/include` gives a client, so a header that is not in `HEADERS`
+is private to its module.
+
+Tests are `ZTEST(Suite, name)` blocks in `Test/test_*.cpp`, registered at load
+time, so a new file needs nothing but a line in `Test/Makefile`. `Test <filter>`
+runs one suite or one case; `Test --help` lists what is there.
+
+Three scripts do the things a unit test cannot see, because they need two
+processes:
+
+| | |
+|---|---|
+| `Test/run-e2e.sh` | the suite against a live server, plus keep-alive and a missing page |
+| `Test/run-permissions-e2e.sh` | certificates granting different things, over both protocols |
+| `Test/run-reload-e2e.sh` | a library replaced under a running server |
+
+The last two need `demo/build.sh` to have run. All three start their own server
+and stop it again.
 
 ---
 

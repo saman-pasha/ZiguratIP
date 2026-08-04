@@ -26,12 +26,77 @@ std::string conf_path;
 std::string catalog_path;
 std::string library_path;
 
+namespace
+{
+  // parsi is the server's compiler with no server around it, so it reads the
+  // server's configuration file and the same keys out of it. What it does not
+  // read is anything about ports or storage: it compiles, and stops.
+  void help()
+  {
+    std::cout
+      << "\tZiguratIP Parsi compiler" << std::endl
+      << std::endl
+      << "Usage: " << std::endl
+      << "\tparsi <file.parsi> [--config=<file>]" << std::endl
+      << "\tparsi --help" << std::endl
+      << std::endl
+      << "Arguments: " << std::endl
+      << "\t<file.parsi>       ::= the source to compile; one file, any number" << std::endl
+      << "\t                       of objects, compiled in the order written" << std::endl
+      << "\t--config           ::= \"configuration file\"" << std::endl
+      << "\t--help | -h        ::= this" << std::endl
+      << std::endl
+      << "What it produces, for each object in the file: " << std::endl
+      << "\t$LD_PATH/lib_NAME_.so       the loadable object" << std::endl
+      << "\t$LD_PATH/_NAME_.hpp         its generated header" << std::endl
+      << "\t$CATALOG_PATH/_NAME_.conf   its catalogue entry" << std::endl
+      << "\t$TMP_PATH/_NAME_.cpp|.out   the generated C++ and the build log" << std::endl
+      << std::endl
+      << "Configuration: " << std::endl
+      << "\tWithout --config, ziguratip.conf is looked for in this order:" << std::endl
+      << "\t  1. $ZIGURATIP_HOME/etc/ziguratip.conf" << std::endl
+      << "\t  2. ~/ZiguratIP/etc/ziguratip.conf" << std::endl
+#if defined(_WIN32) || defined(_WIN64)
+      << "\t  3. %PROGRAMDATA%/ZiguratIP/ziguratip.conf" << std::endl
+#else
+      << "\t  3. /etc/ZiguratIP/ziguratip.conf" << std::endl
+#endif
+      << std::endl
+      << "Settings it reads, with their defaults: " << std::endl
+      << "\t/LOCALE                     en_US.utf8" << std::endl
+      << "\t/HOME_PATH                  $ZIGURATIP_HOME" << std::endl
+      << "\t/CATALOG_PATH               $HOME_PATH/catalog" << std::endl
+      << "\t/LIBRARY_PATH               $HOME_PATH/ld" << std::endl
+      << "\t/PARSER/PATTERNS_FILE       $HOME_PATH/etc/patterns.conf" << std::endl
+      << "\t/PARSER/TRACE_MODE          FALSE  --! prints the parse !--" << std::endl
+      << "\t/COMPILER/CPP               c++    --! must be on PATH !--" << std::endl
+      << "\t/COMPILER/CPP_FLAGS         -Wall -std=c++11 -fPIC" << std::endl
+      << "\t/COMPILER/LD_FLAGS          -shared" << std::endl
+      << "\t/COMPILER/INCLUDE_PATH      $HOME_PATH/include" << std::endl
+      << "\t/COMPILER/OBJ_PATH          $HOME_PATH/obj" << std::endl
+      << "\t/COMPILER/LIB_PATH          $HOME_PATH/lib" << std::endl
+      << "\t/COMPILER/TMP_PATH          $HOME_PATH/tmp" << std::endl
+      << "\t/COMPILER/LD_PATH           $HOME_PATH/ld" << std::endl
+      << "\t/COMPILER/TRACE_MODE        FALSE  --! prints the generated C++ !--" << std::endl
+      << std::endl
+      << "\tAn object named in REQUIRES has to be compiled already, so order" << std::endl
+      << "\tmatters. See doc/parsi.md and doc/configuration.md." << std::endl;
+  }
+}
+
 int main(int argc, char* argv[])
 {
   clock_t begin_time = clock();
 
   Argument args(argc, argv);
-    
+
+  // Before the configuration file is looked for, so asking what parsi takes
+  // works in a tree that is not set up yet.
+  if (args.flag("--help") || args.flag("-h") || argc == 1) {
+    help();
+    return 0;
+  }
+
   if (!args.get("--config", conf_path)) {
     conf_path = Utility::config_path("ziguratip.conf");
   }
@@ -99,8 +164,11 @@ int main(int argc, char* argv[])
   }
   std::cout << "Parser trace mode: '" << ((parser_trace) ? "TRUE" : "FALSE" ) << "'" << std::endl;
 	
-  if (argc > 1) {
-    std::string file_name = argv[1];
+  // The first argument that is not a flag, wherever it sits: "parsi
+  // --config=x file.parsi" used to take "--config=x" as the file name and
+  // report that it did not exist.
+  std::string file_name;
+  if (args.get("", file_name)) {
     std::ifstream file(file_name);
     if (!file.good()) {
       throw ParsiException("file not found");
