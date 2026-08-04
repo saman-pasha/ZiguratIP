@@ -1,11 +1,11 @@
-// A client for run-permissions-e2e.sh.
+// A client for the end-to-end scripts.
 //
-// Opens a secure connection with the certificate it is given and tries one
-// thing, then says in one line whether the server allowed it. Everything
-// interesting about permissions happens between two processes -- the handshake
-// refuses before a request can be sent, and the refusals that come later arrive
-// as protocol errors or as an HTTP status -- so none of it can be seen from
-// inside the server's own test binary.
+// Opens a connection -- secure with the certificate it is given, or plain when
+// given "-" instead -- tries one thing, and says in one line whether the server
+// allowed it. What these scripts are after happens between two processes: a
+// handshake refuses before a request can be sent, a refusal later arrives as a
+// protocol error or an HTTP status, and a server that dies answers nothing at
+// all. None of it can be seen from inside the server's own test binary.
 //
 // Always exits 0: the script compares the line, and a non-zero exit under
 // "set -e" would end the run before it could.
@@ -28,14 +28,15 @@ namespace
 {
   // The binary protocol, through the Connector, which is what a real client
   // uses.
-  void speak_zigurat(const TLS::HandshakeParameters& params, const std::string& host,
+  void speak_zigurat(bool secure, const TLS::HandshakeParameters& params, const std::string& host,
 		     const std::string& port, const std::string& verb, const std::string& argument)
   {
     Connector connector;
 
     // With a timeout, so a probe that gets no answer says so instead of
     // wedging the script that ran it.
-    connector.open(params, host, port, true, 20);
+    if (secure) connector.open(params, host, port, true, 20);
+    else        connector.open(host, port, true, 20);
 
     if (verb == "connect") {
       // Getting here at all is the answer: the handshake is where an
@@ -111,10 +112,15 @@ int main(int argc, char* argv[])
 {
   if (argc < 7) {
     std::cout << "USAGE" << std::endl;
-    std::cout << "  permissions-probe <cert> <key> <authority> <host> <port> "
+    std::cout << "  e2e-probe <cert> <key> <authority> <host> <port> "
 	      << "connect|call|compile|page [argument]" << std::endl;
+    std::cout << "  e2e-probe - - - <host> <port> "
+	      << "connect|call|compile [argument]      (in the clear)" << std::endl;
     return 0;
   }
+
+  // Three dashes where the material would go: no certificate, so no handshake.
+  const bool secure = (std::string(argv[1]) != "-");
 
   TLS::HandshakeParameters params;
   params.protocol_version = TLS::VERSION_1_2;
@@ -131,7 +137,7 @@ int main(int argc, char* argv[])
     if (verb == "page")
       speak_http(params, host, port, argument);
     else
-      speak_zigurat(params, host, port, verb, argument);
+      speak_zigurat(secure, params, host, port, verb, argument);
 
   } catch (const std::exception& error) {
     // One line, so the script can grep it. Newlines in a server message would

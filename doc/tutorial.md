@@ -74,11 +74,21 @@ make -C Test && Test/run-e2e.sh
 
 That starts a server, runs every suite against it including the live Connector
 round trip and a keep-alive check, and stops it again. Expect
-`256 cases, 1109 checks, result: PASS`.
+`257 cases, 1111 checks, result: PASS`.
 
-Once the demo is compiled — step 5 below — `Test/run-permissions-e2e.sh` adds
-the certificate side: it issues several certificates granting different things
-and checks what each one can reach, over both protocols.
+Once the demo is compiled — step 5 below — two more scripts run.
+`Test/run-permissions-e2e.sh` adds the certificate side: it issues several
+certificates granting different things and checks what each one can reach, over
+both protocols. `Test/run-reload-e2e.sh` replaces a library under a running
+server and checks that it survives it.
+
+That last one is worth knowing about before you meet it by accident. Do not
+rebuild `home/lib` while a server is running. A compiled object names the core
+libraries as dependencies, and the loader resolves those names again every time
+one is opened — so a library replaced mid-run is a different file from the one
+the server mapped at startup, and gets loaded a second time. The object then
+runs against a storage engine that was never opened. The server notices and
+refuses, and the only cure is the restart it asks for.
 
 ## 3. Deploying
 

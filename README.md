@@ -109,7 +109,7 @@ and **2190** (HTTP). Open <http://127.0.0.1:2190/> for the landing page.
 ./Test/run-e2e.sh
 ```
 
-Starts a server, runs the full suite against it, stops it again. 256 cases and a
+Starts a server, runs the full suite against it, stops it again. 257 cases and a
 keep-alive check covering every library, the Parsi grammar, and the storage
 engine's ACID, isolation, concurrency and durability behaviour.
 
@@ -121,6 +121,19 @@ Issues certificates granting different things, starts a secure server on its own
 ports, and checks that each one reaches what it should and nothing else — over
 both protocols, and with the switch off as well as on. Needs `demo/build.sh` to
 have run.
+
+```bash
+./Test/run-reload-e2e.sh
+```
+
+Replaces a library under a running server and checks that it says so and stays
+up. Also needs `demo/build.sh`.
+
+> **Do not rebuild `home/lib` while a server is running.** A compiled object
+> names the core libraries as dependencies and the loader resolves those names
+> again every time one is opened, so a library replaced mid-run is loaded a
+> second time and the object binds to that copy instead of the one the server is
+> using. The server notices and refuses the request; restart it.
 
 ---
 

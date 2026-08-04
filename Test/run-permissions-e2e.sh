@@ -200,9 +200,9 @@ HTTP:
 CONF
 
 echo "building the probe"
-PROBE="$WORK/permissions-probe"
+PROBE="$WORK/e2e-probe"
 c++ -Wall -std=c++11 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$PROBE" \
-    "$HERE/permissions-probe.cpp" \
+    "$HERE/e2e-probe.cpp" \
     -lConnector -lCore -lStreamIO -lType -lSocketIO -lCryptography \
     -lEncoding -lConfiguration -lThreading -lLibrary -lCompression
 

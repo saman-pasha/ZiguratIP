@@ -95,6 +95,7 @@ void handle_client()
 	auto handle = library_pool.handle(func_name);
 	auto symbol = (void (*)(void))library_pool.symbol(handle, "call");
 
+	require_runtime(handle);
 	require_objects(handle);
 
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);

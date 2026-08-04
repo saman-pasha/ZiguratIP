@@ -166,6 +166,10 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
       if (!handle)
 	throw HTTPException("404 Not Found");
 
+      // Not a refusal and not the visitor's fault, so it is not a 403: the
+      // server is the thing that is wrong, and the answer says so.
+      require_runtime(handle);
+
       // A page is not something a certificate can name -- Zeytun decides which
       // URLs it serves -- so what is checked is what the page reaches: the
       // tables and procedures it requires.

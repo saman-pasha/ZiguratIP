@@ -23,6 +23,26 @@ Zigurat::Parser* Globals::_parser = nullptr;
 Zigurat::Compiler* Globals::_compiler = nullptr;
 
 
+namespace
+{
+  // One byte, at a different address in every copy of this library that a
+  // process has loaded. Which sounds like a thing that cannot happen, and is
+  // exactly what does happen when home/lib is rebuilt underneath a running
+  // server: the loader resolves a compiled object's dependencies afresh, finds
+  // a file that is no longer the one it mapped, and maps it again. Everything
+  // above then runs against a second Globals, whose streams were never set.
+  char runtime_instance = 0;
+}
+
+// Deliberately not a member: what asks the question is the server, holding a
+// library it has just opened, and it has to be able to ask through that
+// library's own symbols. See require_runtime in the servers.
+extern "C" const void* zigurat_runtime_instance()
+{
+  return &runtime_instance;
+}
+
+
 bool Globals::reset_mode()
 {
   return _reset_mode;
@@ -48,8 +68,22 @@ Zigurat::IsolationLevel Globals::default_isolation_level()
   return _default_isolation_level;
 }
 
+// Everything a compiled object sends goes straight through this pointer, and
+// nothing generated checks it first -- so a null one is not a null check that
+// was forgotten, it is a call through a vtable at address zero, and the process
+// dies with a stack that points at the user's procedure and explains nothing.
+//
+// A thread running compiled code always has a connection bound to it. If it
+// does not, something is wrong that the connection should be told about; and if
+// there is no connection to tell, the thread pool logs it and takes the next
+// job. Either is better than the process.
+//
+// echo_stream stays as it is: generated code tests it for null to decide
+// whether it is answering a page or a client, so null is an answer there.
 Zigurat::binarystream* const Globals::client_stream()
 {
+  if (_client_stream == nullptr)
+    throw Zigurat::ZiguratException(7802, "no connection is bound to this thread");
   return _client_stream;
 }
 

@@ -132,3 +132,27 @@ ZTEST(MVCCS, autocommit_mode_round_trips_through_globals)
 
   Globals::set_default_autocommit_mode(original);
 }
+
+// Compiled code writes its results straight through the client stream and never
+// tests it first, so an unbound one used to be a call through a vtable at
+// address zero: the process died inside the user's procedure with a stack that
+// explained nothing. Asking for a stream that is not there has to be an error
+// the connection can be told about.
+ZTEST(MVCCS, an_unbound_client_stream_is_an_error_and_not_a_null_pointer)
+{
+  Zigurat::binarystream* const original = []() -> Zigurat::binarystream* {
+    try { return Globals::client_stream(); } catch (const ZiguratException&) { return nullptr; }
+  }();
+
+  Globals::set_client_stream(nullptr);
+  ZCHECK_THROWS(Globals::client_stream());
+
+  // The echo stream keeps answering null, because generated code tests it to
+  // decide whether it is serving a page or a client.
+  Zigurat::textstream* const echo = Globals::echo_stream();
+  Globals::set_echo_stream(nullptr);
+  ZCHECK(Globals::echo_stream() == nullptr);
+  Globals::set_echo_stream(echo);
+
+  Globals::set_client_stream(original);
+}
