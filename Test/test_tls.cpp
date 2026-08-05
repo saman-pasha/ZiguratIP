@@ -470,7 +470,12 @@ ZTEST(TLS, a_peer_that_cannot_be_vouched_for_is_refused)
   // The server is the end that judges, so it is the end that must refuse, and
   // it must say why rather than falling over.
   ZCHECK(!server_error.empty());
-  ZCHECK(server_error.find("tbsCertificate") != std::string::npos);
+  // It named "tbsCertificate" when this was walked by hand and the walk ran
+  // out inside that field. The reader is OpenSSL's now and says the thing the
+  // comment above says -- the authority is not a certificate -- so what is
+  // checked here is that the refusal is about the authority, which is tlsbuf's
+  // own words, rather than a field name belonging to a decoder that is gone.
+  ZCHECK(server_error.find("certificate authority") != std::string::npos);
 
   // And the client is told, rather than being left waiting.
   ZCHECK(!client_error.empty());
