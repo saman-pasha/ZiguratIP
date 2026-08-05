@@ -12,6 +12,9 @@
 //
 //     ZIGURAT_BTREE_ROWS=200000 home/bin/Test BTree
 
+#include "bufferstream.hpp"
+#include <map>
+#include <iostream>
 #include "ztest.hpp"
 #include "dbfixture.hpp"
 #include "globals.hpp"
@@ -866,4 +869,130 @@ ZTEST(BTree, truncate_keeps_a_row_whose_delete_was_rolled_back)
   int64_t counted = 0;
   fixture.memory()->cursor<Item>([&counted] (Item&) -> bool { counted++; return true; });
   ZCHECK_EQ(counted, n);
+}
+
+// ---------------------------------------------------------------------------
+// Memory: how the store lays rows out on disk.
+//
+// Run with:  Test Memory
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The page list as dba_pagefiles reports it: hash key -> the page starts
+  // belonging to it. One entry per page, so the size of a key's vector is the
+  // number of pages that object occupies.
+  std::map<std::string, std::vector<int64_t> > page_files(Memory* memory)
+  {
+    bufferstream out;
+    memory->dba_pagefiles(out);
+    out.seekg(0, std::ios::beg);
+
+    std::map<std::string, std::vector<int64_t> > pages;
+    size_t count = 0;
+    out.read_std_size(count);
+    for (size_t i = 0; i < count; i++) {
+      std::string key;
+      int64_t start = 0;
+      out.read_std_string(key);
+      out.read_std_long(start);
+      pages[key].push_back(start);
+    }
+    return pages;
+  }
+
+  size_t total_pages(const std::map<std::string, std::vector<int64_t> >& pages)
+  {
+    size_t n = 0;
+    for (const auto& entry : pages) n += entry.second.size();
+    return n;
+  }
+
+  // Objects occupying exactly one page. An index that gives every row its own
+  // bucket produces one of these per row.
+  size_t single_page_objects(const std::map<std::string, std::vector<int64_t> >& pages)
+  {
+    size_t n = 0;
+    for (const auto& entry : pages) if (entry.second.size() == 1) n++;
+    return n;
+  }
+}
+
+// Rows go into pages together, which is the whole point of having pages.
+ZTEST(Memory, a_table_packs_many_rows_into_each_page)
+{
+  Fixture fixture("memory-packing");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 400;
+  fixture.load(n);
+
+  const std::map<std::string, std::vector<int64_t> > pages = page_files(fixture.memory());
+  ZCHECK(total_pages(pages) > 0);
+
+  // Whatever the layout, four hundred rows must not cost four hundred pages.
+  // At 8 KB each that would be three megabytes for a few kilobytes of data.
+  ZCHECK(total_pages(pages) < (size_t)n);
+}
+
+// The point of this suite, and the property that is currently missing.
+//
+// An index is data too: its entries should sit next to each other in page files
+// the way a table's rows do. Keying a bucket by the address of the row it points
+// at gives every row its own bucket, and every bucket its own page -- so the
+// index costs a page per row and the tree never branches.
+//
+// btreeindex.hpp:180 does exactly that:
+//     composite_key = this->_name + std::to_string(key.pointer.address);
+ZTEST(Memory, an_index_keeps_its_entries_together_like_a_table)
+{
+  Fixture fixture("memory-index-packing");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  const int64_t n = 400;
+  fixture.load(n);
+
+  const std::map<std::string, std::vector<int64_t> > pages = page_files(fixture.memory());
+
+  // The numbers, so a failure says how bad rather than only that it is bad.
+  std::cerr << "    [" << n << " rows] objects=" << pages.size()
+	    << " pages=" << total_pages(pages)
+	    << " single-page objects=" << single_page_objects(pages) << std::endl;
+
+  // Four indexes over four hundred rows. Packed, that is a handful of objects
+  // holding many pages each. Per row, it is hundreds of objects holding one
+  // page each -- which is what to look for.
+  ZCHECK(single_page_objects(pages) < (size_t)n);
+
+  // And the store as a whole stays proportional to the data rather than to the
+  // number of rows times the page size.
+  ZCHECK(total_pages(pages) < (size_t)n);
+}
+
+// A page the store says it has is a page it can describe.
+ZTEST(Memory, every_page_the_store_lists_can_be_read_back)
+{
+  Fixture fixture("memory-readback");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  fixture.load(50);
+
+  const std::map<std::string, std::vector<int64_t> > pages = page_files(fixture.memory());
+  ZCHECK(!pages.empty());
+
+  size_t described = 0;
+  for (const auto& entry : pages) {
+    for (int64_t start : entry.second) {
+      bufferstream request, out;
+      request.write_std_long((int64_t)start);
+      request.seekg(0, std::ios::beg);
+      // dba_pointers reads the start from the same stream it writes to.
+      bufferstream io;
+      io.write_std_long((int64_t)start);
+      io.seekg(0, std::ios::beg);
+      ZCHECK_NOTHROW(fixture.memory()->dba_pointers(io));
+      described++;
+    }
+  }
+  ZCHECK_EQ((uint64_t)described, (uint64_t)total_pages(pages));
 }

@@ -75,6 +75,22 @@ It shows up in the Memory Viewer as an unusable list of page files and, on any
 of them, one row marked INSERTED. That is the symptom; the cost is roughly 8 KB
 of store per indexed row, and a B-tree that never branches.
 
+**There is a test suite for this, and it is red on purpose.** `Test Memory` --
+three cases in `Test/test_btree.cpp` -- says what the layout should be and
+measures what it is. Four hundred rows with four indexes over them:
+
+```
+[400 rows] objects=1209 pages=1226 single-page objects=1205
+```
+
+Twelve hundred pages for four hundred small rows, twelve hundred of the objects
+holding exactly one page. At 8 KB a page that is about ten megabytes of store
+for a few kilobytes of data.
+
+Left failing rather than weakened, the same way `run-reload-e2e` is: a test
+changed to pass is worth less than one that says something true. It goes green
+when an index keeps its entries together the way a table keeps its rows.
+
 Fixing it means deciding what a bucket should be keyed by -- the indexed value,
 presumably, so rows sharing a key share a node -- and letting nodes hold many
 entries. That is a change to the index rather than a repair to it.
