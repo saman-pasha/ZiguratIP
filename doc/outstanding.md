@@ -47,30 +47,6 @@ passing it on -- the same call `require_objects` makes, from the page instead of
 the loader. Until then they belong behind `PERMISSIONS_MODE: FALSE` or off a
 public port entirely.
 
-### A session cookie does not survive a real HTTP round trip
-
-Send `ZIPSESSID` back on the next request and the server mints a *new* session
-instead of finding the one it just issued. Reproduced against a running server:
-two requests, the second carrying the exact cookie the first set, and the second
-answers with a fresh `Set-Cookie`.
-
-The unit tests do not catch it because `Exchange` puts the cookie on the request
-through the object model rather than through a parsed header, so the store and
-the cookie are exercised and the header path is not.
-
-Not the parsing, as far as reading goes: `httpserver.cpp:209` upper-cases the
-field name, `httprequest.cpp:51-56` splits `COOKIE` on `;` then `=` and trims,
-and `HAS_COOKIE`/`COOKIE` look the name up as given. Which leaves
-`Session::INITIALIZE`'s check that the id names a session this server actually
-issued (`session.cpp:53-60`) -- that is where to look next.
-
-**This is why the RPC console still cannot be used across requests**, even
-though the machinery under it is right: every request is a new session, so every
-request is a new owner, and a visitor is refused their own transaction. The
-ownership check itself demonstrably works -- a second browser is refused with
-"that transaction belongs to another session", and an invented id with "no such
-transaction". Fix the cookie and the console works; nothing else is missing.
-
 ### The compiler is gated, not fixed
 
 `COMPILER/REMOTE_MODE` defaults to `FALSE`, so the network cannot reach the

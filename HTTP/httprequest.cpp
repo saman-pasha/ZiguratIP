@@ -43,7 +43,10 @@ namespace Zigurat
 	  this->_headers[Utility::trim(Utility::to_upper(con_parts[0]))] = Utility::trim(parts[1]);
 	}
       }
-      if (this->_content_type == "application/x-www-form-urlencoded" || this->_content_type == "multipart/form-data") {
+      // Media types are case insensitive (RFC 7231 section 3.1.1.1), and the
+      // value is no longer lower-cased on the way in.
+      const std::string content_type = Utility::to_lower(this->_content_type);
+      if (content_type == "application/x-www-form-urlencoded" || content_type == "multipart/form-data") {
 	this->_load_post_vars(); // $_POST
       }
     }

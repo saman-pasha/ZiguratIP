@@ -167,7 +167,7 @@ namespace Zigurat
 
       this->_dispatch_id++;
       if (this->_request->_headers.find("CONNECTION") != this->_request->_headers.end() &&
-	  this->_request->_headers.at("CONNECTION") == "close") { // Connection: close
+	  Utility::to_lower(this->_request->_headers.at("CONNECTION")) == "close") { // case insensitive
 	this->_close = true;
       }
       this->_lock.unlock();

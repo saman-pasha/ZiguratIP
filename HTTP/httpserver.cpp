@@ -209,14 +209,28 @@ namespace Zigurat
 	  std::string field_name = Utility::to_upper(parts[0]);
 	  if (field_name[field_name.size() - 1] == ' ' || field_name[field_name.size() - 1] == '\t')
 	    throw HTTPException("400 Bad Request");
+	  // The name is upper-cased because field names are case insensitive.
+	  // The value is not, and used to be lower-cased along with it.
+	  //
+	  // Header values are opaque octets -- RFC 7230 section 3.2 -- except
+	  // where a particular field says otherwise, and mangling them broke
+	  // anything whose case carries meaning. Sessions most visibly: a cookie
+	  // sent back as ZIPSESSID arrived as zipsessid, never matched the name
+	  // it was stored under, and every request minted a fresh session. The
+	  // same would have happened to an Authorization token, an ETag, or the
+	  // path in a Referer.
+	  //
+	  // The two places that compared a value against lower-case text now
+	  // lower-case it themselves, where the field is one whose values really
+	  // are case insensitive.
 	  std::string field_value;
 	  if (parts.size() == 2) {
-	    field_value = Utility::to_lower(Utility::trim(parts[1]));
+	    field_value = Utility::trim(parts[1]);
 	  } else {
 	    std::stringstream ss_value;
-	    ss_value << Utility::to_lower(Utility::trim(parts[1]));
+	    ss_value << Utility::trim(parts[1]);
 	    for (size_t i = 2; i < parts.size(); i++)
-	      ss_value << ':' << Utility::to_lower(Utility::trim(parts[i]));
+	      ss_value << ':' << Utility::trim(parts[i]);
 	    field_value = ss_value.str();
 	  }
 	  if (headers.find(field_name) == headers.end()) { // Single header

@@ -482,6 +482,20 @@ namespace
     std::string method, uri, path, host, port;
     std::string raw;
     bool reached_handler = false;
+    std::map<std::string, std::string> headers;
+    std::map<std::string, std::string> cookies;
+
+    std::string header(const std::string& name) const
+    {
+      std::map<std::string, std::string>::const_iterator it = headers.find(name);
+      return (it == headers.end()) ? std::string() : it->second;
+    }
+    bool has_header(const std::string& name) const { return headers.count(name) > 0; }
+    std::string cookie(const std::string& name) const
+    {
+      std::map<std::string, std::string>::const_iterator it = cookies.find(name);
+      return (it == cookies.end()) ? std::string() : it->second;
+    }
   };
 
   Served serve(const std::string& request)
@@ -501,6 +515,13 @@ namespace
 	served.path   = request->PATH().value();
 	served.host   = request->HOST().value();
 	served.port   = request->PORT().value();
+	// through the public accessors, which is how a page would ask
+	const char* wanted[] = {"COOKIE", "AUTHORIZATION", "HOST", "CONNECTION"};
+	for (const char* name : wanted)
+	  if (request->HAS_HEADER(String(name)).value())
+	    served.headers[name] = request->HEADER(String(name)).value();
+	if (request->HAS_COOKIE(String("ZIPSESSID")).value())
+	  served.cookies["ZIPSESSID"] = request->COOKIE(String("ZIPSESSID")).value();
       },
       false, 0, false, 8000, 16000, 8 * 1024 * 1024);
 
@@ -534,6 +555,32 @@ ZTEST(Zeytun, an_absolute_form_request_line_carries_its_own_host)
   ZCHECK(served.reached_handler);
   ZCHECK_STR(served.host, "example");
   ZCHECK_STR(served.port, "2190");
+}
+
+// Header values are opaque octets -- RFC 7230 section 3.2 -- and were being
+// lower-cased along with the field name.
+//
+// Field *names* are case insensitive and upper-casing them is right. Values are
+// not, and mangling them broke every field whose case carries meaning. Sessions
+// most visibly: a cookie sent back as ZIPSESSID arrived as zipsessid, never
+// matched the name it was stored under, and the server minted a fresh session on
+// every request -- so a session could be written but never read again, and the
+// RPC console could not hold a transaction across two requests. The same would
+// have happened to an Authorization token or an ETag.
+ZTEST(Zeytun, a_header_value_arrives_with_its_case_intact)
+{
+  Served served = serve("GET /page.zt HTTP/1.1\r\n"
+			"Host: Example.COM\r\n"
+			"Cookie: ZIPSESSID=DeadBeef\r\n"
+			"Authorization: Bearer AbCdEf\r\n"
+			"Connection: close\r\n\r\n");
+
+  ZCHECK(served.reached_handler);
+  ZCHECK_STR(served.cookie("ZIPSESSID"), "DeadBeef");
+  ZCHECK_STR(served.header("AUTHORIZATION"), "Bearer AbCdEf");
+
+  // and the field name is still upper-cased, which is what lookups expect
+  ZCHECK(served.has_header("COOKIE"));
 }
 
 // A refusal with no body is a blank page: a browser shows nothing, view-source
