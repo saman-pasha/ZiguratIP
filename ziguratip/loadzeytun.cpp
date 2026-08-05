@@ -18,8 +18,12 @@ using namespace Zigurat;
 
 // HTTP server configuration
 std::string http_service = "80";
-int         http_backlog = 5;
-int         http_pool_size = 5;
+int         http_backlog = 64;
+// A worker is held for a whole keep-alive connection rather than one request,
+// and a browser opens six at once for a single page. At five, one visitor
+// could occupy every thread and then wait on themselves; the page rendered
+// blank and the log said nothing, because nothing had failed.
+int         http_pool_size = 64;
 bool        http_blocking_mode = true;
 size_t      http_timeout = 0;
 bool        http_async_mode = true;
@@ -203,13 +207,18 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
       mime_types.get("/" + ext + "/", content_type);
       response->SET_HEADER("Content-Type", content_type);
       std::string file_path = home_path + "http" + path;
-      std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+      std::ifstream file(file_path, std::ios::binary);
       if (file.good()) {
-	std::streamsize size = file.tellg();
-	file.seekg(0, std::ios::beg);
-        char buffer[size];
-	if (file.read(buffer, size)) {
-	  Globals::echo_stream()->write(buffer, size);
+	// This read the file's size and then declared char buffer[size] -- an
+	// array whose length is a number off the disk, on the stack of a pooled
+	// thread. Anything larger than that thread's stack ran off the end of
+	// it, and the whole file was held in memory besides. A fixed buffer,
+	// copied out as it fills, has neither problem and does not need the
+	// size in advance.
+	char buffer[64 * 1024];
+	while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+	  Globals::echo_stream()->write(buffer, file.gcount());
+	  if (!file) break;
 	}
       } else {
 	throw HTTPException("404 Not Found");

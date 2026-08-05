@@ -38,6 +38,16 @@ namespace Zigurat
     std::mutex stream_access;
     std::condition_variable stream_semaphore;
 
+    // Every refusal below -- 400, 411, 413, 414, 501 -- used to leave this
+    // function by unwinding past its caller, which put not one byte on the
+    // connection before dropping it. The client sees a socket that closed
+    // without answering: a browser draws a blank page, and a proxy in front of
+    // one reports the server as broken. Neither can say what was wrong,
+    // because nothing was ever said. HEAD is the common way to trip it -- the
+    // request line accepts it and the body of the loop does not implement it,
+    // so a proxy's HEAD probe got silence rather than the 501 it was owed.
+    try {
+
     while (!stream.eof()) {
 
       std::getline(stream, line);
@@ -178,6 +188,35 @@ namespace Zigurat
       }
 
     } // EOF
+
+    } catch (const HTTPException& ex) {
+      // Anything still running has to finish before the socket is written to,
+      // or its output interleaves with the error.
+      if (async_mode) {
+	for (Thread& pipe : pipes)
+	  pipe.join();
+	pipes.clear();
+      }
+
+      const std::string status = ex.what();          // "501 Not Implemented"
+      const std::string body = status + "\n";
+      std::stringstream out;
+      out << "HTTP/1.1 " << status << "\r\n"
+	  << "Content-Type: text/plain; charset=utf-8\r\n"
+	  << "Content-Length: " << body.size() << "\r\n"
+	  << "Connection: close\r\n"
+	  << "\r\n"
+	  << body;
+
+      // Best effort: the peer that sent a malformed request is often the same
+      // peer that has already gone away, and failing to report a failure must
+      // not become a second one.
+      try {
+	stream << out.str();
+	stream.flush();
+      } catch (...) {
+      }
+    }
   }
 
   void HTTPServer::run(TCPServer::Version version, std::string service, int backlog, size_t pool_size, 

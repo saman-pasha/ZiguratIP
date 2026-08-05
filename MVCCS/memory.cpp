@@ -123,7 +123,14 @@ namespace Zigurat
 	if (is_data) {
 	  if (online_lock != RowLock::NONE) {
 
-	    std::cout << "uncommitted_pointer: " << iter->first << "," << begin_address << std::endl;
+	    // hashkey_ptr is const uint8_t*, so streaming it picks the overload
+	    // that prints a C string: strlen ran off the end of a twenty octet
+	    // hash and kept going to the first zero byte, printing whatever it
+	    // passed. AddressSanitizer catches it on the first uncommitted
+	    // pointer found at startup.
+	    std::cout << "uncommitted_pointer: "
+		      << Utility::octet_as_hex(iter->first, sizeof(hashkey_t))
+		      << "," << begin_address << std::endl;
     
 	    this->_load_control(pointer, control);
 
