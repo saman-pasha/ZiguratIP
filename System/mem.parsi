@@ -11,8 +11,8 @@ PUBLIC:
 	OVERRIDE FUNCTION page_load() RETURNS Void
 	BEGIN
 		TRY BEGIN
-			DECLARE SESSION LOCAL con AS Connector;
-			DECLARE SESSION LOCAL watcher AS Connector;
+			DECLARE THREAD LOCAL con AS Connector;
+			DECLARE THREAD LOCAL watcher AS Connector;
 
 			DECLARE do AS String = request.query('do');
 

@@ -13,7 +13,7 @@ BEGIN
 PRIVATE:
 	DECLARE GLOBAL _sessions AS `std::`multimap<`std::`string, `std::`pair<`std::`string, `std::`string> >;
 	DECLARE GLOBAL _mutex AS `std::`mutex;
-	DECLARE SESSION LOCAL _id AS String;
+	DECLARE THREAD LOCAL _id AS String;
 
 PUBLIC:
 	GLOBAL FUNCTION id() RETURNS String

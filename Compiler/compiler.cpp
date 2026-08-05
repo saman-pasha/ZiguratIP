@@ -483,9 +483,25 @@ namespace Zigurat
       if (expr.token.value == "GLOBAL") {
         storage = 's';
 	offset++;
-      } else if (expr.token.value == "SESSION") {
+      } else if (expr.token.value == "THREAD") {
         storage = 't';
 	offset++;
+      } else if (expr.token.value == "SESSION") {
+
+	// SESSION LOCAL was thread_local wearing the wrong name, and the name is
+	// the dangerous part: it reads as "belongs to this visitor" and means
+	// "belongs to this worker thread". Worker threads are pooled across
+	// visitors, so anything a page kept there was handed to whoever the
+	// thread served next.
+	//
+	// Refused here rather than removed from the grammar, so this says which
+	// of the two things was meant instead of "syntax error near SESSION".
+	throw CompileException("SESSION LOCAL is thread local, not session local, and the two are"
+			       " not the same: a worker thread serves many visitors in turn."
+			       " Use THREAD LOCAL for something shared by everything that"
+			       " thread serves -- a connection, a buffer -- or Session::SET and"
+			       " Session::GET for anything belonging to the visitor", expr);
+
       } else if (in_impl) {
 	continue;
       }

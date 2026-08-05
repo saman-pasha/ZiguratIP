@@ -14,7 +14,7 @@ PUBLIC:
 				CALL response.set_header('Content-Type', 'text/html');
 			END
 
-			DECLARE SESSION LOCAL con AS Connector;
+			DECLARE THREAD LOCAL con AS Connector;
 			IF NOT con.is_open() BEGIN
 				CALL con.open();
 			END

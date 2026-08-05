@@ -47,6 +47,34 @@ passing it on -- the same call `require_objects` makes, from the page instead of
 the loader. Until then they belong behind `PERMISSIONS_MODE: FALSE` or off a
 public port entirely.
 
+### The RPC console's transaction belongs to a thread, not a visitor
+
+`System/rpc.parsi` holds its `Connector` in a `THREAD LOCAL` and never closes
+it, and `do=commit` and `do=rollback` arrive as separate HTTP requests. So the
+transaction outlives the request that opened it and belongs to whichever worker
+served it. `home/http/rpc.js` fetches the transaction id for display only and
+sends no identifier back, so the server commits whatever connection the thread
+it landed on happens to hold.
+
+With sixty-four workers, one visitor's `call` and their later `commit` can land
+on different threads, and two visitors sharing a thread share a transaction --
+either can commit the other's uncommitted work.
+
+The keyword no longer lies about this (`THREAD LOCAL` says what it is), but the
+console still behaves this way.
+
+The fix is to address connections by the transaction they carry and record the
+session that opened each, so a visitor can hold several at once and cannot touch
+anyone else's -- with `&tx=` travelling on `call`, `commit` and `rollback`.
+
+It was attempted and backed out. Parsi has no way to name an existing object
+without copying it: `DECLARE x AS T INOUT` is not accepted -- `INOUT` marks a
+parameter -- and `DECLARE x AS T& ` is a syntax error, so a lookup returning a
+connection cannot be bound to a local. The way through is to move each branch
+into a private function taking `con AS Connector INOUT`, which is the one place
+Parsi does pass by reference, and hand it the result of the lookup. That is a
+restructure of the page rather than an edit to it.
+
 ### The compiler is gated, not fixed
 
 `COMPILER/REMOTE_MODE` defaults to `FALSE`, so the network cannot reach the
