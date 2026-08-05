@@ -26,6 +26,27 @@ The fix is escaping by default in `ECHO`, with a deliberate way to opt out for
 the cases that really do emit markup -- not a helper that authors have to
 remember, because escaping-by-omission has never worked for anyone.
 
+### The Zigurat tools go around the permission system
+
+`mem.zt`, `rpc.zt` and `compiler.zt` reach the storage engine by opening their
+own `Connector`, and `con.open()` with no arguments reads `home/etc/connector.conf`
+-- `localhost:2160`, `TLS_MODE: FALSE`. That connection presents no certificate,
+so it carries no subject and no permissions.
+
+The permission system does not need anything added to it. These pages simply do
+not go through it: `PERMISSIONS_MODE` governs what a visitor's certificate lets
+them reach, and then a page opens a second, anonymous connection and reaches
+whatever it likes on the other side of it. A visitor who can load `/rpc.zt` can
+call any procedure, whatever their own certificate grants -- and `/mem.zt` hands
+out the page store's layout, and `/compiler.zt` is the compiler.
+
+`require_objects` cannot see any of it, because what these pages touch is chosen
+at request time rather than declared. What is needed is for them to check
+`Globals::permits()` themselves against the object being asked for, before
+passing it on -- the same call `require_objects` makes, from the page instead of
+the loader. Until then they belong behind `PERMISSIONS_MODE: FALSE` or off a
+public port entirely.
+
 ### The compiler is gated, not fixed
 
 `COMPILER/REMOTE_MODE` defaults to `FALSE`, so the network cannot reach the
