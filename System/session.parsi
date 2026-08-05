@@ -38,7 +38,7 @@ PUBLIC:
 	BEGIN
 		DECLARE lock AS `std::`lock_guard<`std::`mutex>(Session::_mutex);
 		DECLARE sstream AS `std::`stringstream;
-		DECLARE bstream AS `Zigurat::`BufferStream(sstream);
+		DECLARE bstream AS `Zigurat::`bufferstream(sstream);
 		CALL bstream.TEMPLATE_METHOD(`write<T>(value));
 		CALL Session::_sessions.`insert(`std::`make_pair(Session::id().`value(), `std::`make_pair(key.`value(), sstream.`str())));
 	END
@@ -53,7 +53,7 @@ PUBLIC:
 			IF (ContentOf(iter).`second.`first == key.`value()) BEGIN
 				DECLARE sstream AS `std::`stringstream(ContentOf(iter).`second.`second);
 				CALL sstream.`seekg(0, `std::`ios::`beg);
-				DECLARE bstream AS `Zigurat::`BufferStream(sstream);
+				DECLARE bstream AS `Zigurat::`bufferstream(sstream);
 				RETURN bstream.TEMPLATE_METHOD(`read<T>());
 			END
 			CALL Increment(iter);
