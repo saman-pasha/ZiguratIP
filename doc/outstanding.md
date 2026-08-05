@@ -157,22 +157,67 @@ So the page does not damage anything a running server can see. It leaves the
 differently, and the rebuilt free list then hands out space that is already
 occupied.
 
-**It needs a store with some history.** The same sequence on a store created
-fresh -- twenty books loaded, one page fetched, restart -- passes. The store
-that fails is one that has been through the e2e suite's churn of rolled back
-inserts, deletes and truncates. That is the next thing to bisect, and it is the
-harder half.
+**The history that matters, bisected.** Each of these is a fresh store, twenty
+books, then the history under test, then one page, then a restart and an insert:
 
-Two leads worth reading before starting:
+| history | restart |
+|---|---|
+| none | ok |
+| three inserts rolled back | **server aborts** |
+| **one read-only transaction** | **server aborts** |
+| three more inserts committed | ok |
 
-- `Memory::_initialize` frees every transaction record while iterating
-  `_page_list` (`memory.cpp:158-164`), and `_free` moves entries between the
-  page and free lists as it goes. `truncate` has a comment explaining why it
-  collects the dead set *before* freeing any of it, for exactly this reason.
-  `_initialize` does not.
-- `_initialize`'s page walk stops at the first non-data chunk (`memory.cpp:144`)
-  and records it as the page's free tail. A page with a freed hole in the middle
-  would lose everything after the hole.
+A read-only transaction breaks it, so this is not about rolling back a row. What
+those two have in common is that a **transaction record gets freed** while
+another one sits after it in the same page: `rollback_transaction` frees
+`transaction.pointer`, and a connection that closes, or an HTTP request that
+does not commit, rolls back. Committed-only work never frees one, and never
+fails.
+
+**The mechanism, confirmed against the hexmap.** `Memory::_initialize`
+(`memory.cpp:119-150`) walks each page from the first chunk after the page
+header and **stops at the first chunk that is not data**:
+
+```cpp
+} else {
+  this->_free_list_insert(iter->first, pointer);
+  break;                    // memory.cpp:144-147
+}
+```
+
+That is only correct if free space is always the page's tail. Freeing a
+transaction record puts a hole in the middle, and reading the hexmap of a store
+in the failing state says exactly that:
+
+```
+page 0 (offset 0): first free chunk at 3, but 8 allocated chunks come after it
+```
+
+The hole is the *first* thing in the page, so startup registers it and abandons
+the page: eight chunks of live records are never seen, and whatever free space
+lies beyond the records is never registered either. The allocator's rebuilt view
+of that page disagrees with what is actually in it, and the next allocation
+writes over something live. Two records at one address is how a `BTreeValue`
+comes to be read as a `BTreeKey`, and a key unpacking seven fields where a value
+wrote two reads its key past the end of the record -- null.
+
+**The fix is to walk the whole page**, registering every free run rather than
+the first one and then stopping. It needs care that this file has not needed
+elsewhere: the free run's length has to come from the hexmap directly -- scan
+forward while the high bit is clear, ending after the chunk with the standalone
+bit -- because `_pointer`'s size arithmetic assumes a control block that free
+chunks do not have. Which also means the single `_free_list_insert` there today
+is inserting an entry of the wrong size.
+
+Not attempted here. `_initialize` is the one function in the tree where being
+wrong loses a store rather than misbehaving, and there is no log to recover
+from a bad reconstruction.
+
+One more thing in the same function, unproven but adjacent: it frees every
+transaction record while iterating `_page_list` (`memory.cpp:158-164`), and
+`_free` moves entries between the page and free lists as it goes. `truncate`
+carries a comment explaining why it collects the dead set *before* freeing any
+of it. `_initialize` does not.
 
 What a null key most likely *is*: a `BTreeValue` read as a `BTreeKey`. A key
 unpacks seven fields where a value wrote two, so the key field lands past the
