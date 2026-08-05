@@ -13,7 +13,7 @@ namespace Zigurat
   {
     struct Entry
     {
-      std::unique_ptr<Connector> connection;
+      std::shared_ptr<Connector> connection;
       std::string owner;
     };
 
@@ -58,7 +58,7 @@ namespace Zigurat
   {
     if (owner.empty()) throw ZiguratException(7807, "cannot open a transaction for nobody");
 
-    std::unique_ptr<Connector> connection(new Connector());
+    std::shared_ptr<Connector> connection(new Connector());
     connection->open();
 
     const std::string transaction = std::to_string(connection->transaction_id());
@@ -85,7 +85,7 @@ namespace Zigurat
     return transaction;
   }
 
-  Connector& RPCPool::held(const std::string& transaction, const std::string& owner)
+  std::shared_ptr<Connector> RPCPool::held(const std::string& transaction, const std::string& owner)
   {
     if (transaction.empty()) throw ZiguratException(7809, "no transaction named");
 
@@ -101,7 +101,13 @@ namespace Zigurat
     if (found->second.owner != owner)
       throw ZiguratException(7809, "that transaction belongs to another session");
 
-    return *found->second.connection;
+    return found->second.connection;
+  }
+
+  Connector& RPCPool::ref(const std::shared_ptr<Connector>& handle)
+  {
+    if (!handle) throw ZiguratException(7809, "no connection: this handle names nothing");
+    return *handle;
   }
 
   void RPCPool::release(const std::string& transaction)

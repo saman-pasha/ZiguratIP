@@ -1,5 +1,8 @@
 INCLUDE '"httprequest.hpp"';
 INCLUDE '"httpresponse.hpp"';
+INCLUDE '"session.hpp"';
+INCLUDE '"globals.hpp"';
+INCLUDE '"rpcpool.hpp"';
 
 PAGE RPC
 REQUIRES Connector, Serializer
@@ -14,15 +17,26 @@ PUBLIC:
 				CALL response.set_header('Content-Type', 'text/html');
 			END
 
-			DECLARE THREAD LOCAL con AS Connector;
-			IF NOT con.is_open() BEGIN
-				CALL con.open();
-			END
-			
+			-- Who is asking. Over mutual TLS that is the subject of the
+			-- certificate they presented, checked again on every request: a
+			-- person, and the same person in whatever browser. With no
+			-- certificate the session cookie is the best handle there is, and
+			-- it names a browser rather than a person. INITIALIZE throws if a
+			-- page forgets it, so the owner can never be silently empty.
+			CALL `Zigurat::`Session::`INITIALIZE(request, response);
+			DECLARE owner AS String = `Zigurat::`RPCPool::`owner(
+				`Globals::`peer_subject(), `Zigurat::`Session::ID().`value());
+
 			IF request.query('do') == 'id' BEGIN
-				ECHO con.transaction_id();
+				-- A new connection, and the transaction it carries is the name
+				-- everything else is addressed by.
+				ECHO `Zigurat::`RPCPool::`open(owner.`value());
 
 			END ELSE IF request.query('do') == 'call' BEGIN
+				-- The connection this transaction names, if it is yours. The
+				-- constructor throws when it is not, so a stranger cannot reach
+				-- one by guessing its id.
+				DECLARE con AS Connector(request.query('tx'), owner);
 				
 				DECLARE auto_commit AS Bool = request.query('auto_commit').to_bool(TRUE);
 				CALL con.auto_commit(auto_commit);
@@ -79,11 +93,15 @@ PUBLIC:
 				ECHO '<p>Remote Procedure Called Successfully</p>';
 
 			END ELSE IF request.query('do') == 'commit' BEGIN
+				DECLARE con AS Connector(request.query('tx'), owner);
 				CALL con.commit();
+				CALL `Zigurat::`RPCPool::`release(request.query('tx').`value());
 				ECHO '<p>Transaction Committed</p>';
 
 			END ELSE IF request.query('do') == 'rollback' BEGIN
+				DECLARE con AS Connector(request.query('tx'), owner);
 				CALL con.rollback();
+				CALL `Zigurat::`RPCPool::`release(request.query('tx').`value());
 				ECHO '<p>Transaction Rolled back</p>';
 			END
 		END CATCH ex AS Exception BEGIN

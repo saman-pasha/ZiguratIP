@@ -30,12 +30,12 @@ PUBLIC:
 				END
 				
 				CALL con.function('dba_pagefiles');
-				DECLARE size AS ULong = con.`stream().`read_std_size();
+				DECLARE size AS ULong = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_size();
 				DECLARE i AS ULong = 0ul;
 
 				ECHO '[';
 				WHILE i < size BEGIN
-					ECHO '{"hash_key":"', con.`stream().`read_std_string(), '","start":', con.`stream().`read_std_long(), '}';
+					ECHO '{"hash_key":"', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_string(), '","start":', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '}';
 					IF i < size - 1ul BEGIN
 						ECHO ',';
 					END
@@ -52,15 +52,15 @@ PUBLIC:
 				END
 				
 				CALL con.function('dba_pointers');
-				CALL con.`stream().`write_std_long(request.query('start').to_long().`value());
+				CALL `Zigurat::`RPCPool::`ref(con.raw()).`stream().`write_std_long(request.query('start').to_long().`value());
 
 				DECLARE a_type AS UByte;
 				DECLARE a_time AS Timestamp;
 				DECLARE a_state AS UByte;
 				DECLARE a_lock AS UByte;
 				
-				WHILE con.`stream().`read_std_bool() BEGIN
-					SET a_type = con.`stream().`read_std_ubyte();
+				WHILE `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_bool() BEGIN
+					SET a_type = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
 					IF a_type == UByte(0) BEGIN
 						ECHO '<tr class="free-row">';
 					END ELSE IF a_type == 1 BEGIN
@@ -68,11 +68,11 @@ PUBLIC:
 					END ELSE BEGIN
 						ECHO '<tr class="hash-row">';
 					END
-					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
-					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
-					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
+					ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '</td>';
+					ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '</td>';
+					ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '</td>';
 					IF a_type == UByte(1) BEGIN
-						SET a_state = con.`stream().`read_std_ubyte();
+						SET a_state = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
 						IF a_state == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_state == 4 BEGIN
@@ -83,7 +83,7 @@ PUBLIC:
 							ECHO '<td>DELETED</td>';
 						END
 
-						SET a_lock = con.`stream().`read_std_ubyte();
+						SET a_lock = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
 						IF a_lock == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_lock == 1 BEGIN
@@ -92,7 +92,7 @@ PUBLIC:
 							ECHO '<td class="exclusive-lock">EXCLUSIVE</td>';
 						END
 
-						SET a_state = con.`stream().`read_std_ubyte();
+						SET a_state = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
 						IF a_state == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_state == 4 BEGIN
@@ -103,7 +103,7 @@ PUBLIC:
 							ECHO '<td>DELETED</td>';
 						END
 
-						SET a_lock = con.`stream().`read_std_ubyte();
+						SET a_lock = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
 						IF a_lock == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_lock == 1 BEGIN
@@ -112,25 +112,25 @@ PUBLIC:
 							ECHO '<td class="exclusive-lock">EXCLUSIVE</td>';
 						END
 
-						SET a_time = con.`stream().`read_std_time();
+						SET a_time = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
 							ECHO '<td>', a_time.`to_std_string(), '</td>';
 						END
 
-						ECHO '<td>', con.`stream().`read_std_size(), '</td>';
-						ECHO '<td>', con.`stream().`read_std_long(), '</td>';
-						ECHO '<td>', con.`stream().`read_std_long(), '</td>';
+						ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_size(), '</td>';
+						ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '</td>';
+						ECHO '<td>', `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long(), '</td>';
 
-						SET a_time = con.`stream().`read_std_time();
+						SET a_time = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
 							ECHO '<td>', a_time.to_string(), '</td>';
 						END
 
-						SET a_time = con.`stream().`read_std_time();
+						SET a_time = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
@@ -167,9 +167,9 @@ PUBLIC:
 
 				DECLARE transaction_id AS ULong;
 				WHILE TRUE BEGIN
-					SET transaction_id = watcher.`stream().`read_std_size();
+					SET transaction_id = `Zigurat::`RPCPool::`ref(watcher.raw()).`stream().`read_std_size();
 					IF transaction_id > 0ul BEGIN
-						ECHO 'data:{"id":', transaction_id, ',"e":"', watcher.`stream().`read_std_string(), '"}\n\n';
+						ECHO 'data:{"id":', transaction_id, ',"e":"', `Zigurat::`RPCPool::`ref(watcher.raw()).`stream().`read_std_string(), '"}\n\n';
 						CALL response.flush();
 					END ELSE BEGIN
 						BREAK;

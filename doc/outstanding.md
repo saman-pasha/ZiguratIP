@@ -47,30 +47,29 @@ passing it on -- the same call `require_objects` makes, from the page instead of
 the loader. Until then they belong behind `PERMISSIONS_MODE: FALSE` or off a
 public port entirely.
 
-### The RPC console's transaction belongs to a thread, not a visitor
+### A session cookie does not survive a real HTTP round trip
 
-`System/rpc.parsi` holds its `Connector` in a `THREAD LOCAL` and never closes
-it, and `do=commit` and `do=rollback` arrive as separate requests carrying no
-identifier, so the server commits whatever connection the thread it landed on
-happens to hold. Two visitors sharing a worker share a transaction.
+Send `ZIPSESSID` back on the next request and the server mints a *new* session
+instead of finding the one it just issued. Reproduced against a running server:
+two requests, the second carrying the exact cookie the first set, and the second
+answers with a fresh `Set-Cookie`.
 
-`Connector/rpcpool.{hpp,cpp}` is the half of the fix that exists: connections
-addressed by the transaction they carry, owned by whoever opened them, with
-`RPCPool::owner` deciding what "whoever" means -- a certificate subject where
-there is one, the session cookie otherwise. It is built, and its ownership
-policy is tested.
+The unit tests do not catch it because `Exchange` puts the cookie on the request
+through the object model rather than through a parsed header, so the store and
+the cookie are exercised and the header path is not.
 
-What is missing is the page using it. `RPCPool::held` returns a
-`Zigurat::Connector&`, and the Parsi `Connector` is a *subclass* of that
-(`System/connector.parsi:5`), so a base reference cannot be handed to a Parsi
-function whose parameter is the subclass. Converting the page to the base type
-means rewriting `_write_parameter`'s fifty-odd `con.write(Bool(...))` calls,
-which depend on the subclass's per-type overloads.
+Not the parsing, as far as reading goes: `httpserver.cpp:209` upper-cases the
+field name, `httprequest.cpp:51-56` splits `COOKIE` on `;` then `=` and trims,
+and `HAS_COOKIE`/`COOKIE` look the name up as given. Which leaves
+`Session::INITIALIZE`'s check that the id names a session this server actually
+issued (`session.cpp:53-60`) -- that is where to look next.
 
-The way through is to stop making the Parsi `Connector` a subclass and have it
-*hold* a `Zigurat::Connector&` instead. Then the pool hands out the reference,
-the wrapper wraps it, and the page keeps its overloads. That is a change to
-`connector.parsi` rather than to the page, and it is the last piece.
+**This is why the RPC console still cannot be used across requests**, even
+though the machinery under it is right: every request is a new session, so every
+request is a new owner, and a visitor is refused their own transaction. The
+ownership check itself demonstrably works -- a second browser is refused with
+"that transaction belongs to another session", and an invented id with "no such
+transaction". Fix the cookie and the console works; nothing else is missing.
 
 ### The compiler is gated, not fixed
 

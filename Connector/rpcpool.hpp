@@ -3,6 +3,7 @@
 #define __RPCPOOL_HPP__
 
 #include "connector.hpp"
+#include <memory>
 #include <string>
 
 namespace Zigurat
@@ -51,11 +52,19 @@ namespace Zigurat
     // transaction, or if it belongs to somebody else -- which is the case the
     // thread local could not tell apart from your own.
     //
-    // Returns a reference because Parsi has no way to name an existing object:
-    // it cannot declare a reference, cannot return one, and has no dereference
-    // operator. A page takes this straight into a function whose parameter is
-    // declared INOUT, which is the one place Parsi does pass by reference.
-    static Connector& held(const std::string& transaction, const std::string& owner);
+    // Shared rather than a reference, because Parsi has no way to name an
+    // existing object -- it cannot declare a reference, return one, or
+    // dereference a pointer. A handle it can copy is something it can hold, so
+    // the Parsi wrapper keeps one of these and stays copyable.
+    static std::shared_ptr<Connector> held(const std::string& transaction, const std::string& owner);
+
+    // The connection a handle names.
+    //
+    // Parsi cannot dereference: it has no prefix * and no ->, so
+    // shared_ptr::get() hands it a pointer it has no way to use. This gives back
+    // the reference, which Parsi can call methods on directly. It is the whole
+    // reason the wrapper can hold a connection rather than being one.
+    static Connector& ref(const std::shared_ptr<Connector>&);
 
     // Closes and forgets it. Commits nothing: whether the work is kept is the
     // caller's decision and has already been made by the time this runs.
