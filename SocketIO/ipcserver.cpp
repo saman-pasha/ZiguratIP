@@ -16,6 +16,7 @@ namespace Zigurat
     if (!this->_shutdown) throw SocketIOException("ipc server is running");
     this->_shutdown = false;
     this->_pool.charge(pool_size);
+    this->_pool.limit(pool_size * 4);   // see the note in tcpserver.cpp
 
     Socket::ipc_address_t server_address;
 
@@ -55,7 +56,11 @@ namespace Zigurat
       else {
 	if (info[0].revents & Socket::PollEvent::IN) {
 	  Socket::handle_t client_handle = Socket::accept(this->_handle, NULL, NULL);
-	  this->_pool.execute([handler, client_handle] () { handler(client_handle); });
+	  try {
+	    this->_pool.execute([handler, client_handle] () { handler(client_handle); });
+	  } catch (const std::exception&) {
+	    Socket::close(client_handle);   // see the note in tcpserver.cpp
+	  }
 	} else {
 	  throw SocketIOException("ipc poll failed");
 	}

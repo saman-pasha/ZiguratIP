@@ -29,7 +29,12 @@ size_t      http_timeout = 0;
 bool        http_async_mode = true;
 size_t      max_uri_length = 8000;
 size_t      max_headers_length = 16000;
-size_t      max_content_length = 2000000000;
+// Two gigabytes, and the whole body is held in memory before a page sees any
+// of it -- so this was the size of the allocation one request could ask for,
+// times however many workers there are. Eight megabytes is more than the forms
+// and uploads this server has any way of handling; raise it deliberately if
+// something needs more.
+size_t      max_content_length = 8 * 1024 * 1024;
 std::time_t session_timeout = 1800;   // seconds a session may sit idle
 
 // HTTP mime types configuration

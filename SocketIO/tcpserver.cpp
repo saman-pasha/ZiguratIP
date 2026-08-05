@@ -17,6 +17,12 @@ namespace Zigurat
     this->_shutdown = false;
     this->_pool.charge(pool_size);
 
+    // A worker is held for a whole connection, so a queued job is a client
+    // waiting for somebody else to hang up. Allowing a backlog of four times
+    // the workers keeps a burst from being refused while it is still likely to
+    // be served; past that, refusing is faster and kinder than accepting.
+    this->_pool.limit(pool_size * 4);
+
     Socket::tcp_address_info_t hints, *res;
 
     std::memset(&hints, 0x00, sizeof(hints));
@@ -77,7 +83,15 @@ namespace Zigurat
       else {
 	if (info[0].revents & Socket::PollEvent::IN) {
 	  Socket::handle_t client_handle = Socket::accept(this->_handle, NULL, NULL);
-	  this->_pool.execute([handler, client_handle] () { handler(client_handle); });
+	  try {
+	    this->_pool.execute([handler, client_handle] () { handler(client_handle); });
+	  } catch (const std::exception&) {
+	    // Every worker is busy and the queue is at its limit. Close this one
+	    // now: accepting a connection and then holding it in a queue that is
+	    // already too long serves nobody, and the descriptor would be lost
+	    // here rather than closed by the handler that never ran.
+	    Socket::close(client_handle);
+	  }
 	} else {
 	  throw SocketIOException("tcp poll failed");
 	}

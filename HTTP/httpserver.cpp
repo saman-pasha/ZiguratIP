@@ -32,6 +32,7 @@ namespace Zigurat
     std::string host, port;
     char *content = nullptr;
     size_t content_length = 0;   // read for GET too, so it cannot start as garbage
+    size_t headers_length = 0;   // octets of head read for the request in hand
     std::deque<Thread> pipes;
     size_t request_id = 1;
     volatile size_t dispatch_id = 1;
@@ -63,6 +64,16 @@ namespace Zigurat
       // headers is never recognised and every request fails to parse.
       if (line.size() > 0 && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
 
+      // MAX_HEADERS_LENGTH was configured, documented, and passed down through
+      // five signatures without ever being compared to anything. A client
+      // could therefore send header lines until the process ran out of memory:
+      // each one is kept in the map, and nothing was counting. Count the head
+      // as it arrives, including the CRLF that getline consumed, and refuse
+      // once it is longer than the configured limit.
+      headers_length += line.size() + 2;
+      if (max_headers_length > 0 && headers_length > max_headers_length)
+	throw HTTPException("431 Request Header Fields Too Large");
+
       if (line.size() == 0) { // End of headers
 
 	if (headers.find("HOST") == headers.end()) {
@@ -78,11 +89,26 @@ namespace Zigurat
 	    if (headers.find("CONTENT-LENGTH") == headers.end()) {
 	      throw HTTPException("411 Length Required");
 	    } else {
-	      content_length = std::strtoull(headers["CONTENT-LENGTH"].c_str(), NULL, 10);
-	      if (content_length > max_content_length) throw HTTPException("413 Payload Too Large");
-	      content = new char[content_length]; // Post payload data
-	      if ((size_t)stream.read_exact(content, content_length) < content_length)
+	      const std::string& declared = headers["CONTENT-LENGTH"];
+
+	      // strtoull answers 0 for anything it cannot read, so a header of
+	      // "Content-Length: banana" used to mean a body of nothing rather
+	      // than a bad request.
+	      if (declared.empty() || declared.find_first_not_of("0123456789") != std::string::npos)
 		throw HTTPException("400 Bad Request");
+
+	      content_length = std::strtoull(declared.c_str(), NULL, 10);
+	      if (content_length > max_content_length) throw HTTPException("413 Payload Too Large");
+
+	      // Held here rather than as a bare pointer: the read below can fail,
+	      // and it used to throw straight past the only thing that knew about
+	      // this allocation. HTTPRequest takes ownership at the bottom, so a
+	      // client that announced a large body and then went away leaked all
+	      // of it, every time, which is a request anyone can repeat.
+	      std::unique_ptr<char[]> payload(new char[content_length]);
+	      if ((size_t)stream.read_exact(payload.get(), content_length) < content_length)
+		throw HTTPException("400 Bad Request");
+	      content = payload.release();   // HTTPRequest's unique_ptr owns it now
 	    }
 	  } else {
 	    throw HTTPException("501 Not Implemented");
@@ -119,6 +145,7 @@ namespace Zigurat
 	  host.clear();
 	  port.clear();
 	  content_length = 0;
+	  headers_length = 0;   // the next request on this connection starts fresh
 
 	  headers.clear();
 	  content = nullptr;
