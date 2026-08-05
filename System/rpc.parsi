@@ -1,3 +1,5 @@
+INCLUDE '"httprequest.hpp"';
+INCLUDE '"httpresponse.hpp"';
 
 PAGE RPC
 REQUIRES Connector, Serializer
@@ -85,7 +87,7 @@ PUBLIC:
 				ECHO '<p>Transaction Rolled back</p>';
 			END
 		END CATCH ex AS Exception BEGIN
-			ECHO 'RPC Exception: ', ex.code(), ' ', ex.message();
+			ECHO 'RPC Exception: ', ex.`code(), ' ', ex.`message();
 		END
 	END
 

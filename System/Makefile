@@ -14,23 +14,23 @@ endif
 
 lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst J,j,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(subst Y,y,$(subst Z,z,$1))))))))))))))))))))))))))
 
-SQL_FILES := session.sql \
-	isolationlevel.sql \
-	resulttype.sql \
-	connector.sql \
-	htmldrawer.sql \
-	compilerdrawer.sql \
-	compiler.sql \
-	serializer.sql \
-	rpc.sql \
-	mem.sql
+PARSI_FILES := session.parsi \
+	isolationlevel.parsi \
+	resulttype.parsi \
+	connector.parsi \
+	htmldrawer.parsi \
+	compilerdrawer.parsi \
+	compiler.parsi \
+	serializer.parsi \
+	rpc.parsi \
+	mem.parsi
 
-LIB_FILES := $(patsubst %.sql,$(OUT_DIR)/$(PRE_LIB)$(call lc,%)$(POST_LIB),$(SQL_FILES))
+LIB_FILES := $(patsubst %.parsi,$(OUT_DIR)/$(PRE_LIB)$(call lc,%)$(POST_LIB),$(PARSI_FILES))
 
 .PHONY: all
 
 all: $(LIB_FILES)
 	@echo [System] "******* all done *******"
 
-$(OUT_DIR)/$(PRE_LIB)$(call lc,%)$(POST_LIB): %.sql
+$(OUT_DIR)/$(PRE_LIB)$(call lc,%)$(POST_LIB): %.parsi
 	$(BIN_DIR)/parsi $<

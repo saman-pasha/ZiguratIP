@@ -12,17 +12,14 @@ PUBLIC:
 
 	END
 
-	CONSTRUCTOR(path AS String) 
-	INITIALIZE `Zigurat::`Connector(path.`value())
-	BEGIN
+	-- The two constructors that were here took an IPC path, and a host with a
+	-- port and a timeout, and passed them to Zigurat::Connector. That class
+	-- keeps only its default constructor now: connecting moved into open(),
+	-- which takes the same arguments and also has a no-argument form that
+	-- reads home/etc/connector.conf. Nothing constructed one either way, so
+	-- they are gone rather than rewritten -- a constructor whose backing was
+	-- deliberately removed is not worth keeping alive in a wrapper.
 
-	END
-
-	CONSTRUCTOR(host AS String, port AS Int, timeout AS Int = 60) 
-	INITIALIZE `Zigurat::`Connector(host.`value(), port.`value(), timeout.`value())
-	BEGIN
-
-	END
 
 	FUNCTION open() RETURNS Void
 	BEGIN

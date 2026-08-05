@@ -1,6 +1,8 @@
 
 INCLUDE '"shahelper.hpp"';
 INCLUDE '"utility.hpp"';
+INCLUDE '"httprequest.hpp"';
+INCLUDE '"httpresponse.hpp"';
 
 PAGE Mem
 REQUIRES Connector
@@ -28,12 +30,12 @@ PUBLIC:
 				END
 				
 				CALL con.function('dba_pagefiles');
-				DECLARE size AS ULong = con.`client_stream().`read_std_size();
+				DECLARE size AS ULong = con.`stream().`read_std_size();
 				DECLARE i AS ULong = 0ul;
 
 				ECHO '[';
 				WHILE i < size BEGIN
-					ECHO '{\"hash_key\":\"', con.`client_stream().`read_std_string(), '\",\"start\":', con.`client_stream().`read_std_long(), '}';
+					ECHO '{"hash_key":"', con.`stream().`read_std_string(), '","start":', con.`stream().`read_std_long(), '}';
 					IF i < size - 1ul BEGIN
 						ECHO ',';
 					END
@@ -50,27 +52,27 @@ PUBLIC:
 				END
 				
 				CALL con.function('dba_pointers');
-				CALL con.`client_stream().`write_std_long(request.query('start').to_long().`value());
+				CALL con.`stream().`write_std_long(request.query('start').to_long().`value());
 
 				DECLARE a_type AS UByte;
 				DECLARE a_time AS Timestamp;
 				DECLARE a_state AS UByte;
 				DECLARE a_lock AS UByte;
 				
-				WHILE con.`client_stream().`read_std_bool() BEGIN
-					SET a_type = con.`client_stream().`read_std_ubyte();
+				WHILE con.`stream().`read_std_bool() BEGIN
+					SET a_type = con.`stream().`read_std_ubyte();
 					IF a_type == UByte(0) BEGIN
-						ECHO '<tr class=\"free-row\">';
+						ECHO '<tr class="free-row">';
 					END ELSE IF a_type == 1 BEGIN
-						ECHO '<tr class=\"data-row\">';
+						ECHO '<tr class="data-row">';
 					END ELSE BEGIN
-						ECHO '<tr class=\"hash-row\">';
+						ECHO '<tr class="hash-row">';
 					END
-					ECHO '<td>', con.`client_stream().`read_std_long(), '</td>';
-					ECHO '<td>', con.`client_stream().`read_std_long(), '</td>';
-					ECHO '<td>', con.`client_stream().`read_std_long(), '</td>';
+					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
+					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
+					ECHO '<td>', con.`stream().`read_std_long(), '</td>';
 					IF a_type == UByte(1) BEGIN
-						SET a_state = con.`client_stream().`read_std_ubyte();
+						SET a_state = con.`stream().`read_std_ubyte();
 						IF a_state == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_state == 4 BEGIN
@@ -81,16 +83,16 @@ PUBLIC:
 							ECHO '<td>DELETED</td>';
 						END
 
-						SET a_lock = con.`client_stream().`read_std_ubyte();
+						SET a_lock = con.`stream().`read_std_ubyte();
 						IF a_lock == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_lock == 1 BEGIN
-							ECHO '<td class=\"shared-lock\">SHARED</td>';
+							ECHO '<td class="shared-lock">SHARED</td>';
 						END ELSE BEGIN
-							ECHO '<td class=\"exclusive-lock\">EXCLUSIVE</td>';
+							ECHO '<td class="exclusive-lock">EXCLUSIVE</td>';
 						END
 
-						SET a_state = con.`client_stream().`read_std_ubyte();
+						SET a_state = con.`stream().`read_std_ubyte();
 						IF a_state == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_state == 4 BEGIN
@@ -101,41 +103,41 @@ PUBLIC:
 							ECHO '<td>DELETED</td>';
 						END
 
-						SET a_lock = con.`client_stream().`read_std_ubyte();
+						SET a_lock = con.`stream().`read_std_ubyte();
 						IF a_lock == UByte(0) BEGIN
 							ECHO '<td></td>';
 						END ELSE IF a_lock == 1 BEGIN
-							ECHO '<td class=\"shared-lock\">SHARED</td>';
+							ECHO '<td class="shared-lock">SHARED</td>';
 						END ELSE BEGIN
-							ECHO '<td class=\"exclusive-lock\">EXCLUSIVE</td>';
+							ECHO '<td class="exclusive-lock">EXCLUSIVE</td>';
 						END
 
-						SET a_time = con.`client_stream().`read_std_time();
+						SET a_time = con.`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
 							ECHO '<td>', a_time.`to_std_string(), '</td>';
 						END
 
-						ECHO '<td>', con.`client_stream().`read_std_size(), '</td>';
-						ECHO '<td>', con.`client_stream().`read_std_long(), '</td>';
-						ECHO '<td>', con.`client_stream().`read_std_long(), '</td>';
+						ECHO '<td>', con.`stream().`read_std_size(), '</td>';
+						ECHO '<td>', con.`stream().`read_std_long(), '</td>';
+						ECHO '<td>', con.`stream().`read_std_long(), '</td>';
 
-						SET a_time = con.`client_stream().`read_std_time();
+						SET a_time = con.`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
 							ECHO '<td>', a_time.to_string(), '</td>';
 						END
 
-						SET a_time = con.`client_stream().`read_std_time();
+						SET a_time = con.`stream().`read_std_time();
 						IF a_time == 0l BEGIN
 							ECHO '<td></td>';
 						END ELSE BEGIN
 							ECHO '<td>', a_time.to_string(), '</td>';
 						END
 					END ELSE BEGIN
-						ECHO '<td colspan=\"10\" style=\"text-align:center\">N/A</td>';
+						ECHO '<td colspan="10" style="text-align:center">N/A</td>';
 					END
 					ECHO '</tr>';
 				END
@@ -165,9 +167,9 @@ PUBLIC:
 
 				DECLARE transaction_id AS ULong;
 				WHILE TRUE BEGIN
-					SET transaction_id = watcher.`client_stream().`read_std_size();
+					SET transaction_id = watcher.`stream().`read_std_size();
 					IF transaction_id > 0ul BEGIN
-						ECHO 'data:{\"id\":', transaction_id, ',\"e\":\"', watcher.`client_stream().`read_std_string(), '\"}\n\n';
+						ECHO 'data:{"id":', transaction_id, ',"e":"', watcher.`stream().`read_std_string(), '"}\n\n';
 						CALL response.flush();
 					END ELSE BEGIN
 						BREAK;
@@ -176,7 +178,7 @@ PUBLIC:
 
 			END
 		END CATCH ex AS Exception BEGIN
-			ECHO '{\"Exception\": \"', ex.code(), ' ', ex.message(), '\"}';
+			ECHO '{"Exception": "', ex.`code(), ' ', ex.`message(), '"}';
 		END
 	END
 
