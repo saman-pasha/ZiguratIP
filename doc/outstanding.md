@@ -13,19 +13,6 @@ is what it is not, yet.
 
 ## Reachable from the network
 
-### Cross-site scripting, by construction
-
-There is no escaping helper anywhere in the tree, and nothing in the `ECHO`
-path escapes what it is given. `demo/03-pages.parsi:42-44` writes database
-columns straight into HTML, which is the shipped example of how to write a
-page, so it is the pattern anybody following the tutorial will copy.
-
-Anything a visitor can get into a table comes back out as markup.
-
-The fix is escaping by default in `ECHO`, with a deliberate way to opt out for
-the cases that really do emit markup -- not a helper that authors have to
-remember, because escaping-by-omission has never worked for anyone.
-
 ### The Zigurat tools go around the permission system
 
 `mem.zt`, `rpc.zt` and `compiler.zt` reach the storage engine by opening their

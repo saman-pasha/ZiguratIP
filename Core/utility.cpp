@@ -378,4 +378,23 @@ namespace Zigurat
     return value;
   }
 
+  std::string Utility::escape_html(const std::string& text)
+  {
+    std::string safe;
+    safe.reserve(text.size());
+
+    for (char c : text) {
+      switch (c) {
+      case '&':  safe += "&amp;";  break;
+      case '<':  safe += "&lt;";   break;
+      case '>':  safe += "&gt;";   break;
+      case '"':  safe += "&quot;"; break;
+      case '\'': safe += "&#39;";  break;
+      default:   safe += c;        break;
+      }
+    }
+
+    return safe;
+  }
+
 }

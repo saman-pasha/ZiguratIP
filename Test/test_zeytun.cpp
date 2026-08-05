@@ -5,6 +5,7 @@
 #include "httpserver.hpp"
 #include "rpcpool.hpp"
 #include "bufferstream.hpp"
+#include "textstream.hpp"
 #include "types.hpp"
 #include <map>
 #include <set>
@@ -624,4 +625,32 @@ ZTEST(Session, a_certificate_names_a_user_and_a_cookie_names_a_browser)
   // Neither, and there is no owner to speak of. Silence here would mean a
   // transaction owned by nobody, which is how the thread-local version behaved.
   ZCHECK_THROWS(RPCPool::owner("", ""));
+}
+
+// ECHO escapes values and leaves literals alone, which is what stops a page
+// written the way the tutorial shows it from handing a visitor's markup back to
+// the next visitor.
+ZTEST(Zeytun, text_going_into_a_page_is_escaped)
+{
+  ZCHECK_STR(Utility::escape_html("<script>alert(1)</script>"),
+	     "&lt;script&gt;alert(1)&lt;/script&gt;");
+
+  // the attribute-breaking characters too, not just the tag ones
+  ZCHECK_STR(Utility::escape_html("\" onmouseover='x'"), "&quot; onmouseover=&#39;x&#39;");
+
+  // and the ampersand first, so an escape cannot be built out of the escaping
+  ZCHECK_STR(Utility::escape_html("&lt;"), "&amp;lt;");
+
+  // ordinary text is left exactly as it is
+  ZCHECK_STR(Utility::escape_html("Sadegh Hedayat, 1937"), "Sadegh Hedayat, 1937");
+  ZCHECK_STR(Utility::escape_html(""), "");
+
+  // Raw is the deliberate way past, and the only one
+  textstream out;
+  Utility::echo_escaped(out, Utility::raw("<b>bold</b>"));
+  ZCHECK_STR(out.str(), "<b>bold</b>");
+
+  textstream escaped;
+  Utility::echo_escaped(escaped, String("<b>bold</b>"));
+  ZCHECK_STR(escaped.str(), "&lt;b&gt;bold&lt;/b&gt;");
 }

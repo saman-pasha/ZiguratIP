@@ -464,13 +464,37 @@ namespace Zigurat
     }
   }
 
+  // ECHO escapes what it is given, unless the page wrote it as a literal.
+  //
+  // Nothing escaped anything before this, and the shipped example of how to
+  // write a page -- demo/03-pages.parsi -- puts database columns straight into
+  // HTML. So anything a visitor could get into a table came back out as markup,
+  // and the pattern was the one anybody following the tutorial would copy.
+  //
+  // Escaping everything is not an option: a page is mostly markup, and it is
+  // written as literals in the source. But that is the distinction worth
+  // drawing, and it happens to be exactly the right one -- a literal is markup
+  // the author typed, and everything else is a value from somewhere else. So
+  // literals go out as they are and values are escaped, and a page that was
+  // already correct is unchanged while one that was not is fixed without its
+  // author doing anything.
+  //
+  // A page that really does have markup in a variable says so with
+  // Utility::raw, which is the only way past this.
   void Compiler::_echo(const Expression& ast, std::stringstream& code, int lvl)
   {
     std::string tab(lvl, '\t');
     for (const Expression& expr : ast.args) {
-      code << tab << "*Globals::echo_stream() << ";
-      this->_expr.compile(expr, code);
-      code << ';' << std::endl;
+
+      if (expr.token.type == TokenType::STR) {
+	code << tab << "*Globals::echo_stream() << ";
+	this->_expr.compile(expr, code);
+	code << ';' << std::endl;
+      } else {
+	code << tab << "Zigurat::Utility::echo_escaped(*Globals::echo_stream(), ";
+	this->_expr.compile(expr, code);
+	code << ");" << std::endl;
+      }
     }
   }
 
