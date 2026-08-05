@@ -110,6 +110,15 @@ void handle_client()
       } else if (function == "compile") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'compile'" << std::endl;
+
+	// Refused before the code is read, so nothing a client sends gets as far
+	// as the tokenizer, let alone a command line. See COMPILER/REMOTE_MODE in
+	// loadcompiler.cpp for why this is off by default.
+	if (!compiler_remote_mode)
+	  throw ZiguratException(7805, "compiling over the network is disabled;"
+				 " compile with the parsi program and let the server load the object,"
+				 " or set COMPILER/REMOTE_MODE to TRUE if this instance is not exposed");
+
 	std::string code;
 	Globals::client_stream()->read_std_text(code);
 	if (Globals::trace_mode())

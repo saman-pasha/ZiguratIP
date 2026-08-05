@@ -235,7 +235,22 @@ namespace Zigurat
     system(echo_compile_cmd.c_str());
     cpp_compile_cmd += " >> " + out_file_path + " 2>&1";
 
-    std::string cpp_build_cmd = this->_cpp + " " + this->_ld_flags + " -L" + this->_lib_path + " -L" + this->_ld_path 
+    // -L is where the linker looks; it says nothing about where the loader will
+    // look later. A Mach-O object records each dependency by the path it was
+    // linked from, so on macOS an object that requires another finds it with
+    // nothing further asked. An ELF object records only the file name, and the
+    // loader then searches its own paths, which do not include ld_path -- so a
+    // procedure that REQUIRES a table opened with "lib_DEMO::AUTHORS_.so:
+    // cannot open shared object file", having linked against that very file a
+    // moment earlier. Record the two directories in the object itself rather
+    // than requiring whoever starts the server to have exported them.
+    std::string rpath_flags;
+#if !defined(_WIN32) && !defined(_WIN64)
+    rpath_flags = " -Wl,-rpath," + this->_lib_path + " -Wl,-rpath," + this->_ld_path;
+#endif
+
+    std::string cpp_build_cmd = this->_cpp + " " + this->_ld_flags + " -L" + this->_lib_path + " -L" + this->_ld_path
+      + rpath_flags
       + " -o " + ld_file_path + " " + obj_file_path + " " + libs_pack_code.str();
     std::string echo_build_cmd = "echo \"" + cpp_build_cmd + "\" >> " + out_file_path + ENDL;
     system(echo_build_cmd.c_str());

@@ -33,6 +33,7 @@ extern LibraryPool            library_pool;
 // Compiler
 extern Parser   parser;
 extern Compiler compiler;
+extern bool     compiler_remote_mode;
 
 
 // Which copy of the storage engine a compiled object ended up bound to.

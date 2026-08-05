@@ -52,6 +52,34 @@ void load_compiler(const Configuration &config)
 
   std::string value = "";
 
+  // Whether the compile function of the binary protocol answers at all.
+  //
+  // Compiling is not like the other functions. The rest of them read and write
+  // rows through the storage engine, which is bounded by what the engine will
+  // do; compiling hands a string to a C++ compiler and a linker, runs them, and
+  // loads the result into this process. Parsi can embed C++ verbatim, and its
+  // INCLUDE and LINK clauses are spliced onto those command lines, so a client
+  // permitted to declare one object can run anything the server's user can run.
+  // The permission check upstream reads object names, which does not help: the
+  // names can be entirely in order while the code behind them is not.
+  //
+  // So it is off unless somebody turns it on. The parsi program compiles the
+  // same sources offline and the server loads the objects it leaves behind,
+  // which is the arrangement any exposed instance should be using.
+  if (config.get("/COMPILER/REMOTE_MODE", value)) {
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "TRUE")
+      compiler_remote_mode = true;
+    else if (value == "FALSE")
+      compiler_remote_mode = false;
+    else
+      throw ZiguratIPException("invalid value for '/COMPILER/REMOTE_MODE'");
+  }
+  std::cout << "Compiler remote mode: '" << ((compiler_remote_mode) ? "TRUE" : "FALSE") << "'";
+  if (compiler_remote_mode)
+    std::cout << "  --! clients may compile; this is arbitrary code execution as this user !--";
+  std::cout << std::endl;
+
   bool parser_trace = false;
   if (config.get("/PARSER/TRACE_MODE", value)) {
     value = Utility::to_upper(value);

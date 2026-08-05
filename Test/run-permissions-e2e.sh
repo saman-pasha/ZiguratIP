@@ -171,6 +171,11 @@ PARSER:
 	TRACE_MODE: FALSE
 
 COMPILER:
+	# The checks below declare procedures over the protocol, which is refused
+	# by default -- compiling for a client runs a C++ compiler and a linker on
+	# what that client sent. Allowed here because the server is this script's
+	# own, on loopback, for the length of one run. Nothing shipped enables it.
+	REMOTE_MODE: TRUE
 	CPP:       c++
 	CPP_FLAGS: -Wall -std=c++11 -fPIC
 	LD_FLAGS:  -shared
