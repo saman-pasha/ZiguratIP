@@ -622,6 +622,113 @@ namespace Zigurat
     } while (true);
   }
 
+  bool Memory::_visible(Pointer& pointer, lock_t* hexmap_lock, lock_t* data_lock)
+  {
+    uint8_t hex_byte = 0;
+
+    this->_hexmap_io.seekg(this->_pointer_hexmap_address(pointer.address), std::ios::beg);
+
+    this->_hexmap_io.read_std_ubyte(hex_byte);
+    RowState online_state = (RowState)(hex_byte & (uint8_t)12);
+    RowLock  online_lock  = (RowLock)(hex_byte & (uint8_t)3);
+
+    this->_hexmap_io.read_std_ubyte(hex_byte);
+    RowState offline_state = (RowState)(hex_byte & (uint8_t)12);
+
+    Control control;
+    bool is_visible = false;
+    bool settled = false;
+
+    switch ((this->_initialized) ? Memory::transaction.isolation_level() : IsolationLevel::READ_UNCOMMITTED) {
+
+    case IsolationLevel::READ_UNCOMMITTED:
+      if ( (offline_state == RowState::NONE     && online_state == RowState::INSERTED) ||
+	   (offline_state == RowState::INSERTED && online_state == RowState::NONE    ) ) {
+	is_visible = true;
+      }
+      break;
+
+    case IsolationLevel::READ_COMMITTED:
+      if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+	is_visible = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, hexmap_lock, data_lock);
+      }
+      break;
+
+    case IsolationLevel::REPEATABLE_READ:
+    case IsolationLevel::SERIALIZABLE: // handled in transaction class as semaphore
+      if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+
+	if (online_lock == RowLock::NONE) {
+	  this->_load_control(pointer, control);
+
+	  control.online_state = RowState::NONE;
+	  control.online_lock = RowLock::SHARED;
+	  control.online_time = std::time(0);
+	  control.transaction_id = Memory::transaction.id;
+	  control.query_id = Memory::transaction.query_id;
+	  this->_dump_control(pointer, control);
+	  this->_transaction_push(pointer);
+	  is_visible = true;
+	} else {
+	  is_visible = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, hexmap_lock, data_lock);
+	}
+      }
+      break;
+
+    case IsolationLevel::SNAPSHOT:
+      if ( (offline_state == RowState::NONE && online_state != RowState::NONE)
+	   || offline_state == RowState::INSERTED || offline_state == RowState::DELETED) {
+
+	do {
+	  this->_load_control(pointer, control);
+
+	  if (control.transaction_id > 0 && Memory::transaction.id == control.transaction_id) { // own lock
+	    is_visible = (control.online_state == RowState::INSERTED);
+	    break;
+	  }
+
+	  switch (control.offline_state) {
+	  case RowState::NONE:
+	    settled = true;
+	    break;
+
+	  case RowState::INSERTED:
+	  case RowState::UPDATED:
+	    if (control.create_time <= Memory::transaction.init_time) {
+	      is_visible = true;
+	      settled = true;
+	    } else if (control.reference_address > -1) {
+	      pointer = this->_pointer(pointer.hash_key, control.reference_address);
+	    } else {
+	      settled = true;
+	    }
+	    break;
+
+	  case RowState::DELETED:
+	    if (control.modify_time > Memory::transaction.init_time) {
+	      is_visible = true;
+	      settled = true;
+	    } else if (control.reference_address > -1) {
+	      pointer = this->_pointer(pointer.hash_key, control.reference_address);
+	    } else {
+	      settled = true;
+	    }
+	    break;
+
+	  default:
+	    throw MemoryException("invalid row state");
+	  }
+	} while (!settled);
+      }
+      break;
+
+    default:
+      throw MemoryException("invalid isolation level");
+    }
+
+    return is_visible;
+  }
+
   bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, lock_t* hexmap_lock, lock_t* data_lock)
   {
     if (this->_watcher) {

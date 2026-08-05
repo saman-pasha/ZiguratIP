@@ -44,21 +44,28 @@ namespace Zigurat
     bool _is_dependent = false;
     bool _is_multi_level = false;
 
+    // The catalogue index, which is the one index that cannot be treated like
+    // the others: it cannot look itself up through the catalogue, and it cannot
+    // be written inside a transaction. Both follow from the same fact, so it is
+    // decided once here rather than compared by name in two places.
+    bool _is_catalogue = false;
+
+    static bool is_catalogue_name(const std::string& name)
+    {
+      return (name == "IDX_ZIGURAT_BTREERECORD_HASH_NAME");
+    }
+
     void _insert_btreeindex();
     void _select_btreeindex();
     void _update_btreeindex();
     
-    void _insert_btreevalue(hashkey_ptr, BTreeValue&);
     void _insert_btreevalue(BTreeKey<_First>&, const Long&);
     void _delete_btreevalue(BTreeValue&);
 
     BTreeNode _btreenode(const Long&);
     BTreeKey<_First> _btreekey(const Long&);
 
-    void _bucket_key(const BTreeKey<_First>&, hashkey_t);
-    
-    void _cursor_keys(BTreeNode&, std::function<bool (int16_t, BTreeKey<_First>&)>&&);    
-    void _cursor_values(hashkey_ptr, std::function<bool (int64_t, BTreeValue&)>&&);
+    void _cursor_keys(BTreeNode&, std::function<bool (int16_t, BTreeKey<_First>&)>&&);
     void _cursor_values(const BTreeKey<_First>&, std::function<bool (int64_t, BTreeValue&)>&&);
 
     // The chain of nodes above the one being worked on, root first. A split
@@ -75,7 +82,7 @@ namespace Zigurat
     virtual void _unmap_callback(const _Table&, const _First&, const Long&, BTreeKey<_First>&);
     void _unmap(BTreeNode&, const _Table&, const _First&, const Long&);
 
-    void _free_key_bucket(BTreeKey<_First>&);
+    void _free_key_values(BTreeKey<_First>&);
     void _combine_nodes(BTreeNode&, BTreeKey<_First>&);
     virtual void _unmap_key_callback(const _Table&, const _First&, BTreeKey<_First>&);
     void _unmap_key(BTreeNode*, BTreeKey<_First>*, BTreeNode&, const _Table&, const _First&);
@@ -132,9 +139,11 @@ namespace Zigurat
       this->_memory->dba_watch("Independent BTreeIndex: (" + this->_name + ")");
     }    
 
+    this->_is_catalogue = BTreeIndex<_Table, _First>::is_catalogue_name(this->_name);
+
     SHA::checksum(SHA::SHA1, (const uint8_t*)this->_name.c_str(), this->_name.size(), this->_hash_key);
     this->_hash_name = Utility::octet_as_hex(this->_hash_key, Memory::HASHKEY_SIZE);
-    
+
     if (this->_memory)
       this->_select_btreeindex();
   }
@@ -157,6 +166,7 @@ namespace Zigurat
     }    
 
     this->_is_dependent = true;
+    this->_is_catalogue = BTreeIndex<_Table, _First>::is_catalogue_name(this->_name);
     this->_hash_name = hash_name;
     std::memcpy(this->_hash_key, this->_hash_name.c_str(), Memory::HASHKEY_SIZE);
   }
@@ -174,13 +184,6 @@ namespace Zigurat
   {
     return this->_root_address;
   }
-
-  template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_bucket_key(const BTreeKey<_First>& key, hashkey_t hash_key)
-  {
-    std::string composite_key = this->_name + std::to_string(key.pointer.address);
-    SHA::checksum(SHA::SHA1, (const uint8_t*)composite_key.c_str(), composite_key.size(), hash_key);
-  } 
 
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_insert_btreeindex()
@@ -224,7 +227,7 @@ namespace Zigurat
     // catalogue re-inserting its own row on every restart: the root address was
     // read back correctly, but the store gained a duplicate each time.
     bool found = false;
-    if (this->_name == "IDX_ZIGURAT_BTREERECORD_HASH_NAME") {
+    if (this->_is_catalogue) {
 
       std::unique_lock<std::mutex> hexmap_lock(this->_memory->_hexmap_access);
       std::unique_lock<std::mutex> data_lock(this->_memory->_data_access);    
@@ -307,32 +310,64 @@ namespace Zigurat
     return btreekey;
   }
 
-  template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_insert_btreevalue(hashkey_ptr hash_key, BTreeValue& value)
-  {
-    value.pointer = this->_memory->_allocate(hash_key, value.pack_size());
-
-    this->_memory->_transaction_push(value.pointer);
-    this->_memory->_control_insert(&value);
-    
-    this->_memory->_full_hexmap(value.pointer);
-    this->_memory->_data_io.seekp(this->_memory->_pointer_data_address(value.pointer), std::ios::beg);
-    this->_memory->_data_io << value;
-
-    this->_memory->_hexmap_io.flush();
-    this->_memory->_data_io.flush();
-  }
-
+  // Allocated under the index's own hash key, beside the nodes and keys that
+  // were always there, and linked at the head of the key's chain. The head is
+  // the cheap end: pushing there is two writes and never walks what is already
+  // in the chain.
+  //
+  // The key is written back here rather than by the caller. Every path that
+  // reaches this has just inserted or updated the key record, so it exists, and
+  // leaving the new head to be persisted separately is the kind of thing that
+  // works until one caller forgets.
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_insert_btreevalue(BTreeKey<_First>& key, const Long& value)
   {
     BTreeValue btreevalue;
     btreevalue.value = value;
+    btreevalue.next_address = key.values_address;
 
-    hashkey_t hash_key;
-    this->_bucket_key(key, hash_key);
-    
-    this->_insert_btreevalue(hash_key, btreevalue);
+    btreevalue.pointer = this->_memory->_allocate(this->_hash_key, btreevalue.pack_size());
+
+    if (this->_is_catalogue) {
+
+      // The catalogue is written offline, so its index has to be written offline
+      // too. _insert_btreeindex puts the BTreeRecord row down with _dump_control
+      // and an offline INSERTED state -- metadata, true the moment it is
+      // written, holding no lock and belonging to no transaction. Its index
+      // entry went in through _control_insert instead, which takes an EXCLUSIVE
+      // lock and waits for a commit. If the request that registered the index
+      // never commits, or the server is killed before it does, that lock
+      // outlives the process and stays in the store.
+      //
+      // What it costs is out of all proportion to a metadata row. Every index
+      // looks itself up in the catalogue from a *static initialiser*, so the
+      // next server to load that object waits out the lock timeout and then
+      // throws from inside __static_initialization_and_destruction_0 under
+      // dlopen, where no catch can reach it. The process dies, on a read.
+      //
+      // Nothing was hiding this: the bucket a value used to live in was not
+      // where the lookup went looking, so the entry was quietly never found.
+      // Chaining the values off the key is what made it visible.
+      Control control;
+      control.offline_state = RowState::INSERTED;
+      control.create_time = std::time(0);
+      this->_memory->_dump_control(btreevalue.pointer, control);
+
+    } else {
+
+      this->_memory->_transaction_push(btreevalue.pointer);
+      this->_memory->_control_insert(&btreevalue);
+    }
+
+    this->_memory->_full_hexmap(btreevalue.pointer);
+    this->_memory->_data_io.seekp(this->_memory->_pointer_data_address(btreevalue.pointer), std::ios::beg);
+    this->_memory->_data_io << btreevalue;
+
+    key.values_address = btreevalue.pointer.address;
+    this->_memory->_offline_update(key);
+
+    this->_memory->_hexmap_io.flush();
+    this->_memory->_data_io.flush();
   }
     
   template <typename _Table, typename _First>
@@ -365,31 +400,49 @@ namespace Zigurat
     }
   }
 
-  template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_cursor_values(hashkey_ptr hash_key, std::function<bool (int64_t, BTreeValue&)>&& callback)
-  {
-    int16_t counter = -1;
-    this->_memory->_cursor(hash_key, nullptr, nullptr, [&] (const Pointer& pointer) -> bool {
-
-        counter++;
-	BTreeValue value;
-
-	this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(pointer), std::ios::beg);
-	this->_memory->_data_io >> value;
-
-        value.pointer = pointer;
-	return callback(counter, value);
-
-      });
-  }
-
+  // The values of one key, newest first.
+  //
+  // This was a Memory::_cursor over the key's own hash key, which is where the
+  // isolation rules came from for free: a value written by a transaction that
+  // has not committed, or one that was rolled back, was simply not walked past.
+  // A chain has no such scan behind it, so each link is asked the same question
+  // directly -- see Memory::_visible.
+  //
+  // The next address is read before the callback runs, so a callback that
+  // deletes the value it was handed does not lose the rest of the chain.
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_cursor_values(const BTreeKey<_First>& key, std::function<bool (int64_t, BTreeValue&)>&& callback)
   {
-    hashkey_t hash_key;
-    this->_bucket_key(key, hash_key);
+    int64_t counter = -1;
+    Long tmp_address = key.values_address;
 
-    this->_cursor_values(hash_key, std::forward<std::function<bool (int64_t, BTreeValue&)>&&>(callback));
+    while (tmp_address.value() > -1) {
+
+      Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
+
+      BTreeValue value;
+      this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(pointer), std::ios::beg);
+      this->_memory->_data_io >> value;
+
+      tmp_address = value.next_address;
+
+      // Asked after the record is read and the chain has been advanced, because
+      // under SNAPSHOT the answer is an older version of it: the pointer moves,
+      // and the value has to be read again from wherever it moved to.
+      Pointer visible_pointer = pointer;
+      if (!this->_memory->_visible(visible_pointer, nullptr, nullptr)) continue;
+
+      if (visible_pointer.address != pointer.address) {
+	this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(visible_pointer), std::ios::beg);
+	this->_memory->_data_io >> value;
+      }
+
+      value.pointer = visible_pointer;
+
+      counter++;
+      if ( !callback(counter, value) )
+	break;
+    }
   }
 
   template <typename _Table, typename _First>
@@ -730,12 +783,27 @@ namespace Zigurat
 
 	} else if (key == current_key.key) {
 
-	  this->_cursor_values(current_key, [&] (int64_t, BTreeValue& current_value) -> bool {
-	      this->_unmap_callback(object, key, value, current_key);
-	      if (!this->_is_multi_level)
+	  if (this->_is_multi_level) {
+
+	    // The values of a composite index hang off its innermost level, so
+	    // this level has none of its own and the walk below would never run
+	    // -- which left the dependent index holding a deleted row.
+	    this->_unmap_callback(object, key, value, current_key);
+
+	  } else {
+
+	    // One row's entry, not the key's whole chain. A non unique key holds
+	    // a value for every row that shares it, and deleting all of them took
+	    // every one of those rows out of the index along with the one that
+	    // was asked for.
+	    this->_cursor_values(current_key, [&] (int64_t, BTreeValue& current_value) -> bool {
+		if (!(current_value.value == value)) return true;
+
+		this->_unmap_callback(object, key, value, current_key);
 		this->_delete_btreevalue(current_value);
-	      return true;
-	    });
+		return false;
+	      });
+	  }
 	  return false;
 
 	} else {
@@ -768,14 +836,32 @@ namespace Zigurat
     }
   }
   
+  // Gives the whole chain back, for a key that is leaving the tree.
+  //
+  // The bucket version of this called Memory::_free_key, which drops every page
+  // of a hash key -- correct when the key owned a hash key of its own, and
+  // catastrophic now that the hash key is the index's. Each value is freed by
+  // address instead, and the chain is read one link ahead of the freeing.
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_free_key_bucket(BTreeKey<_First>& key)
+  void BTreeIndex<_Table, _First>::_free_key_values(BTreeKey<_First>& key)
   {
-    hashkey_t hash_key;
-    this->_bucket_key(key, hash_key);
-    
-    this->_memory->_free_key(hash_key);	
-  }  
+    Long tmp_address = key.values_address;
+
+    while (tmp_address.value() > -1) {
+
+      Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
+
+      BTreeValue value;
+      this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(pointer), std::ios::beg);
+      this->_memory->_data_io >> value;
+
+      tmp_address = value.next_address;
+
+      this->_memory->_free(pointer);
+    }
+
+    key.values_address = -1;
+  }
   
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_combine_nodes(BTreeNode& node, BTreeKey<_First>& key)
@@ -902,7 +988,7 @@ namespace Zigurat
 	    this->_memory->_offline_update(right_key);
 
 	    this->_unmap_key_callback(object, key, current_key);
-	    this->_free_key_bucket(current_key);
+	    this->_free_key_values(current_key);
 	    this->_memory->_offline_delete(current_key);
 	      
 	    if (right_child_node.degree.value() < this->_min_degree) {
@@ -923,7 +1009,7 @@ namespace Zigurat
 	      }
 
 	      this->_unmap_key_callback(object, key, current_key);
-	      this->_free_key_bucket(current_key);
+	      this->_free_key_values(current_key);
 	      this->_memory->_offline_delete(current_key);
 
 	      return false;
@@ -937,7 +1023,7 @@ namespace Zigurat
 	      this->_memory->_offline_update(left_key);	      
 
 	      this->_unmap_key_callback(object, key, current_key);
-	      this->_free_key_bucket(current_key);
+	      this->_free_key_values(current_key);
 	      this->_memory->_offline_delete(current_key);
 
 	      return false;
@@ -955,7 +1041,7 @@ namespace Zigurat
 	      this->_memory->_offline_update(right_key);
 
 	      this->_unmap_key_callback(object, key, current_key);
-	      this->_free_key_bucket(current_key);
+	      this->_free_key_values(current_key);
 	      this->_memory->_offline_delete(current_key);
 
 	      return false;

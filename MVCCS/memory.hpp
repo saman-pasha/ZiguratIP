@@ -136,6 +136,26 @@ namespace Zigurat
     
     bool _check_lock(RowLock, const Pointer&, Control&, lock_t*, lock_t*);
 
+    // Whether one record is visible to the transaction now running, by the same
+    // rules _cursor applies to each record it walks past.
+    //
+    // _cursor is where those rules live, and everything that reads the store
+    // went through it -- including an index looking up the values of a key,
+    // which is how a rolled back insert stayed out of the index without anyone
+    // having to unmap it. Values are a chain now rather than a hash keyed
+    // bucket, so the walk is the index's own and it has to ask the question
+    // itself.
+    //
+    // Under SNAPSHOT the answer can be an *older* version of the record, so the
+    // pointer is taken by reference and moved to whichever version this
+    // transaction is entitled to see, exactly as _cursor moves it.
+    //
+    // The one thing it does not do is _cursor's retry: finding a row that
+    // changed under a repeatable read makes _cursor roll back to the start of
+    // the query and walk the whole hash key again, which is a scan's answer to
+    // the problem and means nothing when a single record was asked about.
+    bool _visible(Pointer&, lock_t*, lock_t*);
+
     // Cursor
     void _cursor(hashkey_ptr, lock_t*, lock_t*, std::function<bool (const Pointer&)>);
     

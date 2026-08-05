@@ -54,79 +54,70 @@ object *names* and says nothing about the generated code.
 
 ## Storage
 
-### Every indexed row gets its own page
+### What an index costs now, and what it used to
 
-`MVCCS/btreeindex.hpp:180` keys an index bucket by the row it points at:
+**Fixed.** Kept here because the numbers are the guard: `Test Memory` in
+`Test/test_btree.cpp` measures the layout, and if it moves back, this is what it
+moved back from.
+
+An index bucket used to be keyed by the row it pointed at:
 
 ```cpp
 std::string composite_key = this->_name + std::to_string(key.pointer.address);
 ```
 
-The address is per row, so every indexed row hashes to its own bucket, and every
-bucket is its own page file. A bucket that can only ever hold one entry is not a
-bucket, and a B-tree node holding one key is not a node.
+The address is per row, so every indexed row hashed to a bucket of its own and
+every bucket became a page file -- roughly 8 KB of store for eight bytes of row
+address. Nodes and keys were never the problem: they already allocated under the
+index's own hash key. It was only the values.
 
-Measured on a fresh store after the demo and a bulk load: **569 page files, 557
-of them holding exactly one record**, each an 8 KB page carrying a single index
-entry. Table pages pack properly by comparison -- the busiest one holds 74 rows
-with no free space -- so this is the index and not the pager.
-
-It shows up in the Memory Viewer as an unusable list of page files and, on any
-of them, one row marked INSERTED. That is the symptom; the cost is roughly 8 KB
-of store per indexed row, and a B-tree that never branches.
-
-**There is a test suite for this, and it is red on purpose.** `Test Memory` --
-three cases in `Test/test_btree.cpp` -- says what the layout should be and
-measures what it is. Four hundred rows with four indexes over them:
+A key's values are a chain now -- `BTreeValue::next_address`, headed by
+`BTreeKey::values_address` -- allocated under the index's hash key beside the
+nodes and keys. Four hundred rows with four indexes over them:
 
 ```
-[400 rows] objects=1209 pages=1226 single-page objects=1205
+before   [400 rows] objects=1209 pages=1226 single-page objects=1205
+after    [400 rows] objects=9    pages=43   single-page objects=4
 ```
 
-Twelve hundred pages for four hundred small rows, twelve hundred of the objects
-holding exactly one page. At 8 KB a page that is about ten megabytes of store
-for a few kilobytes of data.
+The one thing the chain does not get for free is isolation. A bucket was walked
+by `Memory::_cursor`, which decided what this transaction was allowed to see;
+a chain has no scan behind it, so each link asks `Memory::_visible` the same
+question directly. That is what keeps a rolled back insert out of the index.
 
-Left failing rather than weakened, the same way `run-reload-e2e` is: a test
-changed to pass is worth less than one that says something true. It goes green
-when an index keeps its entries together the way a table keeps its rows.
+### Two things the bucket was hiding
 
-**Why the obvious fix does not work**, traced so the next attempt starts here
-rather than repeating it.
+Both were found by making the values findable, and both are fixed:
 
-The hash key is not decoration -- it *is* the grouping. `_cursor_values`
-(`btreeindex.hpp:369`) walks a bucket by asking `Memory::_cursor` for every row
-under a hash key, and `BTreeValue` (`btreevalue.hpp`) carries nothing but the
-row address. So "which values belong to this key" is expressed *only* by them
-sharing a hash key. Give every value the index's one hash key and they pack
-beautifully -- and every lookup returns every value in the index.
+- **`_unmap` deleted a key's whole chain**, not the entry for the row being
+  unmapped. On any non-unique index that took every row sharing the key out of
+  the index along with the one that was asked for.
+- **A composite index never unmapped its dependent level.** Its values hang off
+  the innermost level, so the outer level had none, so the walk that was meant
+  to reach `_unmap_callback` never ran once.
 
-That rules out the one-line change. Three ways forward, and none of them is
-small:
+### The catalogue's index entry was written inside a transaction
 
-- **Carry the owner in the value.** Add the key node's address to `BTreeValue`
-  and filter in `_cursor_values`. Entries pack, but a lookup becomes a scan of
-  the whole index -- trading the space problem for a worse time one.
-- **Bucket by the indexed value's hash** rather than the key node's address.
-  Rows sharing a value share a bucket, which helps a non-unique index and does
-  nothing at all for a unique one, where every row is its own value. `IDX_ID` is
-  unique, so this leaves the measured case exactly where it is.
-- **Pack values into the node.** Hold many keys and their values inline in one
-  node and split when it fills, which is what a B-tree is and what
-  `_split_node` half implies already. This is the right answer and it changes
-  the on-disk layout.
+Also fixed, and worth writing down because of what it cost. `_insert_btreeindex`
+writes the `BTreeRecord` row with `_dump_control` and an offline `INSERTED`
+state: metadata, true the moment it is written, holding no lock. Its *index
+entry* went in through `_control_insert`, which takes an `EXCLUSIVE` lock and
+waits for a commit -- so a request that registered an index and never committed,
+or a server killed before it did, left that lock in the store permanently.
 
-The third is the real fix. It should not be attempted casually: it rewrites how
-index data is stored, and there is no write-ahead log to recover from a mistake
-(see below). Do it against the `Test Memory` suite, which measures the property
-it has to achieve.
+Every index looks itself up in the catalogue from a static initialiser, so the
+next server to load that object waited out the lock timeout and threw from
+inside `__static_initialization_and_destruction_0` under `dlopen`, where no
+catch can reach it. The process died on a metadata read. Both halves of one
+metadata write now follow the same rule.
 
 ### The Memory Viewer lists every object's pages
 
 `do=pagefiles` returns the whole page list, so the tool's dropdown holds every
-object in the store rather than the one whose name was typed into it. With 569
-of them it cannot be used. The checksum box already works out which hash key is
-yours; the listing should take it and filter.
+object in the store rather than the one whose name was typed into it. Far less
+pressing now that a demo store is tens of pages rather than hundreds, but the
+checksum box already works out which hash key is yours and the listing should
+take it and filter.
 
 ---
 
