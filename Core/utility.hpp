@@ -174,6 +174,17 @@ namespace Zigurat
     static uint32_t ntohl(uint32_t);
     static uint64_t htonll(uint64_t);
     static uint64_t ntohll(uint64_t);
+
+    // Unpredictable octets, straight from the kernel pool. Everything that
+    // needs to be unguessable -- prime candidates, padding, seeds, salts,
+    // session identifiers -- comes through here, so there is one place to be
+    // right about it rather than a std::rand() in each of them.
+    //
+    // Throws rather than returning short or falling back. A caller that cannot
+    // be given entropy must not be handed predictable bytes and told they are
+    // random.
+    static void random_bytes(uint8_t*, size_t);
+    static uint64_t random_uint64();
   };
 
 }

@@ -21,15 +21,24 @@ namespace Zigurat
   // served by the same pooled thread in the same second get the same value.
   // A session id has to be unique and unguessable, hence a real random source
   // and a digest rather than that.
+  //
+  // The random source used to be a std::mt19937_64 seeded once, at static
+  // initialisation, from a single std::random_device{}() -- 64 bits of seed
+  // behind a generator that is not one-way. Mersenne Twister state is
+  // recoverable from its own output, so a client who collected a couple of
+  // session ids could reconstruct the generator and name every id the server
+  // would hand out afterwards, to any user. The digest hid the outputs but the
+  // state was still only 64 bits of guessing away. Now each id is drawn
+  // straight from the kernel pool, and the counter and clock remain only to
+  // guarantee uniqueness if two draws ever collide.
   std::string Session::_new_id()
   {
-    static std::mt19937_64 generator(std::random_device{}());
     static uint64_t counter = 0;
 
     std::stringstream seed;
     {
       std::lock_guard<std::mutex> lock(Session::_store_access);
-      seed << generator() << ':' << generator() << ':' << ++counter;
+      seed << Utility::random_uint64() << ':' << Utility::random_uint64() << ':' << ++counter;
     }
     seed << ':' << (uint64_t)std::time(0);
 

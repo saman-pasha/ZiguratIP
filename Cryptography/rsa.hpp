@@ -70,6 +70,7 @@ namespace Zigurat
     void    MGF(const uint8_t*, int64_t, int64_t, uint8_t*);        // Mask Generation Function
     void    XOR(const uint8_t*, const uint8_t*, int64_t, uint8_t*); // XOR Encoding Operation
     void    SGF(int64_t, uint8_t*);                                 // Seed Generation Function
+    void    SGF_nonzero(int64_t, uint8_t*);                         // ... with no zero octet, for v1.5 padding
   };
 
 }

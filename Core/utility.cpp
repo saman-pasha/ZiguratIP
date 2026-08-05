@@ -2,9 +2,11 @@
 #include <cstring>
 #include <cerrno>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "utility.hpp"
+#include "zexception.hpp"
 #include <iostream>
 #include <fstream>
 #if defined(_WIN32) || defined(_WIN64)
@@ -343,6 +345,37 @@ namespace Zigurat
   uint64_t Utility::ntohll(uint64_t d)
   {
     return Utility::htonll(d);
+  }
+
+  void Utility::random_bytes(uint8_t* out, size_t length)
+  {
+    if (length == 0) return;
+    if (out == nullptr) throw ZiguratException(1, "random_bytes called with no destination");
+
+    // Held open for the life of the thread. Opening per call is a syscall pair
+    // on a path that RSA key generation walks thousands of times, and it is one
+    // more thing that can fail halfway through generating a key.
+    static thread_local int fd = -1;
+    if (fd < 0) {
+      do { fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC); }
+      while (fd < 0 && errno == EINTR);
+      if (fd < 0) throw ZiguratException(1, "cannot open /dev/urandom");
+    }
+
+    size_t taken = 0;
+    while (taken < length) {
+      ssize_t n = ::read(fd, out + taken, length - taken);
+      if (n > 0) { taken += (size_t)n; continue; }
+      if (n < 0 && errno == EINTR) continue;
+      throw ZiguratException(1, "short read from /dev/urandom");
+    }
+  }
+
+  uint64_t Utility::random_uint64()
+  {
+    uint64_t value = 0;
+    Utility::random_bytes((uint8_t*)&value, sizeof(value));
+    return value;
   }
 
 }
