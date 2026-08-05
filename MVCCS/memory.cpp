@@ -707,7 +707,18 @@ namespace Zigurat
     bool is_query = false;
     if (this->_initialized && Memory::transaction.query_time == 0) {
       is_query = true;
-      Memory::transaction.query_id = (int64_t)std::rand();
+
+      // This is written into the store and read back to tell rows the current
+      // query inserted from rows that were already there, so an update cursor
+      // does not walk over its own output. std::rand() with nobody calling
+      // std::srand returns the same sequence on every start of the process --
+      // it only ever varied because generating a key seeded the global state as
+      // a side effect, and that seeding is gone now. A value that decides what
+      // an update sees should not be the same on every run.
+      uint64_t drawn = 0;
+      Utility::random_bytes((uint8_t*)&drawn, sizeof(drawn));
+      Memory::transaction.query_id = (int64_t)(drawn >> 1);   // stays positive
+
       Memory::transaction.query_time = std::time(0);
     }
 

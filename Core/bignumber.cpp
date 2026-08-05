@@ -366,18 +366,38 @@ namespace Zigurat
     return remainder;
   }
 
+  // The same defect BigInt::rand had, in the sibling nobody was looking at.
+  //
+  // std::rand(), seeded once from std::time(0): two numbers drawn in the same
+  // second were the same number. That was fixed in BigInt because RSA keys come
+  // out of it, and missed here because nothing calls this -- BigNumber backs
+  // the SQL numeric tower and no key has ever been generated from it.
+  //
+  // Which is not a reason to leave it. It is published into home/include beside
+  // the one that was fixed, with the same name and the same shape, so the next
+  // caller who reaches for a random BigNumber gets the old bug back with no
+  // sign that it is there. Two functions this alike should not differ in
+  // whether their output can be guessed.
   BigNumber BigNumber::rand(size_t count)
   {
-    static bool seeded = false;
-    if (!seeded) {
-      std::srand(std::time(0));
-      seeded = true;
-    }
+    if (count == 0) throw ArithmeticException("random number of zero words requested");
+
     array_t vector(count);
-    for (size_t i = 0; i < count - 1; i++) {
-      vector[i] = std::rand() % BASE;
+
+    // A full word of entropy each. The old line said std::rand() % BASE, and
+    // BASE is 2^32 while std::rand() stops at 2^31-1, so the top bit of every
+    // word was always clear -- a bit lost per word on top of the seeding.
+    for (size_t i = 0; i < count; i++) {
+      uint32_t word;
+      Utility::random_bytes((uint8_t*)&word, sizeof(word));
+      vector[i] = word;
     }
-    vector[count - 1] = std::rand() % (BASE / 2);
+
+    // Kept under BASE/2 as it always was, and the highest bit that is still
+    // within that is forced: a caller asking for `count` words means a number
+    // of that size, and leaving the top bit to chance is why a 2048-bit key
+    // from this tree used to measure 2047.
+    vector[count - 1] = (vector[count - 1] & (BigNumber::BASE / 2 - 1)) | (BigNumber::BASE / 4);
     return vector;
   }
 
