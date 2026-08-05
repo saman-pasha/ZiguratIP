@@ -52,6 +52,42 @@ object *names* and says nothing about the generated code.
 
 ---
 
+## Storage
+
+### Every indexed row gets its own page
+
+`MVCCS/btreeindex.hpp:180` keys an index bucket by the row it points at:
+
+```cpp
+std::string composite_key = this->_name + std::to_string(key.pointer.address);
+```
+
+The address is per row, so every indexed row hashes to its own bucket, and every
+bucket is its own page file. A bucket that can only ever hold one entry is not a
+bucket, and a B-tree node holding one key is not a node.
+
+Measured on a fresh store after the demo and a bulk load: **569 page files, 557
+of them holding exactly one record**, each an 8 KB page carrying a single index
+entry. Table pages pack properly by comparison -- the busiest one holds 74 rows
+with no free space -- so this is the index and not the pager.
+
+It shows up in the Memory Viewer as an unusable list of page files and, on any
+of them, one row marked INSERTED. That is the symptom; the cost is roughly 8 KB
+of store per indexed row, and a B-tree that never branches.
+
+Fixing it means deciding what a bucket should be keyed by -- the indexed value,
+presumably, so rows sharing a key share a node -- and letting nodes hold many
+entries. That is a change to the index rather than a repair to it.
+
+### The Memory Viewer lists every object's pages
+
+`do=pagefiles` returns the whole page list, so the tool's dropdown holds every
+object in the store rather than the one whose name was typed into it. With 569
+of them it cannot be used. The checksum box already works out which hash key is
+yours; the listing should take it and filter.
+
+---
+
 ## Durability
 
 ### No write-ahead log, and no fsync
