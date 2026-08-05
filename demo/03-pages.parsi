@@ -52,7 +52,7 @@ PUBLIC:
 
         ECHO '<p><a href="lookup.zt">Indexed lookups</a> &middot; ';
         ECHO '<a href="setup.zt">Seed again</a> &middot; ';
-        ECHO '<a href="/">Back to Zeytun</a></p>';
+        ECHO '<a href="index.html">Back to Zeytun</a></p>';
         ECHO '</body></html>';
     END
 END
@@ -118,7 +118,7 @@ PUBLIC:
         FROM demo::books WHERE year > 1950;
         ECHO '</ul>';
 
-        ECHO '<p><a href="catalog.zt">Catalog</a> &middot; <a href="/">Back to Zeytun</a></p>';
+        ECHO '<p><a href="catalog.zt">Catalog</a> &middot; <a href="index.html">Back to Zeytun</a></p>';
         ECHO '</body></html>';
     END
 END
