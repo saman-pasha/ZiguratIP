@@ -47,6 +47,22 @@ passing it on -- the same call `require_objects` makes, from the page instead of
 the loader. Until then they belong behind `PERMISSIONS_MODE: FALSE` or off a
 public port entirely.
 
+### The RPC call stream reads a result type that does not exist
+
+Calling a procedure from the console prints `Unknown result type: 12` before it
+reports success. `ResultType` has six values, 0 to 5, in both
+`Connector/resulttype.hpp` and `System/resulttype.parsi` -- so 12 is not one at
+all, and what is being read as a result type is some other byte.
+
+The call still completes, which is why it has gone unnoticed: the serializer
+loops until it sees `SUCCESSFUL_DONE` and eventually does. But it means the
+reply stream is being read out of step somewhere in `System/serializer.parsi`,
+and a procedure returning a cursor or a value is likely to be read wrongly
+rather than merely reported oddly.
+
+Predates all of this work -- the console could not be driven across requests
+before, so nobody got far enough to see it.
+
 ### The compiler is gated, not fixed
 
 `COMPILER/REMOTE_MODE` defaults to `FALSE`, so the network cannot reach the
