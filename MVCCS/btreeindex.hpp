@@ -83,6 +83,12 @@ namespace Zigurat
     void _unmap(BTreeNode&, const _Table&, const _First&, const Long&);
 
     void _free_key_values(BTreeKey<_First>&);
+    void _unlink_dead_values(BTreeKey<_First>&);
+
+    // Rebuild every chain in this index without its settled dead links. Virtual
+    // because a composite index keeps its values a level down, so its own keys
+    // have none and the walk has to carry on into the dependents.
+    virtual void _unlink_dead();
     void _combine_nodes(BTreeNode&, BTreeKey<_First>&);
     virtual void _unmap_key_callback(const _Table&, const _First&, BTreeKey<_First>&);
     void _unmap_key(BTreeNode*, BTreeKey<_First>*, BTreeNode&, const _Table&, const _First&);
@@ -110,6 +116,12 @@ namespace Zigurat
     void unmap(const _Table&);
     void unmap_key(const _Table&);
 
+    // Gives back the space of every settled dead entry, the way
+    // Memory::truncate does for a table's rows. Deleting a row takes its index
+    // entry with it, so truncating a table without truncating its indexes hands
+    // back the rows and keeps the entries that pointed at them.
+    size_t truncate();
+
     void cursor(std::function<bool (_Table&)>);
     void cursor_equal(const _First, std::function<bool (_Table&)>);
     void cursor_not_equal(const _First, std::function<bool (_Table&)>);
@@ -121,6 +133,11 @@ namespace Zigurat
     // The multi column index derives from this one and overrides the map and
     // unmap callbacks, so it has to be destroyable through a base pointer.
     virtual ~BTreeIndex() { }
+
+    // A composite index builds the index one level down and works through it,
+    // which is reaching into a different specialisation rather than into its
+    // own base -- protected access alone does not reach that far.
+    template <typename...> friend class BTreeIndex;
   };
 
   template <typename _Table, typename _First>
@@ -863,6 +880,72 @@ namespace Zigurat
     key.values_address = -1;
   }
   
+  // A dead value cannot simply be freed: it is a link, and the link before it
+  // names it by address. Free its chunks while something still points at them
+  // and the next allocation is handed a record another chain believes it owns.
+  // So the chain is closed over the dead link first, and the space is asked for
+  // afterwards.
+  template <typename _Table, typename _First>
+  void BTreeIndex<_Table, _First>::_unlink_dead_values(BTreeKey<_First>& key)
+  {
+    bool has_previous = false;
+    BTreeValue previous;
+    Long tmp_address = key.values_address;
+
+    while (tmp_address.value() > -1) {
+
+      Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
+
+      BTreeValue value;
+      this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(pointer), std::ios::beg);
+      this->_memory->_data_io >> value;
+      value.pointer = pointer;
+
+      tmp_address = value.next_address;
+
+      Control control;
+      this->_memory->_load_control(pointer, control);
+
+      // Settled, in the sense _dead_pointers means it: the delete is committed
+      // and no live transaction is still holding the record. One that a session
+      // is mid-flight on is left exactly where it is.
+      if (control.offline_state == RowState::DELETED &&
+	  control.online_state == RowState::NONE &&
+	  control.online_lock == RowLock::NONE) {
+
+	if (has_previous) {
+	  previous.next_address = value.next_address;
+	  this->_memory->_offline_update(previous);
+	} else {
+	  key.values_address = value.next_address;
+	  this->_memory->_offline_update(key);
+	}
+
+      } else {
+	previous = value;
+	has_previous = true;
+      }
+    }
+  }
+
+  template <typename _Table, typename _First>
+  void BTreeIndex<_Table, _First>::_unlink_dead()
+  {
+    if (this->_root_address == -1) return;
+
+    this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
+	this->_unlink_dead_values(current_key);
+	return true;
+      });
+  }
+
+  template <typename _Table, typename _First>
+  size_t BTreeIndex<_Table, _First>::truncate()
+  {
+    this->_unlink_dead();
+    return this->_memory->truncate(this->_hash_key);
+  }
+
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_combine_nodes(BTreeNode& node, BTreeKey<_First>& key)
   {
@@ -1482,6 +1565,42 @@ namespace Zigurat
 						     this->_hash_name, current_key.dependents_address, this->_columns);
 	dependent_index.unmap(object);
       }
+    }
+
+    // Down through the dependents. This level's keys hold no values of their
+    // own -- _map only inserts them where _is_multi_level is false -- so the
+    // base version would find every chain already empty and unlink nothing.
+    virtual void _unlink_dead() override
+    {
+      if (this->_root_address == -1) return;
+
+      this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
+
+	  if (current_key.dependents_address.value() > -1) {
+	    BTreeIndex<_Table, _Rest...> dependent_index(this->_memory, this->_name, this->_is_unique,
+							 this->_hash_name, current_key.dependents_address, this->_columns);
+	    dependent_index._unlink_dead();
+	  }
+
+	  return true;
+	});
+    }
+
+    // Two hash keys to sweep, not one. Every dependent level of one index
+    // shares a hash key -- the dependent constructor takes it from the hash
+    // name, which is passed down unchanged -- and that is not the hash key of
+    // this level, which is the checksum of the index name.
+    size_t truncate()
+    {
+      this->_unlink_dead();
+
+      size_t freed = this->_memory->truncate(this->_hash_key);
+
+      hashkey_t dependent_hash_key;
+      std::memcpy(dependent_hash_key, this->_hash_name.c_str(), Memory::HASHKEY_SIZE);
+      freed += this->_memory->truncate(dependent_hash_key);
+
+      return freed;
     }
 
     virtual void _unmap_key_callback(const _Table& object, const _First& key, BTreeKey<_First>& current_key) override

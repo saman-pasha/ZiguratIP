@@ -622,6 +622,19 @@ namespace Zigurat
     } while (true);
   }
 
+  void Memory::_sync()
+  {
+    this->_hexmap_io.flush();
+    this->_data_io.flush();
+
+    // Data before hexmap, every time. The hexmap is what says a record is
+    // there and what state it is in; the data is the record itself. A hexmap
+    // that reaches the disk first describes a record that may not have, and
+    // that is the one ordering the store cannot recover from.
+    this->_data_io.sync_to_disk();
+    this->_hexmap_io.sync_to_disk();
+  }
+
   bool Memory::_visible(Pointer& pointer, lock_t* hexmap_lock, lock_t* data_lock)
   {
     uint8_t hex_byte = 0;
@@ -1224,17 +1237,33 @@ namespace Zigurat
 
     time_t commit_time = std::time(0);
 
+    // Three writes in an order that has to survive the power going out.
+    //
+    // A row is updated by writing a whole new version elsewhere and then
+    // flipping the control block that adopts it, which is shadow paging and
+    // needs no log to recover -- but only if the writes land in the order they
+    // were made. flush() hands them to the operating system, which is entitled
+    // to reorder them, so without a sync the guarantee is a wish.
+    //
+    // First the intention: this transaction is committing at commit_time, on
+    // disk before any control block moves. _initialize reads exactly this at
+    // startup to decide whether an uncommitted looking record should be
+    // committed or rolled back, so a crash between here and the loop below
+    // still resolves the same way.
     this->_write_transaction(Memory::transaction.id, commit_time);
+    this->_sync();
 
+    // Then the control blocks it licenses.
     for (const auto& pair : Memory::transaction.context) {
       this->_commit_pointer(pair.second, commit_time);
     }
     Memory::transaction.context.clear();
+    this->_sync();
 
+    // And only then is the intention retired, because it is what a crash in the
+    // middle of the loop would have been recovered from.
     this->_write_transaction(Memory::transaction.id, (time_t)0);
-
-    this->_hexmap_io.flush();
-    this->_data_io.flush();
+    this->_sync();
   }
   
   void Memory::commit_transaction_until(time_t)
@@ -1258,9 +1287,8 @@ namespace Zigurat
     Memory::transaction.context.clear();
 
     this->_free(Memory::transaction.pointer);
-    
-    this->_hexmap_io.flush();
-    this->_data_io.flush();
+
+    this->_sync();
   }
   
   void Memory::rollback_transaction_to(time_t time)

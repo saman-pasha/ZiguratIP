@@ -247,6 +247,9 @@ namespace Zigurat
     head << TAB1 << "void prepare() override;" << std::endl;
     head << TAB1 << "void map() override;" << std::endl;
     head << TAB1 << "void unmap() override;" << std::endl;
+    // Shadows BaseTable::truncate_indexes, so Memory::truncate<T>() reaches
+    // this table's indexes rather than the empty one on the base.
+    head << TAB1 << "static void truncate_indexes();" << std::endl;
     head << TAB1 << "friend Zigurat::binarystream& operator<<(Zigurat::binarystream&, const " << name << "&);" << std::endl;
     head << TAB1 << "friend Zigurat::binarystream& operator>>(Zigurat::binarystream&, " << name << "&);"  << std::endl;
     head << "};" << std::endl;
@@ -362,6 +365,13 @@ namespace Zigurat
     impl << '{' << std::endl;
     for (const index_desc_t& index : indexes) {
       impl << TAB1 << name << "::" << std::get<3>(index) << ".unmap(*this);" << std::endl;
+    }
+    impl << '}' << std::endl;
+
+    impl << "void " << name << "::truncate_indexes()" << std::endl; // BTreeIndex truncate
+    impl << '{' << std::endl;
+    for (const index_desc_t& index : indexes) {
+      impl << TAB1 << name << "::" << std::get<3>(index) << ".truncate();" << std::endl;
     }
     impl << '}' << std::endl;
 

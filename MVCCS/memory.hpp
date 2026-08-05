@@ -136,6 +136,10 @@ namespace Zigurat
     
     bool _check_lock(RowLock, const Pointer&, Control&, lock_t*, lock_t*);
 
+    // Flush both files and then push them to the disk, data before hexmap.
+    // Every durability point in the store goes through this.
+    void _sync();
+
     // Whether one record is visible to the transaction now running, by the same
     // rules _cursor applies to each record it walks past.
     //
@@ -388,7 +392,14 @@ namespace Zigurat
   template <typename T>
   size_t Memory::truncate()
   {
-    return this->truncate(T::hash_key);
+    size_t rows = this->truncate(T::hash_key);
+
+    // And the indexes over it, or the space comes back for the rows and stays
+    // taken by the entries that pointed at them. Deleting a row already unmaps
+    // it, so those entries are settled dead by the time anyone truncates.
+    T::truncate_indexes();
+
+    return rows;
   }
 
   template <typename T>

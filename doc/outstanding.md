@@ -123,13 +123,34 @@ take it and filter.
 
 ## Durability
 
-### No write-ahead log, and no fsync
+### No write-ahead log
 
-A `kill -9` in the wrong millisecond corrupts the store, and there is no
-recovery path: no log to replay, no checkpoint to fall back to, no fsck.
+**The fsync half of this is done.** `binarystream::sync_to_disk` is a no-op for
+every stream that is not a file; `filestream` keeps a second descriptor on the
+same path and calls `fsync` on it. `Memory::_sync` flushes both files and pushes
+them to the disk **data before hexmap** -- the hexmap is what says a record is
+there and in what state, the data is the record, and a hexmap that lands first
+describes a record that may not have.
 
-This is arguably the most serious defect in the project. It is not a security
-problem, which is the only reason it is not at the top of this file.
+`commit_transaction` now syncs three times, in the order that makes the sequence
+recoverable: the intention (`_write_transaction` at `commit_time`), then the
+control blocks it licenses, then the retirement of the intention. A crash
+anywhere in the middle leaves `_initialize` reading the same transaction record
+it would have read anyway, and deciding the same way.
+
+That is what makes copy-on-write mean something: a row is updated by writing a
+whole new version elsewhere and flipping the control block that adopts it, which
+is shadow paging and needs no log to recover -- but only if the writes land in
+the order they were made, and `flush()` alone gives no such promise.
+
+**What is still missing** is a log, and with it recovery from a torn write
+rather than from a reordered one: no replay, no checkpoint, no fsck. A `kill -9`
+between the two `fsync` calls of one commit is survivable now; a half-written
+*page* is still not.
+
+Also missing: `_offline_update` writes in place with no size check, which is
+safe only because everything that uses it writes a record of unchanged size.
+That is an invariant nothing enforces.
 
 ---
 

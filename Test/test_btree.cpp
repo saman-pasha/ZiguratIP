@@ -88,6 +88,17 @@ public:
     if (Item::IDX_BUCKET) Item::IDX_BUCKET->map(*this);
   }
 
+  // What compilerddl.cpp emits for a generated table, by hand: Memory::truncate
+  // reaches a table's indexes through this, and without it the rows come back
+  // and the entries that pointed at them do not.
+  static void truncate_indexes()
+  {
+    if (Item::IDX_ID) Item::IDX_ID->truncate();
+    if (Item::IDX_CATEGORY) Item::IDX_CATEGORY->truncate();
+    if (Item::IDX_CATEGORY_SCORE) Item::IDX_CATEGORY_SCORE->truncate();
+    if (Item::IDX_BUCKET) Item::IDX_BUCKET->truncate();
+  }
+
   void unmap() override
   {
     if (Item::IDX_ID) Item::IDX_ID->unmap(*this);
@@ -819,6 +830,54 @@ ZTEST(BTree, truncate_returns_pages_to_the_allocator)
   // rows land back in the pages round one gave up and the store does not move.
   ZCHECK(growth[0] > 0);
   ZCHECK_EQ(growth[1], (int64_t)0);
+}
+
+// The same thing again, with the indexes left switched on.
+//
+// truncate_returns_pages_to_the_allocator nulls the index statics out, so the
+// rows it deletes and reclaims are never indexed. Every row here is, in four
+// indexes, and the entries are what this is about: deleting a row unmaps it, so
+// its entries are settled dead and their space has to come back with the row's.
+// Truncating the table alone hands back the rows and keeps the entries.
+ZTEST(BTree, truncate_reclaims_the_index_entries_as_well_as_the_rows)
+{
+  const int64_t n = 300;
+  int64_t growth[2] = {0, 0};
+
+  for (int truncating = 0; truncating < 2; truncating++) {
+    Fixture fixture(truncating ? "btree-index-defrag-yes" : "btree-index-defrag-no");
+    if (!fixture.ready()) { ZCHECK(false); return; }
+
+    std::vector<Item> rows = fixture.load(n);
+    for (size_t i = 0; i < rows.size(); i++)
+      fixture.memory()->online_delete(rows[i]);
+    fixture.memory()->commit_transaction();
+    fixture.memory()->begin_transaction();
+
+    const int64_t loaded = file_size(fixture.store.data_path);
+
+    if (truncating)
+      ZCHECK_EQ((int64_t)fixture.memory()->truncate<Item>(), n);
+
+    // Round two, into whatever round one gave back.
+    fixture.load(n);
+    growth[truncating] = file_size(fixture.store.data_path) - loaded;
+
+    // And the index still answers for the rows that are there, which is the
+    // half of this that unlinking could quietly break.
+    int64_t through_index = 0;
+    Item::IDX_ID->cursor([&through_index] (Item&) -> bool { through_index++; return true; });
+    ZCHECK_EQ(through_index, n);
+
+    int64_t through_scan = 0;
+    fixture.memory()->cursor<Item>([&through_scan] (Item&) -> bool { through_scan++; return true; });
+    ZCHECK_EQ(through_scan, n);
+  }
+
+  // Reclaiming the entries has to buy something: round two after a truncate
+  // must fit in less new store than round two without one.
+  ZCHECK(growth[0] > 0);
+  ZCHECK(growth[1] < growth[0]);
 }
 
 // Only a committed delete is reclaimable. A delete that is still open could

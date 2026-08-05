@@ -22,6 +22,15 @@ namespace Zigurat
     static std::vector<std::string> path;
 
     static hashkey_t hash_key;
+
+    // Reclaim the space of every settled dead entry in this table's indexes.
+    //
+    // Shadowed by every generated table with one that names its indexes, the
+    // same way name, path and hash_key are shadowed. A table with no indexes,
+    // and every internal record that is not a generated table, keeps this one
+    // and truncating it reclaims its rows and nothing else.
+    static void truncate_indexes();
+
     Pointer pointer;
     BaseTable();
     BaseTable(const Pointer&);
