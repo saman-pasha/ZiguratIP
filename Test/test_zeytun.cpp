@@ -2,6 +2,7 @@
 #include "session.hpp"
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
+#include "httpserver.hpp"
 #include "bufferstream.hpp"
 #include "types.hpp"
 #include <map>
@@ -366,4 +367,85 @@ ZTEST(Zeytun, response_headers_and_cookies)
   visit.response->SET_COOKIE(String("track"), String("42"));
   ZCHECK(visit.response->HAS_COOKIE(String("track")).value());
   ZCHECK_STR(visit.response->COOKIE(String("track")).to_std_string(), "42");
+}
+
+// What a proxy sends, and what happens to a refusal nobody can see.
+namespace
+{
+  // Drives one request through the server's own head parser and hands back
+  // what the handler was given, plus whatever went onto the connection.
+  struct Served
+  {
+    std::string method, uri, path, host, port;
+    std::string raw;
+    bool reached_handler = false;
+  };
+
+  Served serve(const std::string& request)
+  {
+    Served served;
+    bufferstream stream;
+    stream.write(request.data(), (std::streamsize)request.size());
+    stream.seekg(0, std::ios::beg);
+
+    HTTPServer::handle_client(stream,
+      [&served] (binarystream*, HTTPRequest* request, HTTPResponse* response) {
+	std::unique_ptr<HTTPRequest> request_deleter(request);
+	std::unique_ptr<HTTPResponse> response_deleter(response);
+	served.reached_handler = true;
+	served.method = request->METHOD().value();
+	served.uri    = request->URI().value();
+	served.path   = request->PATH().value();
+	served.host   = request->HOST().value();
+	served.port   = request->PORT().value();
+      },
+      false, 0, false, 8000, 16000, 8 * 1024 * 1024);
+
+    stream.clear();
+    stream.seekg(0, std::ios::beg);
+    served.raw = stream.string();
+    return served;
+  }
+}
+
+// RFC 7230 section 5.3.2: a server must accept a request line naming the whole
+// URL, not only the path. Proxies send it. This took the target as it stood, so
+// the path became "/http:/host:2190/page" and every proxied request 404'd.
+ZTEST(Zeytun, an_absolute_form_request_line_is_the_path_it_names)
+{
+  Served origin   = serve("GET /catalog.zt HTTP/1.1\r\nHost: example:2190\r\nConnection: close\r\n\r\n");
+  Served absolute = serve("GET http://example:2190/catalog.zt HTTP/1.1\r\nHost: example:2190\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(origin.reached_handler);
+  ZCHECK(absolute.reached_handler);
+  ZCHECK_STR(absolute.uri, origin.uri);
+  ZCHECK_STR(absolute.path, origin.path);
+}
+
+// The authority in the target stands in for a missing Host, which the same
+// section says to prefer -- and this server refuses a request without one.
+ZTEST(Zeytun, an_absolute_form_request_line_carries_its_own_host)
+{
+  Served served = serve("GET http://example:2190/catalog.zt HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(served.reached_handler);
+  ZCHECK_STR(served.host, "example");
+  ZCHECK_STR(served.port, "2190");
+}
+
+// A refusal with no body is a blank page: a browser shows nothing, view-source
+// shows nothing, and a missing page looks exactly like a broken server.
+ZTEST(Zeytun, a_refusal_says_what_it_was)
+{
+  Served served = serve("BREW /coffee HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(!served.reached_handler);                                  // refused before any page
+  ZCHECK(served.raw.find("501 Not Implemented") != std::string::npos);
+  ZCHECK(served.raw.find("Content-Type: text/plain") != std::string::npos);
+  ZCHECK(served.raw.find("Content-Length: 0") == std::string::npos);  // never an empty refusal
+
+  // and the body is actually there, after the blank line
+  const size_t split = served.raw.find("\r\n\r\n");
+  ZCHECK(split != std::string::npos);
+  ZCHECK(served.raw.size() > split + 4);
 }

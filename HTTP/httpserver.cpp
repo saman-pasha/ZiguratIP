@@ -33,6 +33,7 @@ namespace Zigurat
     char *content = nullptr;
     size_t content_length = 0;   // read for GET too, so it cannot start as garbage
     size_t headers_length = 0;   // octets of head read for the request in hand
+    std::string absolute_authority;  // from an absolute-form target, if it was one
     std::deque<Thread> pipes;
     size_t request_id = 1;
     volatile size_t dispatch_id = 1;
@@ -75,6 +76,8 @@ namespace Zigurat
 	throw HTTPException("431 Request Header Fields Too Large");
 
       if (line.size() == 0) { // End of headers
+
+	if (!absolute_authority.empty()) headers["HOST"] = absolute_authority;
 
 	if (headers.find("HOST") == headers.end()) {
 	  throw HTTPException("400 Bad Request");
@@ -146,6 +149,7 @@ namespace Zigurat
 	  port.clear();
 	  content_length = 0;
 	  headers_length = 0;   // the next request on this connection starts fresh
+	  absolute_authority.clear();
 
 	  headers.clear();
 	  content = nullptr;
@@ -166,6 +170,27 @@ namespace Zigurat
 	  method = Utility::trim(parts[0]);
 	  uri = Utility::trim(parts[1]);
 	  protocol = Utility::trim(parts[2]);
+
+	  // A request line may name the whole URL rather than just the path --
+	  // "GET http://host:2190/page HTTP/1.1" -- and RFC 7230 section 5.3.2
+	  // says a server must accept it. Proxies send it, and this took the
+	  // target as it stood, so the path became "/http:/host:2190/page" and
+	  // every proxied request answered 404.
+	  const size_t scheme = (uri.compare(0, 7, "http://") == 0) ? 7
+	    : ((uri.compare(0, 8, "https://") == 0) ? 8 : 0);
+	  if (scheme > 0) {
+	    const size_t slash = uri.find('/', scheme);
+
+	    // The authority in the target wins over any Host header, which the
+	    // same section says to ignore when the request is in this form.
+	    // Applied once the headers are in, so a Host arriving later cannot
+	    // put itself back.
+	    absolute_authority = uri.substr(scheme, (slash == std::string::npos)
+					    ? std::string::npos : slash - scheme);
+
+	    // No path at all means the root, which is what "http://host" asks for.
+	    uri = (slash == std::string::npos) ? "/" : uri.substr(slash);
+	  }
 	  if (!(method == "GET" || method == "HEAD" || method == "POST" || method == "PUT" || method == "DELETE")) {
 	    throw HTTPException("501 Not Implemented");
 	  } else if (method.size() == 0 || uri.size() == 0 || protocol.size() == 0) {

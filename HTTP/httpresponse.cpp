@@ -80,13 +80,29 @@ namespace Zigurat
     this->_lock.lock();
     this->_stream_semaphore.wait(this->_lock, [&] () { return (this->_request_id == this->_dispatch_id); });
 
+    // A body, because a refusal with none is a blank page.
+    //
+    // This carried Content-Length: 0, which is at least honest about there
+    // being nothing there -- but a browser shown a zero-length 404 draws
+    // nothing at all, and view-source shows nothing either. A page that is
+    // missing and a server that is broken then look identical to whoever is
+    // trying to use it, which is most of why the Colab trouble took as long as
+    // it did to pin down. The other refusals in handle_client already say what
+    // happened; this path is the one that did not.
+    //
+    // Plain text, and only the status: what page was wanted, and why it was
+    // refused, are in the log, and neither is a visitor's business.
+    const std::string body = msg + "\n";
+
     std::stringstream ss_response;
     ss_response << "HTTP/1.1 " << msg << CRLF;
     ss_response << "Date: " << Utility::time_to_string(std::time(0), "%a, %d %b %Y %H:%M:%S %Z") << CRLF;
     ss_response << "Server: Zigurat/0.0 (ZiguratIP; " << Utility::os_name() << ")" << CRLF;
     ss_response << "Connection: close" << CRLF;
-    ss_response << "Content-Length: 0" << CRLF;
+    ss_response << "Content-Type: text/plain; charset=utf-8" << CRLF;
+    ss_response << "Content-Length: " << body.size() << CRLF;
     ss_response << CRLF;
+    ss_response << body;
     this->_stream.write(ss_response.str().c_str(), ss_response.tellp());
 
     this->_dispatch_id++;
