@@ -1286,7 +1286,26 @@ namespace Zigurat
     }
     Memory::transaction.context.clear();
 
-    this->_free(Memory::transaction.pointer);
+    // Freed once, and then forgotten -- because after this the pointer names
+    // space the allocator has taken back, and a second rollback that still
+    // believes in it hands the same chunks to the free list twice.
+    //
+    // Nothing stopped that happening. Zeytun rolls a request back in
+    // RequestScope's destructor whenever the page did not commit, and
+    // Transaction's own destructor rolls back again when the pooled worker
+    // thread ends -- two rollbacks, one pointer. The free list then holds the
+    // chunk twice, two unrelated allocations are handed the same address, and
+    // whichever writes second wins. A BTreeKey landing on a BTreeValue is how
+    // it showed: a key unpacks seven fields where a value wrote two, so the key
+    // field reads past the record and comes back null, and the next insert dies
+    // in Long::operator< walking into it.
+    //
+    // A default Pointer has no hash key, which is also what a transaction that
+    // never allocated one looks like. Neither is something to free.
+    if (Memory::transaction.pointer.hash_key != nullptr)
+      this->_free(Memory::transaction.pointer);
+
+    Memory::transaction.pointer = Pointer();
 
     this->_sync();
   }

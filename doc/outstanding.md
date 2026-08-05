@@ -111,19 +111,10 @@ inside `__static_initialization_and_destruction_0` under `dlopen`, where no
 catch can reach it. The process died on a metadata read. Both halves of one
 metadata write now follow the same rule.
 
-### A null key gets into an index, and the permissions suite is how to see it
+### One HTTP request can leave a store that will not survive a restart
 
-Reproducible, and the recipe is exact:
-
-```sh
-rm -f home/data/data home/data/hexmap
-Test/run-e2e.sh              # passes
-Test/run-permissions-e2e.sh  # passes, on the same store
-# then start a server and fetch /setup.zt
-```
-
-`/setup.zt` answers `Server side error code: 1000, message: NULL value`, and
-under gdb it is one frame:
+An insert then fails with `Server side error code: 1000, message: NULL value`,
+and under gdb it is one frame:
 
 ```
 #1 Zigurat::Long::operator<(Zigurat::Long const&) const          libType.so
@@ -132,35 +123,67 @@ under gdb it is one frame:
 #9 ...::map(DEMO::BOOKS const&)  ->  DEMO::ADD_BOOK  ->  DEMO::SEED
 ```
 
-`Long::operator<` throws `Object::NULL_EXCEPTION` -- code 1000, "NULL value" --
-when either side is null, so **`IDX_DEMO_BOOKS_ID` contains a `BTreeKey` whose
-key is null**. `_map` walks into it comparing, and the insert dies. Nothing is
-wrong with the sequence, the procedure or the page: the index is corrupt and
-every insert into that table now fails against it.
+`Long::operator<` throws `Object::NULL_EXCEPTION` when either side is null, so
+**`IDX_DEMO_BOOKS_ID` holds a `BTreeKey` whose key is null**. Every insert into
+that table then dies walking into it, and because each index looks itself up
+from a static initialiser, the next server to load the object aborts under
+`dlopen` where no catch reaches.
 
-What is known:
+**Bisected.** It was first seen after `run-e2e.sh` then
+`run-permissions-e2e.sh`, but the permissions suite has nothing to do with it:
 
-- **Not the index change.** It reproduces identically with the sequence fix
-  reverted, and the store layout is not what decides it.
-- **Not `run-e2e.sh` alone.** That store seeds perfectly.
-- **Not the restart.** Killing a server with SIGTERM and starting another
-  against the same store leaves it fine -- five books inserted straight after.
-- **It is something `run-permissions-e2e.sh` does**, which is where it has not
-  been narrowed further. That script kills a server mid-run and starts a second
-  one on the same store under `open.conf`, and it drives the compiler to declare
-  and then delete two catalogue objects.
+| step | store afterwards |
+|---|---|
+| connect probes | fine |
+| `call demo::count_books` x4 | fine |
+| **fetch one page** | **broken** |
 
-Worth knowing what a null key is likely to *be*: a `BTreeValue` read as a
-`BTreeKey`. A key unpacks seven fields, a value has two, so reading a value
-through a key's eyes runs off the end and the key field lands on whatever
-follows -- a zero byte is a null descriptor. That would mean an address that
-should name a key names a value instead. Both now live in the same pages, so a
-confused address can land on one where it could not before -- which makes this
-easier to hit than it was, without being a defect the change introduced.
+Narrowed from there. The certificate that is turned away at the TLS handshake --
+never reaching the page -- leaves the store fine; an ordinary `curl` of
+`/catalog.zt` on the plain server breaks it. Permissions, the compiler probes
+and the second `open.conf` server are all innocent.
 
-Whoever picks this up should bisect `run-permissions-e2e.sh` rather than read
-`btreeindex.hpp`: the store is the evidence, and the Memory Viewer will decode
-the index's pages once the failing page is known.
+Narrowed again, on *when*:
+
+```
+insert                              ok
+fetch /catalog.zt                   HTTP 200
+insert, same server                 ok        <- store is fine in memory
+stop, restart, insert               FAILED    <- and broken on disk
+```
+
+So the page does not damage anything a running server can see. It leaves the
+*on-disk* hexmap and free list in a state `Memory::_initialize` reconstructs
+differently, and the rebuilt free list then hands out space that is already
+occupied.
+
+**It needs a store with some history.** The same sequence on a store created
+fresh -- twenty books loaded, one page fetched, restart -- passes. The store
+that fails is one that has been through the e2e suite's churn of rolled back
+inserts, deletes and truncates. That is the next thing to bisect, and it is the
+harder half.
+
+Two leads worth reading before starting:
+
+- `Memory::_initialize` frees every transaction record while iterating
+  `_page_list` (`memory.cpp:158-164`), and `_free` moves entries between the
+  page and free lists as it goes. `truncate` has a comment explaining why it
+  collects the dead set *before* freeing any of it, for exactly this reason.
+  `_initialize` does not.
+- `_initialize`'s page walk stops at the first non-data chunk (`memory.cpp:144`)
+  and records it as the page's free tail. A page with a freed hole in the middle
+  would lose everything after the hole.
+
+What a null key most likely *is*: a `BTreeValue` read as a `BTreeKey`. A key
+unpacks seven fields where a value wrote two, so the key field lands past the
+record and a zero byte is a null descriptor. That means two allocations were
+handed the same address. Keys and values share pages now, so a duplicated
+address can land on one where it could not before -- which makes this easier to
+hit, without being a defect the change introduced.
+
+**Not attributed to a commit.** Checking `0e8d0bd` needs a clean rebuild -- an
+incremental one leaves mixed libraries and fails to link -- and that was not
+done.
 
 ### The Memory Viewer lists every object's pages
 
