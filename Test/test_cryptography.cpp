@@ -282,6 +282,56 @@ ZTEST(Cryptography, a_certificates_subject_reads_as_a_distinguished_name)
   ZCHECK(subject.find(", ") != std::string::npos);       // more than one attribute
 }
 
+// The whole string, character for character, and not a set of substrings.
+//
+// This is the one output in the tree where being close is worse than being
+// wrong. certificate_subject feeds subject_file_name, which names the files in
+// home/etc/users -- so the rendering *is* the registry key. Change a separator
+// or an attribute's short name and every registered user silently stops being
+// registered: the server starts, the certificates still verify, and every
+// connection is refused for a subject nobody can find.
+//
+// It is written down here because the obvious way to reimplement this is
+// OpenSSL's X509_NAME_print_ex, and it does not agree. Its short name for
+// givenName (2.5.4.42) is GN, not givenName, and its separator flags are a
+// choice rather than a default. Any rewrite has to reproduce the string below,
+// whatever it uses underneath.
+ZTEST(Cryptography, a_subject_renders_exactly_this_way_and_no_other)
+{
+  const std::string path = certificate_file("dont-use-certificate.crt");
+  if (path.empty()) { ZCHECK(false); return; }
+
+  filestream crt(path, std::ios::in | std::ios::binary);
+  ZCHECK_STR(X509::certificate_subject(crt),
+	     "C=US, dnQualifier=The Zigurat Informational Platform Project, "
+	     "ST=Chicago, CN=ZiguratIP, DC=ziguratip.com, "
+	     "emailAddress=info@ziguratip.com");
+}
+
+// And the codec that turns that name into a file name, over the characters
+// that would otherwise let a subject name a file outside the directory, or
+// collide with another subject.
+ZTEST(Cryptography, a_subject_survives_being_written_down_as_a_file_name)
+{
+  struct { const char* dn; const char* file; } cases[] = {
+    { "CN=alice",             "CN=alice" },
+    { "CN=alice, O=Acme",     "CN=alice%2C%20O=Acme" },
+    { "CN=a/b, O=x.y",        "CN=a%2Fb%2C%20O=x%2Ey" },
+    { "CN=x=y, O=a,b",        "CN=x=y%2C%20O=a%2Cb" },
+    { "emailAddress=a@b.c",   "emailAddress=a%40b%2Ec" },
+    { "DC=example, DC=com",   "DC=example%2C%20DC=com" },
+    { "CN=\xc3\xa9lise, C=FR", "CN=%C3%A9lise%2C%20C=FR" },
+    { "CN=",                  "CN=" },
+  };
+
+  for (const auto& c : cases) {
+    const std::string encoded = X509::subject_file_name(c.dn);
+    ZCHECK_STR(encoded, c.file);
+    ZCHECK_STR(X509::file_name_subject(encoded), c.dn);   // and back again
+    ZCHECK(encoded.find('/') == std::string::npos);       // never names another directory
+  }
+}
+
 // Signing an arbitrary message with a private key file, and checking it with
 // the certificate that carries the matching public key. This is what proves a
 // peer holds the key its certificate names.
