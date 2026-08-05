@@ -45,6 +45,32 @@ HTTPServer http_server;
 bool       http_tls_mode = false;
 
 extern TLS::HandshakeParameters security_params;
+TLS::HandshakeParameters zeytun_security_params;
+namespace
+{
+  // REQUIRED unless told otherwise, so a configuration written before this
+  // existed behaves exactly as it did.
+  TLS::ClientAuth read_client_auth(const Configuration& conf, const std::string& path)
+  {
+    std::string value;
+    if (!conf.get(path, value)) return TLS::ClientAuth::REQUIRED;
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "REQUIRED") return TLS::ClientAuth::REQUIRED;
+    if (value == "OPTIONAL") return TLS::ClientAuth::OPTIONAL;
+    if (value == "NONE")     return TLS::ClientAuth::NONE;
+    throw ZiguratIPException("invalid value for '" + path + "'");
+  }
+
+  const char* client_auth_name(TLS::ClientAuth mode)
+  {
+    switch (mode) {
+    case TLS::ClientAuth::REQUIRED: return "REQUIRED";
+    case TLS::ClientAuth::OPTIONAL: return "OPTIONAL";
+    default:                        return "NONE";
+    }
+  }
+}
+
 void require_security(const char*);
 
 typedef BasePage* (*NEW_PAGE)(binarystream*, HTTPRequest&, HTTPResponse&);
@@ -330,6 +356,13 @@ void load_zeytun(const Configuration& conf)
   }
   std::cout << "Max content length: '" << max_content_length << "'" << std::endl;
 
+  zeytun_security_params = security_params;
+  zeytun_security_params.client_auth = read_client_auth(conf, "/HTTP/TLS_CLIENT_AUTH");
+  std::cout << "Zeytun client auth: '" << client_auth_name(zeytun_security_params.client_auth) << "'";
+  if (zeytun_security_params.client_auth != TLS::ClientAuth::REQUIRED)
+    std::cout << "  --! a peer with no certificate has no subject and no permissions !--";
+  std::cout << std::endl;
+
   if (conf.get("/HTTP/TLS_MODE", value)) {
     value = Utility::to_upper(Utility::trim(value));
     if (value == "TRUE")
@@ -360,7 +393,7 @@ void load_zeytun(const Configuration& conf)
   std::cout << "Zeytun is ready ..." << std::endl << std::endl;
 	
   if (http_tls_mode) {
-    http_server.run(security_params, TCPServer::IPV4, http_service, http_backlog, http_pool_size,
+    http_server.run(zeytun_security_params, TCPServer::IPV4, http_service, http_backlog, http_pool_size,
 		    zeytun_handler, http_blocking_mode, http_timeout,
 		    http_async_mode, max_uri_length, max_headers_length, max_content_length);
   } else {

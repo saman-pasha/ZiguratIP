@@ -149,13 +149,24 @@ namespace Zigurat
     struct ContextKey
     {
       int entity;
-      std::string certificate, private_key, cipher, authority;
+      int client_auth;
+      // Whether this context refuses peers by subject, because that decides
+      // the maximum protocol version. It is not part of the credentials, and
+      // leaving it out of the key let a context built for a connection with no
+      // register be handed to one that has a register -- so a stranger was
+      // refused under 1.3, after connecting, which is the very thing the cap
+      // exists to prevent.
+      int rejects_by_subject;
+      std::string certificate, private_key, cipher, authority, cipher_list;
       bool operator<(const ContextKey& other) const
       {
 	if (entity != other.entity) return entity < other.entity;
+	if (client_auth != other.client_auth) return client_auth < other.client_auth;
+	if (rejects_by_subject != other.rejects_by_subject) return rejects_by_subject < other.rejects_by_subject;
 	if (certificate != other.certificate) return certificate < other.certificate;
 	if (private_key != other.private_key) return private_key < other.private_key;
 	if (cipher != other.cipher) return cipher < other.cipher;
+	if (cipher_list != other.cipher_list) return cipher_list < other.cipher_list;
 	return authority < other.authority;
       }
     };
@@ -165,13 +176,19 @@ namespace Zigurat
     // The old code read the certificate, the key and the authority off the disk
     // on every handshake, several times each. A context holds the parsed
     // material and OpenSSL makes a connection from it, which is what it is for.
-    SSL_CTX* context_for(TLS::ConnectionEnd entity, const TLS::Credentials& credentials)
+    SSL_CTX* context_for(TLS::ConnectionEnd entity, const TLS::HandshakeParameters& params)
     {
       static std::map<ContextKey, SSL_CTX*> contexts;
       static std::mutex guard;
 
-      const ContextKey key { (int)entity, credentials.certificate, credentials.private_key,
-			     credentials.private_key_cipher, credentials.authority };
+      const TLS::Credentials& credentials = params.credentials;
+      const bool rejects_by_subject = (params.client_auth == TLS::ClientAuth::REQUIRED)
+	&& (bool)params.authorize;
+
+      const ContextKey key { (int)entity, (int)params.client_auth, rejects_by_subject ? 1 : 0,
+			     credentials.certificate, credentials.private_key,
+			     credentials.private_key_cipher, credentials.authority,
+			     params.cipher_list };
 
       ignore_sigpipe_once();
 
@@ -187,21 +204,29 @@ namespace Zigurat
 	// Nothing below TLS 1.2, and no record compression: CRIME.
 	SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
 
-	// And nothing above it yet, which is a decision rather than an omission.
+	// TLS 1.3 is allowed unless this end refuses peers by their subject.
 	//
-	// This end refuses a peer by its subject, in the verify callback, and the
-	// register is the only revocation the design has. Under TLS 1.3 the
-	// client's certificate is not examined until after the client has sent
-	// its Finished and considers the handshake done, so SSL_connect returns
-	// success to a stranger and the refusal reaches it later, as an alert on
-	// a connection it thinks it already has. The suite says an unregistered
-	// subject is refused, and under 1.3 it was not -- it connected, and was
-	// told afterwards.
+	// Under 1.3 a client's certificate is not examined until after it has
+	// sent its Finished and considers the handshake done, so a stranger gets
+	// success out of SSL_connect and hears the refusal afterwards, as an
+	// alert on a connection it believes it already has. Where the register
+	// decides who may connect at all -- REQUIRED, with an authorize hook --
+	// that turns a refusal into a delayed surprise, so those contexts stay at
+	// 1.2 where the answer arrives inside the handshake.
 	//
-	// Allowing 1.3 means the client has to confirm the server accepted it
-	// before reporting a connection, which is a change on the client side and
-	// belongs with the rest of the modern-TLS work rather than here.
-	SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION);
+	// A port a browser is meant to reach does not have that problem, because
+	// it is not asking anyone for a certificate.
+	if (rejects_by_subject) SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION);
+
+	// Forward secrecy or nothing. !kRSA is the important half: static RSA key
+	// transport is what this server used to do, and it is why no browser
+	// would speak to it. ECDHE agrees a secret neither end sent; AEAD leaves
+	// no padding to build an oracle out of.
+	const std::string ciphers = params.cipher_list.empty()
+	  ? std::string("ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!kRSA:!MD5:!SHA1:!RC4:!3DES")
+	  : params.cipher_list;
+	if (SSL_CTX_set_cipher_list(context, ciphers.c_str()) != 1)
+	  throw TLSException("no usable cipher in '" + ciphers + "'");
 	SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION | SSL_OP_CIPHER_SERVER_PREFERENCE);
 
 	if (!credentials.certificate.empty()) {
@@ -225,12 +250,24 @@ namespace Zigurat
 
 	if (!credentials.authority.empty()) {
 	  trust_authority(context, credentials.authority);
-
-	  // Both ends present a certificate and both check it, which is what
-	  // this arrangement has always done: a peer is who the authority says
-	  // it is, or it does not get in.
-	  SSL_CTX_set_verify(context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, verify_peer);
 	  SSL_CTX_set_verify_depth(context, 1);   // one authority, signing leaves directly
+
+	  int mode = SSL_VERIFY_NONE;
+	  switch (params.client_auth) {
+	  case TLS::ClientAuth::REQUIRED:
+	    mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT; break;
+	  case TLS::ClientAuth::OPTIONAL:
+	    // Asked for, checked if given, and not insisted upon. A certificate
+	    // that is offered and does not check out still fails the handshake.
+	    mode = SSL_VERIFY_PEER; break;
+	  case TLS::ClientAuth::NONE:
+	    mode = SSL_VERIFY_NONE; break;
+	  }
+
+	  // A client always checks the server, whatever the server asks of it.
+	  if (entity == TLS::ConnectionEnd::CLIENT) mode = SSL_VERIFY_PEER;
+
+	  SSL_CTX_set_verify(context, mode, verify_peer);
 	}
       } catch (...) {
 	SSL_CTX_free(context);
@@ -363,7 +400,7 @@ namespace Zigurat
     // again -- its read-ahead would take them out from under the record layer.
     this->_tcpstream.open(handle, blocking_mode, timeout);
 
-    SSL_CTX* context = context_for(entity, this->_handshake_params.credentials);
+    SSL_CTX* context = context_for(entity, this->_handshake_params);
     SSL* ssl = SSL_new(context);
     if (ssl == nullptr) throw TLSException("cannot make a TLS connection: " + ssl_error_text());
     this->_ssl = ssl;
@@ -392,7 +429,7 @@ namespace Zigurat
 
     this->_tcpstream.open(node, service, blocking_mode, timeout);
 
-    SSL_CTX* context = context_for(TLS::ConnectionEnd::CLIENT, this->_handshake_params.credentials);
+    SSL_CTX* context = context_for(TLS::ConnectionEnd::CLIENT, this->_handshake_params);
     SSL* ssl = SSL_new(context);
     if (ssl == nullptr) throw TLSException("cannot make a TLS connection: " + ssl_error_text());
     this->_ssl = ssl;
