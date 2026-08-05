@@ -111,6 +111,57 @@ inside `__static_initialization_and_destruction_0` under `dlopen`, where no
 catch can reach it. The process died on a metadata read. Both halves of one
 metadata write now follow the same rule.
 
+### A null key gets into an index, and the permissions suite is how to see it
+
+Reproducible, and the recipe is exact:
+
+```sh
+rm -f home/data/data home/data/hexmap
+Test/run-e2e.sh              # passes
+Test/run-permissions-e2e.sh  # passes, on the same store
+# then start a server and fetch /setup.zt
+```
+
+`/setup.zt` answers `Server side error code: 1000, message: NULL value`, and
+under gdb it is one frame:
+
+```
+#1 Zigurat::Long::operator<(Zigurat::Long const&) const          libType.so
+#2 Zigurat::BTreeIndex<DEMO::BOOKS, Zigurat::Long>::_map(...)::{lambda}
+#7 Zigurat::BTreeIndex<DEMO::BOOKS, Zigurat::Long>::_cursor_keys(...)
+#9 ...::map(DEMO::BOOKS const&)  ->  DEMO::ADD_BOOK  ->  DEMO::SEED
+```
+
+`Long::operator<` throws `Object::NULL_EXCEPTION` -- code 1000, "NULL value" --
+when either side is null, so **`IDX_DEMO_BOOKS_ID` contains a `BTreeKey` whose
+key is null**. `_map` walks into it comparing, and the insert dies. Nothing is
+wrong with the sequence, the procedure or the page: the index is corrupt and
+every insert into that table now fails against it.
+
+What is known:
+
+- **Not the index change.** It reproduces identically with the sequence fix
+  reverted, and the store layout is not what decides it.
+- **Not `run-e2e.sh` alone.** That store seeds perfectly.
+- **Not the restart.** Killing a server with SIGTERM and starting another
+  against the same store leaves it fine -- five books inserted straight after.
+- **It is something `run-permissions-e2e.sh` does**, which is where it has not
+  been narrowed further. That script kills a server mid-run and starts a second
+  one on the same store under `open.conf`, and it drives the compiler to declare
+  and then delete two catalogue objects.
+
+Worth knowing what a null key is likely to *be*: a `BTreeValue` read as a
+`BTreeKey`. A key unpacks seven fields, a value has two, so reading a value
+through a key's eyes runs off the end and the key field lands on whatever
+follows -- a zero byte is a null descriptor. That would mean an address that
+should name a key names a value instead. Both now live in the same pages, so a
+confused address can land on one where it could not before -- which makes this
+easier to hit than it was, without being a defect the change introduced.
+
+Whoever picks this up should bisect `run-permissions-e2e.sh` rather than read
+`btreeindex.hpp`: the store is the evidence, and the Memory Viewer will decode
+the index's pages once the failing page is known.
+
 ### The Memory Viewer lists every object's pages
 
 `do=pagefiles` returns the whole page list, so the tool's dropdown holds every
