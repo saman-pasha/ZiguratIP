@@ -50,30 +50,27 @@ public port entirely.
 ### The RPC console's transaction belongs to a thread, not a visitor
 
 `System/rpc.parsi` holds its `Connector` in a `THREAD LOCAL` and never closes
-it, and `do=commit` and `do=rollback` arrive as separate HTTP requests. So the
-transaction outlives the request that opened it and belongs to whichever worker
-served it. `home/http/rpc.js` fetches the transaction id for display only and
-sends no identifier back, so the server commits whatever connection the thread
-it landed on happens to hold.
+it, and `do=commit` and `do=rollback` arrive as separate requests carrying no
+identifier, so the server commits whatever connection the thread it landed on
+happens to hold. Two visitors sharing a worker share a transaction.
 
-With sixty-four workers, one visitor's `call` and their later `commit` can land
-on different threads, and two visitors sharing a thread share a transaction --
-either can commit the other's uncommitted work.
+`Connector/rpcpool.{hpp,cpp}` is the half of the fix that exists: connections
+addressed by the transaction they carry, owned by whoever opened them, with
+`RPCPool::owner` deciding what "whoever" means -- a certificate subject where
+there is one, the session cookie otherwise. It is built, and its ownership
+policy is tested.
 
-The keyword no longer lies about this (`THREAD LOCAL` says what it is), but the
-console still behaves this way.
+What is missing is the page using it. `RPCPool::held` returns a
+`Zigurat::Connector&`, and the Parsi `Connector` is a *subclass* of that
+(`System/connector.parsi:5`), so a base reference cannot be handed to a Parsi
+function whose parameter is the subclass. Converting the page to the base type
+means rewriting `_write_parameter`'s fifty-odd `con.write(Bool(...))` calls,
+which depend on the subclass's per-type overloads.
 
-The fix is to address connections by the transaction they carry and record the
-session that opened each, so a visitor can hold several at once and cannot touch
-anyone else's -- with `&tx=` travelling on `call`, `commit` and `rollback`.
-
-It was attempted and backed out. Parsi has no way to name an existing object
-without copying it: `DECLARE x AS T INOUT` is not accepted -- `INOUT` marks a
-parameter -- and `DECLARE x AS T& ` is a syntax error, so a lookup returning a
-connection cannot be bound to a local. The way through is to move each branch
-into a private function taking `con AS Connector INOUT`, which is the one place
-Parsi does pass by reference, and hand it the result of the lookup. That is a
-restructure of the page rather than an edit to it.
+The way through is to stop making the Parsi `Connector` a subclass and have it
+*hold* a `Zigurat::Connector&` instead. Then the pool hands out the reference,
+the wrapper wraps it, and the page keeps its overloads. That is a change to
+`connector.parsi` rather than to the page, and it is the last piece.
 
 ### The compiler is gated, not fixed
 

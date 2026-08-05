@@ -3,6 +3,7 @@
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
 #include "httpserver.hpp"
+#include "rpcpool.hpp"
 #include "bufferstream.hpp"
 #include "types.hpp"
 #include <map>
@@ -114,6 +115,84 @@ ZTEST(Session, the_cookie_carries_the_session_to_the_next_request)
     ZCHECK_STR(Session::GET<String>(String("message")).to_std_string(), "Hello World!");
     ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)1);   // not a second one
   }
+}
+
+// What a session is actually for: one page puts something away, a different
+// page takes it out again, and the only thing joining them is the visitor's
+// cookie.
+//
+// The two pages here are two handlers rather than two compiled .parsi objects --
+// what is being tested is the store and the cookie that carries it, and those
+// are the same whichever page calls them. Each begins with INITIALIZE, because
+// every page must, and ends with RELEASE, because the request scope does.
+ZTEST(Session, a_value_set_by_one_page_is_read_by_another)
+{
+  Clean clean;
+
+  std::string cookie;
+
+  // Page one: a form handler that remembers who the visitor said they are.
+  {
+    Exchange page_one;
+    Session::INITIALIZE(*page_one.request, *page_one.response);
+
+    Session::SET<String>(String("who"), String("Sadegh Hedayat"));
+    Session::SET<Int>(String("visits"), Int(1));
+
+    cookie = page_one.cookie_echo();     // what the browser would keep
+    Session::RELEASE();
+  }
+
+  // Between the two, this worker thread is bound to nobody -- as it would be
+  // while it served somebody else entirely.
+  ZCHECK(!Session::IS_INITIALIZED().value());
+
+  // Page two: a different page, same visitor, carrying the cookie back.
+  {
+    Exchange page_two(cookie);
+    Session::INITIALIZE(*page_two.request, *page_two.response);
+
+    ZCHECK_STR(Session::GET<String>(String("who")).to_std_string(), "Sadegh Hedayat");
+    ZCHECK_EQ(Session::GET<Int>(String("visits")).value(), 1);
+
+    // and it can write back for the page after it
+    Session::SET<Int>(String("visits"), Int(2));
+    Session::RELEASE();
+  }
+
+  // Page three, to show the update stuck rather than the first value lingering.
+  {
+    Exchange page_three(cookie);
+    Session::INITIALIZE(*page_three.request, *page_three.response);
+    ZCHECK_EQ(Session::GET<Int>(String("visits")).value(), 2);
+    Session::RELEASE();
+  }
+
+  // One visitor, one session, however many pages they walked through.
+  ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)1);
+}
+
+// A visitor who arrives with no cookie is a different visitor, and must not see
+// what the first one put away.
+ZTEST(Session, another_visitor_does_not_see_it)
+{
+  Clean clean;
+
+  {
+    Exchange mine;
+    Session::INITIALIZE(*mine.request, *mine.response);
+    Session::SET<String>(String("who"), String("Sadegh Hedayat"));
+    Session::RELEASE();
+  }
+
+  {
+    Exchange theirs;                     // no cookie: a fresh browser
+    Session::INITIALIZE(*theirs.request, *theirs.response);
+    ZCHECK(!Session::HAS(String("who")).value());
+    Session::RELEASE();
+  }
+
+  ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)2);   // two visitors
 }
 
 // Anyone can send any cookie, so an id the server never issued must not be
@@ -472,4 +551,30 @@ ZTEST(Zeytun, a_refusal_says_what_it_was)
   const size_t split = served.raw.find("\r\n\r\n");
   ZCHECK(split != std::string::npos);
   ZCHECK(served.raw.size() > split + 4);
+}
+
+// How this server knows who is asking, which has exactly two answers and they
+// are not equally strong.
+ZTEST(Session, a_certificate_names_a_user_and_a_cookie_names_a_browser)
+{
+  // A certificate subject is authenticated: the peer proved it holds the key,
+  // against an authority this server trusts, and it is checked again on every
+  // request. That is a person, and they are the same person in two browsers.
+  ZCHECK_STR(RPCPool::owner("C=US, CN=alice", ""), "peer:C=US, CN=alice");
+
+  // It wins over a cookie, so opening a second browser does not open a second
+  // identity for somebody who has a certificate.
+  ZCHECK_STR(RPCPool::owner("C=US, CN=alice", "abc123"), "peer:C=US, CN=alice");
+
+  // With no certificate there is nobody to be sure about and the cookie is all
+  // there is. It names a browser: whoever holds it is that session.
+  ZCHECK_STR(RPCPool::owner("", "abc123"), "session:abc123");
+
+  // The two are kept apart, so a certificate subject cannot be crafted to read
+  // as somebody's session id and inherit what it owns.
+  ZCHECK(RPCPool::owner("abc123", "") != RPCPool::owner("", "abc123"));
+
+  // Neither, and there is no owner to speak of. Silence here would mean a
+  // transaction owned by nobody, which is how the thread-local version behaved.
+  ZCHECK_THROWS(RPCPool::owner("", ""));
 }

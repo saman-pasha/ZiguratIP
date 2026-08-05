@@ -14,17 +14,8 @@ endif
 
 lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst J,j,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(subst Y,y,$(subst Z,z,$1))))))))))))))))))))))))))
 
-# session.parsi and catalog_pages.parsi are deliberately absent.
-#
-# session.parsi is superseded: the session store is HTTP/session.cpp now, and
-# this is the Parsi version it replaced. It still does not compile -- it calls
-# a write<T> template method through a syntax the compiler no longer emits --
-# and making it compile would only produce a second Session for pages to pick
-# the wrong one of.
-#
-# catalog_pages.parsi does not parse: it writes SELECT '<tr>' AS 'rt, tr', and
-# the tokenizer rejects the comma inside that alias. That is a grammar question
-# rather than drift in the file, and it is not on the path to anything here.
+# session.parsi is gone: the session store is HTTP/session.cpp, and keeping a
+# second class of the same name only gave pages a wrong one to pick.
 PARSI_FILES := isolationlevel.parsi \
 	resulttype.parsi \
 	connector.parsi \
@@ -33,6 +24,7 @@ PARSI_FILES := isolationlevel.parsi \
 	compiler.parsi \
 	serializer.parsi \
 	catalog.parsi \
+	catalog_pages.parsi \
 	rpc.parsi \
 	mem.parsi
 
