@@ -1,4 +1,5 @@
 #include "session.hpp"
+#include "zexception.hpp"
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
 #include "shahelper.hpp"
@@ -93,7 +94,14 @@ namespace Zigurat
 
   void Session::_set_raw(const std::string& key, const std::string& value)
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -105,7 +113,14 @@ namespace Zigurat
 
   bool Session::_get_raw(const std::string& key, std::string& value)
   {
-    if (Session::_current.empty()) return false;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -127,7 +142,14 @@ namespace Zigurat
 
   void Session::REMOVE(String key)
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -136,7 +158,14 @@ namespace Zigurat
 
   void Session::CLEAR()
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -150,7 +179,14 @@ namespace Zigurat
 
   void Session::DESTROY()
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     {
       std::lock_guard<std::mutex> lock(Session::_store_access);

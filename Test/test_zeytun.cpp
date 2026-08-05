@@ -218,12 +218,36 @@ ZTEST(Session, sessions_cannot_read_each_others_values)
 }
 
 // Writing without a session must be inert rather than landing somewhere.
-ZTEST(Session, writing_while_unbound_is_ignored)
+// Using a session nobody asked for is a mistake in the page, and it says so.
+//
+// This used to be writing_while_unbound_is_ignored, and ignored was the wrong
+// answer: a page that forgets INITIALIZE set values that vanished, read back
+// nothing, and reported success. The request looked fine and the data was never
+// there. Reads and writes throw now; asking whether there is a session, and
+// which one, still answer plainly, because those are the questions a page asks
+// before deciding.
+ZTEST(Session, using_a_session_while_unbound_throws)
 {
   Clean clean;
-  ZCHECK_NOTHROW(Session::SET<Int>(String("orphan"), Int(1)));
-  ZCHECK(!Session::HAS(String("orphan")).value());
+
+  ZCHECK_THROWS(Session::SET<Int>(String("orphan"), Int(1)));
+  ZCHECK_THROWS(Session::HAS(String("orphan")));
+  ZCHECK_THROWS(Session::REMOVE(String("orphan")));
+  ZCHECK_THROWS(Session::CLEAR());
+  ZCHECK_THROWS(Session::DESTROY());
+
+  // and nothing was created on the way past
   ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)0);
+
+  // the questions a page asks first still answer
+  ZCHECK_NOTHROW(Session::IS_INITIALIZED());
+  ZCHECK(!Session::IS_INITIALIZED().value());
+  ZCHECK_NOTHROW(Session::ID());
+  ZCHECK_STR(Session::ID().value(), "");
+
+  // and releasing when there is nothing to release is not an error: the request
+  // scope does it on every request, bound or not.
+  ZCHECK_NOTHROW(Session::RELEASE());
 }
 
 ZTEST(Session, release_keeps_the_session_but_destroy_removes_it)
