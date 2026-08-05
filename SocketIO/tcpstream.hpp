@@ -26,6 +26,7 @@ namespace Zigurat
     void open(Socket::handle_t, bool = true, int = 0);
     void open(std::string, std::string, bool = true, int = 0);
     bool is_open() const;
+    Socket::handle_t handle() const;
     void close();
 
     void swap(tcpstream&);

@@ -232,4 +232,9 @@ namespace Zigurat
     if (this->_buffer != nullptr) delete[] this->_buffer;
   }
 
+  Socket::handle_t socketbuf::handle() const
+  {
+    return this->_handle;
+  }
+
 }

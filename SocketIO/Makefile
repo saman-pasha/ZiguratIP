@@ -34,7 +34,7 @@ SOURCES := socket.cpp \
 # Encoding and ZLib out of Compression. None of them were named here: Mach-O
 # resolves them dynamically, so the gap only surfaces as an undefined symbol in
 # whichever ELF executable links this library.
-LIBS := -lCore -lStreamIO -lThreading -lCryptography -lEncoding -lCompression
+LIBS := -lCore -lStreamIO -lThreading -lCryptography -lEncoding -lCompression -lssl -lcrypto
 
 ifeq ($(OS),Windows_NT)
 	LIBS := $(LIBS) -lws2_32
