@@ -28,5 +28,13 @@ SOURCES := sha1.cpp \
 	rsa.cpp \
 	x509.cpp
 
+# x509.cpp stands on DER and CTE from Encoding, BigInt from Core and
+# binarystream from StreamIO. Naming them here rather than leaving them to
+# whoever links this library last: Mach-O was told to look symbols up
+# dynamically, so the omission never showed on the machine this was written on,
+# while an ELF executable refuses to link at all unless -lEncoding happens to
+# follow -lCryptography on its command line.
+LIBS := -lCore -lStreamIO -lEncoding
+
 include ../Makefile.global
 

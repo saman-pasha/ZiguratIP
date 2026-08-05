@@ -2,6 +2,8 @@
 #ifndef __RSA_HPP__
 #define __RSA_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 #include <vector>
 #include "bigint.hpp"

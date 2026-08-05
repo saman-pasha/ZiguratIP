@@ -2,6 +2,8 @@
 #ifndef __BIGINT_HPP__
 #define __BIGINT_HPP__
 
+
+#include <cstdint>
 #include "polynomial.hpp"
 #include "binarystream.hpp"
 #include <iostream>

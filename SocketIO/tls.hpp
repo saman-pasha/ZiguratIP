@@ -2,6 +2,8 @@
 #ifndef __TLS_HPP__
 #define __TLS_HPP__
 
+
+#include <cstdint>
 #include "binarystream.hpp"
 #include <functional>
 #include <vector>

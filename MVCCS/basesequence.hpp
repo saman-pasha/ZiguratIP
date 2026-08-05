@@ -2,6 +2,8 @@
 #ifndef __BASESEQUENCE_HPP__
 #define __BASESEQUENCE_HPP__
 
+
+#include <cstdint>
 #include "basetable.hpp"
 #include "typelong.hpp"
 #include "typestring.hpp"

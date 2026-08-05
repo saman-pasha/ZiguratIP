@@ -2,6 +2,8 @@
 #ifndef __BTREEINDEX_HPP__
 #define __BTREEINDEX_HPP__
 
+
+#include <cstdint>
 #include "memory.hpp"
 #include "btreerecord.hpp"
 #include "btreenode.hpp"

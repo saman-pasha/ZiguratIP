@@ -2,6 +2,8 @@
 #ifndef __BASE32_HPP__
 #define __BASE32_HPP__
 
+
+#include <cstdint>
 #include "binarystream.hpp"
 
 namespace Zigurat

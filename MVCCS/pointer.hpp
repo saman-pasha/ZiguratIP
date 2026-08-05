@@ -2,6 +2,8 @@
 #ifndef __POINTER_HPP__
 #define __POINTER_HPP__
 
+
+#include <cstdint>
 #include "memorybase.hpp"
 
 namespace Zigurat

@@ -2,6 +2,8 @@
 #ifndef __NBOSTREAM_HPP__
 #define __NBOSTREAM_HPP__
 
+
+#include <cstdint>
 #include "binarystream.hpp"
 
 namespace Zigurat

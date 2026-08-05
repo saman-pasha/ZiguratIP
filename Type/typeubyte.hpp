@@ -2,6 +2,8 @@
 #ifndef __UBYTE_HPP__
 #define __UBYTE_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 
 namespace Zigurat

@@ -2,6 +2,8 @@
 #ifndef __BTREEKEY_HPP__
 #define __BTREEKEY_HPP__
 
+
+#include <cstdint>
 #include "basetable.hpp"
 
 namespace Zigurat

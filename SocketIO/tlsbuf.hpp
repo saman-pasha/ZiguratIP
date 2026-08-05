@@ -2,6 +2,8 @@
 #ifndef __TLSBUF_HPP__
 #define __TLSBUF_HPP__
 
+
+#include <cstdint>
 #include "tcpstream.hpp"
 #include "tls.hpp"
 #include "networkstream.hpp"

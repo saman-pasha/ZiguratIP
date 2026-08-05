@@ -2,6 +2,8 @@
 #ifndef __CONTROL_HPP__
 #define __CONTROL_HPP__
 
+
+#include <cstdint>
 #include "rowstate.hpp"
 #include "rowlock.hpp"
 #include <ctime>

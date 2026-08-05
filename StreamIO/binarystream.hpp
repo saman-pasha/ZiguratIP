@@ -2,6 +2,8 @@
 #ifndef __BINARYSTREAM_HPP__
 #define __BINARYSTREAM_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 
 namespace Zigurat

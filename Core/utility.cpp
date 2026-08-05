@@ -20,6 +20,20 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #endif
+
+// utility.hpp already undefines these, but it is included above the platform
+// headers, and on glibc <arpa/inet.h> puts them back as macros expanding to
+// __bswap_32 and friends. The definitions below are then named
+// Utility::__bswap_32, which matches nothing declared in the class, and Core
+// does not compile at all. macOS does not include <arpa/inet.h> here, which is
+// why this only ever showed up away from the machine it was written on.
+#undef htons
+#undef ntohs
+#undef htonl
+#undef ntohl
+#undef htonll
+#undef ntohll
+
 #include <thread>
 #include <ctime>
 

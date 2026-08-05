@@ -2,6 +2,8 @@
 #ifndef __BASETABLE_HPP__
 #define __BASETABLE_HPP__
 
+
+#include <cstdint>
 #include "pointer.hpp"
 #include <string>
 #include <vector>

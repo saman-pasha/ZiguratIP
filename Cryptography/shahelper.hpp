@@ -2,6 +2,8 @@
 #ifndef __SHAHELPER_HPP__
 #define __SHAHELPER_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 #include <string>
 

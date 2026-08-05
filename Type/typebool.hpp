@@ -2,6 +2,8 @@
 #ifndef __BOOL_HPP__
 #define __BOOL_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 
 namespace Zigurat

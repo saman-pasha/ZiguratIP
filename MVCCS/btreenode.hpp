@@ -2,6 +2,8 @@
 #ifndef __BTREENODE_HPP__
 #define __BTREENODE_HPP__
 
+
+#include <cstdint>
 #include "basetable.hpp"
 #include "typebool.hpp"
 #include "typeshort.hpp"

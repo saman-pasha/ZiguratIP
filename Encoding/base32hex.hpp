@@ -2,6 +2,8 @@
 #ifndef __BASE32HEX_HPP__
 #define __BASE32HEX_HPP__
 
+
+#include <cstdint>
 #include "bufferstream.hpp"
 
 namespace Zigurat

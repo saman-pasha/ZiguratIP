@@ -2,6 +2,8 @@
 #ifndef __ARRAYSTREAM_HPP__
 #define __ARRAYSTREAM_HPP__
 
+
+#include <cstdint>
 #include "hbostream.hpp"
 #include "arraybuf.hpp"
 
