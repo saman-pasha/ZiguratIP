@@ -91,9 +91,35 @@ Left failing rather than weakened, the same way `run-reload-e2e` is: a test
 changed to pass is worth less than one that says something true. It goes green
 when an index keeps its entries together the way a table keeps its rows.
 
-Fixing it means deciding what a bucket should be keyed by -- the indexed value,
-presumably, so rows sharing a key share a node -- and letting nodes hold many
-entries. That is a change to the index rather than a repair to it.
+**Why the obvious fix does not work**, traced so the next attempt starts here
+rather than repeating it.
+
+The hash key is not decoration -- it *is* the grouping. `_cursor_values`
+(`btreeindex.hpp:369`) walks a bucket by asking `Memory::_cursor` for every row
+under a hash key, and `BTreeValue` (`btreevalue.hpp`) carries nothing but the
+row address. So "which values belong to this key" is expressed *only* by them
+sharing a hash key. Give every value the index's one hash key and they pack
+beautifully -- and every lookup returns every value in the index.
+
+That rules out the one-line change. Three ways forward, and none of them is
+small:
+
+- **Carry the owner in the value.** Add the key node's address to `BTreeValue`
+  and filter in `_cursor_values`. Entries pack, but a lookup becomes a scan of
+  the whole index -- trading the space problem for a worse time one.
+- **Bucket by the indexed value's hash** rather than the key node's address.
+  Rows sharing a value share a bucket, which helps a non-unique index and does
+  nothing at all for a unique one, where every row is its own value. `IDX_ID` is
+  unique, so this leaves the measured case exactly where it is.
+- **Pack values into the node.** Hold many keys and their values inline in one
+  node and split when it fills, which is what a B-tree is and what
+  `_split_node` half implies already. This is the right answer and it changes
+  the on-disk layout.
+
+The third is the real fix. It should not be attempted casually: it rewrites how
+index data is stored, and there is no write-ahead log to recover from a mistake
+(see below). Do it against the `Test Memory` suite, which measures the property
+it has to achieve.
 
 ### The Memory Viewer lists every object's pages
 
