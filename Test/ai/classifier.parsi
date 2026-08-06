@@ -45,7 +45,18 @@ BEGIN
 	--
 	-- run-ai-e2e.sh rewrites the stub include for the run against the real
 	-- library; nothing else in this file changes between the two.
+	-- <memory> IS REPEATED HERE ON PURPOSE. The INCLUDE above reaches the
+	-- object's header, and the header is included AFTER this block -- the
+	-- block goes first so its own headers are parsed before globals.hpp turns
+	-- AUTO, CAST, VOID and NULL into macros. So a block is on its own for
+	-- what it needs: classifier.cpp names std::shared_ptr, and nothing else
+	-- here would have declared it.
+	--
+	-- Against real libtorch this was invisible, because <torch/torch.h> drags
+	-- <memory> in behind it. It showed up only against the stub, which is one
+	-- argument for keeping the stub tier.
 	BEGIN CPP
+	#include <memory>
 	#include "torch_stub.hpp"
 	#include "classifier.cpp"
 	END
@@ -86,17 +97,44 @@ PUBLIC:
 	FUNCTION predict(seed AS Long) RETURNS Long
 	BEGIN
 		DECLARE n AS Long = `net_inputs();
-		DECLARE i AS Long = 0;
+		CALL this.fill(seed);
+		RETURN `net_predict(this._net, this._pixels.`data(), n.`value());
+	END
 
+	-- The same forward pass answered as a number rather than a class, and
+	-- it is the one worth asserting on. An untrained network's argmax is
+	-- very nearly input-independent -- one class wins for almost every
+	-- picture -- so two seeds sharing a class says nothing about whether
+	-- either reached the model. The largest log-probability moves with the
+	-- input either way, scaled by a million so it survives as a Long.
+	FUNCTION score(seed AS Long) RETURNS Long
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		CALL this.fill(seed);
+		RETURN `net_score(this._net, this._pixels.`data(), n.`value());
+	END
+
+PRIVATE:
+	-- Shared by predict and score, so the two always see the same picture.
+	--
+	-- THE SEED CHANGES THE FREQUENCY, NOT JUST THE PHASE, and that distinction
+	-- is the whole value of the test around it. It was (i * 7 + seed) % 256
+	-- first, which is one ramp slid sideways: every seed then has the identical
+	-- histogram, and a real untrained network answered the same class for all
+	-- of them -- correctly, since the pictures barely differ. Multiplying by
+	-- the seed makes each one a different picture, so a model that reads its
+	-- input has something to distinguish.
+	FUNCTION fill(seed AS Long) RETURNS Void
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		DECLARE i AS Long = 0;
 		CALL this._pixels.`clear();
 		WHILE i < n
 		BEGIN
-			DECLARE b AS Long = (i * 7 + seed) % 256;
+			DECLARE b AS Long = (i * (seed * 13 + 1) + seed * 31) % 256;
 			CALL this._pixels.`push_back(CAST<`float>(b.`value()) / 255.0);
 			SET i = i + 1;
 		END
-
-		RETURN `net_predict(this._net, this._pixels.`data(), n.`value());
 	END
 END
 
@@ -117,5 +155,8 @@ PUBLIC:
 		ECHO ' seed0=', model.predict(0L);
 		ECHO ' seed137=', model.predict(137L);
 		ECHO ' again0=', model.predict(0L);
+		ECHO ' score0=', model.score(0L);
+		ECHO ' score137=', model.score(137L);
+		ECHO ' scoreagain0=', model.score(0L);
 	END
 END

@@ -663,13 +663,16 @@ namespace Zigurat
 
     head << "extern \"C\" void call();" << std::endl;
 
-    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
-
+    // Before the header include, for the reason spelled out in _class: this
+    // object's globals.hpp would otherwise have turned AUTO, CAST, VOID and
+    // NULL into macros before the block's own headers were parsed.
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "CPP") {
 	impl << block_text(expr) << std::endl;
       }
     }
+
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
 
     this->_open_namespace(ast.args[0], impl);
 
@@ -971,17 +974,29 @@ namespace Zigurat
 
     // implementation file
 
-    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
-
-    // The CPP block, above the namespace for the same reason -- so it can bring
-    // its own headers in -- and above the definitions so that whatever it
-    // declares is complete by the time a method uses it. This is where the
-    // weight of a generated model lands, and where it stays.
+    // THE CPP BLOCK COMES FIRST, BEFORE THIS OBJECT'S OWN HEADER, and the
+    // reason is globals.hpp. It defines THIS, CAST, AUTO, VOID, TRUE, FALSE and
+    // NULL as bare macros, and a real C++ library is entitled to use any of
+    // those as an identifier -- libtorch has
+    //
+    //     enum class CuDNNDepthwiseKernel { AUTO, CUDNN, NATIVE };
+    //
+    // in ATen/Context.h, which with AUTO defined reads as `enum class { auto,
+    // ... }' and takes the rest of the header down with it. Emitted after the
+    // header include, a block could therefore not include libtorch at all.
+    //
+    // Before it, the block's headers are parsed while those names still mean
+    // themselves, and globals.hpp defines the macros afterwards for the
+    // generated code that actually wants them. Nothing is lost by the order: a
+    // block is independent C++ by construction -- it defines what the HPP block
+    // declared -- so it has no reason to see this object's own class first.
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "CPP") {
 	impl << block_text(expr) << std::endl;
       }
     }
+
+    impl << "#include \"" << include_name << ".hpp\"" << std::endl;
 
     this->_open_namespace(ast.args[0], impl);
 

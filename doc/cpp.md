@@ -159,3 +159,18 @@ see `example/parsi-fragment.cicili` there for the whole path, this end included.
   loaded; wrap generated code in a namespace of its own if that is a risk.
 * A block is spliced verbatim and is never checked by Parsi. Errors in it are
   C++ compiler errors, reported against the generated file.
+* **A `CPP` block carries its own headers.** It is emitted above
+  `#include "_NAME_.hpp"`, so an object-level `INCLUDE` — which lands in the
+  header — is not in scope inside it. Repeat what the block needs.
+
+  The order is not arbitrary. `globals.hpp` defines `THIS`, `CAST`, `AUTO`,
+  `VOID`, `TRUE`, `FALSE` and `NULL` as bare macros, and a C++ library is
+  entitled to use any of those as an identifier — libtorch has
+
+  ```cpp
+  enum class CuDNNDepthwiseKernel { AUTO, CUDNN, NATIVE };
+  ```
+
+  which with `AUTO` defined reads as `enum class { auto, ... }` and takes the
+  rest of the header down with it. Emitted after the header include, a block
+  could not include libtorch at all.

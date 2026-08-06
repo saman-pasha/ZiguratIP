@@ -238,15 +238,26 @@ INPUTS=$(field inputs)
 S0=$(field seed0)
 S137=$(field seed137)
 A0=$(field again0)
+P0=$(field score0)
+P137=$(field score137)
+PA0=$(field scoreagain0)
 
 check    "the page answered"                "$(test -n "$BODY" && echo yes || echo no)" "yes"
 check    "the model reports its input width" "$INPUTS" "784"
 check    "the same seed twice agrees"        "$A0"     "$S0"
 
-# THE ONE THAT CATCHES A DEAD MODEL. Everything above passes if predict()
-# returns a constant -- a from_blob that reads nothing, a forward that ignores
-# its input, a page that never reaches the object at all.
-check_ne "two seeds give two answers"        "$S0"     "$S137"
+check    "the same seed twice scores the same" "$PA0"   "$P0"
+
+# THE ONE THAT CATCHES A DEAD MODEL, and it asks for a SCORE rather than a
+# class. Two seeds sharing a class proves nothing: an untrained network's
+# argmax is very nearly input-independent, one class wins for almost every
+# picture, and asserting on it failed against real libtorch while passing
+# against the stub -- a test that was wrong rather than a model that was.
+#
+# The largest log-probability moves with the input for a trained and an
+# untrained network alike. Two pictures scoring the same to six decimal places
+# did not both reach the model.
+check_ne "two seeds give two scores"         "$P0"     "$P137"
 
 case "$S0" in
   ''|*[!0-9]*) check "the class is a number in range" "$S0" "0..9" ;;
