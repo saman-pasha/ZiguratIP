@@ -156,10 +156,19 @@ namespace Zigurat
     std::cout << "memory loading... 100%" << std::endl;
     
     if (transactions.size() > 0) {
+      // COLLECTED FIRST, FREED AFTER, which is the rule truncate already
+      // follows and says why: _free moves entries between the page list and the
+      // free list, and it can hand a whole page back to FREE_HASHKEY -- so
+      // freeing from inside the walk mutates what the walk is standing on.
+      std::list<Pointer> spent;
       this->_cursor(TRANSACTIONS_HASHKEY, nullptr, nullptr, [&] (const Pointer& pointer) -> bool {
-	  this->_free(pointer);
+	  spent.push_back(pointer);
 	  return true;
 	});
+
+      for (const Pointer& pointer : spent) {
+	this->_free(pointer);
+      }
       std::cout << "memory restore ends" << std::endl;
     }
 

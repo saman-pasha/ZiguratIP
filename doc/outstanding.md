@@ -201,11 +201,20 @@ writes over something live. Two records at one address is how a `BTreeValue`
 comes to be read as a `BTreeKey`, and a key unpacking seven fields where a value
 wrote two reads its key past the end of the record -- null.
 
-**Two of the three defects below are now fixed** (`memory.cpp`): the walk
-registers every free run instead of stopping at the first, free runs are
-measured straight from the hexmap by `_free_run_count`, and the transaction
-records are collected before any of them is freed rather than freed from inside
-the walk.
+**One of the three defects below is fixed**: the transaction records are
+collected before any of them is freed, rather than freed from inside the walk.
+
+**The page walk itself is NOT fixed, and was reverted after it lost rows.**
+`5fc99f3` made it register every free run instead of stopping at the first, and
+`184cf7c` took that back out: with the holes in the free list the allocator
+reuses them, and
+`Test/test_mvccs.cpp:truncate_leaves_holes_and_a_reopen_must_not_lose_what_is_behind_them`
+shows six new rows landing on six live ones. Before the change the allocator
+never saw those holes and took a fresh page instead — wasteful, and it loses
+nothing. **So the free entries that walk builds are wrong in a way not yet
+identified**, and the reasoning below, which still looks right, is not
+sufficient. Whoever picks this up starts there: the test is written and it
+fails on the change.
 
 **The bug is NOT confirmed fixed**, and the distinction matters. No failing case
 was ever reduced to something that could be run before and after. What was
