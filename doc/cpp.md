@@ -125,6 +125,30 @@ Linkage is inherited either way: `LINK` flags travel through `REQUIRES` (each
 object re-exports what it linked), so only the object that owns the library ever
 names it.
 
+### Passing a value in
+
+A block's functions take plain C++ types, and a Parsi `Long` is
+`Zigurat::Long`, not `long`. It does not convert and `CAST` will not force it;
+`value()` is the accessor:
+
+```
+FUNCTION bump(by AS Long) RETURNS Long
+BEGIN
+	RETURN `net_bump(this._net, by.`value());
+END
+```
+
+A literal has no members, so `0L.`value()` is a syntax error — bind it first
+with `DECLARE zero AS Long = 0;`.
+
+### Generated blocks
+
+Nothing about a block cares where the C++ came from, and a transpiler that can
+write a fragment can fill one. [Cicili](https://github.com/saman-pasha/cicili)
+does: a `header` target gives the declarations and a `source` target with no
+`:compile` gives the definitions, neither carrying an `#include` of its own —
+see `example/parsi-fragment.cicili` there for the whole path, this end included.
+
 ### Limits
 
 * Parsi has no dereference operator and no `*` type suffix, so a block's types
