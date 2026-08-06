@@ -373,3 +373,28 @@ localhost. That puts a widely-audited component between the internet and
 
 The binary protocol cannot go behind an HTTP proxy, which is why its TLS had to
 be made real rather than merely fronted. Zeytun can, and should.
+
+## The reload check is unexercised on Linux
+
+`ziguratip/shared.cpp` compares `zigurat_runtime_instance()` through every
+object it opens, so an object bound to a second copy of the storage engine is
+refused rather than allowed to write rows through a null client stream. That
+check is right and stays.
+
+**`Test/run-reload-e2e.sh` cannot exercise it under glibc**, and now skips there
+rather than reporting two failures. glibc resolves a `DT_NEEDED` entry by name
+against already-loaded objects before touching the filesystem; the core
+libraries carry no `SONAME` and never have, so an object's `libMVCCS.so` binds
+to the copy the server already has mapped and replacing the file changes
+nothing. Measured: after the swap the server maps one libMVCCS, the original,
+shown `(deleted)` — and the object itself *is* freshly `dlopen`ed at that
+moment, so the test's window is genuinely open and the dedup is what closes it.
+
+It was never a regression. `run-reload-e2e.sh` has one commit and was never
+edited, the detection is unchanged since, and no `SONAME` was ever set — there
+is no revision at which this behaved differently here.
+
+To cover it on Linux the libraries would need per-build `SONAME`s, or the object
+would need its dependency resolved by full path. Both change how every object is
+linked, to exercise one guard, so neither is obviously worth it. macOS still
+runs the test for real.

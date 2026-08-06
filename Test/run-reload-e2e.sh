@@ -39,6 +39,40 @@ if [ ! -f "$HOME_DIR/ld/lib_DEMO::COUNT_BOOKS_.so" ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# THIS CANNOT HAPPEN UNDER GLIBC, so the test does not pretend to run there.
+#
+# glibc's loader resolves a DT_NEEDED entry by NAME against the objects it has
+# already loaded, before it looks at the filesystem at all. The core libraries
+# carry no SONAME and never have, so the name is the bare `libMVCCS.so' in both
+# the server and the object -- and the object's dependency binds to the copy the
+# server already has mapped. Replacing the file changes nothing for a process
+# holding it.
+#
+# Measured rather than assumed, on gcc 15 / glibc:
+#
+#   before the call   lib_DEMO::COUNT_BOOKS_.so is not mapped   (window open)
+#   after the call    it is mapped                              (dlopen ran)
+#   libMVCCS mapped   one, the original, shown "(deleted)"      (no second copy)
+#
+# So the server answering OK is CORRECT here, and asserting a refusal is
+# asserting dyld's behaviour on a loader that does not have it. macOS is where
+# this was written and where it means something: dyld's dedup is by install_name
+# and the swapped file arrives with a different one.
+#
+# What is skipped is the TEST, not the protection. ziguratip/shared.cpp still
+# compares zigurat_runtime_instance() through every object it opens, which is
+# right on both platforms -- an object can be bound to a second copy by other
+# routes, an RUNPATH pointing elsewhere being the obvious one. It is that check
+# that is unexercised on Linux, and nothing here should read as though it were.
+if [ "$(uname -s)" = "Linux" ]; then
+  echo "reload: SKIPPED on Linux -- glibc binds the object's libMVCCS by name to"
+  echo "        the copy already mapped, so no second copy exists to detect and"
+  echo "        the refusal this asserts cannot happen. See the note in this"
+  echo "        script. The check in ziguratip/shared.cpp is unexercised here."
+  exit 0
+fi
+
 export ZIGURATIP_HOME="$HOME_DIR"
 export DYLD_LIBRARY_PATH="$HOME_DIR/lib:$DYLD_LIBRARY_PATH"
 export LD_LIBRARY_PATH="$HOME_DIR/lib:$LD_LIBRARY_PATH"
