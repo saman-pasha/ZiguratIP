@@ -201,27 +201,34 @@ writes over something live. Two records at one address is how a `BTreeValue`
 comes to be read as a `BTreeKey`, and a key unpacking seven fields where a value
 wrote two reads its key past the end of the record -- null.
 
-**One of the three defects below is fixed**: the transaction records are
-collected before any of them is freed, rather than freed from inside the walk.
+**Fixed, and the reason the first attempt failed is the interesting part.**
 
-**The page walk itself is NOT fixed, and was reverted after it lost rows.**
-`5fc99f3` made it register every free run instead of stopping at the first, and
-`184cf7c` took that back out: with the holes in the free list the allocator
-reuses them, and
-`Test/test_mvccs.cpp:truncate_leaves_holes_and_a_reopen_must_not_lose_what_is_behind_them`
-shows six new rows landing on six live ones. Before the change the allocator
-never saw those holes and took a fresh page instead — wasteful, and it loses
-nothing. **So the free entries that walk builds are wrong in a way not yet
-identified**, and the reasoning below, which still looks right, is not
-sufficient. Whoever picks this up starts there: the test is written and it
-fails on the change.
+The walk was right and it was not enough. `5fc99f3` made `_initialize` register
+every free run instead of stopping at the first; that lost rows and was reverted
+in `184cf7c`. The walk was not what was wrong — **`_allocate` was**.
 
-**The bug is NOT confirmed fixed**, and the distinction matters. No failing case
-was ever reduced to something that could be run before and after. What was
-corrected is the reconstruction being demonstrably wrong in two ways; whether
-that was the whole of what produced the null key is unproven. If it recurs, this
-section is still the place to start, and the next step is a repro rather than
-another fix.
+Its exact-match branch returned the free entry's `Pointer` unchanged. A free
+entry measures the whole span it covers, data chunks *and* the control block,
+because that is what `_free` writes and what the size comparison needs. A
+Pointer handed to a caller measures the **data**, which is what the other two
+returns in that function answer and what `_pointer_actual_size` expects to add
+the control block back onto. So an exact match gave back a size already
+`CONTROL_SIZE` too large, the record's hexmap run was written `CONTROL_COUNT`
+chunks too long, and it ran over whatever followed.
+
+It was nearly unreachable before: an exact match needs a hole the size of the
+record replacing it, and while startup registered at most one (wrongly measured)
+free run per page, reconstructed entries almost never matched. Walking the page
+properly is what made the holes known, and the allocator then met them.
+
+    walk + old allocator   FAIL   six new rows land on six live ones
+    walk + fixed allocator PASS
+    no walk + old allocator PASS  (and leaks every page past its first hole)
+
+All three defects are now fixed: the walk registers every run, `_free_run_count`
+measures runs from the hexmap rather than through `_pointer`'s record
+arithmetic, the transaction records are collected before any is freed, and
+`_allocate` answers the size it was asked for.
 
 **Where the hole comes from, which is the whole of the repro.** Rows are not
 reclaimed by anything except `TRUNCATE`. `_rollback_pointer` flags a
