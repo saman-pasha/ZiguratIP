@@ -71,6 +71,36 @@ TORCH_ROOT=/opt/torch/torch Test/run-ai-e2e.sh
 The same `classifier.parsi` is used either way; the runner rewrites the one
 include line and adds the `LINK` flags.
 
+## Real weights, and real digits
+
+`classifier.pt` is committed: eight epochs of Adam on the real MNIST, **98.17%
+on the held-out 10,000**, written by cicili's `example/mnist-train.cpp`. The
+object loads it when `CLASSIFIER_WEIGHTS` is set, which the runner does when the
+file is there; unset, the network is untrained and everything except the digit
+check means the same.
+
+The **test set is not committed** — 7.8 MB of someone else's data. To run the
+digit check, put the idx files here:
+
+```
+cd Test/ai
+for f in t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+  curl -sO "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz" && gunzip -f "$f.gz"
+done
+TORCH_ROOT=/opt/torch/torch ../run-ai-e2e.sh
+```
+
+The page then reports the model's answer over the true label for the first ten
+test digits, and the runner asserts every pair agrees:
+
+```
+digits=7/7,2/2,1/1,0/0,4/4,1/1,4/4,9/9,5/5,9/9,
+```
+
+Pairs rather than a fixed string, so retraining does not break the test — what
+is asserted is that the model is right, not that it is the same model. Without
+the files every pair reads `-1/-1` and the check says out loud that it skipped.
+
 ## Two things that bit while this was written
 
 **A quoted include finds `home/tmp` first.** The generated

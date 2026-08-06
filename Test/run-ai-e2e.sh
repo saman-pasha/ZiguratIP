@@ -160,6 +160,25 @@ if [ -n "$TORCH_ROOT" ]; then
   # library path too, not just the compiler.
   LD_LIBRARY_PATH="$TORCH_ROOT/lib:$LD_LIBRARY_PATH"
   export LD_LIBRARY_PATH
+
+  # TRAINED WEIGHTS, if they are here. Test/ai/classifier.pt is what cicili's
+  # example/mnist-train.cpp writes after eight epochs on the real MNIST --
+  # 98.17% on the held-out set. Without it the network is untrained, which is
+  # still a valid run: everything except the digit check means the same.
+  if [ -f "$AI/classifier.pt" ]; then
+    CLASSIFIER_WEIGHTS="$AI/classifier.pt"
+    export CLASSIFIER_WEIGHTS
+    echo "weights: $CLASSIFIER_WEIGHTS"
+  else
+    echo "note: no Test/ai/classifier.pt, the network will be untrained"
+  fi
+
+  # And the test set, for classifying real digits. Not committed -- it is 7.8 MB
+  # of someone else's data -- so this looks where the README says to put it.
+  if [ -z "$MNIST_DIR" ] && [ -f "$AI/t10k-images-idx3-ubyte" ]; then
+    MNIST_DIR="$AI"
+  fi
+  [ -n "$MNIST_DIR" ] && export MNIST_DIR
 else
   echo "tier A: against Test/ai/torch_stub.hpp (set TORCH_ROOT for the real library)"
   cp "$AI/torch_stub.hpp" "$HOME_DIR/ld/"
@@ -258,6 +277,27 @@ check    "the same seed twice scores the same" "$PA0"   "$P0"
 # untrained network alike. Two pictures scoring the same to six decimal places
 # did not both reach the model.
 check_ne "two seeds give two scores"         "$P0"     "$P137"
+
+# THE PAYOFF, when there is a trained model and a test set to read: ten real
+# MNIST digits, the model's answer over the true label. Every pair must agree.
+#
+# Pairs rather than a fixed string, so retraining does not break the test --
+# what is asserted is that the model is right, not that it is the same model.
+# A 98%-accurate net getting all ten is not luck: these are the first ten test
+# digits, and they are not hard ones.
+DIGITS=$(field digits)
+if [ -z "$DIGITS" ] || [ "${DIGITS%%,*}" = "-1/-1" ]; then
+  echo "skip real digits: no MNIST_DIR with t10k-images-idx3-ubyte (see Test/ai/README.md)"
+else
+  bad=0; seen=0
+  for pair in $(echo "$DIGITS" | tr ',' ' '); do
+    got=${pair%%/*}; want=${pair##*/}
+    seen=$((seen + 1))
+    [ "$got" = "$want" ] || { bad=$((bad + 1)); echo "  digit $seen: model said $got, truth $want"; }
+  done
+  check "ten real MNIST digits were read"   "$seen" "10"
+  check "the trained model got them right"  "$bad"  "0"
+fi
 
 case "$S0" in
   ''|*[!0-9]*) check "the class is a number in range" "$S0" "0..9" ;;

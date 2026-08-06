@@ -57,6 +57,7 @@ BEGIN
 	-- argument for keeping the stub tier.
 	BEGIN CPP
 	#include <memory>
+	#include <cstdio>
 	#include "torch_stub.hpp"
 	#include "classifier.cpp"
 	END
@@ -70,14 +71,35 @@ PUBLIC:
 	-- object does. Which is the whole reason this is a CLASS and not a
 	-- PROCEDURE: a procedure would reload them on every call.
 	--
-	-- An empty path means an untrained network. That is what the suite runs:
-	-- an untrained net still answers, deterministically, which is enough to
-	-- prove the object loads and the page reaches it. Nothing here asserts an
-	-- accuracy and nothing should.
+	-- WEIGHTS COME FROM THE ENVIRONMENT, and an empty path means an
+	-- untrained network. Both cases are real: CLASSIFIER_WEIGHTS unset is
+	-- what the stub tier runs, where there is no libtorch to read a
+	-- checkpoint with; set, it is the 98.17%-accurate net trained by
+	-- cicili's example/mnist-train.cpp on the real MNIST.
+	--
+	-- Read ONCE, here, and the handle lives as long as the object does.
+	-- That is the whole reason this is a CLASS and not a PROCEDURE -- a
+	-- procedure would read the checkpoint off disk on every request.
 	CONSTRUCTOR()
 	BEGIN
-		DECLARE path AS String = '';
-		SET this._net = `net_load(path.`to_std_string().`c_str());
+		-- NOT BOUND TO A LOCAL FIRST, because Parsi has no `*' type
+		-- suffix and so cannot declare a char pointer to hold it. Passed
+		-- straight through, and net_load takes null to mean untrained.
+		SET this._net = `net_load(`getenv('CLASSIFIER_WEIGHTS'));
+	END
+
+	-- Classify the INDEXth picture of an MNIST test set, and say what it
+	-- actually is. This is the point of the whole arrangement: a page
+	-- answering a request with a real model's opinion of a real digit.
+	FUNCTION classify(images AS String, index AS Long) RETURNS Long
+	BEGIN
+		RETURN `net_predict_idx(this._net,
+			images.`to_std_string().`c_str(), index.`value());
+	END
+
+	FUNCTION truth(labels AS String, index AS Long) RETURNS Long
+	BEGIN
+		RETURN `idx_label(labels.`to_std_string().`c_str(), index.`value());
 	END
 
 	-- How many floats the model wants, asked rather than assumed.
@@ -158,5 +180,25 @@ PUBLIC:
 		ECHO ' score0=', model.score(0L);
 		ECHO ' score137=', model.score(137L);
 		ECHO ' scoreagain0=', model.score(0L);
+
+		-- Real digits: the model's answer over the true label, ten of
+		-- them. With no MNIST_DIR and no dataset every one reads -1/-1,
+		-- which is what the stub tier prints and what the runner knows
+		-- to skip -- no conditional needed here, because mnist_dir()
+		-- answers the empty string rather than null and a file that
+		-- cannot be opened is a -1 rather than a crash.
+		DECLARE images AS String = '';
+		DECLARE labels AS String = '';
+		SET images = `mnist_dir();
+		SET labels = images + '/t10k-labels-idx1-ubyte';
+		SET images = images + '/t10k-images-idx3-ubyte';
+
+		DECLARE k AS Long = 0;
+		ECHO ' digits=';
+		WHILE k < 10
+		BEGIN
+			ECHO model.classify(images, k), '/', model.truth(labels, k), ',';
+			SET k = k + 1;
+		END
 	END
 END
