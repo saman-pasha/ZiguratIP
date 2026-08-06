@@ -125,11 +125,41 @@ if [ -n "$TORCH_ROOT" ]; then
     exit 1
   fi
   echo "tier B: against the real libtorch at $TORCH_ROOT"
+
   sed -e 's|#include "torch_stub.hpp"|#include <torch/torch.h>|' \
-      -e "s|INCLUDE '<memory>';|INCLUDE '<memory>';\n\tLINK '-L$TORCH_ROOT/lib';\n\tLINK '-ltorch';\n\tLINK '-ltorch_cpu';\n\tLINK '-lc10';|" \
+      -e "s|INCLUDE '<memory>';|INCLUDE '<memory>';\n\tLINK '-L$TORCH_ROOT/lib';\n\tLINK '-Wl,-rpath,$TORCH_ROOT/lib';\n\tLINK '-ltorch';\n\tLINK '-ltorch_cpu';\n\tLINK '-lc10';|" \
       "$AI/classifier.parsi" > "$WORK/classifier.parsi"
-  CPPFLAGS="-I$TORCH_ROOT/include -I$TORCH_ROOT/include/torch/csrc/api/include"
-  export CPPFLAGS
+
+  # THE INCLUDE PATH HAS TO GO THROUGH THE CONFIG FILE. Parsi builds its
+  # compile line from COMPILER/CPP_FLAGS in home/etc/ziguratip.conf
+  # (Compiler/compiler.cpp:232) and reads no environment variable, so an
+  # exported CPPFLAGS is silently ignored -- which is what the first version of
+  # this script did, and it fails as a missing <torch/torch.h> that looks like
+  # a broken TORCH_ROOT.
+  #
+  # And it is -std=c++17, not the c++11 the file ships: libtorch 2.x does not
+  # compile under c++11 at all. Only the OBJECT is built with these; ziguratip
+  # itself is already built.
+  #
+  # The file is restored on the way out, including on a failure -- see the trap.
+  CONF="$HOME_DIR/etc/ziguratip.conf"
+  cp "$CONF" "$WORK/ziguratip.conf.orig"
+  restore_conf() { cp "$WORK/ziguratip.conf.orig" "$CONF" 2>/dev/null || true; }
+  trap 'restore_conf; rm -rf "$WORK"' EXIT
+
+  TORCH_INC="-I$TORCH_ROOT/include -I$TORCH_ROOT/include/torch/csrc/api/include"
+  sed -i.bak "s|CPP_FLAGS: -Wall -std=c++11 -fPIC|CPP_FLAGS: -Wall -std=c++17 -fPIC $TORCH_INC|" "$CONF"
+  rm -f "$CONF.bak"
+  grep -q "std=c++17" "$CONF" || {
+    echo "FAIL could not patch CPP_FLAGS in $CONF -- has the line changed?"
+    grep -n "CPP_FLAGS" "$CONF"
+    exit 1
+  }
+
+  # The object dlopens libtorch at request time, so the SERVER needs the
+  # library path too, not just the compiler.
+  LD_LIBRARY_PATH="$TORCH_ROOT/lib:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH
 else
   echo "tier A: against Test/ai/torch_stub.hpp (set TORCH_ROOT for the real library)"
   cp "$AI/torch_stub.hpp" "$HOME_DIR/ld/"
@@ -176,7 +206,12 @@ stop_server() {
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
 }
-trap 'stop_server; rm -rf "$WORK"' EXIT
+# restore_conf is a no-op in tier A; in tier B it puts ziguratip.conf back, and
+# it MUST stay in this trap -- installing the server trap without it is how a
+# patched -std=c++17 and a torch include path get left in the config file for
+# every later build in the tree.
+restore_conf() { [ -f "$WORK/ziguratip.conf.orig" ] && cp "$WORK/ziguratip.conf.orig" "$HOME_DIR/etc/ziguratip.conf" || true; }
+trap 'stop_server; restore_conf; rm -rf "$WORK"' EXIT
 
 # WAIT FOR ZEYTUN, NOT FOR "ready". The log says "Zigurat is ready" while the
 # HTTP listener is still coming up, so a plain grep for the word wins the race
