@@ -1,0 +1,121 @@
+-- ---------------------------------------------------------------------------
+-- A neural network as a Zigurat object, and a page that asks it a question.
+--
+-- The two blocks below are not written by hand. They are what Cicili's
+-- example/mnist-fragment.cicili emits from
+--
+--     (network Classifier
+--       (input   784)
+--       (dense   256 relu)
+--       (dense   128 relu)
+--       (dense    10 log-softmax))
+--
+-- the same four lines as its example/mnist-dsl.cicili, which trains this
+-- network against the real MNIST. Test/ai/classifier.hpp and .cpp are that
+-- output, copied in verbatim; Test/run-ai-e2e.sh regenerates and diffs them
+-- when a Cicili checkout is around.
+--
+-- THE SPLIT IS THE POINT. Everything that names torch is in the CPP block, so
+-- it is compiled once, into this object's own .so. The HPP block is a forward
+-- declaration and three prototypes -- which is all a page needs, and all it
+-- inherits by REQUIREing this object. A page gets the linkage without paying
+-- for the header.
+-- ---------------------------------------------------------------------------
+
+CLASS Demo::Classifier
+BEGIN
+	-- Inside the class, so they belong to this object and not to its
+	-- neighbours. These two are in the HEADER, because the members below are
+	-- typed with them -- and that is the whole list that belongs there.
+	INCLUDE '<memory>';
+	INCLUDE '<vector>';
+
+	-- Declarations. A forward declaration of Classifier and three prototypes,
+	-- which is all a page needs and all it inherits.
+	BEGIN HPP
+	#include "classifier.hpp"
+	END
+
+	-- Definitions, and TORCH IS INCLUDED HERE RATHER THAN ABOVE. That single
+	-- line placement is the point of having two blocks: written as an object
+	-- INCLUDE it would land in this object's header, and every page that
+	-- REQUIRES Demo::Classifier would compile <torch/torch.h> too. Here it
+	-- stays in this object's own translation unit, and a page still inherits
+	-- the linkage -- links() carries it -- without paying for the header.
+	--
+	-- run-ai-e2e.sh rewrites the stub include for the run against the real
+	-- library; nothing else in this file changes between the two.
+	BEGIN CPP
+	#include "torch_stub.hpp"
+	#include "classifier.cpp"
+	END
+
+PRIVATE:
+	DECLARE _net AS `std::`shared_ptr<`Classifier>;
+	DECLARE _pixels AS `std::`vector<`float>;
+
+PUBLIC:
+	-- The weights are loaded ONCE, here, and the handle lives as long as the
+	-- object does. Which is the whole reason this is a CLASS and not a
+	-- PROCEDURE: a procedure would reload them on every call.
+	--
+	-- An empty path means an untrained network. That is what the suite runs:
+	-- an untrained net still answers, deterministically, which is enough to
+	-- prove the object loads and the page reaches it. Nothing here asserts an
+	-- accuracy and nothing should.
+	CONSTRUCTOR()
+	BEGIN
+		DECLARE path AS String = '';
+		SET this._net = `net_load(path.`to_std_string().`c_str());
+	END
+
+	-- How many floats the model wants, asked rather than assumed.
+	FUNCTION inputs() RETURNS Long
+	BEGIN
+		RETURN `net_inputs();
+	END
+
+	-- A page has no image to upload, so SEED stands in for one: it picks a
+	-- deterministic 784-pixel pattern. Different seeds are different pictures,
+	-- which is what makes the e2e assertion -- two seeds, two answers -- able
+	-- to fail.
+	--
+	-- The buffer is a member, not a local, because net_predict wraps it with
+	-- torch::from_blob and from_blob does not copy. A local would be gone
+	-- before the tensor was read on the real library.
+	FUNCTION predict(seed AS Long) RETURNS Long
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		DECLARE i AS Long = 0;
+
+		CALL this._pixels.`clear();
+		WHILE i < n
+		BEGIN
+			DECLARE b AS Long = (i * 7 + seed) % 256;
+			CALL this._pixels.`push_back(CAST<`float>(b.`value()) / 255.0);
+			SET i = i + 1;
+		END
+
+		RETURN `net_predict(this._net, this._pixels.`data(), n.`value());
+	END
+END
+
+
+-- ---------------------------------------------------------------------------
+-- The page. /predict.zt?seed=N answers with the class the model picked.
+-- ---------------------------------------------------------------------------
+
+PAGE predict
+REQUIRES Demo::Classifier
+BEGIN
+PUBLIC:
+	OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+	BEGIN
+		DECLARE model AS Demo::Classifier;
+
+		ECHO 'inputs=', model.inputs();
+		ECHO ' seed0=', model.predict(0L);
+		ECHO ' seed137=', model.predict(137L);
+		ECHO ' again0=', model.predict(0L);
+	END
+END
