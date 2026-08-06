@@ -141,12 +141,40 @@ namespace Zigurat
 	      this->_rollback_pointer(pointer);
 	    }
 	  }	  
+	  begin_address += this->_pointer_actual_size(pointer);
+
 	} else {
-	  this->_free_list_insert(iter->first, pointer);
-	  break;
+
+	  // A FREE RUN IS NOT A RECORD, and _pointer cannot describe one. It
+	  // seeks past CONTROL_COUNT control chunks and measures what follows,
+	  // which is right for a record and wrong for a hole: a hole has no
+	  // control block, so on a run shorter than CONTROL_COUNT + 1 chunks it
+	  // reads straight through into the record behind it and answers a size
+	  // covering both. That size went into the free list, and the next
+	  // allocation from it wrote over a live row.
+	  //
+	  // So the run is measured from the hexmap, which is the only thing that
+	  // knows where it ends: chunks with the high bit clear, ending after the
+	  // one carrying the standalone bit.
+	  int64_t run = this->_free_run_count(begin_address, end_address);
+
+	  // Zero would not advance, and a page walk that does not advance is a
+	  // hang at startup. It cannot happen -- is_data is false, so the chunk
+	  // here has its high bit clear and counts -- but this loop is not the
+	  // place to find out that something else was assumed wrongly.
+	  if (run <= 0) break;
+
+	  Pointer free_pointer(iter->first, begin_address, run * CHUNK_SIZE);
+	  this->_free_list_insert(iter->first, free_pointer);
+
+	  // AND KEEP WALKING. This used to break, which is only correct if free
+	  // space is always the page's tail. It is not: a rolled-back transaction
+	  // frees its record wherever it sits, and everything allocated after it
+	  // is then behind a hole. Stopping there left those records unseen, the
+	  // free space past them unregistered, and the allocator's view of the
+	  // page disagreeing with what was in it.
+	  begin_address += run * CHUNK_SIZE;
 	}
-	
-	begin_address += this->_pointer_actual_size(pointer);
       }
 
       std::cout << "memory loading... " << (100 * i) / this->_page_count << "%\r";
@@ -156,10 +184,19 @@ namespace Zigurat
     std::cout << "memory loading... 100%" << std::endl;
     
     if (transactions.size() > 0) {
+      // COLLECTED FIRST, FREED AFTER, which is the rule truncate already
+      // follows and says why: _free moves entries between the page list and the
+      // free list, and it can hand a whole page back to FREE_HASHKEY -- so
+      // freeing from inside the walk mutates what the walk is standing on.
+      std::list<Pointer> spent;
       this->_cursor(TRANSACTIONS_HASHKEY, nullptr, nullptr, [&] (const Pointer& pointer) -> bool {
-	  this->_free(pointer);
+	  spent.push_back(pointer);
 	  return true;
 	});
+
+      for (const Pointer& pointer : spent) {
+	this->_free(pointer);
+      }
       std::cout << "memory restore ends" << std::endl;
     }
 
@@ -228,6 +265,40 @@ namespace Zigurat
     this->_hexmap_io.seekp(address, std::ios::beg);
     this->_hexmap_io.fill_n(count - 1, DATA_CHUNK);
     this->_hexmap_io.write_std_ubyte(DATA_STANDALONE_CHUNK + (pointer.size % CHUNK_SIZE));
+  }
+
+  // How many chunks the free run at ADDRESS spans, read from the hexmap.
+  //
+  // A run is bytes with the high bit clear, ending after the one with the
+  // standalone bit -- exactly what _free_hexmap writes. It stops at END_ADDRESS
+  // whatever the bytes say, because a page's free space cannot extend past the
+  // page, and a hexmap that claims otherwise must not send the walk into the
+  // next one.
+  int64_t Memory::_free_run_count(int64_t address, int64_t end_address)
+  {
+    uint8_t hex_byte = 0;
+    int64_t count = 0;
+
+    this->_hexmap_io.seekg(this->_pointer_hexmap_address(address), std::ios::beg);
+
+    while (address + (count * CHUNK_SIZE) < end_address) {
+      this->_hexmap_io.read_std_ubyte(hex_byte);
+
+      if (!this->_hexmap_io.good()) {
+	this->_hexmap_io.clear();
+	throw MemoryException("hexmap ends inside the free run at " + std::to_string(address));
+      }
+
+      // An allocated chunk is not part of this run and must not be counted:
+      // counting it is how a free entry comes to cover a live record.
+      if ((hex_byte & (uint8_t)128) == 128) break;
+
+      count++;
+
+      if ((hex_byte & (uint8_t)64) == 64) break;   // standalone: the run ends here
+    }
+
+    return count;
   }
 
   void Memory::_free_hexmap(int64_t address, int64_t count)

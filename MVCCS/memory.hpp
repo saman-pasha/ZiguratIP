@@ -113,6 +113,7 @@ namespace Zigurat
     Pointer _pointer(hashkey_ptr, int64_t, bool&, RowState&, RowLock&);
 
     void _free_list_insert(hashkey_ptr, const Pointer&);
+    int64_t _free_run_count(int64_t, int64_t);
     int64_t _free_prev_count();
     int64_t _free_next_count();
     void _free(const Pointer&);

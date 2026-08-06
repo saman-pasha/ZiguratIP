@@ -201,23 +201,45 @@ writes over something live. Two records at one address is how a `BTreeValue`
 comes to be read as a `BTreeKey`, and a key unpacking seven fields where a value
 wrote two reads its key past the end of the record -- null.
 
-**The fix is to walk the whole page**, registering every free run rather than
-the first one and then stopping. It needs care that this file has not needed
+**Two of the three defects below are now fixed** (`memory.cpp`): the walk
+registers every free run instead of stopping at the first, free runs are
+measured straight from the hexmap by `_free_run_count`, and the transaction
+records are collected before any of them is freed rather than freed from inside
+the walk.
+
+**The bug is NOT confirmed fixed**, and the distinction matters. No failing case
+was ever reduced to something that could be run before and after. What was
+corrected is the reconstruction being demonstrably wrong in two ways; whether
+that was the whole of what produced the null key is unproven. If it recurs, this
+section is still the place to start, and the next step is a repro rather than
+another fix.
+
+Why a repro was hard, which is worth knowing before trying again: rows are never
+reclaimed (`_rollback_pointer` flags a never-committed row deleted rather than
+freeing it), so a rolled-back insert makes no hole. The only things that free
+chunks are transaction records, `truncate`, and an index dropping its values --
+and transaction records live under `TRANSACTIONS_HASHKEY`, a page of their own,
+so a hole there has no row behind it. The reported damage was to an index page,
+where keys and values now share. That is where a repro should aim.
+
+**The original fix as diagnosed**, kept because it is what was done: It needs care that this file has not needed
 elsewhere: the free run's length has to come from the hexmap directly -- scan
 forward while the high bit is clear, ending after the chunk with the standalone
 bit -- because `_pointer`'s size arithmetic assumes a control block that free
 chunks do not have. Which also means the single `_free_list_insert` there today
 is inserting an entry of the wrong size.
 
-Not attempted here. `_initialize` is the one function in the tree where being
-wrong loses a store rather than misbehaving, and there is no log to recover
-from a bad reconstruction.
+Done, carefully, and with `Test/hexmap-walk.py` added to read a real store's
+hexmap and report what each walk would register -- it never writes, and the line
+that matters is whether a free entry covers an allocated chunk. On the demo
+store neither the old walk nor the new one produces such an entry, which is why
+the corruption remains unreproduced.
 
-One more thing in the same function, unproven but adjacent: it frees every
-transaction record while iterating `_page_list` (`memory.cpp:158-164`), and
-`_free` moves entries between the page and free lists as it goes. `truncate`
-carries a comment explaining why it collects the dead set *before* freeing any
-of it. `_initialize` does not.
+One more thing in the same function, unproven but adjacent, **now fixed**: it
+freed every transaction record from inside the cursor walk, and `_free` moves
+entries between the page and free lists as it goes -- it can hand a whole page
+back to `FREE_HASHKEY`. `truncate` collects the dead set before freeing any of
+it, and `_initialize` now does the same.
 
 What a null key most likely *is*: a `BTreeValue` read as a `BTreeKey`. A key
 unpacks seven fields where a value wrote two, so the key field lands past the
