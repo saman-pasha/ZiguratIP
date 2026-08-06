@@ -265,3 +265,95 @@ ZTEST(MVCCS, a_hole_in_a_page_does_not_swallow_the_record_behind_it)
     reopened.erase();
   }
 }
+
+
+// TRUNCATE is the only thing that gives a page's chunks back, and it gives back
+// only the SETTLED DEAD ones -- rows committed as deleted with no live
+// transaction holding them. The live rows around them stay exactly where they
+// are. So a truncate leaves holes in the MIDDLE of a page with live records
+// behind them, which is the one shape Memory::_initialize used to reconstruct
+// wrongly:
+//
+//   it stopped at the first chunk that was not data, so every live record past
+//   the first hole went unseen and the free space past them unregistered; and
+//   it measured the hole with _pointer, which describes a RECORD -- three
+//   control chunks then data to the standalone bit -- so on a hole shorter than
+//   four chunks it read straight through into the live record behind it and
+//   answered a free entry covering both.
+//
+// Nothing else in the store makes this shape. A never-committed row is flagged
+// deleted rather than freed and there is no vacuum, so neither a rollback nor a
+// delete on its own frees anything; a transaction record is freed on rollback
+// but lives in a page of its own with nothing behind it.
+ZTEST(MVCCS, truncate_leaves_holes_and_a_reopen_must_not_lose_what_is_behind_them)
+{
+  const std::string TAG = "truncate-holes";
+
+  {
+    Store store(TAG);
+    if (!store.ready()) { ZCHECK(false); return; }
+
+    // Interleaved, so the dead ones are among the living rather than a tail:
+    // odd ids are deleted, even ids have to survive all of this.
+    for (int32_t i = 1; i <= 12; i++) {
+      Account row(i, "row " + std::to_string(i), i * 100);
+      store.memory->online_insert(row);
+    }
+    store.memory->commit_transaction();
+
+    std::vector<Account> all = select_all(store.memory);
+    ZCHECK_EQ(all.size(), (size_t)12);
+
+    for (size_t i = 0; i < all.size(); i++) {
+      if (all[i].id.value() % 2 == 1) store.memory->online_delete(all[i]);
+    }
+    store.memory->commit_transaction();
+
+    // Settled dead, so truncate will take their chunks and leave the rest.
+    size_t freed = store.memory->truncate(Account::hash_key);
+    ZCHECK_EQ(freed, (size_t)6);
+    store.memory->commit_transaction();
+
+    ZCHECK_EQ(select_all(store.memory).size(), (size_t)6);
+
+    store.detach();
+    store.hexmap_path.clear();     // ~Store erases what it still holds
+    store.data_path.clear();
+  }
+
+  // The reopen is the whole point: _initialize rebuilds the free list from a
+  // hexmap that now has holes among live records.
+  {
+    Store reopened(TAG, false);
+    if (!reopened.ready()) { ZCHECK(false); return; }
+
+    std::vector<Account> survivors = select_all(reopened.memory);
+    ZCHECK_EQ(survivors.size(), (size_t)6);
+
+    // And then ALLOCATE, which is what turns a wrong free list into a lost row.
+    for (int32_t i = 100; i < 106; i++) {
+      Account row(i, "after the reopen", i);
+      reopened.memory->online_insert(row);
+    }
+    reopened.memory->commit_transaction();
+
+    std::vector<Account> after = select_all(reopened.memory);
+    ZCHECK_EQ(after.size(), (size_t)12);
+
+    // Every even row must still say what it said, byte for byte. A free entry
+    // that covered a live record shows up here as a row that is gone, or one
+    // whose balance and owner no longer agree with its id.
+    int intact = 0;
+    for (size_t i = 0; i < after.size(); i++) {
+      int32_t id = after[i].id.value();
+      if (id > 0 && id <= 12) {
+        ZCHECK(id % 2 == 0);
+        if (after[i].balance == (int64_t)(id * 100) &&
+            after[i].owner == ("row " + std::to_string(id))) intact++;
+      }
+    }
+    ZCHECK_EQ(intact, 6);
+
+    reopened.erase();
+  }
+}
