@@ -39,6 +39,19 @@ namespace Zigurat
       conf << tab2 << "LEVEL: " << level << std::endl;
   }
 
+  // The text of a BEGIN HPP or BEGIN CPP block.
+  //
+  // The tokenizer wrapped it in the raw string literal every quoted Parsi
+  // string is wrapped in -- R"ZIP0ML0S0( ... )ZIP0ML0S0" -- because that is the
+  // one shape the rest of the compiler already carries. Twelve characters off
+  // the front and eleven off the back is that wrapper and nothing else.
+  static std::string block_text(const Expression& ast)
+  {
+    const std::string& raw = ast.args[0].token.value;
+    if (raw.size() < 23) return std::string();
+    return raw.substr(12, raw.size() - 23);
+  }
+
   void Compiler::_include(const Expression& ast)
   {
     this->_includes.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
@@ -585,6 +598,14 @@ namespace Zigurat
       }
     }
 
+    // Above the namespace, so the block can carry its own headers -- the same
+    // arrangement _class uses, and for the same reason.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "HPP") {
+	head << block_text(expr) << std::endl;
+      }
+    }
+
     this->_open_namespace(ast.args[0], head);
 
     head << TAB1 << this->_type_name(ast.args[2].args[0]);
@@ -598,8 +619,15 @@ namespace Zigurat
     head << "extern \"C\" void call();" << std::endl;
 
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
+
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "CPP") {
+	impl << block_text(expr) << std::endl;
+      }
+    }
+
     this->_open_namespace(ast.args[0], impl);
-    
+
     impl << TAB1 << this->_type_name(ast.args[2].args[0]);
     impl << ' ' << name;
     this->_parameters_impl(ast.args[1], impl, 1);
@@ -757,8 +785,28 @@ namespace Zigurat
       }
     }
 
+    // A HPP block goes above the namespace, not inside the class.
+    //
+    // Not inside the class, because there `struct Net;' would declare a type
+    // nested in it, and the CPP block's `struct Net : ...' would be a different
+    // type entirely -- the nested one staying incomplete forever, which a
+    // member declared shared_ptr<Net> survives right up until the destructor
+    // needs it.
+    //
+    // And above the namespace rather than inside it, so that a block can carry
+    // its own #include. That is the whole reason for the two blocks: a model's
+    // <torch/torch.h> belongs to the implementation, and anything that lands in
+    // this header is inherited by every object that REQUIRES this one.
+    // Unqualified names still resolve from inside the namespace, so a member
+    // written shared_ptr<Net> finds it.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "HPP") {
+	head << block_text(expr) << std::endl;
+      }
+    }
+
     this->_open_namespace(ast.args[0], head);
-    
+
     if (is_tmpl_class) {
       const Expression* expr = &(ast.args[0]);
       while (!expr->args.empty()) {
@@ -875,8 +923,19 @@ namespace Zigurat
     // implementation file
 
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
+
+    // The CPP block, above the namespace for the same reason -- so it can bring
+    // its own headers in -- and above the definitions so that whatever it
+    // declares is complete by the time a method uses it. This is where the
+    // weight of a generated model lands, and where it stays.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "CPP") {
+	impl << block_text(expr) << std::endl;
+      }
+    }
+
     this->_open_namespace(ast.args[0], impl);
-    
+
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "DECLARE") {
 	this->_declare(expr, impl, 0, false, true, name);
