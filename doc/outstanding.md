@@ -214,13 +214,31 @@ that was the whole of what produced the null key is unproven. If it recurs, this
 section is still the place to start, and the next step is a repro rather than
 another fix.
 
-Why a repro was hard, which is worth knowing before trying again: rows are never
-reclaimed (`_rollback_pointer` flags a never-committed row deleted rather than
-freeing it), so a rolled-back insert makes no hole. The only things that free
-chunks are transaction records, `truncate`, and an index dropping its values --
-and transaction records live under `TRANSACTIONS_HASHKEY`, a page of their own,
-so a hole there has no row behind it. The reported damage was to an index page,
-where keys and values now share. That is where a repro should aim.
+**Where the hole comes from, which is the whole of the repro.** Rows are not
+reclaimed by anything except `TRUNCATE`. `_rollback_pointer` flags a
+never-committed row deleted rather than freeing it, and there is no vacuum — so
+a rolled-back insert makes no hole, and neither does a delete. Only two things
+free chunks at all:
+
+* a **transaction record**, on rollback — but those live under
+  `TRANSACTIONS_HASHKEY`, a page of their own, so a hole there has nothing
+  behind it;
+* **`TRUNCATE`**, through `BTreeIndex::_unlink_dead()`
+  (`btreeindex.hpp:932`), which is called from `truncate()` and nowhere else.
+
+That second one is the case. `_unlink_dead_values` rebuilds each chain
+*without its settled-dead links*, freeing some values while the live keys and
+values around them stay put — and since the index change, keys and values share
+a page. So it frees chunks in the middle of a page that still holds live
+records, which is the exact shape the walk got wrong.
+
+**The repro to write**, and it needs no server: a table with an index, rows
+inserted and committed, enough churn that some index values are settled dead,
+then `TRUNCATE`, then detach and reopen the store and read the index back. The
+existing `Store` fixture in `Test/dbfixture.hpp` reopens (clear `hexmap_path`
+and `data_path` before it destructs, or it erases the files), and
+`Test/hexmap-walk.py` will say whether the freed chunks left a run that the old
+walk would have measured across a live record.
 
 **The original fix as diagnosed**, kept because it is what was done: It needs care that this file has not needed
 elsewhere: the free run's length has to come from the hexmap directly -- scan
