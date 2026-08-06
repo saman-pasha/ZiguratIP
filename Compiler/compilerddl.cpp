@@ -52,6 +52,47 @@ namespace Zigurat
     return raw.substr(12, raw.size() - 23);
   }
 
+  // INCLUDE and LINK written inside an object body belong to that object.
+  //
+  // File-scope clauses keep accumulating across the suite -- one INCLUDE above
+  // three classes still gives the header to all three, which is what every demo
+  // relies on. A body's clauses are added on top of whatever the file has
+  // gathered so far and taken back off once the object is built, so the next
+  // object in the same file does not inherit them. Which matters because each
+  // object compiles standalone into its own .so: a model's -ltorch is the
+  // model's, not its neighbour's.
+  namespace
+  {
+    struct ClauseScope
+    {
+      std::list<std::string>& includes;
+      std::list<std::string>& links;
+      const size_t include_mark;
+      const size_t link_mark;
+
+      ClauseScope(std::list<std::string>& incs, std::list<std::string>& lnks)
+	: includes(incs), links(lnks), include_mark(incs.size()), link_mark(lnks.size())
+      { }
+
+      ~ClauseScope()
+      {
+	while (this->includes.size() > this->include_mark) this->includes.pop_back();
+	while (this->links.size() > this->link_mark) this->links.pop_back();
+      }
+    };
+  }
+
+  void Compiler::_body_clauses(const Expression& ast)
+  {
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "INCLUDE") {
+	this->_include(expr);
+      } else if (expr.token.value == "LINK") {
+	this->_link(expr);
+      }
+    }
+  }
+
   void Compiler::_include(const Expression& ast)
   {
     this->_includes.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
@@ -582,11 +623,15 @@ namespace Zigurat
     std::stringstream impl;
     std::stringstream conf;
     std::list<std::string> requires;
-      
+
+    // Lives until _build has written the files, then puts the two lists back.
+    ClauseScope clauses(this->_includes, this->_links);
+    this->_body_clauses(ast);
+
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
     head << "#include \"globals.hpp\"" << std::endl;
-    
+
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
@@ -765,7 +810,11 @@ namespace Zigurat
     
     if (is_tmpl_class && is_page)
       throw CompileException("pages couldn't be template", ast);
-      
+
+    // Lives until _build has written the files, then puts the two lists back.
+    ClauseScope clauses(this->_includes, this->_links);
+    this->_body_clauses(ast);
+
     // header file
 
     head << "#ifndef " << guard_name << std::endl;

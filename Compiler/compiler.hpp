@@ -132,6 +132,7 @@ namespace Zigurat
 
     void _include(const Expression&);
     void _link(const Expression&);
+    void _body_clauses(const Expression&);
     std::vector<index_desc_t> _table_indexes(const Expression&);
     void _table(const Expression&);
     void _parameters_head(const Expression&, std::stringstream&, int);

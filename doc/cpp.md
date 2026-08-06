@@ -19,6 +19,36 @@ LINK clause links C++ library at build time.
 LINK '-llibrary|-Llibrary_full_path';
 ```
 
+## Where the two clauses go
+
+Both may be written at file scope or inside a `CLASS`, `PAGE` or `PROCEDURE`.
+
+At file scope they accumulate: a clause applies to every object declared after
+it in the same file. Inside an object it belongs to that object alone, and the
+next object in the file does not inherit it. Since every object compiles
+standalone into its own `.so`, that is where a dependency usually belongs —
+one class's `-ltorch` is not its neighbour's.
+
+```
+INCLUDE '<vector>';        -- both classes get this
+
+CLASS Model
+BEGIN
+    INCLUDE '<torch/torch.h>';   -- only Model
+    LINK '-ltorch';
+    ...
+END
+
+CLASS Report                     -- no torch here
+BEGIN
+    ...
+END
+```
+
+An object-level `INCLUDE` lands in that object's generated header, so every
+object that `REQUIRES` it inherits the header too. To keep a heavy header out of
+the objects downstream, put it in a `BEGIN CPP` block instead — see below.
+
 ## BASE
 
 BASE clause must use after class name for inheriting from external C++ classes.
@@ -59,6 +89,8 @@ Declare in `HPP`, define in `CPP`, and the class holds a handle:
 ```
 CLASS demo::classifier
 BEGIN
+	LINK '-ltorch';
+
 	BEGIN HPP
 	#include <memory>
 	struct Net;

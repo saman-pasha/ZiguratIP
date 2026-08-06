@@ -362,6 +362,86 @@ ZTEST(Grammar, clauses_survive_on_both_sides_of_a_block)
 
 
 // ---------------------------------------------------------------------------
+// INCLUDE and LINK inside an object
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The text of the first INCLUDE or LINK found in an object body, unwrapped.
+  std::string clause_arg(const std::string& source, const std::string& kind)
+  {
+    const Expression suite = parse("SUITE", source);
+    const Expression* clause = block_of(suite, kind);
+    if (clause == nullptr || clause->args.empty()) return "<none>";
+    const std::string& raw = clause->args[0].token.value;
+    if (raw.size() < 23) return "<short>";
+    return raw.substr(12, raw.size() - 23);
+  }
+}
+
+ZTEST(Grammar, a_class_carries_its_own_include_and_link)
+{
+  const std::string source =
+    "CLASS c BEGIN\n"
+    "INCLUDE '<torch/torch.h>';\n"
+    "LINK '-ltorch';\n"
+    "PUBLIC:\n"
+    "DECLARE v AS Long;\n"
+    "END";
+
+  ZCHECK(parses("SUITE", source));
+  ZCHECK_STR(clause_arg(source, "INCLUDE"), "<torch/torch.h>");
+  ZCHECK_STR(clause_arg(source, "LINK"), "-ltorch");
+}
+
+// A procedure's clauses sit in the same run of lookahead as BEGIN HPP, between
+// RETURNS and the body -- so the case to hold is a clause immediately before
+// the BEGIN that opens the body.
+ZTEST(Grammar, a_procedure_carries_its_own_include_and_link)
+{
+  const std::string source =
+    "PROCEDURE p() RETURNS Long\n"
+    "INCLUDE '<cmath>';\n"
+    "LINK '-lm';\n"
+    "BEGIN\nRETURN 1L;\nEND";
+
+  ZCHECK(parses("SUITE", source));
+  ZCHECK_STR(clause_arg(source, "INCLUDE"), "<cmath>");
+  ZCHECK_STR(clause_arg(source, "LINK"), "-lm");
+}
+
+// The two mix with blocks in either order, since both are lookahead on the same
+// token position.
+ZTEST(Grammar, clauses_and_blocks_mix_in_an_object)
+{
+  ZCHECK(parses("SUITE",
+		"CLASS c BEGIN\n"
+		"INCLUDE '<memory>';\n"
+		"BEGIN HPP\nstruct N;\nEND\n"
+		"LINK '-ltorch';\n"
+		"BEGIN CPP\nstruct N { int x; };\nEND\n"
+		"PUBLIC:\n"
+		"DECLARE v AS Long;\n"
+		"END"));
+
+  ZCHECK(parses("SUITE",
+		"PROCEDURE p() RETURNS Long\n"
+		"BEGIN HPP\nstruct H;\nEND\n"
+		"INCLUDE '<cmath>';\n"
+		"BEGIN\nRETURN 1L;\nEND"));
+}
+
+// File scope still works, and is still where a clause goes when more than one
+// object in the file wants it.
+ZTEST(Grammar, file_scope_clauses_are_unchanged)
+{
+  ZCHECK(parses("SUITE",
+		"INCLUDE '<vector>';\nLINK '-lm';\n"
+		"CLASS c BEGIN\nPUBLIC:\nDECLARE v AS Long;\nEND"));
+}
+
+
+// ---------------------------------------------------------------------------
 // Data manipulation
 // ---------------------------------------------------------------------------
 
