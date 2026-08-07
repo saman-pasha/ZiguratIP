@@ -60,6 +60,39 @@ BEGIN
 	#include <cstdio>
 	#include "torch_stub.hpp"
 	#include "classifier.cpp"
+	#include "modelpool.hpp"
+
+	// THE MODEL OUTLIVES THE REQUEST, and this is the whole of what that
+	// takes. A page is constructed per request, so a model held as a page
+	// member is loaded, used once and destroyed -- 946 KB read off disk and
+	// parsed by libtorch to answer one prediction. ModelPool keeps it
+	// instead, keyed by the checkpoint it came from, so a second request
+	// finds it already there.
+	//
+	// The key carries the path because two objects pointed at two
+	// checkpoints are two models, and a pool keyed only by name would hand
+	// the second one the first one's weights.
+	//
+	// The loader runs under the pool's lock, so concurrent first requests
+	// load it once between them rather than once each.
+	static long classifier_loads_count = 0;
+
+	static std::shared_ptr<Classifier> pooled_classifier()
+	{
+	  const char* env = getenv("CLASSIFIER_WEIGHTS");
+	  std::string key = std::string("classifier:") + (env ? env : "<untrained>");
+
+	  return std::static_pointer_cast<Classifier>(
+	    Zigurat::ModelPool::held(key, [env]() -> std::shared_ptr<void> {
+	        classifier_loads_count++;
+	        return std::static_pointer_cast<void>(net_load(env));
+	      }));
+	}
+
+	// How many times the checkpoint was actually read. The point of the pool
+	// is that this stays at one however many requests arrive, so it is worth
+	// being able to ask.
+	static long classifier_loads() { return classifier_loads_count; }
 	END
 
 PRIVATE:
@@ -82,10 +115,10 @@ PUBLIC:
 	-- procedure would read the checkpoint off disk on every request.
 	CONSTRUCTOR()
 	BEGIN
-		-- NOT BOUND TO A LOCAL FIRST, because Parsi has no `*' type
-		-- suffix and so cannot declare a char pointer to hold it. Passed
-		-- straight through, and net_load takes null to mean untrained.
-		SET this._net = `net_load(`getenv('CLASSIFIER_WEIGHTS'));
+		-- FROM THE POOL, not from disk. The first request loads the
+		-- checkpoint and every one after it is handed the same model --
+		-- see pooled_classifier in the CPP block above.
+		SET this._net = `pooled_classifier();
 	END
 
 	-- Classify the INDEXth picture of an MNIST test set, and say what it
@@ -100,6 +133,13 @@ PUBLIC:
 	FUNCTION truth(labels AS String, index AS Long) RETURNS Long
 	BEGIN
 		RETURN `idx_label(labels.`to_std_string().`c_str(), index.`value());
+	END
+
+	-- How many times the checkpoint has been read since the server started.
+	-- One, however many requests have arrived, is what the pool is for.
+	FUNCTION loads() RETURNS Long
+	BEGIN
+		RETURN `classifier_loads();
 	END
 
 	-- How many floats the model wants, asked rather than assumed.
@@ -174,6 +214,7 @@ PUBLIC:
 		DECLARE model AS Demo::Classifier;
 
 		ECHO 'inputs=', model.inputs();
+		ECHO ' loads=', model.loads();
 		ECHO ' seed0=', model.predict(0L);
 		ECHO ' seed137=', model.predict(137L);
 		ECHO ' again0=', model.predict(0L);

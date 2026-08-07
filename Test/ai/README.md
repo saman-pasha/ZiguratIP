@@ -114,3 +114,30 @@ edit here actually reach the object.
 **A `Long` is not a `long`.** `Zigurat::Long` does not convert and `CAST` will
 not force it; `value()` is the accessor. A literal has no members, so
 `` 0L.`value() `` is a syntax error and the zero has to be bound first.
+
+## The model outlives the request
+
+A page is constructed per request, so a model held as a page member is loaded,
+used once and destroyed — 946 KB read off disk and parsed by libtorch to answer
+one prediction. `Demo::Classifier` gets its model from
+[`Library/modelpool.hpp`](../../Library/modelpool.hpp) instead, keyed by the
+checkpoint path, so the first request loads it and every one after is handed the
+same model.
+
+The page reports `loads=`, and the runner fetches it **twice** — one request
+cannot show that anything survived it:
+
+```
+page said: inputs=784 loads=1 …
+and again : inputs=784 loads=1 …
+```
+
+Checked by breaking it: bypass the pool in `pooled_classifier` and the second
+request reads `loads=2`, which is the assertion failing.
+
+`ModelPool` holds `shared_ptr<void>` because `Library` is built long before
+anything that would name a model type. `held()` takes the lock across the
+**load** as well as the lookup, so concurrent first requests load it once
+between them rather than once each. It has a ceiling, and reaching it is an
+error rather than an eviction — what to discard is a policy it deliberately does
+not have.

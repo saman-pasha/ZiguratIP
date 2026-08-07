@@ -248,8 +248,14 @@ grep -q "Zeytun is ready" "$LOG" 2>/dev/null || {
   exit 1
 }
 
+# TWICE, because one request cannot show that anything survived it. The page is
+# constructed per request, so a model held as a page member would be loaded
+# again here -- and `loads' would climb.
 BODY=$(curl -s --max-time 60 "http://127.0.0.1:2190/predict.zt" || true)
 echo "page said: $BODY"
+
+SECOND=$(curl -s --max-time 60 "http://127.0.0.1:2190/predict.zt" || true)
+echo "and again : $SECOND"
 
 field() { echo "$BODY" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
@@ -262,6 +268,15 @@ P137=$(field score137)
 PA0=$(field scoreagain0)
 
 check    "the page answered"                "$(test -n "$BODY" && echo yes || echo no)" "yes"
+check    "the second request answered"      "$(test -n "$SECOND" && echo yes || echo no)" "yes"
+
+# THE POOL. The checkpoint is read once however many requests arrive; without
+# ModelPool this is 1 then 2, because the page that owns the model is built
+# fresh for each one.
+LOADS=$(field loads)
+LOADS2=$(echo "$SECOND" | tr ' ' '\n' | sed -n "s/^loads=//p")
+check    "the checkpoint was read once"     "$LOADS"  "1"
+check    "and not again on the next request" "$LOADS2" "1"
 check    "the model reports its input width" "$INPUTS" "784"
 check    "the same seed twice agrees"        "$A0"     "$S0"
 

@@ -16,6 +16,7 @@ SOURCES := main_test.cpp \
 	test_type.cpp \
 	test_mvccs.cpp \
 	test_btree.cpp \
+	test_modelpool.cpp \
 	test_misc.cpp \
 	test_acid.cpp \
 	test_isolation.cpp \
