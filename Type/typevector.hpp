@@ -65,8 +65,8 @@ namespace Zigurat
     T& operator[](size_t);
     T& operator[](ULong);
     
-    virtual size_t std_size();
-    virtual ULong size();
+    virtual size_t std_size() const;
+    virtual ULong size() const;
     virtual ULong SIZE();
 
     virtual void std_resize(size_t);
@@ -81,28 +81,34 @@ namespace Zigurat
     
     virtual ~Vector();
 
-    friend binarystream& operator<<(binarystream& outstream, Vector<T>&& object)
-    {
-      outstream.write_std_ubyte(object.tdb());
-      if (object._pointer != nullptr) {
-        outstream.write_std_uint((uint32_t)object.size());
-	for (size_t i = 0; i < object.size(); i++) {
-	  outstream << object[i];
-	}
-      }
-      return outstream;
-    }
-  
+    // NEITHER OF THESE HAD EVER BEEN INSTANTIATED, which is why they were full
+    // of things that do not compile: (uint32_t)object.size() casts a ULong to a
+    // scalar with no conversion for it, `i < object.size()' compares a size_t
+    // with a ULong, and object[i] is non-const. A template member is only
+    // checked when something uses it, and nothing in the tree packed a Vector
+    // -- so a caller trying to send one over RPC was the first, and it did not
+    // build.
+    //
+    // Both read the underlying vector directly now rather than going through
+    // size() and operator[]: it is const-correct, it is one cast instead of
+    // three, and it is the same walk pack_size does, which is what keeps the
+    // two agreeing.
     friend binarystream& operator<<(binarystream& outstream, const Vector<T>& object)
     {
       outstream.write_std_ubyte(object.tdb());
       if (object._pointer != nullptr) {
-        outstream.write_std_uint((uint32_t)object.size());
-	for (size_t i = 0; i < object.size(); i++) {
-	  outstream << object[i];
+	const std::vector<T>& elements = *(std::vector<T>*)object._pointer;
+        outstream.write_std_uint((uint32_t)elements.size());
+	for (size_t i = 0; i < elements.size(); i++) {
+	  outstream << elements[i];
 	}
       }
       return outstream;
+    }
+
+    friend binarystream& operator<<(binarystream& outstream, Vector<T>&& object)
+    {
+      return outstream << (const Vector<T>&)object;
     }
   
     friend binarystream& operator>>(binarystream& instream, Vector<T>& object)
@@ -111,11 +117,16 @@ namespace Zigurat
       if ( (tdb & TDByte::IS_NULL) == TDByte::IS_NULL) {
 	object.set_null();
       } else {
+	// Straight at the vector, as operator<< now is. object[i] is declared
+	// and never defined -- an undefined reference the moment anything
+	// unpacks a Vector, which nothing did.
 	if (object._pointer == nullptr) object._pointer = new std::vector<T>();
+	std::vector<T>& elements = *(std::vector<T>*)object._pointer;
+
 	uint32_t size = instream.read_std_uint();
-	object.resize((size_t)size);
+	elements.resize((size_t)size);
 	for (size_t i = 0; i < size; i++) {
-	  instream >> object[i];
+	  instream >> elements[i];
 	}
       }
       return instream;
@@ -349,14 +360,18 @@ namespace Zigurat
   }
 	
   template <typename T>
-  size_t Vector<T>::std_size()
+  // CONST, because packing a Vector asks it -- and the const overload of
+  // operator<< above could therefore never be instantiated. Nothing in the tree
+  // had packed a const Vector, so it compiled for as long as nobody tried; a
+  // caller sending one over RPC is the first, and it would not have built.
+  size_t Vector<T>::std_size() const
   {
     if (this->_pointer == nullptr) throw NULL_EXCEPTION;
     return ((std::vector<T>*)this->_pointer)->size();
   }
  
   template <typename T>
-  ULong Vector<T>::size()
+  ULong Vector<T>::size() const
   {
     return (uint64_t)this->std_size();
   }
@@ -400,11 +415,37 @@ namespace Zigurat
     (*(std::vector<T>*)this->_pointer)[index.value()] = value.value();
   }
 
+  // What operator<< above will write, exactly: the descriptor byte, then the
+  // count, then each element -- so this ASKS THE ELEMENTS rather than working
+  // it out from the type.
+  //
+  // It had two faults, and the first is the one that made a tensor over RPC
+  // impossible. `this->_pointer' was cast to std::string* to ask its size(),
+  // copied from String::pack_size, which reads a std::vector through a
+  // std::string's layout: the answer is whatever those bytes happen to mean and
+  // is not the element count. Connector sizes its frame with this, so the frame
+  // was the wrong length and the far side read the next value out of the
+  // remains of this one.
+  //
+  // The second would have been wrong even with the cast right. An element does
+  // not pack as SIZEOF(T::TDB) bytes -- it packs as its own pack_size, which is
+  // that plus its descriptor byte (Object::pack_size), so the old arithmetic
+  // was short by one byte per element. And it cannot be a multiplication at
+  // all: Vector<String> holds elements of different lengths, and no per-type
+  // constant describes them. Summing what each element reports is both correct
+  // and the only thing that stays correct when T is variable-length.
   template <typename T>
   int64_t Vector<T>::pack_size() const
   {
-    return (this->_pointer == nullptr) ? 1 : 
-      TDByte::SIZEOF_DWORD + (((std::string*)this->_pointer)->size() * TDByte::SIZEOF(T::TDB)) + 1;
+    if (this->_pointer == nullptr) return 1;
+
+    const std::vector<T>& elements = *(std::vector<T>*)this->_pointer;
+
+    int64_t size = 1 + TDByte::SIZEOF_DWORD;   // the descriptor, then the count
+    for (size_t i = 0; i < elements.size(); i++) {
+      size += elements[i].pack_size();
+    }
+    return size;
   }
 
   template <typename T>

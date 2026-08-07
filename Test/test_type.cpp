@@ -211,3 +211,105 @@ ZTEST(Type, vector_of_values)
   ZCHECK_EQ(values.GET(ULong((uint64_t)0)).value(), 1);
   ZCHECK_EQ(values.GET(ULong((uint64_t)2)).value(), 3);
 }
+
+
+// ---------------------------------------------------------------------------
+// pack_size has to be the bytes that get written
+// ---------------------------------------------------------------------------
+
+// The property, checked rather than reasoned about: whatever pack_size claims
+// is what operator<< then writes. Connector sizes its frame from pack_size, so
+// a claim that disagrees with the writing puts the wrong length on the wire and
+// the far side reads the next value out of the remains of this one.
+namespace
+{
+  template <typename V>
+  bool packs_as_it_claims(const V& value, int64_t& claimed, int64_t& written)
+  {
+    char raw[4096];
+    std::memset(raw, 0, sizeof(raw));
+    arraystream stream(raw, sizeof(raw));
+
+    claimed = value.pack_size();
+    stream << value;
+    written = (int64_t)stream.tellp();
+    return claimed == written;
+  }
+}
+
+ZTEST(Type, a_vector_packs_the_size_it_claims)
+{
+  int64_t claimed = 0, written = 0;
+
+  // The case RPC needs: a run of numbers, which is what a tensor arrives as.
+  std::vector<Long> numbers;
+  for (int64_t i = 0; i < 16; i++) numbers.push_back(Long(i * 1000));
+  Vector<Long> longs(numbers);
+
+  ZCHECK(packs_as_it_claims(longs, claimed, written));
+  ZCHECK_EQ(claimed, written);
+
+  // 1 descriptor + 4 count + 16 elements of (1 descriptor + 8) = 149. Spelled
+  // out because the old arithmetic missed the per-element descriptor and would
+  // have said 133 -- close enough to look plausible and wrong on the wire.
+  ZCHECK_EQ(claimed, (int64_t)(1 + 4 + 16 * 9));
+
+  // Empty is not null: still a descriptor and a count of zero.
+  Vector<Long> empty(std::vector<Long>{});
+  ZCHECK(packs_as_it_claims(empty, claimed, written));
+  ZCHECK_EQ(claimed, (int64_t)(1 + 4));
+
+  // Null is the descriptor alone.
+  Vector<Long> nothing(nullptr);
+  ZCHECK(packs_as_it_claims(nothing, claimed, written));
+  ZCHECK_EQ(claimed, (int64_t)1);
+}
+
+// Elements of different lengths, which no per-type constant can describe --
+// this is why the size is summed from the elements and not multiplied.
+ZTEST(Type, a_vector_of_variable_length_elements_packs_the_size_it_claims)
+{
+  int64_t claimed = 0, written = 0;
+
+  std::vector<String> words;
+  words.push_back(String(std::string("a")));
+  words.push_back(String(std::string("tensor")));
+  words.push_back(String(std::string("")));
+  words.push_back(String(std::string("over the wire")));
+  Vector<String> strings(words);
+
+  ZCHECK(packs_as_it_claims(strings, claimed, written));
+  ZCHECK_EQ(claimed, written);
+}
+
+// And the whole point: it survives the round trip at the size it claimed, which
+// is what a caller reading a frame off a socket depends on.
+ZTEST(Type, a_vector_survives_a_binary_roundtrip)
+{
+  char raw[4096];
+  std::memset(raw, 0, sizeof(raw));
+  arraystream stream(raw, sizeof(raw));
+
+  std::vector<Long> numbers;
+  for (int64_t i = 0; i < 8; i++) numbers.push_back(Long(i * 7));
+  Vector<Long> out(numbers);
+
+  const int64_t claimed = out.pack_size();
+  stream << out;
+  ZCHECK_EQ((int64_t)stream.tellp(), claimed);
+
+  stream.seekg(0, std::ios_base::beg);
+
+  Vector<Long> in;
+  stream >> in;
+
+  ZCHECK_EQ((int64_t)in.size().value(), (int64_t)8);
+  bool same = true;
+  for (size_t i = 0; i < 8; i++) {
+    if (in.GET(ULong((uint64_t)i)).value() != (int64_t)(i * 7)) same = false;
+  }
+  ZCHECK(same);
+
+  // Reading stopped exactly where writing did: nothing left over, nothing short.
+  ZCHECK_EQ((int64_t)stream.tellg(), claimed);
+}
