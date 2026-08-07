@@ -1,0 +1,16 @@
+-- A procedure that takes a tensor and answers something about it. The point is
+-- the Vector<Float> crossing the wire, not the arithmetic.
+PROCEDURE demo::tensor_sum(pixels AS Vector<Float>) RETURNS Long
+BEGIN
+	DECLARE n AS ULong = pixels.size();
+	DECLARE i AS ULong = 0;
+	DECLARE total AS Long = 0;
+	WHILE i < n
+	BEGIN
+		DECLARE px AS Float = pixels.GET(i);
+		DECLARE scaled AS Long = CAST<`int64_t>(px.`value());
+		SET total = total + scaled;
+		SET i = i + 1;
+	END
+	RETURN total;
+END

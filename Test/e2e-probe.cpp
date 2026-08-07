@@ -20,6 +20,7 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 using namespace Zigurat;
 
@@ -59,6 +60,50 @@ namespace
       }
 
       connector.commit();
+
+    } else if (verb == "tensor") {
+      // A TENSOR OVER RPC, which is the case Vector's packing exists for and
+      // the one that could not work: pack_size answered a size read off the
+      // wrong layout, both operator<< overloads did not compile, and
+      // operator>> called an operator[] that was declared and never defined.
+      //
+      // ARGUMENT is the element count. The values are a ramp so the answer is
+      // arithmetic the caller can predict rather than an echo -- an echo would
+      // pass even if the server had read nothing and sent the same bytes back.
+      //
+      // WHOLE NUMBERS, and that is not fussiness. The first version sent
+      // i/1000 and expected the sum of i back after the far side multiplied by
+      // a thousand: it answered 306554 where 306936 was expected, because
+      // i/1000 is not exact in a float and the product truncates just below.
+      // The tensor had crossed perfectly and the arithmetic was wrong. An
+      // integer under 2^24 is exact in a float, so what comes back is a
+      // statement about the transport and nothing else.
+      const size_t count = argument.empty() ? 784 : (size_t)std::stoul(argument);
+
+      std::vector<Float> values;
+      values.reserve(count);
+      for (size_t i = 0; i < count; i++) {
+        values.push_back(Float((float)i));
+      }
+      Vector<Float> pixels(values);
+
+      // What the far side should answer: sum of (i/1000 * 1000) = sum of i.
+      int64_t expected = 0;
+      for (size_t i = 0; i < count; i++) expected += (int64_t)i;
+
+      connector.call(argument.empty() ? "demo::tensor_sum" : "demo::tensor_sum");
+      connector.write(pixels);
+
+      Long returned(0);
+      for (ResultType r = connector.result(); r != ResultType::SUCCESSFUL_DONE; r = connector.result()) {
+	if (r == ResultType::CURSOR_OPEN) connector.columns();
+	else if (r == ResultType::RETURN_VALUE) connector.fetch(returned);
+      }
+      connector.commit();
+
+      std::cout << "sent " << count << " floats, server answered "
+		<< returned.value() << ", expected " << expected << std::endl;
+      if (returned.value() != expected) throw ConnectorException("the tensor did not survive the round trip");
 
     } else if (verb == "compile") {
       std::ifstream source(argument);
