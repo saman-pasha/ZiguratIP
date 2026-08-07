@@ -142,6 +142,33 @@ request time*, not only at build time.
 Colab VMs are ephemeral. `PERSIST = True` copies a snapshot from Google Drive onto local
 disk **before** the server starts. The engine never runs against the Drive mount.
 
+**Three directories, not one.** This notebook used to save `home/data` alone, which is
+worse than not saving at all: the rows come back, the server starts happily, and every
+page answers 404. Measured, not assumed — a home with `data` restored and the other two
+empty serves nothing.
+
+| directory | what it is | without it |
+|---|---|---|
+| `home/data` | the page store — the rows | there is no database |
+| `home/catalog` | one `.conf` per object: name, hash key, `REQUIRES` | the compiler cannot resolve `REQUIRES`, so nothing new links |
+| `home/ld` | the compiled `.so` the server `dlopen`s by name | every page and procedure is a 404 |
+
+They are one unit: a store, the metadata describing it, and the code that reads it.
+
+**A snapshot belongs to the build that made it.** A compiled object links against
+`libCore.so`, `libHTTP.so`, `libMVCCS.so` and `libType.so` by bare name, with no version
+— check with `ldd home/ld/lib_BULK_.so`. Objects from one commit loaded by libraries from
+another can fail at `dlopen` with an undefined symbol. So the snapshot carries a
+`MANIFEST` naming its commit, and the restore says so when they differ. Recompiling with
+`demo/build.sh` is the fix; it is one cell.
+
+An older `data`-only snapshot still restores. It names what is missing and why, rather
+than leaving you to discover it as a 404 that looks like a bad URL.
+
+The snapshot cell **refuses while the server is running**. There is no write-ahead log, so
+a copy taken mid-write can be inconsistent — and that torn copy would be the one you
+restore from next time.
+
 ### 4 · Build the demo objects
 
 `demo/build.sh` runs the offline `parsi` compiler over `demo/0*.parsi` in order — each
