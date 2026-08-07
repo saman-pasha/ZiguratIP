@@ -6,6 +6,11 @@
 namespace Zigurat
 {
 
+  bool binarystream::sync_to_disk()
+  {
+    return false;
+  }
+
   std::streamsize binarystream::length()
   {
     std::streampos current = this->tellg();

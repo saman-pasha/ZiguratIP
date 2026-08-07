@@ -3,6 +3,7 @@
 #include "arithmeticexception.hpp"
 #include <iomanip>
 #include <cstring>
+#include <limits>
 #include "bufferstream.hpp"
 
 
@@ -180,7 +181,12 @@ namespace Zigurat
 	for (size_t j = 0; j < sizeof(word_t); j++) {
 	  octet[((a_len - i) * sizeof(word_t)) + j] = (w >> ((sizeof(word_t) - j - 1) * 8)) & 0xff;
 	}
-	w = this->_a[i - 2];
+	// The last turn has no next word to fetch: i is 1, so i - 2 is
+	// size_t(-1) and this read the array from an index near the top of the
+	// address space. The value went unused -- the loop ends -- so nothing
+	// ever looked wrong, but every RSA verify walked off the end of a
+	// BigInt to get it.
+	if (i >= 2) w = this->_a[i - 2];
       }
     }
   }
@@ -206,7 +212,7 @@ namespace Zigurat
 	for (size_t j = 0; j < sizeof(word_t); j++) {
 	  stream.put((w >> ((sizeof(word_t) - j - 1) * 8)) & 0xff);
 	}
-	w = this->_a[i - 2];
+	if (i >= 2) w = this->_a[i - 2];   // see the octet overload above
       }
     }
   }
@@ -444,18 +450,31 @@ namespace Zigurat
     return Polynomial::mod_pow(base._a, exponent._a, divisor._a);
   }
 
+  // This drew from std::rand(), seeded once from std::time(0). Two keys
+  // generated in the same second were the same key, and a key generated at a
+  // known minute was one of about sixty candidates -- which is every
+  // certificate this tree has ever issued. They all have to be reissued;
+  // fixing this does not repair the material it already produced.
   BigInt BigInt::rand(size_t count)
   {
-    static bool seeded = false;
-    if (!seeded) {
-      std::srand(std::time(0));
-      seeded = true;
-    }
+    if (count == 0) throw ArithmeticException("random number of zero words requested");
     array_t vector(count);
-    for (size_t i = 0; i < count - 1; i++) {
-      vector[i] = std::rand() % Polynomial::BASE;
+
+    // Every word gets a full word of entropy. The old code said
+    // std::rand() % BASE, but BASE is 2^32 and std::rand() tops out at 2^31-1,
+    // so the high bit of every single word was always clear -- a bit lost per
+    // word on top of the seeding.
+    for (size_t i = 0; i < count; i++) {
+      uint32_t word;
+      Utility::random_bytes((uint8_t*)&word, sizeof(word));
+      vector[i] = word;
     }
-    vector[count - 1] = std::rand() % (Polynomial::BASE / 2);
+
+    // The top word carries the sign, so the value has to stay under BASE/2.
+    // Within that, force the highest bit that is still positive: a caller
+    // asking for `count` words wants a number of that size, and leaving the
+    // top bit to chance is why a 2048-bit key from this tree measures 2047.
+    vector[count - 1] = (vector[count - 1] & (Polynomial::BASE / 2 - 1)) | (Polynomial::BASE / 4);
     return vector;
   }
 

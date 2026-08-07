@@ -2,6 +2,8 @@
 #ifndef __VECTOR_HPP__
 #define __VECTOR_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 #include "typeulong.hpp"
 #include "typestring.hpp"

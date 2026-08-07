@@ -2,6 +2,8 @@
 #ifndef __BTREEKEY_HPP__
 #define __BTREEKEY_HPP__
 
+
+#include <cstdint>
 #include "basetable.hpp"
 
 namespace Zigurat
@@ -15,17 +17,24 @@ namespace Zigurat
     Long left_address;
     Long right_address;
     Long right_node_address;
-    
+
     Long dependents_address;
+
+    // The first of this key's values, or -1. The rest hang off it through
+    // BTreeValue::next_address. A key owned a hash keyed bucket before this,
+    // which cost a page file per key -- see btreevalue.hpp.
+    Long values_address;
+
     K key;
 
-    BTreeKey() : left_node_address(-1), left_address(-1), right_address(-1), right_node_address(-1), dependents_address(-1) { }
-    
+    BTreeKey() : left_node_address(-1), left_address(-1), right_address(-1), right_node_address(-1),
+		 dependents_address(-1), values_address(-1) { }
+
     int64_t pack_size() override
     {
       return binarystream::pack_size(this->left_node_address, this->left_address,
 				     this->right_address, this->right_node_address,
-				     this->dependents_address, this->key);
+				     this->dependents_address, this->values_address, this->key);
     }
 
     void prepare() override { }
@@ -36,7 +45,7 @@ namespace Zigurat
     {
       outstream.pack(key.left_node_address, key.left_address,
 		     key.right_address, key.right_node_address,
-		     key.dependents_address, key.key);
+		     key.dependents_address, key.values_address, key.key);
       return outstream;
     }
   
@@ -44,7 +53,7 @@ namespace Zigurat
     {
       instream.unpack(key.left_node_address, key.left_address,
 		      key.right_address, key.right_node_address,
-		      key.dependents_address, key.key);
+		      key.dependents_address, key.values_address, key.key);
       return instream;
     }
   };

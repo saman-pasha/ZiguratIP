@@ -1,0 +1,150 @@
+
+INCLUDE '"connector.hpp"';
+INCLUDE '"rpcpool.hpp"';
+INCLUDE '<memory>';
+LINK '-lConnector';
+
+-- Holds a connection rather than being one.
+--
+-- This used to derive from Zigurat::Connector, which made every wrapper its own
+-- connection and meant a page could only ever work with one it had constructed
+-- itself. A transaction that has to survive past the request that opened it
+-- cannot be constructed per request, and Parsi cannot name an existing object --
+-- it has no reference declarations, cannot return a reference, and has no
+-- dereference operator.
+--
+-- A shared handle sidesteps all of that. The wrapper is copyable, so it can be
+-- returned by value, declared as a local, and passed about like any other Parsi
+-- value, while several of them can name the same live connection.
+CLASS Connector
+REQUIRES IsolationLevel, ResultType
+BEGIN
+PRIVATE:
+	DECLARE _con AS `std::`shared_ptr<`Zigurat::`Connector>;
+
+PUBLIC:
+	-- A connection of its own, which is what a page wants when the work
+	-- begins and ends inside one request.
+	CONSTRUCTOR()
+	BEGIN
+		SET this._con = `std::`make_shared<`Zigurat::`Connector>();
+	END
+
+	-- The connection a transaction names, if it belongs to whoever is asking.
+	-- Throws if there is no such transaction or it is somebody else's, so a
+	-- stranger cannot reach one by guessing its id.
+	CONSTRUCTOR(transaction AS String, owner AS String)
+	BEGIN
+		SET this._con = `Zigurat::`RPCPool::`held(transaction.`value(), owner.`value());
+	END
+
+	-- The two constructors that were here took an IPC path, and a host with a
+	-- port and a timeout, and passed them to Zigurat::Connector. That class
+	-- keeps only its default constructor now: connecting moved into open(),
+	-- which takes the same arguments and also has a no-argument form that
+	-- reads home/etc/connector.conf. Nothing constructed one either way, so
+	-- they are gone rather than rewritten -- a constructor whose backing was
+	-- deliberately removed is not worth keeping alive in a wrapper.
+
+
+	-- The connection underneath, for the base methods this wrapper does not
+	-- name. It comes back as the handle rather than a reference, because Parsi
+	-- cannot hold one -- so a caller writes con.raw().`get().`stream() and gets
+	-- to the base without anything having to be dereferenced in Parsi.
+	FUNCTION raw() RETURNS `std::`shared_ptr<`Zigurat::`Connector>
+	BEGIN
+		RETURN this._con;
+	END
+
+	FUNCTION transaction_id() RETURNS ULong
+	BEGIN
+		RETURN `Zigurat::`RPCPool::`ref(this._con).`TRANSACTION_ID();
+	END
+
+	-- These two were inherited before. The base declares them as templates over
+	-- the Type library's types, so they stay templates here.
+	FUNCTION write<T>(value AS T) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`write(value);
+	END
+
+	-- Callers write ECHO con.read<Bool>(), so this returns rather than filling
+	-- an argument. The base takes a reference and returns void, which is why
+	-- the value is made here and handed back.
+	FUNCTION read<T>() RETURNS T
+	BEGIN
+		DECLARE value AS T;
+		CALL `Zigurat::`RPCPool::`ref(this._con).`read(value);
+		RETURN value;
+	END
+
+	FUNCTION open() RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`open();
+	END
+
+	FUNCTION is_open() RETURNS Bool
+	BEGIN
+		RETURN `Zigurat::`RPCPool::`ref(this._con).`is_open();
+	END
+
+	FUNCTION close() RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`close();
+	END
+
+	FUNCTION result() RETURNS ResultType
+	BEGIN
+		RETURN CAST<ResultType>(CAST<`uint8_t>(`Zigurat::`RPCPool::`ref(this._con).`result()));
+	END
+
+	FUNCTION function(func AS String) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`function(func.`value());
+	END
+
+	FUNCTION echo(text AS Text) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`echo(text.`value());
+	END
+
+	FUNCTION compile(code AS Text) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`compile(code.`value());
+	END
+
+	FUNCTION auto_commit(auto_commit AS Bool) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`auto_commit(auto_commit.`value());
+	END
+	
+	FUNCTION isolate(isolation_level AS IsolationLevel) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`isolate(CAST<`Zigurat::`IsolationLevel>(CAST<`uint8_t>(isolation_level)));
+	END
+	
+	FUNCTION call(procedure AS String) RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`call(procedure.`value());
+	END
+
+	FUNCTION commit() RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`commit();
+	END
+
+	FUNCTION rollback() RETURNS Void
+	BEGIN
+		CALL `Zigurat::`RPCPool::`ref(this._con).`rollback();
+	END
+
+	FUNCTION columns() RETURNS Vector<String>
+	BEGIN
+		RETURN `Zigurat::`RPCPool::`ref(this._con).`columns();
+	END
+
+	DESTRUCTOR()
+	BEGIN
+
+	END
+END

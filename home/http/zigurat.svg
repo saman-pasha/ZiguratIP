@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 90" width="720" height="90" role="img" aria-label="Zigurat — multiversion storage engine">
+  <title>Zigurat</title>
+  <desc>A stepped tower of five tiers, drawn as stacked pages, beside the Zigurat wordmark.</desc>
+
+  <defs>
+    <linearGradient id="zg-stone" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0"   stop-color="#3d6fa8"/>
+      <stop offset="1"   stop-color="#73a7e1"/>
+    </linearGradient>
+    <linearGradient id="zg-rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0"    stop-color="#73a7e1"/>
+      <stop offset="0.55" stop-color="#73a7e1"/>
+      <stop offset="1"    stop-color="#73a7e1" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="720" height="90" fill="#ffffff"/>
+
+  <!-- The tower is the data structure: five tiers, each one narrower than the
+       one holding it up, the way a page store stacks and a B-tree narrows
+       toward its root. Ascending, and load-bearing all the way down. -->
+  <g>
+    <rect x="8"  y="64" width="96" height="10" rx="1" fill="url(#zg-stone)"/>
+    <rect x="17" y="52" width="78" height="10" rx="1" fill="url(#zg-stone)"/>
+    <rect x="26" y="40" width="60" height="10" rx="1" fill="url(#zg-stone)"/>
+    <rect x="35" y="28" width="42" height="10" rx="1" fill="url(#zg-stone)"/>
+    <rect x="44" y="16" width="24" height="10" rx="1" fill="url(#zg-stone)"/>
+
+    <!-- the stair up the face, which is what a ziggurat actually has -->
+    <rect x="53" y="16" width="6" height="58" fill="#ffffff" opacity="0.32"/>
+  </g>
+
+  <!-- Wordmark. Wide letter-spacing so it reads as carved rather than typed. -->
+  <text x="130" y="49"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="35" font-weight="700" letter-spacing="7" fill="#1f2d3d">ZIGURAT</text>
+
+  <text x="133" y="70"
+        font-family="system-ui, -apple-system, 'Segoe UI', sans-serif"
+        font-size="12.5" letter-spacing="2.4" fill="#5b6b7d">MULTIVERSION STORAGE &#183; TRANSACTIONS THAT HOLD</text>
+
+  <rect x="130" y="57" width="470" height="2" fill="url(#zg-rule)"/>
+</svg>

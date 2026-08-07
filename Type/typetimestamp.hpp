@@ -2,6 +2,8 @@
 #ifndef __TIMESTAMP_HPP__
 #define __TIMESTAMP_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 #include "typebool.hpp"
 #include <ctime>

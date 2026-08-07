@@ -2,6 +2,8 @@
 #ifndef __MEMORY_HPP__
 #define __MEMORY_HPP__
 
+
+#include <cstdint>
 #include "memorybase.hpp"
 #include "pointer.hpp"
 #include "rowstate.hpp"
@@ -111,6 +113,7 @@ namespace Zigurat
     Pointer _pointer(hashkey_ptr, int64_t, bool&, RowState&, RowLock&);
 
     void _free_list_insert(hashkey_ptr, const Pointer&);
+    int64_t _free_run_count(int64_t, int64_t);
     int64_t _free_prev_count();
     int64_t _free_next_count();
     void _free(const Pointer&);
@@ -133,6 +136,30 @@ namespace Zigurat
     void _rollback_pointer(const Pointer&);
     
     bool _check_lock(RowLock, const Pointer&, Control&, lock_t*, lock_t*);
+
+    // Flush both files and then push them to the disk, data before hexmap.
+    // Every durability point in the store goes through this.
+    void _sync();
+
+    // Whether one record is visible to the transaction now running, by the same
+    // rules _cursor applies to each record it walks past.
+    //
+    // _cursor is where those rules live, and everything that reads the store
+    // went through it -- including an index looking up the values of a key,
+    // which is how a rolled back insert stayed out of the index without anyone
+    // having to unmap it. Values are a chain now rather than a hash keyed
+    // bucket, so the walk is the index's own and it has to ask the question
+    // itself.
+    //
+    // Under SNAPSHOT the answer can be an *older* version of the record, so the
+    // pointer is taken by reference and moved to whichever version this
+    // transaction is entitled to see, exactly as _cursor moves it.
+    //
+    // The one thing it does not do is _cursor's retry: finding a row that
+    // changed under a repeatable read makes _cursor roll back to the start of
+    // the query and walk the whole hash key again, which is a scan's answer to
+    // the problem and means nothing when a single record was asked about.
+    bool _visible(Pointer&, lock_t*, lock_t*);
 
     // Cursor
     void _cursor(hashkey_ptr, lock_t*, lock_t*, std::function<bool (const Pointer&)>);
@@ -366,7 +393,14 @@ namespace Zigurat
   template <typename T>
   size_t Memory::truncate()
   {
-    return this->truncate(T::hash_key);
+    size_t rows = this->truncate(T::hash_key);
+
+    // And the indexes over it, or the space comes back for the rows and stays
+    // taken by the entries that pointed at them. Deleting a row already unmaps
+    // it, so those entries are settled dead by the time anyone truncates.
+    T::truncate_indexes();
+
+    return rows;
   }
 
   template <typename T>

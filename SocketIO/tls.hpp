@@ -2,6 +2,8 @@
 #ifndef __TLS_HPP__
 #define __TLS_HPP__
 
+
+#include <cstdint>
 #include "binarystream.hpp"
 #include <functional>
 #include <vector>
@@ -253,14 +255,46 @@ namespace Zigurat
     // user is, only that something decided.
     typedef std::function<bool (const std::string&)> authorize_t;
 
+    // Whether this end demands a certificate of its peer.
+    //
+    // REQUIRED is what this design has always done and stays the default: a
+    // peer is who the authority says it is or it does not get in. A browser
+    // has no such certificate and never will, so a port meant to be reached
+    // by one has to be told NONE.
+    //
+    // OPTIONAL is not "trust anything". A certificate that is offered is still
+    // checked and a bad one still fails the handshake; what changes is that
+    // offering none is allowed. So a peer cannot get in as a stranger by
+    // sending something broken.
+    enum class ClientAuth : uint8_t
+    {
+      REQUIRED,
+      OPTIONAL,
+      NONE
+    };
+
     struct HandshakeParameters
     {
       ProtocolVersion                protocol_version;
       SessionID                      session_id;
+
+      // cipher_suites and compression_methods named the suites of a record
+      // layer written in this repository. That layer is gone and these are
+      // inert; what is offered now is cipher_list, in OpenSSL's own grammar,
+      // and they stay only so callers still compile.
       std::vector<CipherSuite>       cipher_suites;
       std::vector<CompressionMethod> compression_methods;
+
       Credentials                    credentials;
       authorize_t                    authorize;
+
+      ClientAuth                     client_auth = ClientAuth::REQUIRED;
+
+      // Empty means the default below, which is forward secrecy and nothing
+      // else: ECDHE key agreement, AEAD ciphers, and !kRSA so that static RSA
+      // key transport -- what this server used to do, and the reason no
+      // browser would speak to it -- cannot be negotiated at all.
+      std::string                    cipher_list;
     };
 
     // Change Cipher Specs Message

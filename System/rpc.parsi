@@ -1,3 +1,9 @@
+INCLUDE '"httprequest.hpp"';
+INCLUDE '"httpresponse.hpp"';
+INCLUDE '"session.hpp"';
+INCLUDE '"globals.hpp"';
+INCLUDE '"rpcpool.hpp"';
+INCLUDE '"zexception.hpp"';
 
 PAGE RPC
 REQUIRES Connector, Serializer
@@ -12,15 +18,26 @@ PUBLIC:
 				CALL response.set_header('Content-Type', 'text/html');
 			END
 
-			DECLARE SESSION LOCAL con AS Connector;
-			IF NOT con.is_open() BEGIN
-				CALL con.open();
-			END
-			
+			-- Who is asking. Over mutual TLS that is the subject of the
+			-- certificate they presented, checked again on every request: a
+			-- person, and the same person in whatever browser. With no
+			-- certificate the session cookie is the best handle there is, and
+			-- it names a browser rather than a person. INITIALIZE throws if a
+			-- page forgets it, so the owner can never be silently empty.
+			CALL `Zigurat::`Session::`INITIALIZE(request, response);
+			DECLARE owner AS String = `Zigurat::`RPCPool::`owner(
+				`Globals::`peer_subject(), `Zigurat::`Session::ID().`value());
+
 			IF request.query('do') == 'id' BEGIN
-				ECHO con.transaction_id();
+				-- A new connection, and the transaction it carries is the name
+				-- everything else is addressed by.
+				ECHO `Zigurat::`RPCPool::`open(owner.`value());
 
 			END ELSE IF request.query('do') == 'call' BEGIN
+				-- The connection this transaction names, if it is yours. The
+				-- constructor throws when it is not, so a stranger cannot reach
+				-- one by guessing its id.
+				DECLARE con AS Connector(request.query('tx'), owner);
 				
 				DECLARE auto_commit AS Bool = request.query('auto_commit').to_bool(TRUE);
 				CALL con.auto_commit(auto_commit);
@@ -61,13 +78,24 @@ PUBLIC:
 					END ELSE IF result == ResultType::CURSOR_OPEN BEGIN
 						DECLARE ser AS Serializer(con);
 					END ELSE IF result == ResultType::RETURN_VALUE BEGIN
+						DECLARE taken AS Bool = FALSE;
 						SET i = 0ul;
 						WHILE i < count BEGIN
 							IF quals.get(i) == 'B' OR quals.get(i) == 'O' OR quals.get(i) == 'R' BEGIN
 								CALL this._read_parameter(con, types.get(i));
+								SET taken = TRUE;
 								BREAK;
 							END
 							SET i = i + 1ul;
+						END
+
+						-- The value is on the stream whether or not anybody
+						-- declared somewhere to put it. Leaving it there is what
+						-- desynchronised the reply.
+						IF NOT taken BEGIN
+							ECHO '<p>Returned: ';
+							CALL this._read_value(con);
+							ECHO '</p>';
 						END
 					END ELSE BEGIN
 						ECHO '<p>Unknown result type: ', CAST<`int>(result), '</p>';					
@@ -77,19 +105,78 @@ PUBLIC:
 				ECHO '<p>Remote Procedure Called Successfully</p>';
 
 			END ELSE IF request.query('do') == 'commit' BEGIN
+				DECLARE con AS Connector(request.query('tx'), owner);
 				CALL con.commit();
+				CALL `Zigurat::`RPCPool::`release(request.query('tx').`value());
 				ECHO '<p>Transaction Committed</p>';
 
 			END ELSE IF request.query('do') == 'rollback' BEGIN
+				DECLARE con AS Connector(request.query('tx'), owner);
 				CALL con.rollback();
+				CALL `Zigurat::`RPCPool::`release(request.query('tx').`value());
 				ECHO '<p>Transaction Rolled back</p>';
 			END
 		END CATCH ex AS Exception BEGIN
-			ECHO 'RPC Exception: ', ex.code(), ' ', ex.message();
+			ECHO 'RPC Exception: ', ex.`code(), ' ', ex.`message();
 		END
 	END
 
 PRIVATE:
+	-- A value read from what it says it is, rather than from what somebody
+	-- declared it would be.
+	--
+	-- A procedure that returns something writes RETURN_VALUE and then the value,
+	-- and the value carries its own type descriptor. The loop below used to read
+	-- it only when the caller had declared a parameter marked B, O or R -- so
+	-- calling a procedure with no parameters at all, which the console lets you
+	-- do, left the value sitting in the stream. The next read for a result type
+	-- then got the value's descriptor instead: 12, which is a signed 64 bit, a
+	-- Long, and not a ResultType at all.
+	FUNCTION _read_value(con AS Connector INOUT) RETURNS Void
+	BEGIN
+		DECLARE descriptor AS UByte = `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
+
+		IF descriptor.`value() & TypeDesc::IS_NULL == TypeDesc::IS_NULL BEGIN
+			ECHO '{NULL}';
+		END ELSE 		IF descriptor == Bool::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_bool();
+		END ELSE IF descriptor == Char::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_char();
+		END ELSE IF descriptor == Byte::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_byte();
+		END ELSE IF descriptor == UByte::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ubyte();
+		END ELSE IF descriptor == Short::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_short();
+		END ELSE IF descriptor == UShort::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ushort();
+		END ELSE IF descriptor == Int::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_int();
+		END ELSE IF descriptor == UInt::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_uint();
+		END ELSE IF descriptor == Long::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_long();
+		END ELSE IF descriptor == ULong::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_ulong();
+		END ELSE IF descriptor == Float::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_float();
+		END ELSE IF descriptor == Double::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_double();
+		END ELSE IF descriptor == Real::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_real();
+		END ELSE IF descriptor == Timestamp::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_time();
+		END ELSE IF descriptor == String::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_string();
+		END ELSE IF descriptor == Text::TDB BEGIN
+			ECHO `Zigurat::`RPCPool::`ref(con.raw()).`stream().`read_std_text();
+		END ELSE BEGIN
+			-- Nothing else is a value, so the stream is already out of step
+			-- and reading on would only make it worse.
+			THROW `Zigurat::`ZiguratException(7810, 'unreadable value in the reply');
+		END
+	END
+
 	FUNCTION _write_parameter(con AS Connector INOUT, type AS String, value AS String) RETURNS Void
 	BEGIN
 		DECLARE is_null AS Bool = FALSE;

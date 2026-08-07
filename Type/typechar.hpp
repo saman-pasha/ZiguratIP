@@ -2,6 +2,8 @@
 #ifndef __CHAR_HPP__
 #define __CHAR_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 
 namespace Zigurat

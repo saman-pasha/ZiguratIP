@@ -8,6 +8,14 @@
 namespace Zigurat
 {
 
+  // Every line of a response ended with std::endl, which is one \n. HTTP wants
+  // CRLF -- RFC 7230 section 3 -- and the blank line that separates the head
+  // from the body doubly so. Browsers forgive it, which is why this survived;
+  // proxies are entitled not to, and one in front of the server can drop the
+  // response or hand back nothing rather than repair it.
+  static const char* const CRLF = "\r\n";
+
+
   HTTPResponse::HTTPResponse(HTTPRequest* request, size_t request_id, volatile size_t& dispatch_id, 
 			     binarystream& stream, std::mutex& stream_access, std::condition_variable& stream_semaphore)
     : _request(request), _request_id(request_id), _dispatch_id(dispatch_id), 
@@ -72,12 +80,29 @@ namespace Zigurat
     this->_lock.lock();
     this->_stream_semaphore.wait(this->_lock, [&] () { return (this->_request_id == this->_dispatch_id); });
 
+    // A body, because a refusal with none is a blank page.
+    //
+    // This carried Content-Length: 0, which is at least honest about there
+    // being nothing there -- but a browser shown a zero-length 404 draws
+    // nothing at all, and view-source shows nothing either. A page that is
+    // missing and a server that is broken then look identical to whoever is
+    // trying to use it, which is most of why the Colab trouble took as long as
+    // it did to pin down. The other refusals in handle_client already say what
+    // happened; this path is the one that did not.
+    //
+    // Plain text, and only the status: what page was wanted, and why it was
+    // refused, are in the log, and neither is a visitor's business.
+    const std::string body = msg + "\n";
+
     std::stringstream ss_response;
-    ss_response << "HTTP/1.1 " << msg << std::endl;
-    ss_response << "Date: " << Utility::time_to_string(std::time(0), "%a, %d %b %Y %H:%M:%S %Z") << std::endl;
-    ss_response << "Server: Zigurat/0.0 (ZiguratIP; " << Utility::os_name() << ")" << std::endl;
-    ss_response << "Connection: close" << std::endl;
-    ss_response << std::endl << std::endl;
+    ss_response << "HTTP/1.1 " << msg << CRLF;
+    ss_response << "Date: " << Utility::time_to_string(std::time(0), "%a, %d %b %Y %H:%M:%S %Z") << CRLF;
+    ss_response << "Server: Zigurat/0.0 (ZiguratIP; " << Utility::os_name() << ")" << CRLF;
+    ss_response << "Connection: close" << CRLF;
+    ss_response << "Content-Type: text/plain; charset=utf-8" << CRLF;
+    ss_response << "Content-Length: " << body.size() << CRLF;
+    ss_response << CRLF;
+    ss_response << body;
     this->_stream.write(ss_response.str().c_str(), ss_response.tellp());
 
     this->_dispatch_id++;
@@ -105,14 +130,14 @@ namespace Zigurat
 
       std::stringstream ss_response;
 
-      ss_response << this->_protocol << " " << this->_status_code << " " << this->_reason_phrase << std::endl;
+      ss_response << this->_protocol << " " << this->_status_code << " " << this->_reason_phrase << CRLF;
 
       for (auto& pair : this->_headers) {
-	ss_response << this->_header_case(pair.first) << ": " << pair.second << std::endl;
+	ss_response << this->_header_case(pair.first) << ": " << pair.second << CRLF;
       }
 
       if (has_content) {
-	ss_response << "Content-Length: " << this->_echo_buffer->tellp() << std::endl;
+	ss_response << "Content-Length: " << this->_echo_buffer->tellp() << CRLF;
       }
     
       for (auto& pair : this->_cookies) {
@@ -132,17 +157,17 @@ namespace Zigurat
 	}
 	ss_response.seekp(-1, std::ios::cur);
 	std::cout << std::endl;
-	ss_response << std::endl;
+	ss_response << CRLF;
       }
     
-      ss_response << std::endl;
+      ss_response << CRLF;
       this->_stream.write(ss_response.str().c_str(), ss_response.tellp());
       this->_stream.write(this->_echo_buffer->str().c_str(), this->_echo_buffer->tellp());
       this->_echo_buffer->str("");
 
       this->_dispatch_id++;
       if (this->_request->_headers.find("CONNECTION") != this->_request->_headers.end() &&
-	  this->_request->_headers.at("CONNECTION") == "close") { // Connection: close
+	  Utility::to_lower(this->_request->_headers.at("CONNECTION")) == "close") { // case insensitive
 	this->_close = true;
       }
       this->_lock.unlock();

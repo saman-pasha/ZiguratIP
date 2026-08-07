@@ -33,6 +33,7 @@ TCPServer tcp_server;
 TLSServer tls_server;
 
 extern TLS::HandshakeParameters security_params;
+TLS::HandshakeParameters zigurat_security_params;
 void require_security(const char*);
 #if defined(_WIN32) || defined(_WIN64)
 #else
@@ -110,6 +111,15 @@ void handle_client()
       } else if (function == "compile") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'compile'" << std::endl;
+
+	// Refused before the code is read, so nothing a client sends gets as far
+	// as the tokenizer, let alone a command line. See COMPILER/REMOTE_MODE in
+	// loadcompiler.cpp for why this is off by default.
+	if (!compiler_remote_mode)
+	  throw ZiguratException(7805, "compiling over the network is disabled;"
+				 " compile with the parsi program and let the server load the object,"
+				 " or set COMPILER/REMOTE_MODE to TRUE if this instance is not exposed");
+
 	std::string code;
 	Globals::client_stream()->read_std_text(code);
 	if (Globals::trace_mode())
@@ -302,6 +312,22 @@ void load_zigurat(const Configuration& conf)
     spss >> server_timeout;
   }
 
+  zigurat_security_params = security_params;
+  {
+    std::string mode;
+    if (conf.get("/SERVER/TLS_CLIENT_AUTH", mode)) {
+      mode = Utility::to_upper(Utility::trim(mode));
+      if (mode == "REQUIRED")      zigurat_security_params.client_auth = TLS::ClientAuth::REQUIRED;
+      else if (mode == "OPTIONAL") zigurat_security_params.client_auth = TLS::ClientAuth::OPTIONAL;
+      else if (mode == "NONE")     zigurat_security_params.client_auth = TLS::ClientAuth::NONE;
+      else throw ZiguratIPException("invalid value for '/SERVER/TLS_CLIENT_AUTH'");
+    }
+  }
+  std::cout << "Server client auth: '"
+	    << ((zigurat_security_params.client_auth == TLS::ClientAuth::REQUIRED) ? "REQUIRED"
+		: (zigurat_security_params.client_auth == TLS::ClientAuth::OPTIONAL) ? "OPTIONAL" : "NONE")
+	    << "'" << std::endl;
+
   if (conf.get("/SERVER/TLS_MODE", value)) {
     value = Utility::to_upper(Utility::trim(value));
     if (value == "TRUE")
@@ -348,7 +374,7 @@ void load_zigurat(const Configuration& conf)
 
   if (server_type == "TCP" && server_tls_mode) {
     std::thread server_thread([&] () {
-	tls_server.credentials(security_params);
+	tls_server.credentials(zigurat_security_params);
 	tls_server.run(TCPServer::IPV4, server_tcp_service, server_backlog, server_pool_size, zigurat_tls_handler);
       });
     server_thread.detach();

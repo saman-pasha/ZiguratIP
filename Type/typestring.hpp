@@ -2,6 +2,8 @@
 #ifndef __STRING_HPP__
 #define __STRING_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 #include "typebool.hpp"
 #include <string>

@@ -2,7 +2,10 @@
 #include "session.hpp"
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
+#include "httpserver.hpp"
+#include "rpcpool.hpp"
 #include "bufferstream.hpp"
+#include "textstream.hpp"
 #include "types.hpp"
 #include <map>
 #include <set>
@@ -115,6 +118,84 @@ ZTEST(Session, the_cookie_carries_the_session_to_the_next_request)
   }
 }
 
+// What a session is actually for: one page puts something away, a different
+// page takes it out again, and the only thing joining them is the visitor's
+// cookie.
+//
+// The two pages here are two handlers rather than two compiled .parsi objects --
+// what is being tested is the store and the cookie that carries it, and those
+// are the same whichever page calls them. Each begins with INITIALIZE, because
+// every page must, and ends with RELEASE, because the request scope does.
+ZTEST(Session, a_value_set_by_one_page_is_read_by_another)
+{
+  Clean clean;
+
+  std::string cookie;
+
+  // Page one: a form handler that remembers who the visitor said they are.
+  {
+    Exchange page_one;
+    Session::INITIALIZE(*page_one.request, *page_one.response);
+
+    Session::SET<String>(String("who"), String("Sadegh Hedayat"));
+    Session::SET<Int>(String("visits"), Int(1));
+
+    cookie = page_one.cookie_echo();     // what the browser would keep
+    Session::RELEASE();
+  }
+
+  // Between the two, this worker thread is bound to nobody -- as it would be
+  // while it served somebody else entirely.
+  ZCHECK(!Session::IS_INITIALIZED().value());
+
+  // Page two: a different page, same visitor, carrying the cookie back.
+  {
+    Exchange page_two(cookie);
+    Session::INITIALIZE(*page_two.request, *page_two.response);
+
+    ZCHECK_STR(Session::GET<String>(String("who")).to_std_string(), "Sadegh Hedayat");
+    ZCHECK_EQ(Session::GET<Int>(String("visits")).value(), 1);
+
+    // and it can write back for the page after it
+    Session::SET<Int>(String("visits"), Int(2));
+    Session::RELEASE();
+  }
+
+  // Page three, to show the update stuck rather than the first value lingering.
+  {
+    Exchange page_three(cookie);
+    Session::INITIALIZE(*page_three.request, *page_three.response);
+    ZCHECK_EQ(Session::GET<Int>(String("visits")).value(), 2);
+    Session::RELEASE();
+  }
+
+  // One visitor, one session, however many pages they walked through.
+  ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)1);
+}
+
+// A visitor who arrives with no cookie is a different visitor, and must not see
+// what the first one put away.
+ZTEST(Session, another_visitor_does_not_see_it)
+{
+  Clean clean;
+
+  {
+    Exchange mine;
+    Session::INITIALIZE(*mine.request, *mine.response);
+    Session::SET<String>(String("who"), String("Sadegh Hedayat"));
+    Session::RELEASE();
+  }
+
+  {
+    Exchange theirs;                     // no cookie: a fresh browser
+    Session::INITIALIZE(*theirs.request, *theirs.response);
+    ZCHECK(!Session::HAS(String("who")).value());
+    Session::RELEASE();
+  }
+
+  ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)2);   // two visitors
+}
+
 // Anyone can send any cookie, so an id the server never issued must not be
 // adopted -- otherwise a caller picks its own session identifier.
 ZTEST(Session, a_forged_cookie_does_not_take_over_a_session)
@@ -217,12 +298,36 @@ ZTEST(Session, sessions_cannot_read_each_others_values)
 }
 
 // Writing without a session must be inert rather than landing somewhere.
-ZTEST(Session, writing_while_unbound_is_ignored)
+// Using a session nobody asked for is a mistake in the page, and it says so.
+//
+// This used to be writing_while_unbound_is_ignored, and ignored was the wrong
+// answer: a page that forgets INITIALIZE set values that vanished, read back
+// nothing, and reported success. The request looked fine and the data was never
+// there. Reads and writes throw now; asking whether there is a session, and
+// which one, still answer plainly, because those are the questions a page asks
+// before deciding.
+ZTEST(Session, using_a_session_while_unbound_throws)
 {
   Clean clean;
-  ZCHECK_NOTHROW(Session::SET<Int>(String("orphan"), Int(1)));
-  ZCHECK(!Session::HAS(String("orphan")).value());
+
+  ZCHECK_THROWS(Session::SET<Int>(String("orphan"), Int(1)));
+  ZCHECK_THROWS(Session::HAS(String("orphan")));
+  ZCHECK_THROWS(Session::REMOVE(String("orphan")));
+  ZCHECK_THROWS(Session::CLEAR());
+  ZCHECK_THROWS(Session::DESTROY());
+
+  // and nothing was created on the way past
   ZCHECK_EQ((uint64_t)Session::COUNT().value(), (uint64_t)0);
+
+  // the questions a page asks first still answer
+  ZCHECK_NOTHROW(Session::IS_INITIALIZED());
+  ZCHECK(!Session::IS_INITIALIZED().value());
+  ZCHECK_NOTHROW(Session::ID());
+  ZCHECK_STR(Session::ID().value(), "");
+
+  // and releasing when there is nothing to release is not an error: the request
+  // scope does it on every request, bound or not.
+  ZCHECK_NOTHROW(Session::RELEASE());
 }
 
 ZTEST(Session, release_keeps_the_session_but_destroy_removes_it)
@@ -366,4 +471,186 @@ ZTEST(Zeytun, response_headers_and_cookies)
   visit.response->SET_COOKIE(String("track"), String("42"));
   ZCHECK(visit.response->HAS_COOKIE(String("track")).value());
   ZCHECK_STR(visit.response->COOKIE(String("track")).to_std_string(), "42");
+}
+
+// What a proxy sends, and what happens to a refusal nobody can see.
+namespace
+{
+  // Drives one request through the server's own head parser and hands back
+  // what the handler was given, plus whatever went onto the connection.
+  struct Served
+  {
+    std::string method, uri, path, host, port;
+    std::string raw;
+    bool reached_handler = false;
+    std::map<std::string, std::string> headers;
+    std::map<std::string, std::string> cookies;
+
+    std::string header(const std::string& name) const
+    {
+      std::map<std::string, std::string>::const_iterator it = headers.find(name);
+      return (it == headers.end()) ? std::string() : it->second;
+    }
+    bool has_header(const std::string& name) const { return headers.count(name) > 0; }
+    std::string cookie(const std::string& name) const
+    {
+      std::map<std::string, std::string>::const_iterator it = cookies.find(name);
+      return (it == cookies.end()) ? std::string() : it->second;
+    }
+  };
+
+  Served serve(const std::string& request)
+  {
+    Served served;
+    bufferstream stream;
+    stream.write(request.data(), (std::streamsize)request.size());
+    stream.seekg(0, std::ios::beg);
+
+    HTTPServer::handle_client(stream,
+      [&served] (binarystream*, HTTPRequest* request, HTTPResponse* response) {
+	std::unique_ptr<HTTPRequest> request_deleter(request);
+	std::unique_ptr<HTTPResponse> response_deleter(response);
+	served.reached_handler = true;
+	served.method = request->METHOD().value();
+	served.uri    = request->URI().value();
+	served.path   = request->PATH().value();
+	served.host   = request->HOST().value();
+	served.port   = request->PORT().value();
+	// through the public accessors, which is how a page would ask
+	const char* wanted[] = {"COOKIE", "AUTHORIZATION", "HOST", "CONNECTION"};
+	for (const char* name : wanted)
+	  if (request->HAS_HEADER(String(name)).value())
+	    served.headers[name] = request->HEADER(String(name)).value();
+	if (request->HAS_COOKIE(String("ZIPSESSID")).value())
+	  served.cookies["ZIPSESSID"] = request->COOKIE(String("ZIPSESSID")).value();
+      },
+      false, 0, false, 8000, 16000, 8 * 1024 * 1024);
+
+    stream.clear();
+    stream.seekg(0, std::ios::beg);
+    served.raw = stream.string();
+    return served;
+  }
+}
+
+// RFC 7230 section 5.3.2: a server must accept a request line naming the whole
+// URL, not only the path. Proxies send it. This took the target as it stood, so
+// the path became "/http:/host:2190/page" and every proxied request 404'd.
+ZTEST(Zeytun, an_absolute_form_request_line_is_the_path_it_names)
+{
+  Served origin   = serve("GET /catalog.zt HTTP/1.1\r\nHost: example:2190\r\nConnection: close\r\n\r\n");
+  Served absolute = serve("GET http://example:2190/catalog.zt HTTP/1.1\r\nHost: example:2190\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(origin.reached_handler);
+  ZCHECK(absolute.reached_handler);
+  ZCHECK_STR(absolute.uri, origin.uri);
+  ZCHECK_STR(absolute.path, origin.path);
+}
+
+// The authority in the target stands in for a missing Host, which the same
+// section says to prefer -- and this server refuses a request without one.
+ZTEST(Zeytun, an_absolute_form_request_line_carries_its_own_host)
+{
+  Served served = serve("GET http://example:2190/catalog.zt HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(served.reached_handler);
+  ZCHECK_STR(served.host, "example");
+  ZCHECK_STR(served.port, "2190");
+}
+
+// Header values are opaque octets -- RFC 7230 section 3.2 -- and were being
+// lower-cased along with the field name.
+//
+// Field *names* are case insensitive and upper-casing them is right. Values are
+// not, and mangling them broke every field whose case carries meaning. Sessions
+// most visibly: a cookie sent back as ZIPSESSID arrived as zipsessid, never
+// matched the name it was stored under, and the server minted a fresh session on
+// every request -- so a session could be written but never read again, and the
+// RPC console could not hold a transaction across two requests. The same would
+// have happened to an Authorization token or an ETag.
+ZTEST(Zeytun, a_header_value_arrives_with_its_case_intact)
+{
+  Served served = serve("GET /page.zt HTTP/1.1\r\n"
+			"Host: Example.COM\r\n"
+			"Cookie: ZIPSESSID=DeadBeef\r\n"
+			"Authorization: Bearer AbCdEf\r\n"
+			"Connection: close\r\n\r\n");
+
+  ZCHECK(served.reached_handler);
+  ZCHECK_STR(served.cookie("ZIPSESSID"), "DeadBeef");
+  ZCHECK_STR(served.header("AUTHORIZATION"), "Bearer AbCdEf");
+
+  // and the field name is still upper-cased, which is what lookups expect
+  ZCHECK(served.has_header("COOKIE"));
+}
+
+// A refusal with no body is a blank page: a browser shows nothing, view-source
+// shows nothing, and a missing page looks exactly like a broken server.
+ZTEST(Zeytun, a_refusal_says_what_it_was)
+{
+  Served served = serve("BREW /coffee HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n");
+
+  ZCHECK(!served.reached_handler);                                  // refused before any page
+  ZCHECK(served.raw.find("501 Not Implemented") != std::string::npos);
+  ZCHECK(served.raw.find("Content-Type: text/plain") != std::string::npos);
+  ZCHECK(served.raw.find("Content-Length: 0") == std::string::npos);  // never an empty refusal
+
+  // and the body is actually there, after the blank line
+  const size_t split = served.raw.find("\r\n\r\n");
+  ZCHECK(split != std::string::npos);
+  ZCHECK(served.raw.size() > split + 4);
+}
+
+// How this server knows who is asking, which has exactly two answers and they
+// are not equally strong.
+ZTEST(Session, a_certificate_names_a_user_and_a_cookie_names_a_browser)
+{
+  // A certificate subject is authenticated: the peer proved it holds the key,
+  // against an authority this server trusts, and it is checked again on every
+  // request. That is a person, and they are the same person in two browsers.
+  ZCHECK_STR(RPCPool::owner("C=US, CN=alice", ""), "peer:C=US, CN=alice");
+
+  // It wins over a cookie, so opening a second browser does not open a second
+  // identity for somebody who has a certificate.
+  ZCHECK_STR(RPCPool::owner("C=US, CN=alice", "abc123"), "peer:C=US, CN=alice");
+
+  // With no certificate there is nobody to be sure about and the cookie is all
+  // there is. It names a browser: whoever holds it is that session.
+  ZCHECK_STR(RPCPool::owner("", "abc123"), "session:abc123");
+
+  // The two are kept apart, so a certificate subject cannot be crafted to read
+  // as somebody's session id and inherit what it owns.
+  ZCHECK(RPCPool::owner("abc123", "") != RPCPool::owner("", "abc123"));
+
+  // Neither, and there is no owner to speak of. Silence here would mean a
+  // transaction owned by nobody, which is how the thread-local version behaved.
+  ZCHECK_THROWS(RPCPool::owner("", ""));
+}
+
+// ECHO escapes values and leaves literals alone, which is what stops a page
+// written the way the tutorial shows it from handing a visitor's markup back to
+// the next visitor.
+ZTEST(Zeytun, text_going_into_a_page_is_escaped)
+{
+  ZCHECK_STR(Utility::escape_html("<script>alert(1)</script>"),
+	     "&lt;script&gt;alert(1)&lt;/script&gt;");
+
+  // the attribute-breaking characters too, not just the tag ones
+  ZCHECK_STR(Utility::escape_html("\" onmouseover='x'"), "&quot; onmouseover=&#39;x&#39;");
+
+  // and the ampersand first, so an escape cannot be built out of the escaping
+  ZCHECK_STR(Utility::escape_html("&lt;"), "&amp;lt;");
+
+  // ordinary text is left exactly as it is
+  ZCHECK_STR(Utility::escape_html("Sadegh Hedayat, 1937"), "Sadegh Hedayat, 1937");
+  ZCHECK_STR(Utility::escape_html(""), "");
+
+  // Raw is the deliberate way past, and the only one
+  textstream out;
+  Utility::echo_escaped(out, Utility::raw("<b>bold</b>"));
+  ZCHECK_STR(out.str(), "<b>bold</b>");
+
+  textstream escaped;
+  Utility::echo_escaped(escaped, String("<b>bold</b>"));
+  ZCHECK_STR(escaped.str(), "&lt;b&gt;bold&lt;/b&gt;");
 }

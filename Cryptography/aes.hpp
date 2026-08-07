@@ -2,6 +2,8 @@
 #ifndef __AES_HPP__
 #define __AES_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 
 namespace Zigurat

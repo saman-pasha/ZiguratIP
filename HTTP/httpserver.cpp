@@ -32,11 +32,23 @@ namespace Zigurat
     std::string host, port;
     char *content = nullptr;
     size_t content_length = 0;   // read for GET too, so it cannot start as garbage
+    size_t headers_length = 0;   // octets of head read for the request in hand
+    std::string absolute_authority;  // from an absolute-form target, if it was one
     std::deque<Thread> pipes;
     size_t request_id = 1;
     volatile size_t dispatch_id = 1;
     std::mutex stream_access;
     std::condition_variable stream_semaphore;
+
+    // Every refusal below -- 400, 411, 413, 414, 501 -- used to leave this
+    // function by unwinding past its caller, which put not one byte on the
+    // connection before dropping it. The client sees a socket that closed
+    // without answering: a browser draws a blank page, and a proxy in front of
+    // one reports the server as broken. Neither can say what was wrong,
+    // because nothing was ever said. HEAD is the common way to trip it -- the
+    // request line accepts it and the body of the loop does not implement it,
+    // so a proxy's HEAD probe got silence rather than the 501 it was owed.
+    try {
 
     while (!stream.eof()) {
 
@@ -53,7 +65,19 @@ namespace Zigurat
       // headers is never recognised and every request fails to parse.
       if (line.size() > 0 && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
 
+      // MAX_HEADERS_LENGTH was configured, documented, and passed down through
+      // five signatures without ever being compared to anything. A client
+      // could therefore send header lines until the process ran out of memory:
+      // each one is kept in the map, and nothing was counting. Count the head
+      // as it arrives, including the CRLF that getline consumed, and refuse
+      // once it is longer than the configured limit.
+      headers_length += line.size() + 2;
+      if (max_headers_length > 0 && headers_length > max_headers_length)
+	throw HTTPException("431 Request Header Fields Too Large");
+
       if (line.size() == 0) { // End of headers
+
+	if (!absolute_authority.empty()) headers["HOST"] = absolute_authority;
 
 	if (headers.find("HOST") == headers.end()) {
 	  throw HTTPException("400 Bad Request");
@@ -68,11 +92,26 @@ namespace Zigurat
 	    if (headers.find("CONTENT-LENGTH") == headers.end()) {
 	      throw HTTPException("411 Length Required");
 	    } else {
-	      content_length = std::strtoull(headers["CONTENT-LENGTH"].c_str(), NULL, 10);
-	      if (content_length > max_content_length) throw HTTPException("413 Payload Too Large");
-	      content = new char[content_length]; // Post payload data
-	      if ((size_t)stream.read_exact(content, content_length) < content_length)
+	      const std::string& declared = headers["CONTENT-LENGTH"];
+
+	      // strtoull answers 0 for anything it cannot read, so a header of
+	      // "Content-Length: banana" used to mean a body of nothing rather
+	      // than a bad request.
+	      if (declared.empty() || declared.find_first_not_of("0123456789") != std::string::npos)
 		throw HTTPException("400 Bad Request");
+
+	      content_length = std::strtoull(declared.c_str(), NULL, 10);
+	      if (content_length > max_content_length) throw HTTPException("413 Payload Too Large");
+
+	      // Held here rather than as a bare pointer: the read below can fail,
+	      // and it used to throw straight past the only thing that knew about
+	      // this allocation. HTTPRequest takes ownership at the bottom, so a
+	      // client that announced a large body and then went away leaked all
+	      // of it, every time, which is a request anyone can repeat.
+	      std::unique_ptr<char[]> payload(new char[content_length]);
+	      if ((size_t)stream.read_exact(payload.get(), content_length) < content_length)
+		throw HTTPException("400 Bad Request");
+	      content = payload.release();   // HTTPRequest's unique_ptr owns it now
 	    }
 	  } else {
 	    throw HTTPException("501 Not Implemented");
@@ -109,6 +148,8 @@ namespace Zigurat
 	  host.clear();
 	  port.clear();
 	  content_length = 0;
+	  headers_length = 0;   // the next request on this connection starts fresh
+	  absolute_authority.clear();
 
 	  headers.clear();
 	  content = nullptr;
@@ -129,6 +170,27 @@ namespace Zigurat
 	  method = Utility::trim(parts[0]);
 	  uri = Utility::trim(parts[1]);
 	  protocol = Utility::trim(parts[2]);
+
+	  // A request line may name the whole URL rather than just the path --
+	  // "GET http://host:2190/page HTTP/1.1" -- and RFC 7230 section 5.3.2
+	  // says a server must accept it. Proxies send it, and this took the
+	  // target as it stood, so the path became "/http:/host:2190/page" and
+	  // every proxied request answered 404.
+	  const size_t scheme = (uri.compare(0, 7, "http://") == 0) ? 7
+	    : ((uri.compare(0, 8, "https://") == 0) ? 8 : 0);
+	  if (scheme > 0) {
+	    const size_t slash = uri.find('/', scheme);
+
+	    // The authority in the target wins over any Host header, which the
+	    // same section says to ignore when the request is in this form.
+	    // Applied once the headers are in, so a Host arriving later cannot
+	    // put itself back.
+	    absolute_authority = uri.substr(scheme, (slash == std::string::npos)
+					    ? std::string::npos : slash - scheme);
+
+	    // No path at all means the root, which is what "http://host" asks for.
+	    uri = (slash == std::string::npos) ? "/" : uri.substr(slash);
+	  }
 	  if (!(method == "GET" || method == "HEAD" || method == "POST" || method == "PUT" || method == "DELETE")) {
 	    throw HTTPException("501 Not Implemented");
 	  } else if (method.size() == 0 || uri.size() == 0 || protocol.size() == 0) {
@@ -147,14 +209,28 @@ namespace Zigurat
 	  std::string field_name = Utility::to_upper(parts[0]);
 	  if (field_name[field_name.size() - 1] == ' ' || field_name[field_name.size() - 1] == '\t')
 	    throw HTTPException("400 Bad Request");
+	  // The name is upper-cased because field names are case insensitive.
+	  // The value is not, and used to be lower-cased along with it.
+	  //
+	  // Header values are opaque octets -- RFC 7230 section 3.2 -- except
+	  // where a particular field says otherwise, and mangling them broke
+	  // anything whose case carries meaning. Sessions most visibly: a cookie
+	  // sent back as ZIPSESSID arrived as zipsessid, never matched the name
+	  // it was stored under, and every request minted a fresh session. The
+	  // same would have happened to an Authorization token, an ETag, or the
+	  // path in a Referer.
+	  //
+	  // The two places that compared a value against lower-case text now
+	  // lower-case it themselves, where the field is one whose values really
+	  // are case insensitive.
 	  std::string field_value;
 	  if (parts.size() == 2) {
-	    field_value = Utility::to_lower(Utility::trim(parts[1]));
+	    field_value = Utility::trim(parts[1]);
 	  } else {
 	    std::stringstream ss_value;
-	    ss_value << Utility::to_lower(Utility::trim(parts[1]));
+	    ss_value << Utility::trim(parts[1]);
 	    for (size_t i = 2; i < parts.size(); i++)
-	      ss_value << ':' << Utility::to_lower(Utility::trim(parts[i]));
+	      ss_value << ':' << Utility::trim(parts[i]);
 	    field_value = ss_value.str();
 	  }
 	  if (headers.find(field_name) == headers.end()) { // Single header
@@ -178,6 +254,35 @@ namespace Zigurat
       }
 
     } // EOF
+
+    } catch (const HTTPException& ex) {
+      // Anything still running has to finish before the socket is written to,
+      // or its output interleaves with the error.
+      if (async_mode) {
+	for (Thread& pipe : pipes)
+	  pipe.join();
+	pipes.clear();
+      }
+
+      const std::string status = ex.what();          // "501 Not Implemented"
+      const std::string body = status + "\n";
+      std::stringstream out;
+      out << "HTTP/1.1 " << status << "\r\n"
+	  << "Content-Type: text/plain; charset=utf-8\r\n"
+	  << "Content-Length: " << body.size() << "\r\n"
+	  << "Connection: close\r\n"
+	  << "\r\n"
+	  << body;
+
+      // Best effort: the peer that sent a malformed request is often the same
+      // peer that has already gone away, and failing to report a failure must
+      // not become a second one.
+      try {
+	stream << out.str();
+	stream.flush();
+      } catch (...) {
+      }
+    }
   }
 
   void HTTPServer::run(TCPServer::Version version, std::string service, int backlog, size_t pool_size, 

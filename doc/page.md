@@ -47,3 +47,27 @@ PUBLIC:
     END
 END
 ```
+
+## Escaping
+
+`ECHO` escapes what it is given, unless the page wrote it as a literal.
+
+A literal is markup the author typed, so it goes out as it stands. Anything else
+is a value from somewhere -- a column, a query parameter, a session -- and is
+escaped on the way out. So this is safe without the author doing anything:
+
+```parsi
+ECHO '<td>', book.title, '</td>';
+```
+
+The markup stays markup, and a title of `<script>alert(1)</script>` arrives as
+`&lt;script&gt;alert(1)&lt;/script&gt;`.
+
+A page that has genuinely built markup in a variable has to say so:
+
+```parsi
+ECHO `Zigurat::`Utility::`raw(rendered_html);
+```
+
+That is the only way past the escaping. It is one word and it greps, which is
+the point: the places that emit unchecked markup can be listed.

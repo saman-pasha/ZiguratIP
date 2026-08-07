@@ -105,7 +105,7 @@ PUBLIC:
         ECHO '<p>EU rows: ', rows, ' &mdash; amount total: ', total, '</p>';
 
         ECHO '<p><a href="bulk.zt">Load more</a> &middot; ';
-        ECHO '<a href="/">Back to Zeytun</a></p>';
+        ECHO '<a href="index.html">Back to Zeytun</a></p>';
         ECHO '</body></html>';
     END
 END

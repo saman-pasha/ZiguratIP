@@ -2,6 +2,8 @@
 #ifndef __ULONG_HPP__
 #define __ULONG_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 
 namespace Zigurat

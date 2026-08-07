@@ -2,6 +2,8 @@
 #ifndef __CONNECTOR_HPP__
 #define __CONNECTOR_HPP__
 
+
+#include <cstdint>
 #include "resulttype.hpp"
 #include <vector>
 #include <string>

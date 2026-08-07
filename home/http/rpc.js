@@ -1,24 +1,37 @@
 
 var call_xhr = null;
 
-function transaction_id()
+// The transaction this console is working in.
+//
+// do=id used to report whichever transaction the worker thread happened to be
+// holding, so there was nothing to remember and nothing to send back. It opens
+// one now and hands back its id, and that id has to travel with every call,
+// commit and rollback -- it is how the server finds the connection again, and
+// how it knows the transaction is yours.
+var current_tx = null;
+
+// Opens a transaction and shows which one. Committing or rolling back ends the
+// one in hand, so a fresh one is opened straight after to work in next.
+function new_transaction()
 {
     $.ajax({
 	dataType: "text",
 	url: "rpc.zt?do=id",
 	async: false,
 	error: function(xhr) {
+	    current_tx = null;
 	    $("#spn_transaction_id").html("RPC Service not respond");
 	},
 	success: function(data) {
-	    $("#spn_transaction_id").html(data);
+	    current_tx = $.trim(data);
+	    $("#spn_transaction_id").html(current_tx);
 	}
     });
 }
 
 $(document).ready(function () {
 
-    transaction_id();
+    new_transaction();
 
     $("#btn_add").click(function () {
 	$("#tbl_params").append(`
@@ -63,8 +76,10 @@ $(document).ready(function () {
 
     $("#btn_call").click(function () {
 
-	transaction_id();
-
+	// Calls happen *in* the transaction already open, and used to start a new
+	// one here -- which was harmless when do=id only reported whatever the
+	// worker thread held, and is a leak now that it opens a connection: the
+	// one from page load was abandoned, still counting against the pool.
 	$("#div_result_set").empty();
 	$("#div_operations").hide();
 	$("#div_abort").show();
@@ -110,7 +125,8 @@ $(document).ready(function () {
 	call_xhr = $.ajax({
 	    method: "post",
 	    dataType: "html",
-	    url: 'rpc.zt?do=call&auto_commit=' + $("#chb_auto_commit").is(":checked") +
+	    url: 'rpc.zt?do=call&tx=' + encodeURIComponent(current_tx) +
+		'&auto_commit=' + $("#chb_auto_commit").is(":checked") +
 		'&iso_lvl=' + $("#slc_iso_lvl").val() + '&proc=' + $("#txt_name").val(), 
 	    data: data,
 	    error: function() {
@@ -146,25 +162,23 @@ $(document).ready(function () {
 
     $("#btn_commit").click(function () {
 
-	transaction_id();
-	
 	$("#div_result_set").empty();
 	$("#div_result_set").append("<img id=\"img_indicator\" src=\"indicator.gif\"/>");
 
-	$("#div_result_set").load('rpc.zt?do=commit', function() {
+	$("#div_result_set").load('rpc.zt?do=commit&tx=' + encodeURIComponent(current_tx), function() {
 	    $("#img_indicator").hide();
+	    new_transaction();          // that one is finished; carry on in the next
 	});
     });
 
     $("#btn_rollback").click(function () {
 
-	transaction_id();
-
 	$("#div_result_set").empty();
 	$("#div_result_set").append("<img id=\"img_indicator\" src=\"indicator.gif\"/>");
 
-	$("#div_result_set").load('rpc.zt?do=rollback', function() {
+	$("#div_result_set").load('rpc.zt?do=rollback&tx=' + encodeURIComponent(current_tx), function() {
 	    $("#img_indicator").hide();
+	    new_transaction();
 	});
     });
 

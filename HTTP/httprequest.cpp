@@ -1,11 +1,28 @@
 #include "httprequest.hpp"
+#include "httpexception.hpp"
 #include "bufferstream.hpp"
 #include "typechar.hpp"
 #include "utility.hpp"
+#include <cctype>
 
 
 namespace Zigurat
 {
+
+  namespace
+  {
+    // One hex digit, or -1. Percent-decoding used to hand the two characters to
+    // a stringstream and read them back as hex, which cannot say whether it
+    // read anything: "%zz" extracted nothing, left the value at zero, and
+    // decoded to a NUL that the caller then treated as data.
+    int hex_digit(char ch)
+    {
+      if (ch >= '0' && ch <= '9') return ch - '0';
+      if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+      if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+      return -1;
+    }
+  }
 
   HTTPRequest::HTTPRequest(std::string method, std::string uri, std::string protocol, std::map<std::string, std::string> headers, 
 			   std::string host, std::string port, char* content, size_t content_length) 
@@ -26,7 +43,10 @@ namespace Zigurat
 	  this->_headers[Utility::trim(Utility::to_upper(con_parts[0]))] = Utility::trim(parts[1]);
 	}
       }
-      if (this->_content_type == "application/x-www-form-urlencoded" || this->_content_type == "multipart/form-data") {
+      // Media types are case insensitive (RFC 7231 section 3.1.1.1), and the
+      // value is no longer lower-cased on the way in.
+      const std::string content_type = Utility::to_lower(this->_content_type);
+      if (content_type == "application/x-www-form-urlencoded" || content_type == "multipart/form-data") {
 	this->_load_post_vars(); // $_POST
       }
     }
@@ -187,16 +207,17 @@ namespace Zigurat
       if (ch == '+') {
 	var_value.push_back(' ');
       } else if (ch == '%') {
-	char ch1, ch2;
-	ch1 = *(++iter);
-	ch2 = *(++iter);
-	std::string str_hex;
-	str_hex.push_back(ch1);
-	str_hex.push_back(ch2);
-	std::stringstream ss_hex(str_hex);
-	uint16_t int_hex;
-	ss_hex >> std::hex >> int_hex;
-	var_value.push_back((char)int_hex);
+	// An escape is a % and exactly two hex digits. Both used to be taken
+	// with *(++iter) and no test whatever, so "GET /a%" ran the iterator
+	// past end() and read whatever lay beyond the string -- reachable in a
+	// single request, before any authentication, from anyone who can open
+	// the port.
+	if (this->_uri.end() - iter < 3) throw HTTPException("400 Bad Request");
+	const int hi = hex_digit(*(iter + 1));
+	const int lo = hex_digit(*(iter + 2));
+	if (hi < 0 || lo < 0) throw HTTPException("400 Bad Request");
+	iter += 2;
+	var_value.push_back((char)((hi << 4) | lo));
       } else if (ch == '?') {
 	this->_path = var_value;
 	var_value.clear();
@@ -216,8 +237,10 @@ namespace Zigurat
 	  var_name.clear();
 	  var_value.clear();
 	}
+	// push_back(ch) here, and ch is the '#' that got us in -- so a fragment
+	// came out as a run of hashes the right length rather than its own text.
 	while (++iter != this->_uri.end()) {
-	  var_value.push_back(ch);
+	  var_value.push_back(*iter);
 	}
 	this->_fragment = var_value;
 	var_value.clear();
@@ -239,24 +262,33 @@ namespace Zigurat
 
   void HTTPRequest::_load_post_vars()
   {
+    // The body is not a C string. httpserver.cpp allocates new char[length] and
+    // reads exactly that many octets into it, so there is no terminator; the
+    // bufferstream constructor takes a std::string by value, so handing it the
+    // bare pointer ran strlen() off the end of the allocation and kept going
+    // until it happened on a zero byte -- on every POST, and whatever it swept
+    // up on the way became form variables. Give it the length we were told.
+    if (!this->_content || this->_content_length == 0) return;
+
     uint8_t ch;
-    bufferstream buffer((char*)this->_content.get());
+    bufferstream buffer(std::string(this->_content.get(), this->_content_length));
     std::string var_name, var_value;
     while (!buffer.eof()) {
       buffer.read_std_ubyte(ch);
       if (ch == '+') {
 	var_value.push_back(' ');
       } else if (ch == '%') {
-	uint8_t ch1, ch2;
+	// Same escape, same rule as the query string. The two reads were not
+	// checked either, so a body ending in '%' left both characters holding
+	// whatever the stack had in them and decoded that.
+	uint8_t ch1 = 0, ch2 = 0;
 	buffer.read_std_ubyte(ch1);
 	buffer.read_std_ubyte(ch2);
-	std::string str_hex;
-	str_hex.push_back(ch1);
-	str_hex.push_back(ch2);
-	std::stringstream ss_hex(str_hex);
-	uint16_t int_hex;
-	ss_hex >> std::hex >> int_hex;
-	var_value.push_back((uint8_t)int_hex);
+	if (buffer.eof() || buffer.fail()) throw HTTPException("400 Bad Request");
+	const int hi = hex_digit((char)ch1);
+	const int lo = hex_digit((char)ch2);
+	if (hi < 0 || lo < 0) throw HTTPException("400 Bad Request");
+	var_value.push_back((uint8_t)((hi << 4) | lo));
       } else if (ch == '=') {
 	var_name = var_value;
 	var_value.clear();

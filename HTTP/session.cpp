@@ -1,4 +1,5 @@
 #include "session.hpp"
+#include "zexception.hpp"
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
 #include "shahelper.hpp"
@@ -21,15 +22,24 @@ namespace Zigurat
   // served by the same pooled thread in the same second get the same value.
   // A session id has to be unique and unguessable, hence a real random source
   // and a digest rather than that.
+  //
+  // The random source used to be a std::mt19937_64 seeded once, at static
+  // initialisation, from a single std::random_device{}() -- 64 bits of seed
+  // behind a generator that is not one-way. Mersenne Twister state is
+  // recoverable from its own output, so a client who collected a couple of
+  // session ids could reconstruct the generator and name every id the server
+  // would hand out afterwards, to any user. The digest hid the outputs but the
+  // state was still only 64 bits of guessing away. Now each id is drawn
+  // straight from the kernel pool, and the counter and clock remain only to
+  // guarantee uniqueness if two draws ever collide.
   std::string Session::_new_id()
   {
-    static std::mt19937_64 generator(std::random_device{}());
     static uint64_t counter = 0;
 
     std::stringstream seed;
     {
       std::lock_guard<std::mutex> lock(Session::_store_access);
-      seed << generator() << ':' << generator() << ':' << ++counter;
+      seed << Utility::random_uint64() << ':' << Utility::random_uint64() << ':' << ++counter;
     }
     seed << ':' << (uint64_t)std::time(0);
 
@@ -84,7 +94,14 @@ namespace Zigurat
 
   void Session::_set_raw(const std::string& key, const std::string& value)
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -96,7 +113,14 @@ namespace Zigurat
 
   bool Session::_get_raw(const std::string& key, std::string& value)
   {
-    if (Session::_current.empty()) return false;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -118,7 +142,14 @@ namespace Zigurat
 
   void Session::REMOVE(String key)
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -127,7 +158,14 @@ namespace Zigurat
 
   void Session::CLEAR()
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     std::lock_guard<std::mutex> lock(Session::_store_access);
     std::map<std::string, Store>::iterator it = Session::_store.find(Session::_current);
@@ -141,7 +179,14 @@ namespace Zigurat
 
   void Session::DESTROY()
   {
-    if (Session::_current.empty()) return;
+    // Reading or writing a session that was never bound used to return quietly,
+    // and quietly is the wrong answer: a page that forgets INITIALIZE then sets
+    // values that vanish, reads back nothing, and reports success. Nothing in
+    // the request fails, so the bug surfaces later as data that was never
+    // there. A page must ask for a session before it has one.
+    if (Session::_current.empty())
+      throw ZiguratException(7806, "no session: call Session::INITIALIZE(request, response) before using one");
+
 
     {
       std::lock_guard<std::mutex> lock(Session::_store_access);

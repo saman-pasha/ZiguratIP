@@ -16,7 +16,8 @@ PROJECTS := Core \
 	ca \
 	parsi \
 	ziguratip \
-	Test
+	Test \
+	System
 
 #export COMPILER := clang++
 export MODE := Debug

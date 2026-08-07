@@ -23,6 +23,12 @@ namespace Zigurat
     // Drains the put area to the socket. Returns false on a socket error.
     bool flush_put_area();
 
+  public:
+    // The descriptor itself. OpenSSL is given the socket directly through a
+    // BIO, so the TLS buffer needs to know which one it is; nothing else here
+    // hands it out, and nothing else should.
+    Socket::handle_t handle() const;
+
   public:    
     socketbuf(const socketbuf&) = delete;
     socketbuf(socketbuf&&);

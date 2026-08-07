@@ -16,6 +16,7 @@ std::string home_path;
 std::string catalog_path;
 bool        trace_mode = false;
 bool        reset_mode = false;
+bool        compiler_remote_mode = false;
 
 // Declared here and defined by the loaders below, which are included after the
 // shared instance variables they read.
@@ -104,6 +105,7 @@ namespace
       << "\t/TRANSACTION/MODE           NON-AUTOCOMMIT | AUTOCOMMIT" << std::endl
       << "\t/TRANSACTION/ISOLATION_LEVEL READ-COMMITTED --! of five !--" << std::endl
       << "\t/LIBRARY/CACHE_MODE         NONE | GLOBAL | LOCAL" << std::endl
+      << "\t/COMPILER/REMOTE_MODE       FALSE  --! clients may compile; code execution !--" << std::endl
       << "\t/COMPILER/CPP               c++" << std::endl
       << "\t/SERVER/TYPE                TCP | IPC" << std::endl
       << "\t/SERVER/PORT                2160   --! the binary protocol !--" << std::endl

@@ -2,6 +2,8 @@
 #ifndef __BINARYSTREAM_HPP__
 #define __BINARYSTREAM_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 
 namespace Zigurat
@@ -29,6 +31,20 @@ namespace Zigurat
     virtual std::basic_ostream<char_type>& write(const char_type*, std::streamsize, std::streampos);
     virtual std::basic_ostream<char_type>& write(std::istream&, std::streamsize, std::streampos);
     virtual std::basic_ostream<char_type>& fill_n(size_t, char_type);
+
+    // Push what has been written the rest of the way, to the disk itself.
+    //
+    // flush() only empties this process's buffers into the operating system,
+    // which is enough for another process to read but not enough to survive the
+    // machine losing power: the kernel is free to hold it in cache for as long
+    // as it likes, and to write it out in whatever order suits it. Copy on write
+    // only recovers correctly if the new record reaches the platter before the
+    // control block that adopts it, and that ordering is exactly what a cache is
+    // entitled to ignore.
+    //
+    // False when there is nowhere to push to, which is every stream that is not
+    // a file.
+    virtual bool sync_to_disk();
 
     // STD Types out
     virtual bool read_std_bool();

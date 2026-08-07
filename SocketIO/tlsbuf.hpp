@@ -2,6 +2,8 @@
 #ifndef __TLSBUF_HPP__
 #define __TLSBUF_HPP__
 
+
+#include <cstdint>
 #include "tcpstream.hpp"
 #include "tls.hpp"
 #include "networkstream.hpp"
@@ -21,44 +23,16 @@ namespace Zigurat
     TLS::ProtocolVersion     _protocol_version = TLS::VERSION_1_2;
     TLS::HandshakeParameters _handshake_params;
 
-    // One counter per direction. A single shared counter was incremented by
-    // both the sender and the receiver, so the two ends disagreed about the
-    // sequence number the moment traffic stopped being strictly alternating,
-    // and every MAC after that point failed. Each is reset when the cipher
-    // state changes, which is what a ChangeCipherSpec means.
-    uint64_t                 _read_sequence_number = 0;
-    uint64_t                 _write_sequence_number = 0;
-
-    // TLS keeps one cipher state per direction, and they change at different
-    // moments: a ChangeCipherSpec only ever settles the direction it travels in.
-    // A single shared state meant that sending one also switched this end's
-    // reading, so anything the peer sent before its own ChangeCipherSpec -- an
-    // alert refusing the handshake, most importantly -- was decrypted with keys
-    // the peer had not started using, and came out as noise.
-    TLS::SecurityParameters  _read_state, _write_state, _pending_state;
-
-    uint8_t *client_write_MAC_key = nullptr;
-    uint8_t *server_write_MAC_key = nullptr;
-    uint8_t *client_write_key     = nullptr;
-    uint8_t *server_write_key     = nullptr;
-    uint8_t *client_write_IV      = nullptr;
-    uint8_t *server_write_IV      = nullptr;
-
-    // Every handshake message that crosses the connection, in order and exactly
-    // as it appeared, header included. Finished proves both ends saw the same
-    // conversation, and CertificateVerify signs it, so it has to be the bytes
-    // rather than a re-encoding of them.
-    networkstream _transcript;
-
-    void _transcribe(binarystream&);
-    void _transcript_hash(uint8_t*);
-    void _transcript_bytes(binarystream&);
-
-    void _send_record(TLS::Record&);
-    void _recv_record(TLS::Record&);
-    void _alert(TLS::AlertLevel, TLS::AlertDescription);
-    void _send_handshake(TLS::Handshake&);
-    void _recv_handshake(TLS::Handshake&);
+    // OpenSSL owns the connection now. What used to sit here -- the read and
+    // write cipher states, six key and IV pointers, two sequence numbers and a
+    // running transcript of the handshake -- was the machinery of a TLS
+    // implementation written in this repository, and none of it is wanted.
+    //
+    // _ssl owns the BIO wrapped round the socket. _tcpstream stays because it
+    // opens and closes the socket and holds the timeouts; nothing reads or
+    // writes through it any more, and doing so would take bytes out from under
+    // the record layer.
+    void* _ssl = nullptr;      // SSL*, cast inside tlsbuf.cpp
 
     // Who the peer turned out to be, once its certificate has been checked
     // against the authority, and what that certificate says it may do. The
@@ -67,21 +41,19 @@ namespace Zigurat
     std::string              _peer_subject;
     std::vector<std::string> _peer_permissions;
 
-    void _credential(const std::string&, binarystream&);
-    void _check_peer_certificate(binarystream&);
+    // Fills _peer_subject and _peer_permissions from the certificate the peer
+    // presented, once OpenSSL has decided it is one this authority vouched for.
+    void _capture_peer();
 
-    void _send_certificate();
-    void _recv_certificate(binarystream&);
-    void _send_change_cipher_spec();
-    void _recv_change_cipher_spec();
-    void _derive_keys(binarystream&);
-    void _send_finished(const char*);
-    void _recv_finished(const char*);
+  public:
+    // Called from OpenSSL's verify callback once a certificate has been shown
+    // to be genuine and issued by this end's authority. Takes the subject and
+    // the permissions off it and asks the authorize hook whether this server
+    // has heard of the holder. Public only because a C callback has to reach
+    // it; nothing else should.
+    bool authorize_peer(void*);
 
-    void _server_hello();
-    void _server_handshake();
-    void _client_hello();
-    void _client_handshake();
+  protected:
 
   public:
     // The distinguished name on the peer's certificate. Empty until the
@@ -115,7 +87,6 @@ namespace Zigurat
     virtual int_type overflow(int_type = traits_type::eof()) override;
     virtual int_type pbackfail(int_type = traits_type::eof()) override;
 
-    virtual void renegotiate();    
     virtual bool is_open() const;
     virtual tlsbuf* close();
     virtual ~tlsbuf();

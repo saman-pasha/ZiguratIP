@@ -16,7 +16,7 @@ BEGIN
 		     			</tr>
 				</thead>
 				<tbody>';	
-		SELECT '<tr>' AS 'rt, tr',
+		SELECT '<tr>',
 		       '<td>', obj_id, '</td>',
 		       '<td>', obj_type, '</td>',
 		       '<td>', obj_domain, '</td>',

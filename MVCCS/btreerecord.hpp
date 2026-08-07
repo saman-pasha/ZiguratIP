@@ -2,6 +2,8 @@
 #ifndef __BTREERECORD_HPP__
 #define __BTREERECORD_HPP__
 
+
+#include <cstdint>
 #include "basetable.hpp"
 #include "typebool.hpp"
 #include "typeshort.hpp"

@@ -249,6 +249,199 @@ ZTEST(Grammar, clauses_sequence)
 
 
 // ---------------------------------------------------------------------------
+// BEGIN HPP / BEGIN CPP -- C++ taken whole
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The one clause the tokenizer does not tokenize, so these check what came
+  // out the other side rather than only that it parsed.
+  const Expression* block_of(const Expression& suite, const std::string& kind)
+  {
+    for (const Expression& object : suite.args)
+      for (const Expression& clause : object.args)
+	if (clause.token.value == kind) return &clause;
+    return nullptr;
+  }
+
+  std::string block_body(const std::string& source, const std::string& kind)
+  {
+    const Expression suite = parse("SUITE", source);
+    const Expression* block = block_of(suite, kind);
+    if (block == nullptr || block->args.empty()) return "<none>";
+    const std::string& raw = block->args[0].token.value;
+    if (raw.size() < 23) return "<short>";
+    return raw.substr(12, raw.size() - 23);   // the R"ZIP0ML0S0( ... )ZIP0ML0S0" wrapper
+  }
+}
+
+ZTEST(Grammar, a_cpp_block_reaches_the_compiler_untouched)
+{
+  // Every one of these would have been eaten by the tokenizer: :: is a name
+  // separator, < and > are operators, // opens a comment and " opens a string.
+  ZCHECK_STR(block_body("CLASS c BEGIN\nBEGIN CPP\n"
+			"struct N : a::b { int f() { return 1 < 2 ? 3 : 4; } }; // note\n"
+			"END\nEND",
+			"CPP"),
+	     "struct N : a::b { int f() { return 1 < 2 ? 3 : 4; } }; // note");
+}
+
+// The failure this rule exists to survive. C++ may say END wherever it likes,
+// so long as it is never alone on a line -- which is a rule about layout and
+// therefore one a generator can be held to.
+ZTEST(Grammar, END_inside_a_literal_does_not_close_a_block)
+{
+  ZCHECK_STR(block_body("CLASS c BEGIN\nBEGIN CPP\n"
+			"const char* s = \"END\";\n"
+			"int after_the_literal = 1;\n"
+			"END\nEND",
+			"CPP"),
+	     "const char* s = \"END\";\nint after_the_literal = 1;");
+}
+
+ZTEST(Grammar, hpp_and_cpp_are_separate_blocks)
+{
+  const std::string source =
+    "CLASS c BEGIN\n"
+    "BEGIN HPP\nstruct N;\nEND\n"
+    "BEGIN CPP\nstruct N { int x; };\nEND\n"
+    "END";
+
+  ZCHECK_STR(block_body(source, "HPP"), "struct N;");
+  ZCHECK_STR(block_body(source, "CPP"), "struct N { int x; };");
+}
+
+// An empty block is legal and produces nothing, which matters because a
+// generator emitting no declarations should not have to omit the clause.
+ZTEST(Grammar, an_empty_block_is_legal)
+{
+  ZCHECK(parses("SUITE", "CLASS c BEGIN\nBEGIN HPP\nEND\nEND"));
+  ZCHECK_STR(block_body("CLASS c BEGIN\nBEGIN HPP\nEND\nEND", "HPP"), "");
+}
+
+// A block that never closes must be refused rather than swallowing the rest of
+// the file, which is what a missing END would otherwise do.
+ZTEST(Grammar, an_unterminated_block_is_refused)
+{
+  ZCHECK(!parses("SUITE", "CLASS c BEGIN\nBEGIN CPP\nstruct N { int x; };\n"));
+}
+
+// A procedure takes blocks too, which is the awkward one: its body already
+// opens with BEGIN, so `BEGIN CPP' has to be told apart from it by what
+// follows. The case that matters is the one with no block at all -- every
+// procedure ever written is that case.
+ZTEST(Grammar, a_procedure_takes_blocks_and_still_parses_without_them)
+{
+  ZCHECK(parses("SUITE", "PROCEDURE p() RETURNS Long\nBEGIN\nRETURN 1L;\nEND"));
+
+  ZCHECK(parses("SUITE",
+		"PROCEDURE p() RETURNS Long\n"
+		"BEGIN CPP\nstruct H { int v; };\nEND\n"
+		"BEGIN\nRETURN 1L;\nEND"));
+
+  // REQUIRES in front of it, because that is where the lookahead is tightest.
+  ZCHECK(parses("SUITE",
+		"PROCEDURE p() RETURNS Long\nREQUIRES demo::books\n"
+		"BEGIN HPP\nstruct H;\nEND\n"
+		"BEGIN CPP\nstruct H { int v; };\nEND\n"
+		"BEGIN\nRETURN 1L;\nEND"));
+}
+
+// Ordinary clauses still parse on either side of a block: the tokenizer has to
+// hand control back, and the line numbering has to survive the jump.
+ZTEST(Grammar, clauses_survive_on_both_sides_of_a_block)
+{
+  ZCHECK(parses("SUITE",
+		"CLASS c BEGIN\n"
+		"PRIVATE:\n"
+		"BEGIN CPP\nstruct N { int x; };\nEND\n"
+		"PUBLIC:\n"
+		"DECLARE v AS Long;\n"
+		"END"));
+}
+
+
+// ---------------------------------------------------------------------------
+// INCLUDE and LINK inside an object
+// ---------------------------------------------------------------------------
+
+namespace
+{
+  // The text of the first INCLUDE or LINK found in an object body, unwrapped.
+  std::string clause_arg(const std::string& source, const std::string& kind)
+  {
+    const Expression suite = parse("SUITE", source);
+    const Expression* clause = block_of(suite, kind);
+    if (clause == nullptr || clause->args.empty()) return "<none>";
+    const std::string& raw = clause->args[0].token.value;
+    if (raw.size() < 23) return "<short>";
+    return raw.substr(12, raw.size() - 23);
+  }
+}
+
+ZTEST(Grammar, a_class_carries_its_own_include_and_link)
+{
+  const std::string source =
+    "CLASS c BEGIN\n"
+    "INCLUDE '<torch/torch.h>';\n"
+    "LINK '-ltorch';\n"
+    "PUBLIC:\n"
+    "DECLARE v AS Long;\n"
+    "END";
+
+  ZCHECK(parses("SUITE", source));
+  ZCHECK_STR(clause_arg(source, "INCLUDE"), "<torch/torch.h>");
+  ZCHECK_STR(clause_arg(source, "LINK"), "-ltorch");
+}
+
+// A procedure's clauses sit in the same run of lookahead as BEGIN HPP, between
+// RETURNS and the body -- so the case to hold is a clause immediately before
+// the BEGIN that opens the body.
+ZTEST(Grammar, a_procedure_carries_its_own_include_and_link)
+{
+  const std::string source =
+    "PROCEDURE p() RETURNS Long\n"
+    "INCLUDE '<cmath>';\n"
+    "LINK '-lm';\n"
+    "BEGIN\nRETURN 1L;\nEND";
+
+  ZCHECK(parses("SUITE", source));
+  ZCHECK_STR(clause_arg(source, "INCLUDE"), "<cmath>");
+  ZCHECK_STR(clause_arg(source, "LINK"), "-lm");
+}
+
+// The two mix with blocks in either order, since both are lookahead on the same
+// token position.
+ZTEST(Grammar, clauses_and_blocks_mix_in_an_object)
+{
+  ZCHECK(parses("SUITE",
+		"CLASS c BEGIN\n"
+		"INCLUDE '<memory>';\n"
+		"BEGIN HPP\nstruct N;\nEND\n"
+		"LINK '-ltorch';\n"
+		"BEGIN CPP\nstruct N { int x; };\nEND\n"
+		"PUBLIC:\n"
+		"DECLARE v AS Long;\n"
+		"END"));
+
+  ZCHECK(parses("SUITE",
+		"PROCEDURE p() RETURNS Long\n"
+		"BEGIN HPP\nstruct H;\nEND\n"
+		"INCLUDE '<cmath>';\n"
+		"BEGIN\nRETURN 1L;\nEND"));
+}
+
+// File scope still works, and is still where a clause goes when more than one
+// object in the file wants it.
+ZTEST(Grammar, file_scope_clauses_are_unchanged)
+{
+  ZCHECK(parses("SUITE",
+		"INCLUDE '<vector>';\nLINK '-lm';\n"
+		"CLASS c BEGIN\nPUBLIC:\nDECLARE v AS Long;\nEND"));
+}
+
+
+// ---------------------------------------------------------------------------
 // Data manipulation
 // ---------------------------------------------------------------------------
 

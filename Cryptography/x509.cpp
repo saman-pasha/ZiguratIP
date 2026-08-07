@@ -10,10 +10,129 @@
 #include "utility.hpp"
 #include "certificateexception.hpp"
 #include <cstring>
+#include <memory>
+#include <sstream>
+
+// Before namespace Zigurat, because OpenSSL's X509 is a type at global scope
+// and this file defines a class of the same name. Inside Zigurat, the OpenSSL
+// one has to be written ::X509.
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/objects.h>
+#include <openssl/asn1.h>
 
 
 namespace Zigurat
 {
+
+  namespace
+  {
+    // Reading a certificate someone else sent used to mean walking its DER by
+    // hand: step over the version, count six fields, find a tag. That code ran
+    // on octets from the network, before the peer had proved anything, and it
+    // is the last place in this tree that should have been written here rather
+    // than taken from a library that many people read. These four functions --
+    // subject, public key, permissions, signature -- are the ones a handshake
+    // calls on a stranger's certificate, so they go first.
+
+    std::string stream_bytes(binarystream& stream)
+    {
+      stream.clear();
+      stream.seekg(0, std::ios::beg);
+      std::string out;
+      char buffer[8192];
+      while (stream.read(buffer, sizeof(buffer)) || stream.gcount() > 0) {
+        out.append(buffer, (size_t)stream.gcount());
+        if (!stream) break;
+      }
+      stream.clear();
+      stream.seekg(0, std::ios::beg);
+      return out;
+    }
+
+    struct BioFree  { void operator()(BIO* b) const { if (b) BIO_free(b); } };
+    struct CertFree { void operator()(::X509* c) const { if (c) ::X509_free(c); } };
+    struct KeyFree  { void operator()(EVP_PKEY* k) const { if (k) EVP_PKEY_free(k); } };
+
+    // DER first, then PEM. ca writes DER by default and PEM on request, and a
+    // peer sends whichever it was given.
+    std::unique_ptr< ::X509, CertFree> read_certificate(binarystream& stream)
+    {
+      const std::string bytes = stream_bytes(stream);
+      if (bytes.empty()) throw CertificateException("no certificate");
+
+      std::unique_ptr<BIO, BioFree> bio(BIO_new_mem_buf(bytes.data(), (int)bytes.size()));
+      if (!bio) throw CertificateException("out of memory reading a certificate");
+
+      ::X509* cert = d2i_X509_bio(bio.get(), nullptr);
+      if (cert == nullptr) {
+        BIO_reset(bio.get());
+        cert = PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr);
+      }
+      if (cert == nullptr) throw CertificateException("not a certificate");
+      return std::unique_ptr< ::X509, CertFree>(cert);
+    }
+
+    // The short names this tree writes a distinguished name with. Deliberately
+    // not X509_NAME_print_ex: its table says GN where this one says givenName,
+    // and the rendering is what names the files under home/etc/users, so a
+    // different spelling unregisters everyone who is registered. An OID with no
+    // entry here is written the way DER::oid_to_string writes one.
+    std::string attribute_name(const ASN1_OBJECT* object)
+    {
+      char dotted[128];
+      const int written = OBJ_obj2txt(dotted, sizeof(dotted), object, 1);
+      if (written <= 0) return "{ }";
+      const std::string oid(dotted, (size_t)((written < (int)sizeof(dotted)) ? written : (int)sizeof(dotted) - 1));
+
+      if (oid == "2.5.4.3")  return "CN";
+      if (oid == "2.5.4.4")  return "SN";
+      if (oid == "2.5.4.5")  return "serialNumber";
+      if (oid == "2.5.4.6")  return "C";
+      if (oid == "2.5.4.7")  return "L";
+      if (oid == "2.5.4.8")  return "ST";
+      if (oid == "2.5.4.10") return "O";
+      if (oid == "2.5.4.11") return "OU";
+      if (oid == "2.5.4.12") return "title";
+      if (oid == "2.5.4.41") return "name";
+      if (oid == "2.5.4.42") return "givenName";
+      if (oid == "2.5.4.43") return "initials";
+      if (oid == "2.5.4.44") return "generationQualifier";
+      if (oid == "2.5.4.46") return "dnQualifier";
+      if (oid == "2.5.4.65") return "pseudonym";
+      if (oid == "0.9.2342.19200300.100.1.25") return "DC";
+      if (oid == "1.2.840.113549.1.9.1")       return "emailAddress";
+
+      std::stringstream unknown;          // "{ 2 5 4 99 }", as DER writes it
+      unknown << "{ ";
+      std::string part;
+      std::stringstream in(oid);
+      while (std::getline(in, part, '.')) unknown << part << " ";
+      unknown << "}";
+      return unknown.str();
+    }
+
+    // The contents of a DER structure, without its own tag and length. The
+    // callers of certificate_public_key wrap what they get in a SEQUENCE
+    // themselves, so what comes out here has to be unwrapped the same way it
+    // always was.
+    std::string der_contents(const unsigned char* der, size_t length)
+    {
+      if (length < 2) throw CertificateException("truncated DER");
+      size_t index = 1;                                  // past the tag
+      size_t size = der[index++];
+      if (size & 0x80) {
+        const size_t count = size & 0x7f;
+        if (count == 0 || count > 4 || index + count > length) throw CertificateException("bad DER length");
+        size = 0;
+        for (size_t i = 0; i < count; i++) size = (size << 8) | der[index++];
+      }
+      if (index + size > length) throw CertificateException("DER runs past its buffer");
+      return std::string((const char*)der + index, size);
+    }
+  }
 
   size_t X509::_generate(std::string signature, binarystream& algorithm_id, binarystream& pik, binarystream& puk)
   {
@@ -888,67 +1007,41 @@ namespace Zigurat
   {
     std::vector<std::string> permissions;
 
-    bufferstream certificate;
-    X509::_load_certificate(crt_stream, certificate);
+    auto certificate = read_certificate(crt_stream);
 
-    bufferstream tbs;
-    DER::decode_sequence(certificate, tbs);
+    std::unique_ptr<ASN1_OBJECT, void(*)(ASN1_OBJECT*)>
+      oid(::OBJ_txt2obj(X509::PERMISSIONS_OID, 1), ::ASN1_OBJECT_free);
+    if (!oid) throw CertificateException("cannot read the permissions oid");
 
-    bufferstream version;
-    if (!DER::decode_context(tbs, version, 0))
-      return permissions;                       // v1: there is nowhere for them to be
+    const int where = ::X509_get_ext_by_OBJ(certificate.get(), oid.get(), -1);
+    if (where < 0) return permissions;    // v1, and anything issued before this existed
 
-    // Past serial, signature, issuer, validity, subject and the key, to [3].
-    for (int i = 0; i < 6; i++) {
-      if (tbs.tellg() >= tbs.length()) return permissions;
-      bufferstream skipped;
-      DER::decode_tlv(tbs, skipped);
-    }
+    ::X509_EXTENSION* extension = ::X509_get_ext(certificate.get(), where);
+    if (extension == nullptr) return permissions;
 
-    bufferstream wrapper, extensions;
-    if (!DER::decode_context(tbs, wrapper, 3)) return permissions;
-    DER::decode_sequence(wrapper, extensions);
+    const ASN1_OCTET_STRING* payload = ::X509_EXTENSION_get_data(extension);
+    if (payload == nullptr) return permissions;
 
-    const DER::oid_t wanted = permissions_oid();
+    // Inside the octet string is a SEQUENCE OF UTF8String, which is the shape
+    // issue() writes. Walking it is left to the ASN.1 decoder rather than done
+    // by hand, since these octets came off the wire.
+    const unsigned char* p = ::ASN1_STRING_get0_data(payload);
+    long remaining = ::ASN1_STRING_length(payload);
 
-    while (extensions.tellg() < extensions.length()) {
+    long body = 0;
+    int tag = 0, cls = 0;
+    if (::ASN1_get_object(&p, &body, &tag, &cls, remaining) & 0x80)
+      throw CertificateException("permissions extension is malformed");
+    if (tag != V_ASN1_SEQUENCE) throw CertificateException("permissions extension is not a sequence");
 
-      bufferstream extension;
-      DER::decode_sequence(extensions, extension);
-
-      DER::oid_t oid = DER::decode_oid(extension);
-      if (oid != wanted) continue;              // some other extension: not ours to read
-
-      // critical is optional and defaults to false, so it may or may not be
-      // sitting between the OID and the payload.
-      bufferstream payload;
-      const std::streampos mark = extension.tellg();
-      try {
-	DER::decode_octet_string(extension, payload);
-      } catch (const std::exception&) {
-	extension.clear();
-	extension.seekg(mark, std::ios::beg);
-	DER::decode_boolean(extension);
-	payload.string("");
-	DER::decode_octet_string(extension, payload);
-      }
-
-      bufferstream granted;
-      DER::decode_sequence(payload, granted);
-
-      // decode_utf8_string writes into an array, so the length is read from the
-      // header first to know how much room to give it.
-      while (granted.tellg() < granted.length()) {
-	const std::streampos mark = granted.tellg();
-	DER::decode_tag(granted);
-	const size_t length = DER::decode_length(granted);
-	granted.clear();
-	granted.seekg(mark, std::ios::beg);
-
-	std::vector<uint8_t> text(length + 1, 0);
-	DER::decode_utf8_string(granted, text.data());
-	permissions.push_back(std::string((const char*)text.data(), length));
-      }
+    const unsigned char* end = p + body;
+    while (p < end) {
+      long item = 0;
+      if (::ASN1_get_object(&p, &item, &tag, &cls, end - p) & 0x80)
+        throw CertificateException("permissions extension is malformed");
+      if (tag != V_ASN1_UTF8STRING) throw CertificateException("a permission is not a utf8 string");
+      permissions.push_back(std::string((const char*)p, (size_t)item));
+      p += item;
     }
 
     return permissions;
@@ -956,13 +1049,28 @@ namespace Zigurat
 
   void X509::certificate_public_key(binarystream& crt_stream, binarystream& puk_info)
   {
-    bufferstream certificate;
-    X509::_load_certificate(crt_stream, certificate);
+    auto certificate = read_certificate(crt_stream);
 
-    bufferstream spki;
-    _tbs_element(certificate, 5, spki);          // subjectPublicKeyInfo
+    ::X509_PUBKEY* pubkey = ::X509_get_X509_PUBKEY(certificate.get());
+    if (pubkey == nullptr) throw CertificateException("certificate carries no public key");
 
-    DER::decode_sequence(spki, puk_info);
+    unsigned char* der = nullptr;
+    const int length = ::i2d_X509_PUBKEY(pubkey, &der);
+    if (length <= 0 || der == nullptr) throw CertificateException("cannot encode the public key");
+
+    std::string contents;
+    try {
+      // i2d gives a whole SubjectPublicKeyInfo; this has always handed back its
+      // contents and left the caller to wrap them, and tlsbuf and ca both do.
+      contents = der_contents(der, (size_t)length);
+    } catch (...) {
+      OPENSSL_free(der);
+      throw;
+    }
+    OPENSSL_free(der);
+
+    puk_info.write(contents.data(), (std::streamsize)contents.size());
+    puk_info.seekg(0, std::ios::beg);
   }
 
   // Rendered the way OpenSSL prints a name -- "C=US, CN=..." -- so what a
@@ -1001,33 +1109,27 @@ namespace Zigurat
 
   std::string X509::certificate_subject(binarystream& crt_stream)
   {
-    bufferstream certificate;
-    X509::_load_certificate(crt_stream, certificate);
-
-    bufferstream subject_tlv;
-    _tbs_element(certificate, 4, subject_tlv);   // subject
-
-    bufferstream rdns;
-    DER::decode_sequence(subject_tlv, rdns);
+    auto certificate = read_certificate(crt_stream);
+    ::X509_NAME* subject = ::X509_get_subject_name(certificate.get());
+    if (subject == nullptr) throw CertificateException("certificate has no subject");
 
     std::string name;
-    while (rdns.length() > rdns.tellg()) {
+    const int count = ::X509_NAME_entry_count(subject);
+    for (int i = 0; i < count; i++) {
+      ::X509_NAME_ENTRY* entry = ::X509_NAME_get_entry(subject, i);
+      if (entry == nullptr) continue;
 
-      bufferstream rdn, attribute;
-      DER::decode_set(rdns, rdn);
-      DER::decode_sequence(rdn, attribute);
+      const ASN1_OBJECT* object = ::X509_NAME_ENTRY_get_object(entry);
+      const ASN1_STRING* value  = ::X509_NAME_ENTRY_get_data(entry);
+      if (object == nullptr || value == nullptr) continue;
 
-      DER::oid_t oid = DER::decode_oid(attribute);
-
-      bufferstream value;
-      DER::decode_tlv(attribute, value);
-      DER::decode_tag(value);
-      const size_t length = DER::decode_length(value);
-      std::string text((size_t)length, 0);
-      if (length > 0) value.read(&text[0], (std::streamsize)length);
+      // The octets as they stand, which is what the hand written reader took:
+      // no transcoding, so a UTF-8 name stays the bytes it arrived as.
+      const std::string text((const char*)::ASN1_STRING_get0_data(value),
+                             (size_t)::ASN1_STRING_length(value));
 
       if (!name.empty()) name += ", ";
-      name += _attribute_name(oid) + "=" + text;
+      name += attribute_name(object) + "=" + text;
     }
 
     return name;
@@ -1178,18 +1280,27 @@ namespace Zigurat
 
   void X509::validate_by_puk(binarystream& puk_stream, binarystream& crt_stream)
   {
-    bufferstream puk_info;
-    X509::_load_puk_info(puk_stream, puk_info);
+    const std::string key_bytes = stream_bytes(puk_stream);
+    if (key_bytes.empty()) throw CertificateException("no public key");
 
-    bufferstream certificate;
-    X509::_load_certificate(crt_stream, certificate);
+    std::unique_ptr<BIO, BioFree> bio(BIO_new_mem_buf(key_bytes.data(), (int)key_bytes.size()));
+    if (!bio) throw CertificateException("out of memory reading a public key");
 
-    bufferstream tbs_certificate_data, signature_algorithm_id, signature_value;
-    DER::decode_tlv(certificate, tbs_certificate_data);
-    DER::decode_sequence(certificate, signature_algorithm_id);
-    DER::decode_bit_string(certificate, signature_value);
+    EVP_PKEY* raw = ::d2i_PUBKEY_bio(bio.get(), nullptr);
+    if (raw == nullptr) {
+      BIO_reset(bio.get());
+      raw = ::PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
+    }
+    if (raw == nullptr) throw CertificateException("not a public key");
+    std::unique_ptr<EVP_PKEY, KeyFree> key(raw);
 
-    X509::_verify(puk_info, signature_algorithm_id, tbs_certificate_data, signature_value);
+    auto certificate = read_certificate(crt_stream);
+
+    // One call, and it covers what three hand written steps used to: pulling
+    // the tbsCertificate back out as the exact octets that were signed, reading
+    // the algorithm, and checking the signature over them.
+    if (::X509_verify(certificate.get(), key.get()) != 1)
+      throw CertificateException("the certificate was not signed by this key");
   }
 
 }

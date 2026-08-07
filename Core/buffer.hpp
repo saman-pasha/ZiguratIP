@@ -2,6 +2,8 @@
 #ifndef __BUFFER_HPP__
 #define __BUFFER_HPP__
 
+
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <initializer_list>

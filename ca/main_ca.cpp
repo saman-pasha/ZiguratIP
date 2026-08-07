@@ -3,6 +3,7 @@
 #include <string>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include "certificateexception.hpp"
 #include "utility.hpp"
 #include "argument.hpp"

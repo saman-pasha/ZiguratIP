@@ -235,7 +235,22 @@ namespace Zigurat
     system(echo_compile_cmd.c_str());
     cpp_compile_cmd += " >> " + out_file_path + " 2>&1";
 
-    std::string cpp_build_cmd = this->_cpp + " " + this->_ld_flags + " -L" + this->_lib_path + " -L" + this->_ld_path 
+    // -L is where the linker looks; it says nothing about where the loader will
+    // look later. A Mach-O object records each dependency by the path it was
+    // linked from, so on macOS an object that requires another finds it with
+    // nothing further asked. An ELF object records only the file name, and the
+    // loader then searches its own paths, which do not include ld_path -- so a
+    // procedure that REQUIRES a table opened with "lib_DEMO::AUTHORS_.so:
+    // cannot open shared object file", having linked against that very file a
+    // moment earlier. Record the two directories in the object itself rather
+    // than requiring whoever starts the server to have exported them.
+    std::string rpath_flags;
+#if !defined(_WIN32) && !defined(_WIN64)
+    rpath_flags = " -Wl,-rpath," + this->_lib_path + " -Wl,-rpath," + this->_ld_path;
+#endif
+
+    std::string cpp_build_cmd = this->_cpp + " " + this->_ld_flags + " -L" + this->_lib_path + " -L" + this->_ld_path
+      + rpath_flags
       + " -o " + ld_file_path + " " + obj_file_path + " " + libs_pack_code.str();
     std::string echo_build_cmd = "echo \"" + cpp_build_cmd + "\" >> " + out_file_path + ENDL;
     system(echo_build_cmd.c_str());
@@ -449,13 +464,37 @@ namespace Zigurat
     }
   }
 
+  // ECHO escapes what it is given, unless the page wrote it as a literal.
+  //
+  // Nothing escaped anything before this, and the shipped example of how to
+  // write a page -- demo/03-pages.parsi -- puts database columns straight into
+  // HTML. So anything a visitor could get into a table came back out as markup,
+  // and the pattern was the one anybody following the tutorial would copy.
+  //
+  // Escaping everything is not an option: a page is mostly markup, and it is
+  // written as literals in the source. But that is the distinction worth
+  // drawing, and it happens to be exactly the right one -- a literal is markup
+  // the author typed, and everything else is a value from somewhere else. So
+  // literals go out as they are and values are escaped, and a page that was
+  // already correct is unchanged while one that was not is fixed without its
+  // author doing anything.
+  //
+  // A page that really does have markup in a variable says so with
+  // Utility::raw, which is the only way past this.
   void Compiler::_echo(const Expression& ast, std::stringstream& code, int lvl)
   {
     std::string tab(lvl, '\t');
     for (const Expression& expr : ast.args) {
-      code << tab << "*Globals::echo_stream() << ";
-      this->_expr.compile(expr, code);
-      code << ';' << std::endl;
+
+      if (expr.token.type == TokenType::STR) {
+	code << tab << "*Globals::echo_stream() << ";
+	this->_expr.compile(expr, code);
+	code << ';' << std::endl;
+      } else {
+	code << tab << "Zigurat::Utility::echo_escaped(*Globals::echo_stream(), ";
+	this->_expr.compile(expr, code);
+	code << ");" << std::endl;
+      }
     }
   }
 
@@ -468,9 +507,25 @@ namespace Zigurat
       if (expr.token.value == "GLOBAL") {
         storage = 's';
 	offset++;
-      } else if (expr.token.value == "SESSION") {
+      } else if (expr.token.value == "THREAD") {
         storage = 't';
 	offset++;
+      } else if (expr.token.value == "SESSION") {
+
+	// SESSION LOCAL was thread_local wearing the wrong name, and the name is
+	// the dangerous part: it reads as "belongs to this visitor" and means
+	// "belongs to this worker thread". Worker threads are pooled across
+	// visitors, so anything a page kept there was handed to whoever the
+	// thread served next.
+	//
+	// Refused here rather than removed from the grammar, so this says which
+	// of the two things was meant instead of "syntax error near SESSION".
+	throw CompileException("SESSION LOCAL is thread local, not session local, and the two are"
+			       " not the same: a worker thread serves many visitors in turn."
+			       " Use THREAD LOCAL for something shared by everything that"
+			       " thread serves -- a connection, a buffer -- or Session::SET and"
+			       " Session::GET for anything belonging to the visitor", expr);
+
       } else if (in_impl) {
 	continue;
       }

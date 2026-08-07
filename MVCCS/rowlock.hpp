@@ -2,6 +2,8 @@
 #ifndef __ROWLOCK_HPP__
 #define __ROWLOCK_HPP__
 
+
+#include <cstdint>
 namespace Zigurat {
 
   enum class RowLock : uint8_t

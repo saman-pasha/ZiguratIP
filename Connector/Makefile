@@ -4,9 +4,11 @@ TYPE := Library
 
 HEADERS := connector.hpp \
 	connectorexception.hpp \
-	resulttype.hpp
+	resulttype.hpp \
+	rpcpool.hpp
 
-SOURCES := connector.cpp
+SOURCES := connector.cpp \
+	rpcpool.cpp
 
 LIBS := -lCore -lConfiguration -lStreamIO -lSocketIO
 

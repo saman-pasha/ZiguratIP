@@ -2,6 +2,8 @@
 #ifndef __TEXT_HPP__
 #define __TEXT_HPP__
 
+
+#include <cstdint>
 #include "typeobject.hpp"
 #include "typeulong.hpp"
 #include <string>

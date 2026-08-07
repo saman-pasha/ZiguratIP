@@ -1,3 +1,5 @@
+INCLUDE '"httprequest.hpp"';
+INCLUDE '"httpresponse.hpp"';
 
 PAGE Compiler
 REQUIRES Connector, CompilerDrawer 
@@ -19,7 +21,7 @@ PUBLIC:
 				CALL drawer.draw();
 				CALL con.close();
 			END CATCH ex AS Exception BEGIN
-				DECLARE drawer AS CompilerDrawer(request.post('code'), ex.message());
+				DECLARE drawer AS CompilerDrawer(request.post('code'), ex.`message());
 				CALL drawer.draw();
 			END
 		END

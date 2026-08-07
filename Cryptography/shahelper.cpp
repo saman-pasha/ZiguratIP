@@ -1,103 +1,138 @@
 #include "shahelper.hpp"
-#include "sha.hpp"
 #include "cryptographyexception.hpp"
 #include "utility.hpp"
+#include <vector>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 
 namespace Zigurat
 {
 
+  namespace
+  {
+    // The digests were five files of hand-written SHA -- the reference code
+    // from RFC 6234, carried in the tree and maintained here. They computed
+    // the right answers, which is the least that can be asked of a digest and
+    // not much of an argument for keeping them: this is exactly the code that
+    // ought to be somebody else's, reviewed by more people than have ever read
+    // this repository.
+    //
+    // The output is unchanged, and has to be. SHA-1 digests name the B-tree
+    // index files under home/data and the compiled objects under home/ld, so a
+    // different byte here does not produce a wrong answer -- it produces a
+    // store whose indexes cannot be found.
+    const EVP_MD* digest_of(SHA::Version version)
+    {
+      switch (version) {
+      case SHA::Version::SHA1:   return EVP_sha1();
+      case SHA::Version::SHA224: return EVP_sha224();
+      case SHA::Version::SHA256: return EVP_sha256();
+      case SHA::Version::SHA384: return EVP_sha384();
+      case SHA::Version::SHA512: return EVP_sha512();
+      default: throw CryptographyException("sha unknown version");
+      }
+    }
+
+    // Reading a caller's length into a buffer, without putting that length on
+    // the stack. The stream overloads used to say uint8_t buffer[length] with
+    // the length passed in by whoever called them -- the same array-of-unknown-
+    // size that killed the server when it was asked for a large file.
+    const size_t CHUNK = 64 * 1024;
+  }
+
   void SHA::checksum(SHA::Version version, const uint8_t* octets, size_t length, uint8_t* digest)
   {
-    if (version == SHA::Version::SHA1) {
-      SHA1Context context;
-      if (SHA1Reset(&context) > 0)               throw CryptographyException("sha error");
-      if (SHA1Input(&context, octets, length))   throw CryptographyException("sha error");
-      if (SHA1Result(&context, digest) > 0)      throw CryptographyException("sha error");
-    } else if (version == SHA::Version::SHA224) {
-      SHA224Context context;
-      if (SHA224Reset(&context) > 0)             throw CryptographyException("sha error");
-      if (SHA224Input(&context, octets, length)) throw CryptographyException("sha error");
-      if (SHA224Result(&context, digest) > 0)    throw CryptographyException("sha error");
-    } else if (version == SHA::Version::SHA256) {
-      SHA256Context context;
-      if (SHA256Reset(&context) > 0)             throw CryptographyException("sha error");
-      if (SHA256Input(&context, octets, length)) throw CryptographyException("sha error");
-      if (SHA256Result(&context, digest) > 0)    throw CryptographyException("sha error");
-    } else if (version == SHA::Version::SHA384) {
-      SHA384Context context;
-      if (SHA384Reset(&context) > 0)             throw CryptographyException("sha error");
-      if (SHA384Input(&context, octets, length)) throw CryptographyException("sha error");
-      if (SHA384Result(&context, digest) > 0)    throw CryptographyException("sha error");
-    } else if (version == SHA::Version::SHA512) {
-      SHA512Context context;
-      if (SHA512Reset(&context) > 0)             throw CryptographyException("sha error");
-      if (SHA512Input(&context, octets, length)) throw CryptographyException("sha error");
-      if (SHA512Result(&context, digest) > 0)    throw CryptographyException("sha error");
-    } else {
-      throw CryptographyException("sha unknown version");
-    }
+    if (octets == nullptr && length > 0) throw CryptographyException("sha given no data");
+
+    unsigned int written = 0;
+    if (EVP_Digest(octets, length, digest, &written, digest_of(version), nullptr) != 1)
+      throw CryptographyException("sha error");
+    if (written != SHA::size(version)) throw CryptographyException("sha error");
   }
 
   void SHA::checksum(Version version, std::istream& octets, size_t length, std::ostream& digest)
   {
-    uint8_t octets_buffer[length];
-    octets.read((char*)octets_buffer, length);
-    
-    size_t  digest_length = SHA::size(version);
-    uint8_t digest_buffer[digest_length];
-  
-    SHA::checksum(version, octets_buffer, length, digest_buffer);
-  
-    digest.write((char*)digest_buffer, digest_length);
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (context == nullptr) throw CryptographyException("sha error");
+
+    try {
+      if (EVP_DigestInit_ex(context, digest_of(version), nullptr) != 1)
+	throw CryptographyException("sha error");
+
+      // Fed through in fixed pieces, so a length of any size costs the same
+      // sixty-four kilobytes rather than that much stack.
+      std::vector<uint8_t> buffer(CHUNK);
+      size_t remaining = length;
+      while (remaining > 0) {
+	const size_t want = (remaining < CHUNK) ? remaining : CHUNK;
+	octets.read((char*)buffer.data(), want);
+	const std::streamsize got = octets.gcount();
+	if (got <= 0) throw CryptographyException("sha short read");
+	if (EVP_DigestUpdate(context, buffer.data(), (size_t)got) != 1)
+	  throw CryptographyException("sha error");
+	remaining -= (size_t)got;
+      }
+
+      uint8_t out[EVP_MAX_MD_SIZE];
+      unsigned int written = 0;
+      if (EVP_DigestFinal_ex(context, out, &written) != 1)
+	throw CryptographyException("sha error");
+
+      EVP_MD_CTX_free(context);
+      digest.write((char*)out, written);
+    } catch (...) {
+      EVP_MD_CTX_free(context);
+      throw;
+    }
   }
 
   std::string SHA::checksum(Version version, const std::string& data)
   {
-    size_t  digest_length = SHA::size(version);
-    uint8_t digest_buffer[digest_length];
-    
+    uint8_t digest_buffer[EVP_MAX_MD_SIZE];
     SHA::checksum(version, (const uint8_t*)data.c_str(), data.length(), digest_buffer);
-
-    return Utility::octet_as_hex(digest_buffer, digest_length);
+    return Utility::octet_as_hex(digest_buffer, SHA::size(version));
   }
 
   void SHA::hmac(Version version, const uint8_t* key, size_t key_len, const uint8_t* text, size_t text_len, uint8_t* digest)
   {
-    switch (version) {
-    case SHA::Version::SHA1:   ::hmac(SHAversion::SHA1  , text, text_len, key, key_len, digest); break;
-    case SHA::Version::SHA224: ::hmac(SHAversion::SHA224, text, text_len, key, key_len, digest); break;
-    case SHA::Version::SHA256: ::hmac(SHAversion::SHA256, text, text_len, key, key_len, digest); break;
-    case SHA::Version::SHA384: ::hmac(SHAversion::SHA384, text, text_len, key, key_len, digest); break;
-    case SHA::Version::SHA512: ::hmac(SHAversion::SHA512, text, text_len, key, key_len, digest); break;
-    default: throw CryptographyException("sha unknown version");
-    }
+    unsigned int written = 0;
+    if (::HMAC(digest_of(version), key, (int)key_len, text, text_len, digest, &written) == nullptr)
+      throw CryptographyException("hmac error");
+    if (written != SHA::size(version)) throw CryptographyException("hmac error");
   }
 
   void SHA::hmac(Version version, std::istream& key, size_t key_length, std::istream& text, size_t text_length, std::ostream& digest)
   {
-    uint8_t key_buffer[key_length];
-    key.read((char*)key_buffer, key_length);
+    // Both of these were arrays sized by the caller's length as well.
+    std::vector<uint8_t> key_buffer(key_length);
+    if (key_length > 0) {
+      key.read((char*)key_buffer.data(), key_length);
+      if ((size_t)key.gcount() < key_length) throw CryptographyException("hmac short read");
+    }
 
-    uint8_t text_buffer[text_length];
-    text.read((char*)text_buffer, text_length);
+    std::vector<uint8_t> text_buffer(text_length);
+    if (text_length > 0) {
+      text.read((char*)text_buffer.data(), text_length);
+      if ((size_t)text.gcount() < text_length) throw CryptographyException("hmac short read");
+    }
 
-    size_t  digest_length = SHA::size(version);
-    uint8_t digest_buffer[digest_length];
+    uint8_t digest_buffer[EVP_MAX_MD_SIZE];
+    SHA::hmac(version, key_buffer.data(), key_length, text_buffer.data(), text_length, digest_buffer);
 
-    SHA::hmac(version, key_buffer, key_length, text_buffer, text_length, digest_buffer);
-
-    digest.write((char*)digest_buffer, digest_length);
+    digest.write((char*)digest_buffer, SHA::size(version));
   }
 
+  // Written out rather than asked of EVP_MD_get_size: these are fixed by the
+  // standard and will not change, and they are wanted before a context exists.
   size_t SHA::size(SHA::Version version)
   {
     switch (version) {
-    case SHA::Version::SHA1:   return SHA1HashSize;
-    case SHA::Version::SHA224: return SHA224HashSize;
-    case SHA::Version::SHA256: return SHA256HashSize;
-    case SHA::Version::SHA384: return SHA384HashSize;
-    case SHA::Version::SHA512: return SHA512HashSize;
+    case SHA::Version::SHA1:   return 20;
+    case SHA::Version::SHA224: return 28;
+    case SHA::Version::SHA256: return 32;
+    case SHA::Version::SHA384: return 48;
+    case SHA::Version::SHA512: return 64;
     default: throw CryptographyException("sha unknown version");
     }
   }

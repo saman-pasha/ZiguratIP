@@ -1,5 +1,6 @@
 #include "rsa.hpp"
 #include "shahelper.hpp"
+#include "utility.hpp"
 #include <cmath>
 #include <cstring>
 #include "cryptographyexception.hpp"
@@ -149,7 +150,12 @@ namespace Zigurat
         mod_t v = 0, w = 0;
 	mod_t::gcd(p_1, p_1, w, v);
 
-	int64_t t = 4;
+	// Four rounds leaves a composite accepted with probability up to 4^-4,
+	// which is about one in 256 -- far too often for something that is done
+	// once and then trusted for the life of the key. Sixty-four rounds is the
+	// conventional figure and costs nothing next to the search that found the
+	// candidate in the first place.
+	int64_t t = 64;
 	for (int64_t i = 0; i < t; i++) {
 
 	  mod_t a = mod_t::rand(1, p_1);
@@ -400,7 +406,7 @@ namespace Zigurat
     
     int64_t psLen = k - mLen - 3;
     uint8_t PS[psLen];
-    SGF(psLen, PS);
+    SGF_nonzero(psLen, PS);
     
     uint8_t EM[k];
     EM[0] = 0x00;
@@ -766,11 +772,33 @@ namespace Zigurat
       X[i] = lhs[i] ^ rhs[i];
   }
 
+  // OAEP seeds and PSS salts. Every octet is uniform over 0..255.
+  //
+  // This used to pick characters out of a 62 letter alphanumeric table with
+  // std::rand(), which is two separate faults. std::rand() was seeded from the
+  // clock, so the seed was as guessable as the key it was protecting; and an
+  // alphanumeric octet carries under six bits rather than eight and is
+  // recognisable on sight, so an attacker who could see the padding knew it was
+  // padding and had a third of the search space handed to them.
   void RSA::SGF(int64_t seedLen, uint8_t* S)
   {
-    static const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    for (int64_t i = 0; i < seedLen; i++)
-      S[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+    if (seedLen <= 0) return;
+    Utility::random_bytes(S, (size_t)seedLen);
+  }
+
+  // The padding string of a PKCS#1 v1.5 encryption block, where RFC 8017
+  // section 7.2.1 requires every octet to be nonzero: the first 0x00 after the
+  // 0x02 is what marks the end of the padding, so a zero drawn into PS would
+  // truncate the block and corrupt the message on the way back out.
+  void RSA::SGF_nonzero(int64_t psLen, uint8_t* PS)
+  {
+    if (psLen <= 0) return;
+    Utility::random_bytes(PS, (size_t)psLen);
+    for (int64_t i = 0; i < psLen; i++) {
+      // Redraw rather than substitute. Mapping zero onto a fixed octet would
+      // make that octet turn up twice as often as any other.
+      while (PS[i] == 0x00) Utility::random_bytes(PS + i, 1);
+    }
   }
 
 }

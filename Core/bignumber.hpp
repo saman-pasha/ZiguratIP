@@ -2,6 +2,8 @@
 #ifndef __BIGNUMBER_HPP__
 #define __BIGNUMBER_HPP__
 
+
+#include <cstdint>
 #include "polynomial.hpp"
 #include "buffer.hpp"
 #include <iostream>

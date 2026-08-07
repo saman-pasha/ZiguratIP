@@ -526,7 +526,7 @@ END
 
 The session store is shared across worker threads and swept for idle entries
 (`HTTP/SESSION_TIMEOUT`, 1800 seconds by default). `Session` itself is written
-in Parsi, in `System/session.sql` — but see [Status](#status): that file
+in C++, in `HTTP/session.cpp` (the Parsi original was removed: it
 does not currently compile.
 
 ---

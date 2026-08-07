@@ -2,6 +2,8 @@
 #ifndef __OBJECT_HPP__
 #define __OBJECT_HPP__
 
+
+#include <cstdint>
 #include "tdbyte.hpp"
 #include "zexception.hpp"
 

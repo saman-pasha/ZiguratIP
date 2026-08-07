@@ -39,6 +39,60 @@ namespace Zigurat
       conf << tab2 << "LEVEL: " << level << std::endl;
   }
 
+  // The text of a BEGIN HPP or BEGIN CPP block.
+  //
+  // The tokenizer wrapped it in the raw string literal every quoted Parsi
+  // string is wrapped in -- R"ZIP0ML0S0( ... )ZIP0ML0S0" -- because that is the
+  // one shape the rest of the compiler already carries. Twelve characters off
+  // the front and eleven off the back is that wrapper and nothing else.
+  static std::string block_text(const Expression& ast)
+  {
+    const std::string& raw = ast.args[0].token.value;
+    if (raw.size() < 23) return std::string();
+    return raw.substr(12, raw.size() - 23);
+  }
+
+  // INCLUDE and LINK written inside an object body belong to that object.
+  //
+  // File-scope clauses keep accumulating across the suite -- one INCLUDE above
+  // three classes still gives the header to all three, which is what every demo
+  // relies on. A body's clauses are added on top of whatever the file has
+  // gathered so far and taken back off once the object is built, so the next
+  // object in the same file does not inherit them. Which matters because each
+  // object compiles standalone into its own .so: a model's -ltorch is the
+  // model's, not its neighbour's.
+  namespace
+  {
+    struct ClauseScope
+    {
+      std::list<std::string>& includes;
+      std::list<std::string>& links;
+      const size_t include_mark;
+      const size_t link_mark;
+
+      ClauseScope(std::list<std::string>& incs, std::list<std::string>& lnks)
+	: includes(incs), links(lnks), include_mark(incs.size()), link_mark(lnks.size())
+      { }
+
+      ~ClauseScope()
+      {
+	while (this->includes.size() > this->include_mark) this->includes.pop_back();
+	while (this->links.size() > this->link_mark) this->links.pop_back();
+      }
+    };
+  }
+
+  void Compiler::_body_clauses(const Expression& ast)
+  {
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "INCLUDE") {
+	this->_include(expr);
+      } else if (expr.token.value == "LINK") {
+	this->_link(expr);
+      }
+    }
+  }
+
   void Compiler::_include(const Expression& ast)
   {
     this->_includes.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
@@ -247,6 +301,9 @@ namespace Zigurat
     head << TAB1 << "void prepare() override;" << std::endl;
     head << TAB1 << "void map() override;" << std::endl;
     head << TAB1 << "void unmap() override;" << std::endl;
+    // Shadows BaseTable::truncate_indexes, so Memory::truncate<T>() reaches
+    // this table's indexes rather than the empty one on the base.
+    head << TAB1 << "static void truncate_indexes();" << std::endl;
     head << TAB1 << "friend Zigurat::binarystream& operator<<(Zigurat::binarystream&, const " << name << "&);" << std::endl;
     head << TAB1 << "friend Zigurat::binarystream& operator>>(Zigurat::binarystream&, " << name << "&);"  << std::endl;
     head << "};" << std::endl;
@@ -362,6 +419,13 @@ namespace Zigurat
     impl << '{' << std::endl;
     for (const index_desc_t& index : indexes) {
       impl << TAB1 << name << "::" << std::get<3>(index) << ".unmap(*this);" << std::endl;
+    }
+    impl << '}' << std::endl;
+
+    impl << "void " << name << "::truncate_indexes()" << std::endl; // BTreeIndex truncate
+    impl << '{' << std::endl;
+    for (const index_desc_t& index : indexes) {
+      impl << TAB1 << name << "::" << std::get<3>(index) << ".truncate();" << std::endl;
     }
     impl << '}' << std::endl;
 
@@ -559,11 +623,15 @@ namespace Zigurat
     std::stringstream impl;
     std::stringstream conf;
     std::list<std::string> requires;
-      
+
+    // Lives until _build has written the files, then puts the two lists back.
+    ClauseScope clauses(this->_includes, this->_links);
+    this->_body_clauses(ast);
+
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
     head << "#include \"globals.hpp\"" << std::endl;
-    
+
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
 	for (const Expression& ch_expr : expr.args) {
@@ -572,6 +640,14 @@ namespace Zigurat
 	  head << "#include \"" << inc_name << ".hpp\"" << std::endl;
 	}
 	break;
+      }
+    }
+
+    // Above the namespace, so the block can carry its own headers -- the same
+    // arrangement _class uses, and for the same reason.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "HPP") {
+	head << block_text(expr) << std::endl;
       }
     }
 
@@ -587,9 +663,19 @@ namespace Zigurat
 
     head << "extern \"C\" void call();" << std::endl;
 
+    // Before the header include, for the reason spelled out in _class: this
+    // object's globals.hpp would otherwise have turned AUTO, CAST, VOID and
+    // NULL into macros before the block's own headers were parsed.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "CPP") {
+	impl << block_text(expr) << std::endl;
+      }
+    }
+
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
+
     this->_open_namespace(ast.args[0], impl);
-    
+
     impl << TAB1 << this->_type_name(ast.args[2].args[0]);
     impl << ' ' << name;
     this->_parameters_impl(ast.args[1], impl, 1);
@@ -727,7 +813,11 @@ namespace Zigurat
     
     if (is_tmpl_class && is_page)
       throw CompileException("pages couldn't be template", ast);
-      
+
+    // Lives until _build has written the files, then puts the two lists back.
+    ClauseScope clauses(this->_includes, this->_links);
+    this->_body_clauses(ast);
+
     // header file
 
     head << "#ifndef " << guard_name << std::endl;
@@ -747,8 +837,28 @@ namespace Zigurat
       }
     }
 
+    // A HPP block goes above the namespace, not inside the class.
+    //
+    // Not inside the class, because there `struct Net;' would declare a type
+    // nested in it, and the CPP block's `struct Net : ...' would be a different
+    // type entirely -- the nested one staying incomplete forever, which a
+    // member declared shared_ptr<Net> survives right up until the destructor
+    // needs it.
+    //
+    // And above the namespace rather than inside it, so that a block can carry
+    // its own #include. That is the whole reason for the two blocks: a model's
+    // <torch/torch.h> belongs to the implementation, and anything that lands in
+    // this header is inherited by every object that REQUIRES this one.
+    // Unqualified names still resolve from inside the namespace, so a member
+    // written shared_ptr<Net> finds it.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "HPP") {
+	head << block_text(expr) << std::endl;
+      }
+    }
+
     this->_open_namespace(ast.args[0], head);
-    
+
     if (is_tmpl_class) {
       const Expression* expr = &(ast.args[0]);
       while (!expr->args.empty()) {
@@ -864,9 +974,32 @@ namespace Zigurat
 
     // implementation file
 
+    // THE CPP BLOCK COMES FIRST, BEFORE THIS OBJECT'S OWN HEADER, and the
+    // reason is globals.hpp. It defines THIS, CAST, AUTO, VOID, TRUE, FALSE and
+    // NULL as bare macros, and a real C++ library is entitled to use any of
+    // those as an identifier -- libtorch has
+    //
+    //     enum class CuDNNDepthwiseKernel { AUTO, CUDNN, NATIVE };
+    //
+    // in ATen/Context.h, which with AUTO defined reads as `enum class { auto,
+    // ... }' and takes the rest of the header down with it. Emitted after the
+    // header include, a block could therefore not include libtorch at all.
+    //
+    // Before it, the block's headers are parsed while those names still mean
+    // themselves, and globals.hpp defines the macros afterwards for the
+    // generated code that actually wants them. Nothing is lost by the order: a
+    // block is independent C++ by construction -- it defines what the HPP block
+    // declared -- so it has no reason to see this object's own class first.
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "CPP") {
+	impl << block_text(expr) << std::endl;
+      }
+    }
+
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
+
     this->_open_namespace(ast.args[0], impl);
-    
+
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "DECLARE") {
 	this->_declare(expr, impl, 0, false, true, name);

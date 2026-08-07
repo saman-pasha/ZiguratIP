@@ -2,6 +2,7 @@
 #include "tokenizeexception.hpp"
 #include <iostream>
 #include <algorithm>
+#include <iterator>
 #include "token.hpp"
 #include "utility.hpp"
 
@@ -145,6 +146,84 @@ namespace Zigurat
 	} else {
 	  tokens.emplace_back(TokenType::NAME, name, blineno, bcolno);
 	}
+
+	// BEGIN HPP and BEGIN CPP: C++ taken whole, because it cannot be
+	// tokenized.
+	//
+	// By the time the parser saw a block of C++, `<' would be an operator,
+	// `//' a comment, `::' a name separator and the string literals
+	// something else again. So the tokenizer stops being one here: it finds
+	// the end of the block, takes the text untouched, and hands it on as a
+	// single string token for the compiler to splice.
+	//
+	// A block ends at a line that is nothing but END. That is a rule about
+	// layout rather than about C++, which is what makes it checkable -- C++
+	// may write END wherever it likes so long as it is never alone on a
+	// line. The alternative, counting BEGIN and END as a nesting depth,
+	// cannot work: C++ has neither word, so there is nothing to count.
+	if ((name == "HPP" || name == "CPP") && tokens.size() >= 2 &&
+	    std::prev(tokens.end(), 2)->type == TokenType::NAME &&
+	    std::prev(tokens.end(), 2)->value == "BEGIN") {
+
+	  size_t body_begin = code.find('\n', (size_t)(iter - code.begin()));
+	  if (body_begin == std::string::npos)
+	    throw TokenizeException("BEGIN " + name + " runs to the end of the source", blineno, bcolno, wch);
+	  body_begin++;
+
+	  size_t scan = body_begin;
+	  size_t body_end = std::string::npos;
+	  size_t resume = std::string::npos;
+	  size_t lines = 0;
+
+	  while (scan <= code.size()) {
+	    size_t eol = code.find('\n', scan);
+	    if (eol == std::string::npos) eol = code.size();
+
+	    // The line with its surrounding space taken off. Uppercased because
+	    // every other keyword in Parsi is matched that way.
+	    std::string line;
+	    size_t from = code.find_first_not_of(" \t\r", scan);
+	    if (from != std::string::npos && from < eol) {
+	      size_t to = code.find_last_not_of(" \t\r", eol - 1);
+	      if (to != std::string::npos && to >= from)
+		line = Utility::to_upper(code.substr(from, to - from + 1));
+	    }
+
+	    if (line == "END") {
+	      // Without the -1 the body would carry the newline that ends its
+	      // last line, and every block would gain a blank line each time it
+	      // went through here.
+	      body_end = (scan > body_begin) ? scan - 1 : body_begin;
+	      resume = eol;
+	      break;
+	    }
+
+	    lines++;
+	    if (eol == code.size()) break;
+	    scan = eol + 1;
+	  }
+
+	  if (body_end == std::string::npos)
+	    throw TokenizeException("BEGIN " + name + " has no END on a line of its own", blineno, bcolno, wch);
+
+	  // A raw string literal, the same shape a quoted Parsi string becomes,
+	  // so the compiler strips it the one way it already knows how.
+	  tokens.emplace_back(TokenType::STR,
+			      "R\"ZIP0ML0S0(" + code.substr(body_begin, body_end - body_begin) + ")ZIP0ML0S0\"",
+			      blineno, bcolno);
+	  tokens.emplace_back(TokenType::NAME, "END", blineno + lines + 1, 1);
+
+	  // Left one short of the newline that ends the END line, so the loop
+	  // steps onto it and counts it like any other -- which is what keeps
+	  // the line numbers in later diagnostics true.
+	  if (resume >= code.size()) resume = code.size() - 1;
+	  lineno = blineno + lines + 1;
+	  colno = 0;
+	  iter = code.begin() + (resume > 0 ? resume - 1 : 0);
+	  mode = '?';
+	  continue;
+	}
+
 	if (wch != '\r' && wch != '\n') {
 	  iter--;
 	  colno--;

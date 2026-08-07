@@ -2,6 +2,8 @@
 #ifndef __DBFIXTURE_HPP__
 #define __DBFIXTURE_HPP__
 
+
+#include <cstdint>
 // A concrete table plus a throwaway page store, so the ACID, isolation and
 // concurrency suites can drive real rows through MVCCS.
 

@@ -1,0 +1,204 @@
+-- ---------------------------------------------------------------------------
+-- A neural network as a Zigurat object, and a page that asks it a question.
+--
+-- The two blocks below are not written by hand. They are what Cicili's
+-- example/mnist-fragment.cicili emits from
+--
+--     (network Classifier
+--       (input   784)
+--       (dense   256 relu)
+--       (dense   128 relu)
+--       (dense    10 log-softmax))
+--
+-- the same four lines as its example/mnist-dsl.cicili, which trains this
+-- network against the real MNIST. Test/ai/classifier.hpp and .cpp are that
+-- output, copied in verbatim; Test/run-ai-e2e.sh regenerates and diffs them
+-- when a Cicili checkout is around.
+--
+-- THE SPLIT IS THE POINT. Everything that names torch is in the CPP block, so
+-- it is compiled once, into this object's own .so. The HPP block is a forward
+-- declaration and three prototypes -- which is all a page needs, and all it
+-- inherits by REQUIREing this object. A page gets the linkage without paying
+-- for the header.
+-- ---------------------------------------------------------------------------
+
+CLASS Demo::Classifier
+BEGIN
+	-- Inside the class, so they belong to this object and not to its
+	-- neighbours. These two are in the HEADER, because the members below are
+	-- typed with them -- and that is the whole list that belongs there.
+	INCLUDE '<memory>';
+	INCLUDE '<vector>';
+
+	-- Declarations. A forward declaration of Classifier and three prototypes,
+	-- which is all a page needs and all it inherits.
+	BEGIN HPP
+	#include "classifier.hpp"
+	END
+
+	-- Definitions, and TORCH IS INCLUDED HERE RATHER THAN ABOVE. That single
+	-- line placement is the point of having two blocks: written as an object
+	-- INCLUDE it would land in this object's header, and every page that
+	-- REQUIRES Demo::Classifier would compile <torch/torch.h> too. Here it
+	-- stays in this object's own translation unit, and a page still inherits
+	-- the linkage -- links() carries it -- without paying for the header.
+	--
+	-- run-ai-e2e.sh rewrites the stub include for the run against the real
+	-- library; nothing else in this file changes between the two.
+	-- <memory> IS REPEATED HERE ON PURPOSE. The INCLUDE above reaches the
+	-- object's header, and the header is included AFTER this block -- the
+	-- block goes first so its own headers are parsed before globals.hpp turns
+	-- AUTO, CAST, VOID and NULL into macros. So a block is on its own for
+	-- what it needs: classifier.cpp names std::shared_ptr, and nothing else
+	-- here would have declared it.
+	--
+	-- Against real libtorch this was invisible, because <torch/torch.h> drags
+	-- <memory> in behind it. It showed up only against the stub, which is one
+	-- argument for keeping the stub tier.
+	BEGIN CPP
+	#include <memory>
+	#include <cstdio>
+	#include "torch_stub.hpp"
+	#include "classifier.cpp"
+	END
+
+PRIVATE:
+	DECLARE _net AS `std::`shared_ptr<`Classifier>;
+	DECLARE _pixels AS `std::`vector<`float>;
+
+PUBLIC:
+	-- The weights are loaded ONCE, here, and the handle lives as long as the
+	-- object does. Which is the whole reason this is a CLASS and not a
+	-- PROCEDURE: a procedure would reload them on every call.
+	--
+	-- WEIGHTS COME FROM THE ENVIRONMENT, and an empty path means an
+	-- untrained network. Both cases are real: CLASSIFIER_WEIGHTS unset is
+	-- what the stub tier runs, where there is no libtorch to read a
+	-- checkpoint with; set, it is the 98.17%-accurate net trained by
+	-- cicili's example/mnist-train.cpp on the real MNIST.
+	--
+	-- Read ONCE, here, and the handle lives as long as the object does.
+	-- That is the whole reason this is a CLASS and not a PROCEDURE -- a
+	-- procedure would read the checkpoint off disk on every request.
+	CONSTRUCTOR()
+	BEGIN
+		-- NOT BOUND TO A LOCAL FIRST, because Parsi has no `*' type
+		-- suffix and so cannot declare a char pointer to hold it. Passed
+		-- straight through, and net_load takes null to mean untrained.
+		SET this._net = `net_load(`getenv('CLASSIFIER_WEIGHTS'));
+	END
+
+	-- Classify the INDEXth picture of an MNIST test set, and say what it
+	-- actually is. This is the point of the whole arrangement: a page
+	-- answering a request with a real model's opinion of a real digit.
+	FUNCTION classify(images AS String, index AS Long) RETURNS Long
+	BEGIN
+		RETURN `net_predict_idx(this._net,
+			images.`to_std_string().`c_str(), index.`value());
+	END
+
+	FUNCTION truth(labels AS String, index AS Long) RETURNS Long
+	BEGIN
+		RETURN `idx_label(labels.`to_std_string().`c_str(), index.`value());
+	END
+
+	-- How many floats the model wants, asked rather than assumed.
+	FUNCTION inputs() RETURNS Long
+	BEGIN
+		RETURN `net_inputs();
+	END
+
+	-- A page has no image to upload, so SEED stands in for one: it picks a
+	-- deterministic 784-pixel pattern. Different seeds are different pictures,
+	-- which is what makes the e2e assertion -- two seeds, two answers -- able
+	-- to fail.
+	--
+	-- The buffer is a member, not a local, because net_predict wraps it with
+	-- torch::from_blob and from_blob does not copy. A local would be gone
+	-- before the tensor was read on the real library.
+	FUNCTION predict(seed AS Long) RETURNS Long
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		CALL this.fill(seed);
+		RETURN `net_predict(this._net, this._pixels.`data(), n.`value());
+	END
+
+	-- The same forward pass answered as a number rather than a class, and
+	-- it is the one worth asserting on. An untrained network's argmax is
+	-- very nearly input-independent -- one class wins for almost every
+	-- picture -- so two seeds sharing a class says nothing about whether
+	-- either reached the model. The largest log-probability moves with the
+	-- input either way, scaled by a million so it survives as a Long.
+	FUNCTION score(seed AS Long) RETURNS Long
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		CALL this.fill(seed);
+		RETURN `net_score(this._net, this._pixels.`data(), n.`value());
+	END
+
+PRIVATE:
+	-- Shared by predict and score, so the two always see the same picture.
+	--
+	-- THE SEED CHANGES THE FREQUENCY, NOT JUST THE PHASE, and that distinction
+	-- is the whole value of the test around it. It was (i * 7 + seed) % 256
+	-- first, which is one ramp slid sideways: every seed then has the identical
+	-- histogram, and a real untrained network answered the same class for all
+	-- of them -- correctly, since the pictures barely differ. Multiplying by
+	-- the seed makes each one a different picture, so a model that reads its
+	-- input has something to distinguish.
+	FUNCTION fill(seed AS Long) RETURNS Void
+	BEGIN
+		DECLARE n AS Long = `net_inputs();
+		DECLARE i AS Long = 0;
+		CALL this._pixels.`clear();
+		WHILE i < n
+		BEGIN
+			DECLARE b AS Long = (i * (seed * 13 + 1) + seed * 31) % 256;
+			CALL this._pixels.`push_back(CAST<`float>(b.`value()) / 255.0);
+			SET i = i + 1;
+		END
+	END
+END
+
+
+-- ---------------------------------------------------------------------------
+-- The page. /predict.zt?seed=N answers with the class the model picked.
+-- ---------------------------------------------------------------------------
+
+PAGE predict
+REQUIRES Demo::Classifier
+BEGIN
+PUBLIC:
+	OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+	BEGIN
+		DECLARE model AS Demo::Classifier;
+
+		ECHO 'inputs=', model.inputs();
+		ECHO ' seed0=', model.predict(0L);
+		ECHO ' seed137=', model.predict(137L);
+		ECHO ' again0=', model.predict(0L);
+		ECHO ' score0=', model.score(0L);
+		ECHO ' score137=', model.score(137L);
+		ECHO ' scoreagain0=', model.score(0L);
+
+		-- Real digits: the model's answer over the true label, ten of
+		-- them. With no MNIST_DIR and no dataset every one reads -1/-1,
+		-- which is what the stub tier prints and what the runner knows
+		-- to skip -- no conditional needed here, because mnist_dir()
+		-- answers the empty string rather than null and a file that
+		-- cannot be opened is a -1 rather than a crash.
+		DECLARE images AS String = '';
+		DECLARE labels AS String = '';
+		SET images = `mnist_dir();
+		SET labels = images + '/t10k-labels-idx1-ubyte';
+		SET images = images + '/t10k-images-idx3-ubyte';
+
+		DECLARE k AS Long = 0;
+		ECHO ' digits=';
+		WHILE k < 10
+		BEGIN
+			ECHO model.classify(images, k), '/', model.truth(labels, k), ',';
+			SET k = k + 1;
+		END
+	END
+END

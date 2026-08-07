@@ -1,23 +1,283 @@
 #include "tlsbuf.hpp"
 #include <cstring>
-#include "utility.hpp"
-#include "networkstream.hpp"
-#include "arraystream.hpp"
-#include "tlsexception.hpp"
-#include "zlibhelper.hpp"
-#include "aes.hpp"
-#include "shahelper.hpp"
-#include "x509.hpp"
-#include "der.hpp"
-#include "filestream.hpp"
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
 #include <vector>
 #include <string>
-#include <cassert>
-#include <cstdlib>
+#include "utility.hpp"
+#include "tlsexception.hpp"
+#include "x509.hpp"
+#include "bufferstream.hpp"
+
+#include <csignal>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
 
 
 namespace Zigurat
 {
+
+  namespace
+  {
+    // What used to be here was a TLS 1.2 implementation written in this
+    // repository: a record layer, a handshake, a key schedule, CBC padding and
+    // a MAC comparison, about fifty kilobytes of it. It worked well enough to
+    // talk to itself, which is very nearly the only thing it ever talked to.
+    //
+    // Three defects go with it rather than being fixed in place. The premaster
+    // secret was decrypted with PKCS#1 v1.5 and a distinguishable error came
+    // back when the padding was wrong, which is a Bleichenbacher oracle. The
+    // CBC padding check read the length byte and never the padding behind it,
+    // which is the other classic one. The MAC was compared with std::memcmp,
+    // which stops at the first byte that differs and so takes longer over a
+    // nearly-right forgery than a hopeless one.
+    //
+    // None of them are fixed here. They are gone because nothing in this file
+    // implements TLS any more.
+
+    // Writing to a socket whose peer has hung up raises SIGPIPE, and the
+    // default disposition is to kill the process.
+    //
+    // socketbuf never had this problem: it sends with MSG_NOSIGNAL on Linux and
+    // sets SO_NOSIGPIPE on the platforms that have it. OpenSSL's socket BIO
+    // does neither -- it calls write() -- so handing it the descriptor brings
+    // the hazard back, and it belongs to this library rather than to whoever
+    // links it. ziguratip already ignores the signal in main; the test binary
+    // does not, and it died here rather than reporting the case that exists to
+    // catch exactly this.
+    void ignore_sigpipe_once()
+    {
+#if !defined(_WIN32) && !defined(_WIN64)
+      static std::once_flag once;
+      std::call_once(once, [] () { std::signal(SIGPIPE, SIG_IGN); });
+#endif
+    }
+
+    std::string ssl_error_text()
+    {
+      std::string text;
+      unsigned long code;
+      while ((code = ERR_get_error()) != 0) {
+	char buffer[256];
+	ERR_error_string_n(code, buffer, sizeof(buffer));
+	if (!text.empty()) text += "; ";
+	text += buffer;
+      }
+      return text.empty() ? std::string("no detail") : text;
+    }
+
+    // Where a tlsbuf finds itself again from inside OpenSSL's verify callback.
+    int peer_index()
+    {
+      static const int index = SSL_get_ex_new_index(0, (void*)"tlsbuf", nullptr, nullptr, nullptr);
+      return index;
+    }
+
+    // A certificate file, whichever way round it was written.
+    // SSL_CTX_load_verify_locations reads PEM only, and ca writes DER unless
+    // asked otherwise, so the authority is parsed here and put into the store
+    // directly. That takes both without anyone having to know which they hold.
+    void trust_authority(SSL_CTX* context, const std::string& path)
+    {
+      std::ifstream file(path, std::ios::binary);
+      if (!file.good()) throw TLSException("cannot read the certificate authority: " + path);
+      std::stringstream contents;
+      contents << file.rdbuf();
+      const std::string bytes = contents.str();
+      if (bytes.empty()) throw TLSException("cannot read the certificate authority: it is empty");
+
+      BIO* bio = BIO_new_mem_buf(bytes.data(), (int)bytes.size());
+      if (bio == nullptr) throw TLSException("out of memory reading the certificate authority");
+
+      ::X509* authority = d2i_X509_bio(bio, nullptr);
+      if (authority == nullptr) {
+	BIO_reset(bio);
+	authority = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+      }
+      BIO_free(bio);
+      if (authority == nullptr)
+	throw TLSException("cannot read the certificate authority: not a certificate");
+
+      ::X509_STORE* store = SSL_CTX_get_cert_store(context);
+      if (store == nullptr || X509_STORE_add_cert(store, authority) != 1) {
+	::X509_free(authority);
+	throw TLSException("cannot trust the certificate authority: " + ssl_error_text());
+      }
+
+      // Named as an acceptable issuer as well, so a client is told which
+      // certificate to offer rather than having to guess.
+      SSL_CTX_add_client_CA(context, authority);
+      ::X509_free(authority);
+    }
+
+    int passphrase(char* buffer, int size, int, void* userdata)
+    {
+      const std::string* phrase = (const std::string*)userdata;
+      if (phrase == nullptr) return 0;
+      const size_t length = (phrase->size() < (size_t)size) ? phrase->size() : (size_t)size;
+      std::memcpy(buffer, phrase->data(), length);
+      return (int)length;
+    }
+
+    // OpenSSL decides whether a certificate is genuine and was issued by the
+    // authority. Whether this server has heard of the holder is its own
+    // question, and it is asked here, at the point the peer is named, so the
+    // refusal is an alert in the handshake rather than a puzzle afterwards.
+    int verify_peer(int preverified, ::X509_STORE_CTX* store)
+    {
+      if (preverified != 1) return 0;
+      if (X509_STORE_CTX_get_error_depth(store) != 0) return 1;   // decide once, at the leaf
+
+      SSL* ssl = (SSL*)X509_STORE_CTX_get_ex_data(store, SSL_get_ex_data_X509_STORE_CTX_idx());
+      if (ssl == nullptr) return 1;
+
+      tlsbuf* buffer = (tlsbuf*)SSL_get_ex_data(ssl, peer_index());
+      if (buffer == nullptr) return 1;
+
+      if (buffer->authorize_peer(X509_STORE_CTX_get_current_cert(store))) return 1;
+
+      X509_STORE_CTX_set_error(store, X509_V_ERR_CERT_REJECTED);
+      return 0;
+    }
+
+    struct ContextKey
+    {
+      int entity;
+      int client_auth;
+      // Whether this context refuses peers by subject, because that decides
+      // the maximum protocol version. It is not part of the credentials, and
+      // leaving it out of the key let a context built for a connection with no
+      // register be handed to one that has a register -- so a stranger was
+      // refused under 1.3, after connecting, which is the very thing the cap
+      // exists to prevent.
+      int rejects_by_subject;
+      std::string certificate, private_key, cipher, authority, cipher_list;
+      bool operator<(const ContextKey& other) const
+      {
+	if (entity != other.entity) return entity < other.entity;
+	if (client_auth != other.client_auth) return client_auth < other.client_auth;
+	if (rejects_by_subject != other.rejects_by_subject) return rejects_by_subject < other.rejects_by_subject;
+	if (certificate != other.certificate) return certificate < other.certificate;
+	if (private_key != other.private_key) return private_key < other.private_key;
+	if (cipher != other.cipher) return cipher < other.cipher;
+	if (cipher_list != other.cipher_list) return cipher_list < other.cipher_list;
+	return authority < other.authority;
+      }
+    };
+
+    // One context per set of credentials, kept for the life of the process.
+    //
+    // The old code read the certificate, the key and the authority off the disk
+    // on every handshake, several times each. A context holds the parsed
+    // material and OpenSSL makes a connection from it, which is what it is for.
+    SSL_CTX* context_for(TLS::ConnectionEnd entity, const TLS::HandshakeParameters& params)
+    {
+      static std::map<ContextKey, SSL_CTX*> contexts;
+      static std::mutex guard;
+
+      const TLS::Credentials& credentials = params.credentials;
+      const bool rejects_by_subject = (params.client_auth == TLS::ClientAuth::REQUIRED)
+	&& (bool)params.authorize;
+
+      const ContextKey key { (int)entity, (int)params.client_auth, rejects_by_subject ? 1 : 0,
+			     credentials.certificate, credentials.private_key,
+			     credentials.private_key_cipher, credentials.authority,
+			     params.cipher_list };
+
+      ignore_sigpipe_once();
+
+      std::lock_guard<std::mutex> lock(guard);
+      auto found = contexts.find(key);
+      if (found != contexts.end()) return found->second;
+
+      SSL_CTX* context = SSL_CTX_new((entity == TLS::ConnectionEnd::SERVER)
+				     ? TLS_server_method() : TLS_client_method());
+      if (context == nullptr) throw TLSException("cannot make a TLS context: " + ssl_error_text());
+
+      try {
+	// Nothing below TLS 1.2, and no record compression: CRIME.
+	SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION);
+
+	// TLS 1.3 is allowed unless this end refuses peers by their subject.
+	//
+	// Under 1.3 a client's certificate is not examined until after it has
+	// sent its Finished and considers the handshake done, so a stranger gets
+	// success out of SSL_connect and hears the refusal afterwards, as an
+	// alert on a connection it believes it already has. Where the register
+	// decides who may connect at all -- REQUIRED, with an authorize hook --
+	// that turns a refusal into a delayed surprise, so those contexts stay at
+	// 1.2 where the answer arrives inside the handshake.
+	//
+	// A port a browser is meant to reach does not have that problem, because
+	// it is not asking anyone for a certificate.
+	if (rejects_by_subject) SSL_CTX_set_max_proto_version(context, TLS1_2_VERSION);
+
+	// Forward secrecy or nothing. !kRSA is the important half: static RSA key
+	// transport is what this server used to do, and it is why no browser
+	// would speak to it. ECDHE agrees a secret neither end sent; AEAD leaves
+	// no padding to build an oracle out of.
+	const std::string ciphers = params.cipher_list.empty()
+	  ? std::string("ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!eNULL:!kRSA:!MD5:!SHA1:!RC4:!3DES")
+	  : params.cipher_list;
+	if (SSL_CTX_set_cipher_list(context, ciphers.c_str()) != 1)
+	  throw TLSException("no usable cipher in '" + ciphers + "'");
+	SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION | SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+	if (!credentials.certificate.empty()) {
+	  // PEM or DER: the call wants to be told which, and ca writes either.
+	  if (SSL_CTX_use_certificate_file(context, credentials.certificate.c_str(), SSL_FILETYPE_PEM) != 1 &&
+	      SSL_CTX_use_certificate_file(context, credentials.certificate.c_str(), SSL_FILETYPE_ASN1) != 1)
+	    throw TLSException("cannot read this end's certificate: " + credentials.certificate);
+	}
+
+	if (!credentials.private_key.empty()) {
+	  SSL_CTX_set_default_passwd_cb(context, passphrase);
+	  SSL_CTX_set_default_passwd_cb_userdata(context, (void*)&credentials.private_key_cipher);
+
+	  if (SSL_CTX_use_PrivateKey_file(context, credentials.private_key.c_str(), SSL_FILETYPE_PEM) != 1 &&
+	      SSL_CTX_use_PrivateKey_file(context, credentials.private_key.c_str(), SSL_FILETYPE_ASN1) != 1)
+	    throw TLSException("cannot read this end's private key: " + credentials.private_key);
+
+	  if (SSL_CTX_check_private_key(context) != 1)
+	    throw TLSException("this end's private key does not belong to its certificate");
+	}
+
+	if (!credentials.authority.empty()) {
+	  trust_authority(context, credentials.authority);
+	  SSL_CTX_set_verify_depth(context, 1);   // one authority, signing leaves directly
+
+	  int mode = SSL_VERIFY_NONE;
+	  switch (params.client_auth) {
+	  case TLS::ClientAuth::REQUIRED:
+	    mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT; break;
+	  case TLS::ClientAuth::OPTIONAL:
+	    // Asked for, checked if given, and not insisted upon. A certificate
+	    // that is offered and does not check out still fails the handshake.
+	    mode = SSL_VERIFY_PEER; break;
+	  case TLS::ClientAuth::NONE:
+	    mode = SSL_VERIFY_NONE; break;
+	  }
+
+	  // A client always checks the server, whatever the server asks of it.
+	  if (entity == TLS::ConnectionEnd::CLIENT) mode = SSL_VERIFY_PEER;
+
+	  SSL_CTX_set_verify(context, mode, verify_peer);
+	}
+      } catch (...) {
+	SSL_CTX_free(context);
+	throw;
+      }
+
+      contexts[key] = context;
+      return context;
+    }
+  }
 
   const std::streamsize tlsbuf::BUFFER_SIZE = 16384;
 
@@ -31,413 +291,163 @@ namespace Zigurat
   tlsbuf::tlsbuf(tlsbuf&& other)
     : _tcpstream(std::forward<tcpstream&&>(other._tcpstream)), _buffer(other._buffer), _length(other._length)
   {
+    this->_handshake_params = other._handshake_params;
+    this->_ssl = other._ssl;
+    this->_peer_subject = std::move(other._peer_subject);
+    this->_peer_permissions = std::move(other._peer_permissions);
+
     other._buffer = nullptr;
     other._length = 0;
+    other._ssl = nullptr;
 
     this->setg(other.eback(), other.gptr(), other.egptr());
     this->setp(other.pptr(), other.epptr());
+
+    // The verify callback finds its tlsbuf through the SSL, so a connection
+    // that has moved has to be pointed at where it moved to.
+    if (this->_ssl != nullptr) SSL_set_ex_data((SSL*)this->_ssl, peer_index(), this);
   }
 
   tlsbuf& tlsbuf::operator=(tlsbuf&& other)
   {
     if (this->_buffer != nullptr) delete[] this->_buffer;
+    if (this->_ssl != nullptr) SSL_free((SSL*)this->_ssl);
 
     this->_tcpstream = std::forward<tcpstream&&>(other._tcpstream);
+    this->_handshake_params = other._handshake_params;
     this->_buffer = other._buffer;
     this->_length = other._length;
+    this->_ssl = other._ssl;
+    this->_peer_subject = std::move(other._peer_subject);
+    this->_peer_permissions = std::move(other._peer_permissions);
 
     other._buffer = nullptr;
     other._length = 0;
+    other._ssl = nullptr;
 
     this->setg(other.eback(), other.gptr(), other.egptr());
     this->setp(other.pptr(), other.epptr());
 
+    if (this->_ssl != nullptr) SSL_set_ex_data((SSL*)this->_ssl, peer_index(), this);
+
     return *this;
   }
 
-  void tlsbuf::_transcribe(binarystream& message)
+  // Called from the verify callback with a certificate OpenSSL has already
+  // decided is genuine and issued by the authority this end trusts. What is
+  // left is who the holder is, and whether this server has heard of them.
+  bool tlsbuf::authorize_peer(void* certificate)
   {
-    const std::streamsize length = message.length();
-    message.read(this->_transcript, 0, length);
-  }
+    ::X509* peer = (::X509*)certificate;
+    if (peer == nullptr) return false;
 
-  // Everything said so far, as it crossed the wire. What CertificateVerify signs:
-  // RFC 5246 7.4.8 signs the handshake messages themselves, and the signature
-  // operation does the hashing.
-  void tlsbuf::_transcript_bytes(binarystream& out)
-  {
-    const std::streamsize length = this->_transcript.length();
-    this->_transcript.read(out, 0, length);
-  }
+    unsigned char* der = nullptr;
+    const int length = i2d_X509(peer, &der);
+    if (length <= 0 || der == nullptr) return false;
 
-  // SHA-256 over everything said so far. TLS 1.2 ties the digest to the cipher
-  // suite's PRF hash, and every suite here uses SHA-256.
-  void tlsbuf::_transcript_hash(uint8_t* digest)
-  {
-    const std::streamsize length = this->_transcript.length();
-    networkstream copy;
-    this->_transcript.read(copy, 0, length);
+    bool allowed = true;
+    try {
+      bufferstream encoded;
+      encoded.write((const char*)der, (std::streamsize)length);
+      encoded.seekg(0, std::ios::beg);
+      this->_peer_subject = X509::certificate_subject(encoded);
 
-    uint8_t* bytes = new uint8_t[(size_t)(length > 0 ? length : 1)];
-    copy.read((char*)bytes, length);
-    SHA::checksum(SHA::SHA256, bytes, (size_t)length, digest);
-    delete[] bytes;
-  }
+      encoded.clear();
+      encoded.seekg(0, std::ios::beg);
+      this->_peer_permissions = X509::certificate_permissions(encoded);
 
-  void tlsbuf::_send_record(TLS::Record &record)
-  {
-    if (record.length > tlsbuf::BUFFER_SIZE) throw TLSException("invalid fragment length");
-    
-    TLS::SecurityParameters &params = this->_write_state;
-    uint64_t        sequence_number = this->_write_sequence_number++;
-      
-    this->_tcpstream.write_std_ubyte((uint8_t)record.type);
-    this->_tcpstream.write_std_ubyte(record.version.major);
-    this->_tcpstream.write_std_ubyte(record.version.minor);
-
-    networkstream compressed;
-    switch (params.compression_algorithm) {
-    case TLS::CompressionMethod::NONE:
-      record.fragment.read(compressed, record.length);
-      break;
-    case TLS::CompressionMethod::DEFLATE:
-      ZLib::compress(ZLib::DEFLATE, record.fragment, record.length, compressed);
-      break;
-    default:
-      throw TLSException("unsupported compression algorithm");
+      if (this->_handshake_params.authorize)
+	allowed = this->_handshake_params.authorize(this->_peer_subject);
+    } catch (const std::exception&) {
+      allowed = false;
     }
-    uint16_t compressed_length = compressed.tellp();
-    
-    if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::NONE) {
+    OPENSSL_free(der);
 
-      if (params.mac_algorithm == TLS::MACAlgorithm::NONE) {
-	this->_tcpstream.write_std_ushort(compressed_length);
-	compressed.read(this->_tcpstream, compressed_length);
-      } else {
-	this->_tcpstream.write_std_ushort(compressed_length + params.mac_length);
-	compressed.read(this->_tcpstream, compressed_length);
-	compressed.seekg(0, std::ios_base::beg);
-	uint8_t mac[params.mac_length];
-	TLS::MAC(params.mac_algorithm,
-		 (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_MAC_key : this->client_write_MAC_key,
-		 params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
-	this->_tcpstream.write((char*)mac, params.mac_length);
-      }
-
-    } else if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::AES) {
-
-      if (params.cipher_type == TLS::CipherType::BLOCK) {
-
-	// plain = compressed || MAC || padding, padded so the whole of it is a
-	// whole number of blocks, then chained under a fresh IV that goes out in
-	// front of it in the clear. The IV is not enciphered and is not part of
-	// what the MAC covers.
-	networkstream plain;
-
-	compressed.read(plain, compressed_length);
-
-	uint8_t mac[params.mac_length];
-	compressed.seekg(0, std::ios_base::beg);
-	TLS::MAC(params.mac_algorithm,
-		 (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_MAC_key : this->client_write_MAC_key,
-		 params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
-	plain.write((char*)mac, params.mac_length);
-
-	std::streamsize unpadded = compressed_length + params.mac_length + sizeof(uint8_t);
-	uint8_t padding_length = (uint8_t)((params.block_length - (unpadded % params.block_length)) % params.block_length);
-	plain.fill_n(padding_length + 1, padding_length);
-
-	uint8_t iv[params.record_iv_length];
-	TLS::IV(iv, params.record_iv_length);
-
-	const std::streamsize plain_length = plain.length();
-	this->_tcpstream.write_std_ushort((uint16_t)(params.record_iv_length + plain_length));
-	this->_tcpstream.write((char*)iv, params.record_iv_length);
-
-	if (params.enc_key_length == 16) {
-
-	  AES128::key_t write_key;
-	  std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_key : this->client_write_key, params.enc_key_length);
-	  AES128::schedule_t expanded_key;
-	  AES128::KeyExpansion(write_key, expanded_key);
-	  AES128::CipherCBC(plain, expanded_key, iv, this->_tcpstream);
-
-	} else if (params.enc_key_length == 32) {
-
-	  AES256::key_t write_key;
-	  std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->server_write_key : this->client_write_key, params.enc_key_length);
-	  AES256::schedule_t expanded_key;
-	  AES256::KeyExpansion(write_key, expanded_key);
-	  AES256::CipherCBC(plain, expanded_key, iv, this->_tcpstream);
-
-	} else {
-	  throw TLSException("unsupported encryption key length");
-	}
-      } else {
-	throw TLSException("unsupported cipher type");
-      }
-    } else {
-      throw TLSException("unsupported bulk cipher algorithm");
+    if (!allowed) {
+      this->_peer_subject.clear();
+      this->_peer_permissions.clear();
     }
-
-    this->_tcpstream.flush();
-  }
-  
-  void tlsbuf::_recv_record(TLS::Record &record)
-  {
-    TLS::SecurityParameters &params = this->_read_state;
-
-    // A tcpstream is one iostream for both directions, so a write that failed
-    // poisons reading too. That is exactly backwards at the end of a refused
-    // handshake: the peer sends its reason and hangs up, this end's next write
-    // fails because the peer has gone, and the reason -- already sitting in the
-    // receive buffer -- becomes unreadable. Clearing here costs nothing if the
-    // connection really is finished, because the read below fails again.
-    if (!this->_tcpstream.good() && !this->_tcpstream.eof())
-      this->_tcpstream.clear();
-    uint64_t        sequence_number;
-    
-    do {
-
-      const std::streampos start = record.fragment.tellg();
-      sequence_number = this->_read_sequence_number++;
-      
-      record.type = (TLS::ContentType)this->_tcpstream.read_std_ubyte();
-      record.version = {this->_tcpstream.read_std_ubyte(), this->_tcpstream.read_std_ubyte()};
-
-      uint16_t compressed_length;
-      networkstream compressed;
-      if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::NONE) {
-
-	// read_exact, not read: a record is whatever length its header says, and
-	// TCP is free to deliver that in as many pieces as it likes. A single read
-	// returns what has arrived so far, which for anything that did not fit one
-	// segment left the rest of the record to be parsed as the next one. The
-	// encrypted path below already did this; the plain one did not, and the
-	// plain path is the one every handshake starts on.
-	if (params.mac_algorithm == TLS::MACAlgorithm::NONE) {
-	  compressed_length = this->_tcpstream.read_std_ushort();
-	  this->_tcpstream.read_exact(compressed, compressed_length);
-	} else {
-	  compressed_length = this->_tcpstream.read_std_ushort() - params.mac_length;
-	  this->_tcpstream.read_exact(compressed, compressed_length);
-
-	  uint8_t mac[params.mac_length];
-	  TLS::MAC(params.mac_algorithm,
-		   (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_MAC_key : this->server_write_MAC_key,
-		   params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
-	  compressed.seekg(0, std::ios_base::beg);
-	
-	  uint8_t record_mac[params.mac_length];
-	  this->_tcpstream.read_exact((char*)record_mac, params.mac_length);
-
-	  if (std::memcmp(mac, record_mac, params.mac_length) != 0)	  
-	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_RECORD_MAC);
-	}
-
-      } else if (params.bulk_cipher_algorithm == TLS::BulkCipherAlgorithm::AES) {
-
-	if (params.cipher_type == TLS::CipherType::BLOCK) {
-
-	  // The IV came in front, in the clear, and is not part of the cipher text.
-	  uint16_t record_length = this->_tcpstream.read_std_ushort();
-	  if (record_length < params.record_iv_length + params.block_length)
-	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECODE_ERROR);
-
-	  uint8_t iv[params.record_iv_length];
-	  this->_tcpstream.read_exact((char*)iv, params.record_iv_length);
-
-	  const uint16_t cipher_text_length = record_length - params.record_iv_length;
-	  networkstream cipher_text;
-	  this->_tcpstream.read_exact(cipher_text, cipher_text_length);
-
-	  networkstream input;
-	  if (params.enc_key_length == 16) {
-
-	    AES128::key_t write_key;
-	    std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_key : this->server_write_key, params.enc_key_length);
-	    AES128::schedule_t expanded_key;
-	    AES128::KeyExpansion(write_key, expanded_key);
-	    AES128::InverseCipherCBC(cipher_text, expanded_key, iv, input);
-
-	  } else if (params.enc_key_length == 32) {
-
-	    AES256::key_t write_key;
-	    std::memcpy(write_key, (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_key : this->server_write_key, params.enc_key_length);
-	    AES256::schedule_t expanded_key;
-	    AES256::KeyExpansion(write_key, expanded_key);
-	    AES256::InverseCipherCBC(cipher_text, expanded_key, iv, input);
-
-	  } else {
-	    throw TLSException("unsupported encryption key length");
-	  }
-
-	  const uint8_t padding_length = (uint8_t)input.at(cipher_text_length - 1);
-	  if (cipher_text_length < params.mac_length + padding_length + 1)
-	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_RECORD_MAC);
-
-	  compressed_length = cipher_text_length - params.mac_length - padding_length - 1;
-	  input.read(compressed, compressed_length);
-
-	  uint8_t mac[params.mac_length];
-	  TLS::MAC(params.mac_algorithm,
-		   (params.entity == TLS::ConnectionEnd::SERVER) ? this->client_write_MAC_key : this->server_write_MAC_key,
-		   params.mac_key_length, sequence_number, record.type, record.version, compressed, compressed_length, mac);
-	  compressed.seekg(0, std::ios_base::beg);
-
-	  uint8_t record_mac[params.mac_length];
-	  input.read((char*)record_mac, params.mac_length);
-
-	  if (std::memcmp(mac, record_mac, params.mac_length) != 0)
-	    this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_RECORD_MAC);
-	} else {
-	  throw TLSException("unsupported cipher type");
-	}
-      } else {
-	throw TLSException("unsupported bulk cipher algorithm");
-      }
-
-      switch (params.compression_algorithm) {
-      case TLS::CompressionMethod::NONE:
-	compressed.read(record.fragment, compressed_length);
-	record.length = compressed_length;
-	break;
-      case TLS::CompressionMethod::DEFLATE:
-	ZLib::decompress(ZLib::DEFLATE, compressed, compressed_length, record.fragment);
-	record.length = record.fragment.tellp();
-	break;
-      default:
-	throw TLSException("unsupported compression algorithm");
-      }
-
-      // Where this record's fragment began, so anything read to inspect it can be
-      // put back. These used to rewind by -record.length from wherever the read
-      // had left the cursor, which for a one octet peek is a seek to a negative
-      // position: it fails, the stream goes bad, and every subsequent read
-      // returns nothing. On the client that meant every handshake message
-      // arrived empty and was rejected as unexpected.
-      const std::streampos fragment_begin = start;
-
-      if (record.type == TLS::ContentType::ALERT) {
-
-	// From the start of this record's fragment, not from wherever writing it
-	// left the position. Reading on past the end returned zeroes, so every
-	// alert looked like level 0 -- neither warning nor fatal -- and a fatal
-	// one fell through to be waited past instead of raised. The peer's reason
-	// for refusing was lost, and what surfaced was whatever went wrong next.
-	record.fragment.clear();
-	record.fragment.seekg(fragment_begin, std::ios_base::beg);
-
-	TLS::AlertLevel level = (TLS::AlertLevel)record.fragment.read_std_ubyte();
-	TLS::AlertDescription description = (TLS::AlertDescription)record.fragment.read_std_ubyte();
-	if (level == TLS::AlertLevel::FATAL)
-	  throw TLSException("fatal alert " + std::to_string((uint8_t)description));
-
-	// A warning -- close_notify among them -- is noted and the wait resumes.
-	record.type = (TLS::ContentType)0;
-	record.version = {0, 0};
-	record.length = 0;
-	record.fragment.clear();
-	record.fragment.seekg(fragment_begin, std::ios_base::beg);
-	record.fragment.seekp(fragment_begin, std::ios_base::beg);
-	continue;
-
-      } else if (record.type == TLS::ContentType::HANDSHAKE && params.entity == TLS::ConnectionEnd::CLIENT) {
-
-	TLS::HandshakeType msg_type = (TLS::HandshakeType)record.fragment.read_std_ubyte();
-	record.fragment.clear();
-	record.fragment.seekg(fragment_begin, std::ios_base::beg);
-
-	if (msg_type == TLS::HandshakeType::HELLO_REQUEST) {
-	  record.type = (TLS::ContentType)0;
-	  record.version = {0, 0};
-	  record.length = 0;
-	  record.fragment.seekp(fragment_begin, std::ios_base::beg);
-	  this->_client_handshake();
-	  continue;
-	}
-
-	break;
-
-      } else {
-	break;
-      }
-      
-    } while(true);
+    return allowed;
   }
 
-  void tlsbuf::_alert(TLS::AlertLevel level, TLS::AlertDescription description)
+  // The subject and the permissions were taken in the verify callback, where
+  // the certificate was in hand. A peer that presented none leaves them empty,
+  // which is what a connection with nobody on the other end of it should say.
+  void tlsbuf::_capture_peer()
   {
-    networkstream plain_text;
-    plain_text.write_std_ubyte((uint8_t)level);
-    plain_text.write_std_ubyte((uint8_t)description);
-    
-    TLS::Record record {TLS::ContentType::ALERT, this->_protocol_version, plain_text.tellp(), plain_text};
-    
-    this->_send_record(record);
+    SSL* ssl = (SSL*)this->_ssl;
+    if (ssl == nullptr) return;
 
-    if (level == TLS::AlertLevel::FATAL)
-      throw TLSException("fatal alert " + std::to_string((uint8_t)description));
-  }
-
-  // The four octet header -- one of type, three of length -- is part of what
-  // goes on the wire, so the fragmenting below counts it. Measuring against
-  // handshake.length alone left the last four octets of every message unsent.
-  void tlsbuf::_send_handshake(TLS::Handshake& handshake)
-  {
-    networkstream plain_text;
-    plain_text.write_std_ubyte((uint8_t)handshake.msg_type);
-    TLS::uint24(handshake.length, plain_text);
-    handshake.body.read(plain_text, 0, handshake.length);
-
-    this->_transcribe(plain_text);
-
-    const std::streamsize total = plain_text.length();
-    std::streamsize count = 0;
-    TLS::Record     record {TLS::ContentType::HANDSHAKE, this->_protocol_version, 0, plain_text};
-    do {
-      record.length = std::min(total - count, this->BUFFER_SIZE);
-      count        += record.length;
-      this->_send_record(record);
-    } while (count < total);
-  }
-
-  void tlsbuf::_recv_handshake(TLS::Handshake& handshake)
-  {
-    networkstream plain_text;
-    TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, plain_text};
-    this->_recv_record(record);
-
-    // An assert would be compiled out of a release build, and "the peer sent
-    // something other than a handshake message" is exactly the case that must
-    // still be refused there.
-    if (record.type != TLS::ContentType::HANDSHAKE)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-    handshake.msg_type = (TLS::HandshakeType)plain_text.read_std_ubyte();
-    handshake.length   = TLS::uint24(plain_text);
-
-    // What the first record carried beyond the four octet header. This was
-    // adding the header rather than subtracting it, so the count ran two octets
-    // over the body on every message and a fragmented one was never reassembled.
-    std::streamsize count = record.length - (sizeof(uint8_t) * 4);
-    plain_text.read(handshake.body, count);
-
-    while (count < handshake.length) {
-      this->_recv_record(record);
-      if (record.type != TLS::ContentType::HANDSHAKE)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-      plain_text.read(handshake.body, record.length);
-      count += record.length;
+    ::X509* peer = SSL_get1_peer_certificate(ssl);
+    if (peer == nullptr) {
+      this->_peer_subject.clear();
+      this->_peer_permissions.clear();
+      return;
     }
+    ::X509_free(peer);
+  }
 
-    // The transcript is the messages as they appeared on the wire, header and
-    // all, because that is what Finished and CertificateVerify sign over.
-    networkstream transcribed;
-    transcribed.write_std_ubyte((uint8_t)handshake.msg_type);
-    TLS::uint24(handshake.length, transcribed);
-    handshake.body.read(transcribed, 0, handshake.length);
-    this->_transcribe(transcribed);
+  tlsbuf* tlsbuf::open(TLS::ConnectionEnd entity, TLS::HandshakeParameters params,
+		       Socket::handle_t handle, bool blocking_mode, int timeout)
+  {
+    this->_handshake_params = params;
+
+    if (this->_buffer == nullptr)
+      this->setbuf(new char_type[tlsbuf::BUFFER_SIZE], tlsbuf::BUFFER_SIZE);
+
+    // The socket keeps its owner and its timeouts here; the bytes on it belong
+    // to OpenSSL from now on, and nothing may read or write through _tcpstream
+    // again -- its read-ahead would take them out from under the record layer.
+    this->_tcpstream.open(handle, blocking_mode, timeout);
+
+    SSL_CTX* context = context_for(entity, this->_handshake_params);
+    SSL* ssl = SSL_new(context);
+    if (ssl == nullptr) throw TLSException("cannot make a TLS connection: " + ssl_error_text());
+    this->_ssl = ssl;
+    SSL_set_ex_data(ssl, peer_index(), this);
+
+    BIO* bio = BIO_new_socket((int)handle, BIO_NOCLOSE);
+    if (bio == nullptr) throw TLSException("cannot wrap the socket: " + ssl_error_text());
+    SSL_set_bio(ssl, bio, bio);
+
+    const int done = (entity == TLS::ConnectionEnd::SERVER) ? SSL_accept(ssl) : SSL_connect(ssl);
+    if (done != 1)
+      throw TLSException(std::string((entity == TLS::ConnectionEnd::SERVER)
+				     ? "the peer was refused: " : "this end was refused: ") + ssl_error_text());
+
+    this->_capture_peer();
+    return this;
+  }
+
+  tlsbuf* tlsbuf::open(TLS::HandshakeParameters params, std::string node, std::string service,
+		       bool blocking_mode, int timeout)
+  {
+    this->_handshake_params = params;
+
+    if (this->_buffer == nullptr)
+      this->setbuf(new char_type[tlsbuf::BUFFER_SIZE], tlsbuf::BUFFER_SIZE);
+
+    this->_tcpstream.open(node, service, blocking_mode, timeout);
+
+    SSL_CTX* context = context_for(TLS::ConnectionEnd::CLIENT, this->_handshake_params);
+    SSL* ssl = SSL_new(context);
+    if (ssl == nullptr) throw TLSException("cannot make a TLS connection: " + ssl_error_text());
+    this->_ssl = ssl;
+    SSL_set_ex_data(ssl, peer_index(), this);
+
+    // Which host was asked for, so a server holding more than one certificate
+    // can answer with the right one.
+    if (!node.empty()) SSL_set_tlsext_host_name(ssl, node.c_str());
+
+    BIO* bio = BIO_new_socket((int)this->_tcpstream.handle(), BIO_NOCLOSE);
+    if (bio == nullptr) throw TLSException("cannot wrap the socket: " + ssl_error_text());
+    SSL_set_bio(ssl, bio, bio);
+
+    if (SSL_connect(ssl) != 1)
+      throw TLSException("this end was refused: " + ssl_error_text());
+
+    this->_capture_peer();
+    return this;
   }
 
   const std::string& tlsbuf::peer_subject() const
@@ -448,699 +458,6 @@ namespace Zigurat
   const std::vector<std::string>& tlsbuf::peer_permissions() const
   {
     return this->_peer_permissions;
-  }
-
-  // A credential named in the parameters, read off disk into memory. Each is
-  // opened fresh every time it is needed: X509 consumes the stream it is given,
-  // and the handshake needs some of them more than once.
-  void tlsbuf::_credential(const std::string& path, binarystream& content)
-  {
-    if (path.empty()) throw TLSException("no certificate configured for this end");
-
-    filestream file(path, std::ios::in | std::ios::binary);
-    if (!file.good()) throw TLSException("cannot read '" + path + "'");
-
-    file.read(content, file.length());
-  }
-
-  // The whole of the trust decision. There is no chain to walk: either the
-  // owner's authority signed this certificate or the peer has no business here.
-  void tlsbuf::_check_peer_certificate(binarystream& certificate)
-  {
-    networkstream authority, puk_info, authority_key;
-    this->_credential(this->_handshake_params.credentials.authority, authority);
-
-    try {
-      X509::certificate_public_key(authority, puk_info);
-      DER::encode_sequence(authority_key, puk_info);
-    } catch (const std::exception& error) {
-      throw TLSException(std::string("cannot read the certificate authority: ") + error.what());
-    }
-
-    networkstream to_validate;
-    certificate.read(to_validate, 0, certificate.length());
-
-    try {
-      X509::validate_by_puk(authority_key, to_validate);
-    } catch (const std::exception&) {
-      // Whatever the reason -- a signature that does not check out, a shape that
-      // does not parse -- the peer is not one this authority vouched for.
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNKNOWN_CA);
-    }
-
-    networkstream for_subject;
-    certificate.read(for_subject, 0, certificate.length());
-    this->_peer_subject = X509::certificate_subject(for_subject);
-
-    // What the issuer wrote into this particular certificate. A subject may
-    // hold several, each granting something different, so this has to come off
-    // the one that opened the connection rather than off anything kept here.
-    networkstream for_permissions;
-    certificate.read(for_permissions, 0, certificate.length());
-    this->_peer_permissions = X509::certificate_permissions(for_permissions);
-
-    // The authority's signature says the peer is genuine, not that it is still
-    // welcome. Whoever installed a policy gets the last word.
-    if (this->_handshake_params.authorize
-	&& !this->_handshake_params.authorize(this->_peer_subject))
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::ACCESS_DENIED);
-  }
-
-  void tlsbuf::_send_certificate()
-  {
-    networkstream certificate, body;
-    this->_credential(this->_handshake_params.credentials.certificate, certificate);
-
-    // certificate_list: one entry, since the peer already holds the authority.
-    const std::streamsize length = certificate.length();
-    TLS::uint24(length + 3, body);
-    TLS::uint24(length, body);
-    certificate.read(body, 0, length);
-
-    TLS::Handshake message {TLS::HandshakeType::CERTIFICATE, body.length(), body};
-    this->_send_handshake(message);
-  }
-
-  void tlsbuf::_recv_certificate(binarystream& certificate)
-  {
-    networkstream body;
-    TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-    this->_recv_handshake(message);
-
-    if (message.msg_type != TLS::HandshakeType::CERTIFICATE)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-    const uint32_t list_length = TLS::uint24(body);
-    if (list_length == 0)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::BAD_CERTIFICATE);
-
-    const uint32_t first_length = TLS::uint24(body);
-    body.read(certificate, first_length);
-  }
-
-  void tlsbuf::_send_change_cipher_spec()
-  {
-    networkstream body;
-    body.write_std_ubyte((uint8_t)TLS::CipherSpecType::CHANGE_CIPHER_SPEC);
-
-    TLS::Record record {TLS::ContentType::CHANGE_CIPHER_SPEC, this->_protocol_version, 1, body};
-    this->_send_record(record);
-
-    // Everything sent after this goes out under the new state, counted from
-    // zero. Reading is untouched: the peer decides when its own writing changes.
-    this->_write_state = this->_pending_state;
-    this->_write_sequence_number = 0;
-  }
-
-  void tlsbuf::_recv_change_cipher_spec()
-  {
-    networkstream body;
-    TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, body};
-    this->_recv_record(record);
-
-    if (record.type != TLS::ContentType::CHANGE_CIPHER_SPEC)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-    this->_read_state = this->_pending_state;
-    this->_read_sequence_number = 0;
-  }
-
-  // master_secret = PRF(pre_master_secret, "master secret",
-  //                     client_random + server_random)[0..47], and the write
-  //  keys from it. Both ends run this over the same inputs and never exchange
-  //  the result.
-  void tlsbuf::_derive_keys(binarystream& pre_master_secret)
-  {
-    TLS::SecurityParameters& params = this->_pending_state;
-
-    uint8_t randoms[TLS::RANDOM_LENGTH * 2];
-    std::memcpy(randoms, params.client_random, TLS::RANDOM_LENGTH);
-    std::memcpy(randoms + TLS::RANDOM_LENGTH, params.server_random, TLS::RANDOM_LENGTH);
-
-    const std::streamsize length = pre_master_secret.length();
-    std::vector<uint8_t> secret((size_t)(length > 0 ? length : 1));
-    pre_master_secret.read((char*)secret.data(), 0, length);
-
-    TLS::PRF(params.prf_algorithm,
-	     secret.data(),             (size_t)length,
-	     (const uint8_t*)"master secret", 13,
-	     randoms,                   sizeof(randoms),
-	     params.master_secret,      TLS::MASTER_SECRET_LENGTH);
-
-    delete[] this->client_write_MAC_key;
-    delete[] this->server_write_MAC_key;
-    delete[] this->client_write_key;
-    delete[] this->server_write_key;
-    delete[] this->client_write_IV;
-    delete[] this->server_write_IV;
-
-    this->client_write_MAC_key = new uint8_t[params.mac_key_length  ? params.mac_key_length  : 1];
-    this->server_write_MAC_key = new uint8_t[params.mac_key_length  ? params.mac_key_length  : 1];
-    this->client_write_key     = new uint8_t[params.enc_key_length  ? params.enc_key_length  : 1];
-    this->server_write_key     = new uint8_t[params.enc_key_length  ? params.enc_key_length  : 1];
-    this->client_write_IV      = new uint8_t[params.fixed_iv_length ? params.fixed_iv_length : 1];
-    this->server_write_IV      = new uint8_t[params.fixed_iv_length ? params.fixed_iv_length : 1];
-
-    TLS::calculate_keys(params,
-			this->client_write_MAC_key, this->server_write_MAC_key,
-			this->client_write_key,     this->server_write_key,
-			this->client_write_IV,      this->server_write_IV);
-  }
-
-  // verify_data = PRF(master_secret, label, hash of every handshake message so
-  // far)[0..11]. It proves both ends saw the same conversation, so a tampered
-  // hello cannot survive to here.
-  void tlsbuf::_send_finished(const char* label)
-  {
-    uint8_t digest[SHA::size(SHA::SHA256)];
-    this->_transcript_hash(digest);          // before this message joins it
-
-    networkstream body;
-    uint8_t verify_data[12];
-    TLS::PRF(this->_pending_state.prf_algorithm,
-	     this->_pending_state.master_secret, TLS::MASTER_SECRET_LENGTH,
-	     (const uint8_t*)label, std::strlen(label),
-	     digest, sizeof(digest),
-	     verify_data, sizeof(verify_data));
-
-    body.write((char*)verify_data, sizeof(verify_data));
-
-    TLS::Handshake message {TLS::HandshakeType::FINISHED, body.length(), body};
-    this->_send_handshake(message);
-  }
-
-  void tlsbuf::_recv_finished(const char* label)
-  {
-    uint8_t digest[SHA::size(SHA::SHA256)];
-    this->_transcript_hash(digest);          // before the incoming message joins it
-
-    networkstream body;
-    TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-    this->_recv_handshake(message);
-
-    if (message.msg_type != TLS::HandshakeType::FINISHED)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-    uint8_t expected[12];
-    TLS::PRF(this->_pending_state.prf_algorithm,
-	     this->_pending_state.master_secret, TLS::MASTER_SECRET_LENGTH,
-	     (const uint8_t*)label, std::strlen(label),
-	     digest, sizeof(digest),
-	     expected, sizeof(expected));
-
-    uint8_t received[12];
-    if (message.length != (std::streamsize)sizeof(received))
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECODE_ERROR);
-    body.read((char*)received, 0, (std::streamsize)sizeof(received));
-
-    if (std::memcmp(expected, received, sizeof(expected)) != 0)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECRYPT_ERROR);
-  }
-
-  void tlsbuf::_server_hello()
-  {
-    networkstream client_body, server_body;
-    TLS::Handshake client_hello {(TLS::HandshakeType)0, 0, client_body};
-    this->_recv_handshake(client_hello);
-    if (client_hello.msg_type != TLS::HandshakeType::CLIENT_HELLO)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
-    
-    this->_pending_state.entity = this->_write_state.entity;
-
-    this->_protocol_version.major = client_body.read_std_ubyte();
-    this->_protocol_version.minor = client_body.read_std_ubyte();
-    if (this->_protocol_version.major != TLS::VERSION_1_2.major || this->_protocol_version.minor != TLS::VERSION_1_2.minor)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
-    server_body.write_std_ubyte(this->_protocol_version.major);
-    server_body.write_std_ubyte(this->_protocol_version.minor);                         // server_version
-
-    client_body.read((char*)&this->_pending_state.client_random, TLS::RANDOM_LENGTH);
-    uint32_t gmt_unix_time = Utility::htonl(std::time(0));
-    std::memcpy(&this->_pending_state.server_random, &gmt_unix_time, sizeof(uint32_t)); // random.gmt_unix_time
-    TLS::IV((uint8_t*)&this->_pending_state.server_random + sizeof(uint32_t), TLS::RANDOM_LENGTH - sizeof(uint32_t));
-    server_body.write((char*)&this->_pending_state.server_random, TLS::RANDOM_LENGTH);  // random.random_bytes
-
-    client_body.ignore(client_body.read_std_ubyte());
-    server_body.write_std_ubyte(0);                     // session_id 0 -> no resumption
-
-    // Read from client_body, write into server_body. These were reading the
-    // client's offer out of the reply being built, which is empty at this point,
-    // so no cipher suite and no compression method could ever be agreed.
-    // The client's whole offer is read before any of it is answered. Breaking
-    // out of these loops on the first match left the rest of the list unread,
-    // and everything after it -- compressions, extensions -- was then parsed
-    // from the middle of a cipher suite. A peer that offers exactly what this
-    // end wants and nothing more never showed it; any other peer desynchronised
-    // on its first message.
-    const uint16_t cipher_suites_length = client_body.read_std_ushort();
-    std::vector<TLS::CipherSuite> offered_suites;
-    for (uint16_t i = 0; i + 1 < cipher_suites_length; i += 2) {
-      TLS::CipherSuite suite {client_body.read_std_ubyte(), client_body.read_std_ubyte()};
-      offered_suites.push_back(suite);
-    }
-
-    // RFC 5746: a peer may signal secure renegotiation as a pseudo suite in the
-    // offer rather than as an extension.
-    bool peer_signalled_renegotiation = false;
-    for (TLS::CipherSuite& suite : offered_suites)
-      if (suite.revision == TLS::TLS_EMPTY_RENEGOTIATION_INFO_SCSV.revision
-	  && suite.suite_id == TLS::TLS_EMPTY_RENEGOTIATION_INFO_SCSV.suite_id)
-	peer_signalled_renegotiation = true;
-
-    const uint8_t compressions_count = client_body.read_std_ubyte();
-    std::vector<TLS::CompressionMethod> offered_compressions;
-    for (uint8_t i = 0; i < compressions_count; i++)
-      offered_compressions.push_back((TLS::CompressionMethod)client_body.read_std_ubyte());
-
-    // This end's preference wins, which is the server's right and keeps the
-    // choice out of the peer's hands.
-    bool cipher_suite_found = false;
-    for (TLS::CipherSuite& server_suite : this->_handshake_params.cipher_suites) {
-      for (TLS::CipherSuite& client_suite : offered_suites) {
-	if (client_suite.revision == server_suite.revision
-	    && client_suite.suite_id == server_suite.suite_id) {
-	  TLS::cipher_suite(server_suite, this->_pending_state);
-	  server_body.write_std_ubyte(server_suite.revision);
-	  server_body.write_std_ubyte(server_suite.suite_id);
-	  cipher_suite_found = true;
-	  break;
-	}
-      }
-      if (cipher_suite_found) break;
-    }
-    if (!cipher_suite_found)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
-
-    bool compression_found = false;
-    for (TLS::CompressionMethod server_compression : this->_handshake_params.compression_methods) {
-      for (TLS::CompressionMethod client_compression : offered_compressions) {
-	if (client_compression == server_compression) {
-	  this->_pending_state.compression_algorithm = server_compression;
-	  server_body.write_std_ubyte((uint8_t)server_compression);
-	  compression_found = true;
-	  break;
-	}
-      }
-      if (compression_found) break;
-    }
-    if (!compression_found) {
-      // NONE is always acceptable and every client offers it.
-      this->_pending_state.compression_algorithm = TLS::CompressionMethod::NONE;
-      server_body.write_std_ubyte((uint8_t)TLS::CompressionMethod::NONE);
-    }
-
-    // extensions. Walked by declared length and otherwise ignored: an extension
-    // this end does not implement is not an error, and skipping it by its own
-    // length is what keeps the rest of the block readable. The previous version
-    // consumed the block twice, never advanced past an extension it did not
-    // recognise, and answered with a length it had not written anything for.
-    //
-    // The reply carries none. RFC 5246 7.4.1.4 forbids a server from sending an
-    // extension the client did not offer, and there is none here worth echoing,
-    // so the block is left off entirely -- which is legal and is what a client
-    // that sent no extensions expects to see.
-    bool peer_named_algorithms  = false;
-    bool peer_signs_with_sha256 = false;
-
-    if (client_body.tellg() < client_body.length()) {
-
-      const uint16_t extensions_length = client_body.read_std_ushort();
-      std::streamsize remaining = extensions_length;
-
-      while (remaining >= 4) {
-
-	const uint16_t extension_type = client_body.read_std_ushort();
-	const uint16_t data_length = client_body.read_std_ushort();
-	remaining -= 4;
-
-	if (data_length > remaining) break;              // malformed: stop reading
-
-	if ((TLS::ExtensionType)extension_type == TLS::ExtensionType::SIGNATURE_ALGORITHMS) {
-	  peer_named_algorithms = true;
-	  peer_signs_with_sha256 =
-	    TLS::accepts_signature_algorithm(client_body, data_length, TLS::SIG_RSA_SHA256);
-	} else if ((TLS::ExtensionType)extension_type == TLS::ExtensionType::RENEGOTIATION_INFO) {
-	  peer_signalled_renegotiation = true;
-	  client_body.ignore(data_length);
-	} else {
-	  client_body.ignore(data_length);
-	}
-
-	remaining -= data_length;
-      }
-    }
-
-    // A peer that named its algorithms and did not name this one cannot produce
-    // the CertificateVerify this end is about to ask for. A peer that named none
-    // is let through: the specification reads that as SHA-1, and refusing it here
-    // would turn a stricter check into a worse error message further on.
-    if (peer_named_algorithms && !peer_signs_with_sha256)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
-
-    // RFC 5746 5: a peer that asked about secure renegotiation has to be
-    // answered, and for a first handshake the answer is an empty
-    // renegotiated_connection. A peer that did not ask gets no extensions block
-    // at all, which is what this end's own client expects. Renegotiation itself
-    // is not offered -- this only states, truthfully, that nothing was renegotiated.
-    if (peer_signalled_renegotiation) {
-      networkstream extensions;
-      extensions.write_std_ushort((uint16_t)TLS::ExtensionType::RENEGOTIATION_INFO);
-      extensions.write_std_ushort(1);                 // extension_data length
-      extensions.write_std_ubyte(0);                  // renegotiated_connection: empty
-
-      server_body.write_std_ushort((uint16_t)extensions.length());
-      extensions.read(server_body, 0, extensions.length());
-    }
-
-    TLS::Handshake server_hello {TLS::HandshakeType::SERVER_HELLO, server_body.tellp(), server_body};
-    this->_send_handshake(server_hello);
-  }
-
-  // The server's side of a mutually authenticated exchange:
-  //
-  //   <- ClientHello                ServerHello ->
-  //                                Certificate ->
-  //                         CertificateRequest ->
-  //                           ServerHelloDone  ->
-  //   <- Certificate
-  //   <- ClientKeyExchange
-  //   <- CertificateVerify
-  //   <- ChangeCipherSpec, Finished
-  //                    ChangeCipherSpec, Finished ->
-  //
-  // The client is asked for a certificate unconditionally. That is the point of
-  // the arrangement: nobody talks to this server without one the owner issued.
-  void tlsbuf::_server_handshake()
-  {
-    this->_transcript.string("");
-    this->_peer_subject.clear();
-    this->_peer_permissions.clear();
-
-    this->_server_hello();
-    this->_send_certificate();
-
-    {
-      // CertificateRequest. One type, RSA signing, and no acceptable authority
-      // named -- there is only ever one, and the peer already has it.
-      networkstream body;
-      body.write_std_ubyte(1);                        // certificate_types
-      body.write_std_ubyte((uint8_t)TLS::ClientCertificateType::RSA_SIGN);
-
-      // supported_signature_algorithms. Required in TLS 1.2 and it sits between
-      // the types and the authorities; leaving it out shifted everything after
-      // it, so a conforming client could not read the message.
-      std::vector<TLS::SignatureAndHashAlgorithm> algorithms;
-      algorithms.push_back(TLS::SIG_RSA_SHA256);
-      TLS::write_signature_algorithms(body, algorithms);
-
-      body.write_std_ushort(0);                       // certificate_authorities
-      TLS::Handshake message {TLS::HandshakeType::CERTIFICATE_REQUEST, body.length(), body};
-      this->_send_handshake(message);
-    }
-
-    {
-      networkstream body;
-      TLS::Handshake message {TLS::HandshakeType::SERVER_HELLO_DONE, 0, body};
-      this->_send_handshake(message);
-    }
-
-    networkstream peer_certificate;
-    this->_recv_certificate(peer_certificate);
-    this->_check_peer_certificate(peer_certificate);
-
-    // ClientKeyExchange: the pre master secret, encrypted to this server's key.
-    networkstream pre_master_secret;
-    {
-      networkstream body;
-      TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-      this->_recv_handshake(message);
-      if (message.msg_type != TLS::HandshakeType::CLIENT_KEY_EXCHANGE)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-      const uint16_t length = body.read_std_ushort();
-      networkstream encrypted;
-      body.read(encrypted, length);
-
-      networkstream key;
-      this->_credential(this->_handshake_params.credentials.private_key, key);
-      try {
-	X509::decrypt(key, this->_handshake_params.credentials.private_key_cipher,
-		      encrypted, pre_master_secret);
-      } catch (const std::exception&) {
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECRYPT_ERROR);
-      }
-    }
-
-    // CertificateVerify, over everything said up to here. Without it a client
-    // could present somebody else's certificate: encrypting to the server's key
-    // proves nothing about who is doing the encrypting.
-    {
-      // Captured before the message joins the transcript, because what it signs
-      // is everything that came before it.
-      networkstream signed_messages;
-      this->_transcript_bytes(signed_messages);
-
-      networkstream body;
-      TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-      this->_recv_handshake(message);
-      if (message.msg_type != TLS::HandshakeType::CERTIFICATE_VERIFY)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-      const uint8_t hash_algorithm = body.read_std_ubyte();
-      const uint8_t signature_algorithm = body.read_std_ubyte();
-      if (hash_algorithm != (uint8_t)TLS::HashAlgorithm::SHA256
-	  || signature_algorithm != (uint8_t)TLS::SignatureAlgorithm::RSA)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::ILLEGAL_PARAMETER);
-
-      const uint16_t length = body.read_std_ushort();
-
-      networkstream signature, certificate;
-      body.read(signature, length);
-      peer_certificate.read(certificate, 0, peer_certificate.length());
-
-      if (!X509::verify(certificate, "SHA-256", signed_messages, signature))
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::DECRYPT_ERROR);
-    }
-
-    this->_derive_keys(pre_master_secret);
-
-    this->_recv_change_cipher_spec();
-    this->_recv_finished("client finished");
-
-    this->_send_change_cipher_spec();
-    this->_send_finished("server finished");
-  }
-
-  void tlsbuf::_client_hello()
-  {
-    networkstream client_body;
-
-    this->_pending_state.entity = this->_write_state.entity;
-
-    client_body.write_std_ubyte(this->_handshake_params.protocol_version.major);
-    client_body.write_std_ubyte(this->_handshake_params.protocol_version.minor);        // client_version
-
-    uint32_t gmt_unix_time = Utility::htonl(std::time(0));
-    std::memcpy(&this->_pending_state.client_random, &gmt_unix_time, sizeof(uint32_t)); // random.gmt_unix_time
-    TLS::IV((uint8_t*)&this->_pending_state.client_random + sizeof(uint32_t), TLS::RANDOM_LENGTH - sizeof(uint32_t));
-    client_body.write((char*)&this->_pending_state.client_random, TLS::RANDOM_LENGTH);  // random.random_bytes
-
-    client_body.write_std_ubyte(this->_handshake_params.session_id.size());
-    client_body.write((char*)this->_handshake_params.session_id.data(),
-		 this->_handshake_params.session_id.size());                         // session_id
-
-    client_body.write_std_ushort(this->_handshake_params.cipher_suites.size() * sizeof(TLS::CipherSuite));
-    client_body.write((char*)this->_handshake_params.cipher_suites.data(),
-		 this->_handshake_params.cipher_suites.size() * sizeof(TLS::CipherSuite)); // cipher_suites
-
-    client_body.write_std_ubyte(this->_handshake_params.compression_methods.size());
-    client_body.write((char*)this->_handshake_params.compression_methods.data(),
-		 this->_handshake_params.compression_methods.size());                // compression_methods
-
-    // extensions. RFC 5246 7.4.1.4.1: a TLS 1.2 client that offers no
-    // signature_algorithms is taken to have offered SHA-1 with its certificate's
-    // key type, which is not what this end signs CertificateVerify with. It goes
-    // out unconditionally.
-    {
-      networkstream extension, extensions;
-
-      std::vector<TLS::SignatureAndHashAlgorithm> algorithms;
-      algorithms.push_back(TLS::SIG_RSA_SHA256);
-      TLS::write_signature_algorithms(extension, algorithms);
-
-      extensions.write_std_ushort((uint16_t)TLS::ExtensionType::SIGNATURE_ALGORITHMS);
-      extensions.write_std_ushort((uint16_t)extension.length());
-      extension.read(extensions, 0, extension.length());
-
-      client_body.write_std_ushort((uint16_t)extensions.length());
-      extensions.read(client_body, 0, extensions.length());
-    }
-
-    TLS::Handshake client_hello {TLS::HandshakeType::CLIENT_HELLO, client_body.tellp(), client_body};
-    this->_send_handshake(client_hello);
-  }
-
-  void tlsbuf::_client_handshake()
-  {
-    this->_transcript.string("");
-    this->_peer_subject.clear();
-    this->_peer_permissions.clear();
-
-    this->_client_hello();
-
-    // ServerHello, and the state it settled on.
-    {
-      networkstream body;
-      TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-      this->_recv_handshake(message);
-      if (message.msg_type != TLS::HandshakeType::SERVER_HELLO)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-      this->_pending_state.entity = this->_write_state.entity;
-      this->_pending_state.prf_algorithm = TLS::PRFAlgorithm::TLS_PRF_SHA256;
-
-      this->_protocol_version.major = body.read_std_ubyte();
-      this->_protocol_version.minor = body.read_std_ubyte();
-
-      body.read((char*)&this->_pending_state.server_random, TLS::RANDOM_LENGTH);
-      body.ignore(body.read_std_ubyte());             // session_id
-
-      TLS::CipherSuite chosen {body.read_std_ubyte(), body.read_std_ubyte()};
-      TLS::cipher_suite(chosen, this->_pending_state);
-      this->_pending_state.compression_algorithm = (TLS::CompressionMethod)body.read_std_ubyte();
-    }
-
-    networkstream peer_certificate;
-    this->_recv_certificate(peer_certificate);
-    this->_check_peer_certificate(peer_certificate);
-
-    // CertificateRequest, then ServerHelloDone.
-    {
-      networkstream body;
-      TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-      this->_recv_handshake(message);
-      if (message.msg_type != TLS::HandshakeType::CERTIFICATE_REQUEST)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-
-      // certificate_types, then the algorithms the server will verify with. If
-      // it will not take an RSA certificate signed under SHA-256, this end has
-      // nothing it can offer and should say so now rather than be refused later.
-      const uint8_t types_count = body.read_std_ubyte();
-      bool rsa_sign_wanted = false;
-      for (uint8_t i = 0; i < types_count; i++)
-	if (body.read_std_ubyte() == (uint8_t)TLS::ClientCertificateType::RSA_SIGN)
-	  rsa_sign_wanted = true;
-
-      const std::streamsize left = body.length() - body.tellg();
-      if (!rsa_sign_wanted
-	  || !TLS::accepts_signature_algorithm(body, left, TLS::SIG_RSA_SHA256))
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::HANDSHAKE_FAILURE);
-    }
-    {
-      networkstream body;
-      TLS::Handshake message {(TLS::HandshakeType)0, 0, body};
-      this->_recv_handshake(message);
-      if (message.msg_type != TLS::HandshakeType::SERVER_HELLO_DONE)
-	this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-    }
-
-    this->_send_certificate();
-
-    // The pre master secret: the version this end offered, then 46 random
-    // octets, encrypted to the key the server's certificate names.
-    networkstream pre_master_secret;
-    {
-      pre_master_secret.write_std_ubyte(this->_handshake_params.protocol_version.major);
-      pre_master_secret.write_std_ubyte(this->_handshake_params.protocol_version.minor);
-      uint8_t random[46];
-      TLS::IV(random, sizeof(random));
-      pre_master_secret.write((char*)random, (std::streamsize)sizeof(random));
-
-      networkstream to_encrypt, encrypted, certificate;
-      pre_master_secret.read(to_encrypt, 0, pre_master_secret.length());
-      peer_certificate.read(certificate, 0, peer_certificate.length());
-      X509::encrypt(certificate, to_encrypt, encrypted);
-
-      networkstream body;
-      body.write_std_ushort((uint16_t)encrypted.length());
-      encrypted.read(body, 0, encrypted.length());
-
-      TLS::Handshake message {TLS::HandshakeType::CLIENT_KEY_EXCHANGE, body.length(), body};
-      this->_send_handshake(message);
-    }
-
-    // CertificateVerify: this end signs the conversation so far, which is what
-    // proves it holds the key its certificate names.
-    {
-      // The handshake messages themselves. Signing their digest instead put a
-      // second SHA-256 inside the signature, which both ends agreed on and no
-      // other implementation would.
-      networkstream key, to_sign, signature;
-      this->_credential(this->_handshake_params.credentials.private_key, key);
-      this->_transcript_bytes(to_sign);
-      X509::sign(key, this->_handshake_params.credentials.private_key_cipher,
-		 "SHA-256", to_sign, signature);
-
-      networkstream body;
-      body.write_std_ubyte((uint8_t)TLS::HashAlgorithm::SHA256);
-      body.write_std_ubyte((uint8_t)TLS::SignatureAlgorithm::RSA);
-      body.write_std_ushort((uint16_t)signature.length());
-      signature.read(body, 0, signature.length());
-
-      TLS::Handshake message {TLS::HandshakeType::CERTIFICATE_VERIFY, body.length(), body};
-      this->_send_handshake(message);
-    }
-
-    this->_derive_keys(pre_master_secret);
-
-    this->_send_change_cipher_spec();
-    this->_send_finished("client finished");
-
-    this->_recv_change_cipher_spec();
-    this->_recv_finished("server finished");
-  }
-
-  tlsbuf* tlsbuf::open(TLS::ConnectionEnd entity, TLS::HandshakeParameters params, Socket::handle_t handle, bool blocking_mode, int timeout)
-  {
-    std::memset(&this->_read_state,  0x00, sizeof(TLS::SecurityParameters));
-    std::memset(&this->_write_state, 0x00, sizeof(TLS::SecurityParameters));
-    std::memset(&this->_pending_state, 0x00, sizeof(TLS::SecurityParameters));
-    this->_read_state.entity = entity;
-    this->_write_state.entity = entity;
-    if (params.protocol_version.major != TLS::VERSION_1_2.major || params.protocol_version.minor != TLS::VERSION_1_2.minor)
-      throw TLSException("unsupported protocol version");
-    this->_handshake_params = params;
-
-    // Application data needs somewhere to gather before it becomes a record.
-    if (this->_buffer == nullptr)
-      this->setbuf(new char_type[tlsbuf::BUFFER_SIZE], tlsbuf::BUFFER_SIZE);
-
-    this->_tcpstream.open(handle, blocking_mode, timeout);
-    if (entity == TLS::ConnectionEnd::SERVER)
-      this->_server_handshake();
-    else
-      this->_client_handshake();
-    return this;
-  }
-
-  tlsbuf* tlsbuf::open(TLS::HandshakeParameters params, std::string node, std::string service, bool blocking_mode, int timeout)
-  {
-    std::memset(&this->_read_state,  0x00, sizeof(TLS::SecurityParameters));
-    std::memset(&this->_write_state, 0x00, sizeof(TLS::SecurityParameters));
-    std::memset(&this->_pending_state, 0x00, sizeof(TLS::SecurityParameters));
-    this->_read_state.entity = TLS::ConnectionEnd::CLIENT;
-    this->_write_state.entity = TLS::ConnectionEnd::CLIENT;
-    if (params.protocol_version.major != TLS::VERSION_1_2.major || params.protocol_version.minor != TLS::VERSION_1_2.minor)
-      throw TLSException("unsupported protocol version");
-    this->_handshake_params = params;
-
-    // Application data needs somewhere to gather before it becomes a record.
-    if (this->_buffer == nullptr)
-      this->setbuf(new char_type[tlsbuf::BUFFER_SIZE], tlsbuf::BUFFER_SIZE);
-
-    this->_tcpstream.open(node, service, blocking_mode, timeout);
-    this->_client_handshake();
-    return this;
   }
 
   tlsbuf* tlsbuf::setbuf(char_type* s, std::streamsize n)
@@ -1186,76 +503,56 @@ namespace Zigurat
 
     // About to block waiting for the peer, so anything still queued for it has
     // to go out first -- the same rule socketbuf follows, and for the same
-    // reason. Without it a request/response protocol deadlocks with the reply
-    // sitting unsent in the put area while both ends wait to read.
-    // A failure to flush is not a reason to stop: the peer may have hung up
-    // precisely because it has already said why, and that is what this read is
-    // about to collect.
+    // reason. Without it a request and its reply deadlock, the reply sitting
+    // unsent in the put area while both ends wait to read.
     if (this->pptr() != nullptr && this->pptr() > this->pbase())
       this->overflow(traits_type::eof());
 
-    arraystream plain_text(this->_buffer, this->_length);
+    SSL* ssl = (SSL*)this->_ssl;
+    if (ssl == nullptr) return traits_type::eof();
 
-    TLS::Record record {(TLS::ContentType)0, {0, 0}, 0, plain_text};
-    
-    this->_recv_record(record);
-    if (record.type != TLS::ContentType::APPLICATION_DATA)
-      this->_alert(TLS::AlertLevel::FATAL, TLS::AlertDescription::UNEXPECTED_MESSAGE);
-    
-    if (!this->_tcpstream.good()) {
-      this->setg(nullptr, nullptr, nullptr); 
+    const int taken = SSL_read(ssl, this->_buffer, (int)this->_length);
+    if (taken <= 0) {
+      // A peer that shut down cleanly and a peer that vanished say the same
+      // thing to a reader: there is nothing more coming.
+      this->setg(nullptr, nullptr, nullptr);
       return traits_type::eof();
     }
 
-    this->setg(this->_buffer, this->_buffer, this->_buffer + plain_text.tellp());
-    return traits_type::to_int_type(*this->_buffer);
+    this->setg(this->_buffer, this->_buffer, this->_buffer + taken);
+    return traits_type::to_int_type(*this->gptr());
   }
 
   tlsbuf::int_type tlsbuf::overflow(int_type ch)
   {
-    std::streamsize plain_text_length = this->pptr() - this->pbase();
+    SSL* ssl = (SSL*)this->_ssl;
+    if (ssl == nullptr) return traits_type::eof();
 
-    // Nothing pending is not a failure, and an empty record is not worth
-    // sending: a flush on an idle connection would otherwise emit one.
-    if (plain_text_length == 0) {
-      if (traits_type::eq_int_type(ch, traits_type::eof()))
-	return traits_type::not_eof(ch);
+    const std::streamsize pending = (this->pptr() != nullptr) ? (this->pptr() - this->pbase()) : 0;
+
+    std::streamsize written = 0;
+    while (written < pending) {
+      const int sent = SSL_write(ssl, this->pbase() + written, (int)(pending - written));
+      if (sent <= 0) {
+	this->setp(nullptr, nullptr);
+	return traits_type::eof();
+      }
+      written += sent;
     }
 
-    arraystream     plain_text(this->_buffer, plain_text_length);
-
-    TLS::Record record {TLS::ContentType::APPLICATION_DATA, this->_protocol_version, plain_text_length, plain_text};
-    
-    this->_send_record(record);
-    
-    if (!this->_tcpstream.good()) {
-      this->setp(nullptr, nullptr);      
-      return traits_type::eof();
-    }
-
-    if (!traits_type::eq_int_type(ch, traits_type::eof())) *this->_buffer = ch;
     this->setp(this->_buffer, this->_buffer + this->_length);
-    return traits_type::to_int_type(0);
+
+    if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+      *this->pptr() = traits_type::to_char_type(ch);
+      this->pbump(1);
+    }
+
+    return traits_type::not_eof(ch);
   }
 
   tlsbuf::int_type tlsbuf::pbackfail(int_type)
   {
     return traits_type::eof();
-  }
-
-  void tlsbuf::renegotiate()
-  {
-    if (this->_write_state.entity == TLS::ConnectionEnd::CLIENT) throw TLSException("only server could start renegotiation process");
-
-    networkstream plain_text;
-    plain_text.write_std_ubyte((uint8_t)TLS::HandshakeType::HELLO_REQUEST);
-    plain_text.fill_n(3, 0x00);
-    
-    TLS::Record record {TLS::ContentType::HANDSHAKE, this->_protocol_version, plain_text.tellp(), plain_text};
-    
-    this->_send_record(record);
-
-    this->_server_handshake();
   }
 
   bool tlsbuf::is_open() const
@@ -1265,15 +562,16 @@ namespace Zigurat
 
   tlsbuf* tlsbuf::close()
   {
-    // close_notify is a warning, not a failure. Sending it at FATAL made _alert
-    // throw on the way out of every clean shutdown, so closing a healthy
-    // connection raised an exception. A peer that has already gone is not an
-    // error either -- there is nobody left to tell.
-    if (this->_tcpstream.is_open()) {
-      try {
-	this->_alert(TLS::AlertLevel::WARNING, TLS::AlertDescription::CLOSE_NOTIFY);
-      } catch (...) {
-      }
+    if (this->_ssl != nullptr) {
+      SSL* ssl = (SSL*)this->_ssl;
+
+      // close_notify, and only the sending half of it: waiting for the peer's
+      // in reply is what a second SSL_shutdown does, and a peer that has gone
+      // already is not an error, there is nobody left to tell.
+      SSL_shutdown(ssl);
+
+      SSL_free(ssl);          // takes the BIO with it
+      this->_ssl = nullptr;
     }
 
     this->_tcpstream.close();
@@ -1282,15 +580,13 @@ namespace Zigurat
 
   tlsbuf::~tlsbuf()
   {
-    this->_tcpstream.close();
+    if (this->_ssl != nullptr) {
+      SSL_free((SSL*)this->_ssl);
+      this->_ssl = nullptr;
+    }
 
+    this->_tcpstream.close();
     delete[] this->_buffer;
-    delete[] this->client_write_MAC_key;
-    delete[] this->server_write_MAC_key;
-    delete[] this->client_write_key;
-    delete[] this->server_write_key;
-    delete[] this->client_write_IV;
-    delete[] this->server_write_IV;
   }
 
 }

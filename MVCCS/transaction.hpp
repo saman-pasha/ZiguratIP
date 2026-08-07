@@ -2,6 +2,8 @@
 #ifndef __TRANSACTION_HPP__
 #define __TRANSACTION_HPP__
 
+
+#include <cstdint>
 #include "isolationlevel.hpp"
 #include "pointer.hpp"
 #include <ctime>

@@ -123,7 +123,14 @@ namespace Zigurat
 	if (is_data) {
 	  if (online_lock != RowLock::NONE) {
 
-	    std::cout << "uncommitted_pointer: " << iter->first << "," << begin_address << std::endl;
+	    // hashkey_ptr is const uint8_t*, so streaming it picks the overload
+	    // that prints a C string: strlen ran off the end of a twenty octet
+	    // hash and kept going to the first zero byte, printing whatever it
+	    // passed. AddressSanitizer catches it on the first uncommitted
+	    // pointer found at startup.
+	    std::cout << "uncommitted_pointer: "
+		      << Utility::octet_as_hex(iter->first, sizeof(hashkey_t))
+		      << "," << begin_address << std::endl;
     
 	    this->_load_control(pointer, control);
 
@@ -134,12 +141,40 @@ namespace Zigurat
 	      this->_rollback_pointer(pointer);
 	    }
 	  }	  
+	  begin_address += this->_pointer_actual_size(pointer);
+
 	} else {
-	  this->_free_list_insert(iter->first, pointer);
-	  break;
+
+	  // A FREE RUN IS NOT A RECORD, and _pointer cannot describe one. It
+	  // seeks past CONTROL_COUNT control chunks and measures what follows,
+	  // which is right for a record and wrong for a hole: a hole has no
+	  // control block, so on a run shorter than CONTROL_COUNT + 1 chunks it
+	  // reads straight through into the record behind it and answers a size
+	  // covering both. That size went into the free list, and the next
+	  // allocation from it wrote over a live row.
+	  //
+	  // So the run is measured from the hexmap, which is the only thing that
+	  // knows where it ends: chunks with the high bit clear, ending after the
+	  // one carrying the standalone bit.
+	  int64_t run = this->_free_run_count(begin_address, end_address);
+
+	  // Zero would not advance, and a page walk that does not advance is a
+	  // hang at startup. It cannot happen -- is_data is false, so the chunk
+	  // here has its high bit clear and counts -- but this loop is not the
+	  // place to find out that something else was assumed wrongly.
+	  if (run <= 0) break;
+
+	  Pointer free_pointer(iter->first, begin_address, run * CHUNK_SIZE);
+	  this->_free_list_insert(iter->first, free_pointer);
+
+	  // AND KEEP WALKING. This used to break, which is only correct if free
+	  // space is always the page's tail. It is not: a rolled-back transaction
+	  // frees its record wherever it sits, and everything allocated after it
+	  // is then behind a hole. Stopping there left those records unseen, the
+	  // free space past them unregistered, and the allocator's view of the
+	  // page disagreeing with what was in it.
+	  begin_address += run * CHUNK_SIZE;
 	}
-	
-	begin_address += this->_pointer_actual_size(pointer);
       }
 
       std::cout << "memory loading... " << (100 * i) / this->_page_count << "%\r";
@@ -149,10 +184,19 @@ namespace Zigurat
     std::cout << "memory loading... 100%" << std::endl;
     
     if (transactions.size() > 0) {
+      // COLLECTED FIRST, FREED AFTER, which is the rule truncate already
+      // follows and says why: _free moves entries between the page list and the
+      // free list, and it can hand a whole page back to FREE_HASHKEY -- so
+      // freeing from inside the walk mutates what the walk is standing on.
+      std::list<Pointer> spent;
       this->_cursor(TRANSACTIONS_HASHKEY, nullptr, nullptr, [&] (const Pointer& pointer) -> bool {
-	  this->_free(pointer);
+	  spent.push_back(pointer);
 	  return true;
 	});
+
+      for (const Pointer& pointer : spent) {
+	this->_free(pointer);
+      }
       std::cout << "memory restore ends" << std::endl;
     }
 
@@ -223,6 +267,40 @@ namespace Zigurat
     this->_hexmap_io.write_std_ubyte(DATA_STANDALONE_CHUNK + (pointer.size % CHUNK_SIZE));
   }
 
+  // How many chunks the free run at ADDRESS spans, read from the hexmap.
+  //
+  // A run is bytes with the high bit clear, ending after the one with the
+  // standalone bit -- exactly what _free_hexmap writes. It stops at END_ADDRESS
+  // whatever the bytes say, because a page's free space cannot extend past the
+  // page, and a hexmap that claims otherwise must not send the walk into the
+  // next one.
+  int64_t Memory::_free_run_count(int64_t address, int64_t end_address)
+  {
+    uint8_t hex_byte = 0;
+    int64_t count = 0;
+
+    this->_hexmap_io.seekg(this->_pointer_hexmap_address(address), std::ios::beg);
+
+    while (address + (count * CHUNK_SIZE) < end_address) {
+      this->_hexmap_io.read_std_ubyte(hex_byte);
+
+      if (!this->_hexmap_io.good()) {
+	this->_hexmap_io.clear();
+	throw MemoryException("hexmap ends inside the free run at " + std::to_string(address));
+      }
+
+      // An allocated chunk is not part of this run and must not be counted:
+      // counting it is how a free entry comes to cover a live record.
+      if ((hex_byte & (uint8_t)128) == 128) break;
+
+      count++;
+
+      if ((hex_byte & (uint8_t)64) == 64) break;   // standalone: the run ends here
+    }
+
+    return count;
+  }
+
   void Memory::_free_hexmap(int64_t address, int64_t count)
   {
     this->_hexmap_io.seekp(address, std::ios::beg);
@@ -281,7 +359,21 @@ namespace Zigurat
 
       if (actual_size == iter->second.size) {
 
-	Pointer pointer = iter->second;
+	// SIZE, NOT THE ENTRY'S SIZE. A free entry measures the whole span it
+	// covers -- data chunks and the control block -- because that is what
+	// _free wrote and what the comparison above needs. A Pointer handed to
+	// a caller measures the DATA, which is what the other two returns here
+	// answer and what _pointer_actual_size expects to add the control block
+	// back onto.
+	//
+	// Returning the entry as it stood gave back a Pointer whose size was
+	// already CONTROL_SIZE too large, so the record's hexmap run was
+	// written CONTROL_COUNT chunks too long and ran over whatever followed
+	// it. It was nearly unreachable while startup registered at most one
+	// free run per page: an exact match needs the hole to be the size of
+	// the record replacing it, and a page has to be walked properly before
+	// its holes are known.
+	Pointer pointer(iter->second.hash_key, iter->second.address, size);
 	delete[] iter->first;
 	this->_free_list.erase(iter);
 	return pointer;
@@ -615,6 +707,126 @@ namespace Zigurat
     } while (true);
   }
 
+  void Memory::_sync()
+  {
+    this->_hexmap_io.flush();
+    this->_data_io.flush();
+
+    // Data before hexmap, every time. The hexmap is what says a record is
+    // there and what state it is in; the data is the record itself. A hexmap
+    // that reaches the disk first describes a record that may not have, and
+    // that is the one ordering the store cannot recover from.
+    this->_data_io.sync_to_disk();
+    this->_hexmap_io.sync_to_disk();
+  }
+
+  bool Memory::_visible(Pointer& pointer, lock_t* hexmap_lock, lock_t* data_lock)
+  {
+    uint8_t hex_byte = 0;
+
+    this->_hexmap_io.seekg(this->_pointer_hexmap_address(pointer.address), std::ios::beg);
+
+    this->_hexmap_io.read_std_ubyte(hex_byte);
+    RowState online_state = (RowState)(hex_byte & (uint8_t)12);
+    RowLock  online_lock  = (RowLock)(hex_byte & (uint8_t)3);
+
+    this->_hexmap_io.read_std_ubyte(hex_byte);
+    RowState offline_state = (RowState)(hex_byte & (uint8_t)12);
+
+    Control control;
+    bool is_visible = false;
+    bool settled = false;
+
+    switch ((this->_initialized) ? Memory::transaction.isolation_level() : IsolationLevel::READ_UNCOMMITTED) {
+
+    case IsolationLevel::READ_UNCOMMITTED:
+      if ( (offline_state == RowState::NONE     && online_state == RowState::INSERTED) ||
+	   (offline_state == RowState::INSERTED && online_state == RowState::NONE    ) ) {
+	is_visible = true;
+      }
+      break;
+
+    case IsolationLevel::READ_COMMITTED:
+      if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+	is_visible = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, hexmap_lock, data_lock);
+      }
+      break;
+
+    case IsolationLevel::REPEATABLE_READ:
+    case IsolationLevel::SERIALIZABLE: // handled in transaction class as semaphore
+      if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+
+	if (online_lock == RowLock::NONE) {
+	  this->_load_control(pointer, control);
+
+	  control.online_state = RowState::NONE;
+	  control.online_lock = RowLock::SHARED;
+	  control.online_time = std::time(0);
+	  control.transaction_id = Memory::transaction.id;
+	  control.query_id = Memory::transaction.query_id;
+	  this->_dump_control(pointer, control);
+	  this->_transaction_push(pointer);
+	  is_visible = true;
+	} else {
+	  is_visible = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, hexmap_lock, data_lock);
+	}
+      }
+      break;
+
+    case IsolationLevel::SNAPSHOT:
+      if ( (offline_state == RowState::NONE && online_state != RowState::NONE)
+	   || offline_state == RowState::INSERTED || offline_state == RowState::DELETED) {
+
+	do {
+	  this->_load_control(pointer, control);
+
+	  if (control.transaction_id > 0 && Memory::transaction.id == control.transaction_id) { // own lock
+	    is_visible = (control.online_state == RowState::INSERTED);
+	    break;
+	  }
+
+	  switch (control.offline_state) {
+	  case RowState::NONE:
+	    settled = true;
+	    break;
+
+	  case RowState::INSERTED:
+	  case RowState::UPDATED:
+	    if (control.create_time <= Memory::transaction.init_time) {
+	      is_visible = true;
+	      settled = true;
+	    } else if (control.reference_address > -1) {
+	      pointer = this->_pointer(pointer.hash_key, control.reference_address);
+	    } else {
+	      settled = true;
+	    }
+	    break;
+
+	  case RowState::DELETED:
+	    if (control.modify_time > Memory::transaction.init_time) {
+	      is_visible = true;
+	      settled = true;
+	    } else if (control.reference_address > -1) {
+	      pointer = this->_pointer(pointer.hash_key, control.reference_address);
+	    } else {
+	      settled = true;
+	    }
+	    break;
+
+	  default:
+	    throw MemoryException("invalid row state");
+	  }
+	} while (!settled);
+      }
+      break;
+
+    default:
+      throw MemoryException("invalid isolation level");
+    }
+
+    return is_visible;
+  }
+
   bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, lock_t* hexmap_lock, lock_t* data_lock)
   {
     if (this->_watcher) {
@@ -700,7 +912,18 @@ namespace Zigurat
     bool is_query = false;
     if (this->_initialized && Memory::transaction.query_time == 0) {
       is_query = true;
-      Memory::transaction.query_id = (int64_t)std::rand();
+
+      // This is written into the store and read back to tell rows the current
+      // query inserted from rows that were already there, so an update cursor
+      // does not walk over its own output. std::rand() with nobody calling
+      // std::srand returns the same sequence on every start of the process --
+      // it only ever varied because generating a key seeded the global state as
+      // a side effect, and that seeding is gone now. A value that decides what
+      // an update sees should not be the same on every run.
+      uint64_t drawn = 0;
+      Utility::random_bytes((uint8_t*)&drawn, sizeof(drawn));
+      Memory::transaction.query_id = (int64_t)(drawn >> 1);   // stays positive
+
       Memory::transaction.query_time = std::time(0);
     }
 
@@ -1099,17 +1322,33 @@ namespace Zigurat
 
     time_t commit_time = std::time(0);
 
+    // Three writes in an order that has to survive the power going out.
+    //
+    // A row is updated by writing a whole new version elsewhere and then
+    // flipping the control block that adopts it, which is shadow paging and
+    // needs no log to recover -- but only if the writes land in the order they
+    // were made. flush() hands them to the operating system, which is entitled
+    // to reorder them, so without a sync the guarantee is a wish.
+    //
+    // First the intention: this transaction is committing at commit_time, on
+    // disk before any control block moves. _initialize reads exactly this at
+    // startup to decide whether an uncommitted looking record should be
+    // committed or rolled back, so a crash between here and the loop below
+    // still resolves the same way.
     this->_write_transaction(Memory::transaction.id, commit_time);
+    this->_sync();
 
+    // Then the control blocks it licenses.
     for (const auto& pair : Memory::transaction.context) {
       this->_commit_pointer(pair.second, commit_time);
     }
     Memory::transaction.context.clear();
+    this->_sync();
 
+    // And only then is the intention retired, because it is what a crash in the
+    // middle of the loop would have been recovered from.
     this->_write_transaction(Memory::transaction.id, (time_t)0);
-
-    this->_hexmap_io.flush();
-    this->_data_io.flush();
+    this->_sync();
   }
   
   void Memory::commit_transaction_until(time_t)
@@ -1132,10 +1371,28 @@ namespace Zigurat
     }
     Memory::transaction.context.clear();
 
-    this->_free(Memory::transaction.pointer);
-    
-    this->_hexmap_io.flush();
-    this->_data_io.flush();
+    // Freed once, and then forgotten -- because after this the pointer names
+    // space the allocator has taken back, and a second rollback that still
+    // believes in it hands the same chunks to the free list twice.
+    //
+    // Nothing stopped that happening. Zeytun rolls a request back in
+    // RequestScope's destructor whenever the page did not commit, and
+    // Transaction's own destructor rolls back again when the pooled worker
+    // thread ends -- two rollbacks, one pointer. The free list then holds the
+    // chunk twice, two unrelated allocations are handed the same address, and
+    // whichever writes second wins. A BTreeKey landing on a BTreeValue is how
+    // it showed: a key unpacks seven fields where a value wrote two, so the key
+    // field reads past the record and comes back null, and the next insert dies
+    // in Long::operator< walking into it.
+    //
+    // A default Pointer has no hash key, which is also what a transaction that
+    // never allocated one looks like. Neither is something to free.
+    if (Memory::transaction.pointer.hash_key != nullptr)
+      this->_free(Memory::transaction.pointer);
+
+    Memory::transaction.pointer = Pointer();
+
+    this->_sync();
   }
   
   void Memory::rollback_transaction_to(time_t time)

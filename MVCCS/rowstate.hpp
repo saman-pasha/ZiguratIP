@@ -2,6 +2,8 @@
 #ifndef __ROWSTATE_HPP__
 #define __ROWSTATE_HPP__
 
+
+#include <cstdint>
 namespace Zigurat {
 
   enum class RowState : uint8_t

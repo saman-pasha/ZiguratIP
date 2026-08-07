@@ -84,4 +84,10 @@ namespace Zigurat
     if (this->rdbuf() != nullptr) delete this->rdbuf();
   }
 
+  Socket::handle_t tcpstream::handle() const
+  {
+    const tcpbuf* buffer = dynamic_cast<const tcpbuf*>(this->rdbuf());
+    return (buffer == nullptr) ? Socket::INVALID_SOCKET : buffer->handle();
+  }
+
 }

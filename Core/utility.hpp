@@ -6,6 +6,8 @@
 #include <list>
 #include <tuple>
 #include <string>
+#include <sstream>
+#include <ostream>
 #include <vector>
 #include <cstdint>
 #include <algorithm>
@@ -174,6 +176,60 @@ namespace Zigurat
     static uint32_t ntohl(uint32_t);
     static uint64_t htonll(uint64_t);
     static uint64_t ntohll(uint64_t);
+
+    // Unpredictable octets, straight from the kernel pool. Everything that
+    // needs to be unguessable -- prime candidates, padding, seeds, salts,
+    // session identifiers -- comes through here, so there is one place to be
+    // right about it rather than a std::rand() in each of them.
+    //
+    // Throws rather than returning short or falling back. A caller that cannot
+    // be given entropy must not be handed predictable bytes and told they are
+    // random.
+    static void random_bytes(uint8_t*, size_t);
+
+    // Text that is safe to put inside an HTML document.
+    //
+    // & < > " ' become entities. Everything else is left alone, so this is safe
+    // to apply to text that needs no escaping and cheap enough to apply to all
+    // of it.
+    static std::string escape_html(const std::string&);
+
+    // Markup, deliberately.
+    //
+    // ECHO escapes what it is given unless the page wrote it as a literal, so a
+    // page that has built markup in a variable has to say so. Wrapping it in
+    // this is that saying: it is one word, it is greppable, and it is the only
+    // way past the escaping.
+    struct Raw
+    {
+      std::string text;
+    };
+
+    static Raw raw(const std::string& text) { return Raw{text}; }
+
+    // What ECHO calls for anything that is not a literal.
+    //
+    // The value is rendered the way it would have been written straight to the
+    // stream, and then escaped. Numbers come through unchanged; a String
+    // carrying <script> does not.
+    // Rendered into a stream of the destination's own type, so whatever
+    // operator<< the value has for that stream is the one used -- the Type
+    // library defines them per stream type, not for std::ostream.
+    template <typename S, typename T>
+    static void echo_escaped(S& out, const T& value)
+    {
+      S rendered;
+      rendered << value;
+      out << Utility::escape_html(rendered.str());
+    }
+
+    // The overload that lets Raw past, and the only one that does.
+    template <typename S>
+    static void echo_escaped(S& out, const Raw& markup)
+    {
+      out << markup.text;
+    }
+    static uint64_t random_uint64();
   };
 
 }

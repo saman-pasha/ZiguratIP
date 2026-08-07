@@ -18,14 +18,23 @@ using namespace Zigurat;
 
 // HTTP server configuration
 std::string http_service = "80";
-int         http_backlog = 5;
-int         http_pool_size = 5;
+int         http_backlog = 64;
+// A worker is held for a whole keep-alive connection rather than one request,
+// and a browser opens six at once for a single page. At five, one visitor
+// could occupy every thread and then wait on themselves; the page rendered
+// blank and the log said nothing, because nothing had failed.
+int         http_pool_size = 64;
 bool        http_blocking_mode = true;
 size_t      http_timeout = 0;
 bool        http_async_mode = true;
 size_t      max_uri_length = 8000;
 size_t      max_headers_length = 16000;
-size_t      max_content_length = 2000000000;
+// Two gigabytes, and the whole body is held in memory before a page sees any
+// of it -- so this was the size of the allocation one request could ask for,
+// times however many workers there are. Eight megabytes is more than the forms
+// and uploads this server has any way of handling; raise it deliberately if
+// something needs more.
+size_t      max_content_length = 8 * 1024 * 1024;
 std::time_t session_timeout = 1800;   // seconds a session may sit idle
 
 // HTTP mime types configuration
@@ -36,6 +45,32 @@ HTTPServer http_server;
 bool       http_tls_mode = false;
 
 extern TLS::HandshakeParameters security_params;
+TLS::HandshakeParameters zeytun_security_params;
+namespace
+{
+  // REQUIRED unless told otherwise, so a configuration written before this
+  // existed behaves exactly as it did.
+  TLS::ClientAuth read_client_auth(const Configuration& conf, const std::string& path)
+  {
+    std::string value;
+    if (!conf.get(path, value)) return TLS::ClientAuth::REQUIRED;
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "REQUIRED") return TLS::ClientAuth::REQUIRED;
+    if (value == "OPTIONAL") return TLS::ClientAuth::OPTIONAL;
+    if (value == "NONE")     return TLS::ClientAuth::NONE;
+    throw ZiguratIPException("invalid value for '" + path + "'");
+  }
+
+  const char* client_auth_name(TLS::ClientAuth mode)
+  {
+    switch (mode) {
+    case TLS::ClientAuth::REQUIRED: return "REQUIRED";
+    case TLS::ClientAuth::OPTIONAL: return "OPTIONAL";
+    default:                        return "NONE";
+    }
+  }
+}
+
 void require_security(const char*);
 
 typedef BasePage* (*NEW_PAGE)(binarystream*, HTTPRequest&, HTTPResponse&);
@@ -203,13 +238,18 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
       mime_types.get("/" + ext + "/", content_type);
       response->SET_HEADER("Content-Type", content_type);
       std::string file_path = home_path + "http" + path;
-      std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+      std::ifstream file(file_path, std::ios::binary);
       if (file.good()) {
-	std::streamsize size = file.tellg();
-	file.seekg(0, std::ios::beg);
-        char buffer[size];
-	if (file.read(buffer, size)) {
-	  Globals::echo_stream()->write(buffer, size);
+	// This read the file's size and then declared char buffer[size] -- an
+	// array whose length is a number off the disk, on the stack of a pooled
+	// thread. Anything larger than that thread's stack ran off the end of
+	// it, and the whole file was held in memory besides. A fixed buffer,
+	// copied out as it fills, has neither problem and does not need the
+	// size in advance.
+	char buffer[64 * 1024];
+	while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+	  Globals::echo_stream()->write(buffer, file.gcount());
+	  if (!file) break;
 	}
       } else {
 	throw HTTPException("404 Not Found");
@@ -316,6 +356,13 @@ void load_zeytun(const Configuration& conf)
   }
   std::cout << "Max content length: '" << max_content_length << "'" << std::endl;
 
+  zeytun_security_params = security_params;
+  zeytun_security_params.client_auth = read_client_auth(conf, "/HTTP/TLS_CLIENT_AUTH");
+  std::cout << "Zeytun client auth: '" << client_auth_name(zeytun_security_params.client_auth) << "'";
+  if (zeytun_security_params.client_auth != TLS::ClientAuth::REQUIRED)
+    std::cout << "  --! a peer with no certificate has no subject and no permissions !--";
+  std::cout << std::endl;
+
   if (conf.get("/HTTP/TLS_MODE", value)) {
     value = Utility::to_upper(Utility::trim(value));
     if (value == "TRUE")
@@ -346,7 +393,7 @@ void load_zeytun(const Configuration& conf)
   std::cout << "Zeytun is ready ..." << std::endl << std::endl;
 	
   if (http_tls_mode) {
-    http_server.run(security_params, TCPServer::IPV4, http_service, http_backlog, http_pool_size,
+    http_server.run(zeytun_security_params, TCPServer::IPV4, http_service, http_backlog, http_pool_size,
 		    zeytun_handler, http_blocking_mode, http_timeout,
 		    http_async_mode, max_uri_length, max_headers_length, max_content_length);
   } else {
