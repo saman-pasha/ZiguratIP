@@ -65,7 +65,7 @@ For the real thing:
 
 ```
 pip install torch --target /opt/torch
-TORCH_ROOT=/opt/torch/torch Test/run-ai-e2e.sh
+LIBTORCH=/opt/torch/torch Test/run-ai-e2e.sh
 ```
 
 The same `classifier.parsi` is used either way; the runner rewrites the one
@@ -87,7 +87,7 @@ cd Test/ai
 for f in t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
   curl -sO "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz" && gunzip -f "$f.gz"
 done
-TORCH_ROOT=/opt/torch/torch ../run-ai-e2e.sh
+LIBTORCH=/opt/torch/torch ../run-ai-e2e.sh
 ```
 
 The page then reports the model's answer over the true label for the first ten
