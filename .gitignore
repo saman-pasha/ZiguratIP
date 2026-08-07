@@ -132,3 +132,7 @@ Test/ai/t10k-images-idx3-ubyte
 Test/ai/t10k-labels-idx1-ubyte
 Test/ai/train-images-idx3-ubyte
 Test/ai/train-labels-idx1-ubyte
+
+# Byte-compiled Emacs Lisp. parsi-mode.el is the source; the .elc is built by
+# whoever loads it.
+emacs/*.elc

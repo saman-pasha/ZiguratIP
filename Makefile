@@ -15,6 +15,7 @@ PROJECTS := Core \
 	Compiler \
 	ca \
 	parsi \
+	parsic \
 	ziguratip \
 	Test \
 	System
