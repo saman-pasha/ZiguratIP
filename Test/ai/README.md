@@ -61,12 +61,19 @@ the page answers, that the model reports its own input width, that the same
 input twice agrees, and that two different inputs do not collapse to one
 answer — the last being the one that catches a model nothing ever reaches.
 
-For the real thing:
+For the real thing — **opt in**, with `$LIBTORCH` (or `$TORCH_ROOT`, its older
+name):
 
 ```
 pip install torch --target /opt/torch
 LIBTORCH=/opt/torch/torch Test/run-ai-e2e.sh
 ```
+
+An installed libtorch is not taken as permission to use it. Tier B compiles
+against the real headers, which is minutes rather than seconds, and a suite
+that gets slower because of something else installed on the machine is a suite
+people stop running. If the pip package is around, tier A notices and prints
+the line that would switch — offered, not taken.
 
 The same `classifier.parsi` is used either way; the runner rewrites the one
 include line and adds the `LINK` flags.
