@@ -1,0 +1,36 @@
+-- ---------------------------------------------------------------------------
+-- Step 1 of the milestone: an object, compiled onto a Colab server from your
+-- own machine, over the Cloudflare tunnel.
+--
+-- Nothing here is special. It is an ordinary Parsi table, sequence and
+-- procedure -- the point is WHERE it ends up: this file never leaves your
+-- editor as anything but an HTTP request, and the .so it becomes is built by
+-- the compiler inside the Colab VM, into the home tree the running server is
+-- already reading.
+--
+-- Compile it with C-c C-r in parsi-mode, with URL set in connector.conf.
+-- colab/TUTORIAL.md walks the whole scenario through.
+-- ---------------------------------------------------------------------------
+
+TABLE colab::greetings
+BEGIN
+	COLUMN id      AS Long   PRIMARY KEY;
+	COLUMN who     AS String;
+	COLUMN saying  AS String;
+END
+
+SEQUENCE colab::greetings_seq
+BEGIN
+	FROM 1;
+	TO Long::MAX;
+	STEP 1;
+END
+
+PROCEDURE colab::greet(who AS String, saying AS String)
+RETURNS Long
+REQUIRES colab::greetings, colab::greetings_seq
+BEGIN
+	DECLARE id AS Long = colab::greetings_seq::NEXT();
+	INSERT INTO colab::greetings VALUES (id, who, saying);
+	RETURN id;
+END

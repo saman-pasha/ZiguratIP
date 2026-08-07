@@ -203,6 +203,85 @@ taken mid-write can be inconsistent.
 
 ---
 
+## The milestone: edit here, compile there, see it served
+
+This is the whole thing end to end — a Parsi file on your own machine, compiled
+onto the Colab VM through the tunnel, and the page it makes served back to your
+browser.
+
+**First, the correction it starts with.** The obvious way to set this up is to
+put the tunnel hostname and a port into `connector.conf` and press `C-c C-r`.
+That cannot work. `HOST`/`PORT` there are Zigurat's **binary protocol**, and a
+Cloudflare quick tunnel is an *HTTP reverse proxy* — `cloudflared --url` is
+documented as "connect to the local **webserver**". A socket opened to
+`your-tunnel.trycloudflare.com:443` speaking the binary protocol meets
+Cloudflare's edge expecting HTTP and is refused. There is no port that fixes it;
+carrying TCP needs a *named* tunnel and a Cloudflare account, which a quick
+tunnel is not.
+
+What does go through is HTTP, and ZiguratIP already has an HTTP way in:
+`compiler.zt`, a page that hands what you POST to the compiler. So
+`connector.conf` gained a `URL:` key, and that is what you set.
+
+### On the Colab side
+
+1. Run the notebook down to **4b** and set `ENABLE_REMOTE_COMPILE = True`. That
+   turns on `COMPILER/REMOTE_MODE` and compiles `System/`'s four objects,
+   `compiler.parsi` among them.
+2. Start the server (**cell 5**) — restart it if it was already up, so it reads
+   the new setting.
+3. Open the tunnel (**cell 6**): `TUNNEL = True`. The compiler check will now
+   object, because a compiler page is exactly what you have just built on
+   purpose. `I_UNDERSTAND = True` is the acknowledgement.
+4. Copy the `https://….trycloudflare.com` it prints.
+
+> 🔓 From here until you stop it, **anyone with that URL can compile and run C++
+> inside the VM**, as the user running the server. That is what the arrangement
+> is; it is not a hole in it. Throwaway VM, and stop it when you are done.
+
+### On your machine
+
+5. Put the URL in `connector.conf` — `C-c C-f` in `parsi-mode` opens it:
+
+   ```
+   URL: https://wide-brave-yellow-cat.trycloudflare.com
+   ```
+
+   No port. `https` is 443 and the tunnel hostname is the whole address.
+
+6. Open [`colab/example/01-greeting.parsi`](example/01-greeting.parsi) and press
+   **`C-c C-r`**. It reads `Compiled Successfully` in the echo area — the table,
+   the sequence and the procedure now exist on the Colab VM.
+
+7. Open [`colab/example/02-greeting-page.parsi`](example/02-greeting-page.parsi)
+   and press **`C-c C-r`** as well. In that order: the page `REQUIRES` the
+   procedure, so the other way round it fails to link, and the error says so.
+
+8. Open the tunnel URL with the page on the end:
+
+   ```
+   https://wide-brave-yellow-cat.trycloudflare.com/greeting.zt?who=yourname
+   ```
+
+Zeytun loads the object you just built, inserts a row, and answers with the
+table. Written on your machine, compiled on theirs, served back.
+
+### When it does not work
+
+| what you see | what it is |
+|---|---|
+| `Compiled Successfully` but the page 404s | the page compiled, the URL is wrong — it is the PAGE's name, `greeting.zt`, not the file's |
+| a link error naming `colab::greet` | step 7 ran before step 6 |
+| `answered HTTP 500` | `compiler.zt` is there but `COMPILER/REMOTE_MODE` is not on, or the server was not restarted after 4b |
+| `answered HTTP 404` | `compiler.zt` was never compiled — cell 4b did not run, or failed part way |
+| the echo area says nothing at all | `URL:` is still commented out, so `C-c C-r` went to `parsic` and the binary protocol instead |
+
+A failure opens a `*parsi compile*` buffer with the server's answer in full,
+because a compiler message in the echo area is gone by the time you look away
+from the browser.
+
+---
+
 ## Editing Parsi with an editor
 
 `emacs/parsi-mode.el` in this repository gives syntax highlighting, indentation, and two

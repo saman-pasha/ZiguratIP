@@ -40,6 +40,8 @@
 ;;; Code:
 
 (require 'compile)
+(require 'url)
+(require 'subr-x)
 
 (defgroup parsi nil
   "Editing Parsi, ZiguratIP's language."
@@ -530,6 +532,84 @@ This opens the file itself, not a copy."
       (user-error "No %s in any of: %s" name
                   (string-join (parsi--config-candidates name) ", ")))))
 
+(defun parsi--config-value (name key)
+  "The value of KEY in configuration file NAME, or nil.
+
+Enough of the format to read one setting: `#\' starts a comment, and a key is
+followed by a colon.  It is not a parser for the whole file and does not need to
+be -- one key is asked for, and a key that is commented out has to read as
+absent or the comment in the shipped connector.conf would turn itself on."
+  (let ((path (parsi--config-path name)))
+    (when (and path (file-readable-p path))
+      (with-temp-buffer
+        (insert-file-contents path)
+        (goto-char (point-min))
+        (let (found)
+          (while (and (not found) (not (eobp)))
+            (let* ((line (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position)))
+                   (bare (car (split-string line "#"))))
+              (when (string-match (concat "\\_<" (regexp-quote key) "\\_>[ \t]*:[ \t]*\\(.+\\)")
+                                  bare)
+                (let ((value (string-trim (match-string 1 bare))))
+                  (unless (string= value "") (setq found value)))))
+            (forward-line 1))
+          found)))))
+
+;; Compiling by POSTing to compiler.zt, which is how a server behind an HTTP
+;; tunnel is reached. The binary protocol cannot go that way: a Cloudflare quick
+;; tunnel is an HTTP reverse proxy, so a socket to hostname:443 speaking
+;; Zigurat's protocol meets Cloudflare's edge expecting HTTP and is refused.
+;;
+;; The answer comes back as a rendered HTML page rather than a status, because
+;; compiler.zt is a page a human fills in -- CompilerDrawer puts the outcome in
+;; a <span> above the textarea. So the outcome is read out of the markup, which
+;; is as fragile as it sounds; anything unrecognised is shown whole rather than
+;; guessed at.
+(defun parsi--unescape-html (text)
+  "Undo the escaping a page did on its way out.
+
+The message arrives inside HTML, so the compiler\'s own quotes come back as
+entities: `near &#39;RETRN&#39;\' rather than `near \'RETRN\'\'.  Only the five
+that Parsi\'s own escaping produces are undone -- this is reading one span, not
+parsing a document, and inventing a general entity decoder here would be
+pretending to more than that."
+  (let ((pairs '(("&lt;" . "<") ("&gt;" . ">") ("&quot;" . "\"")
+                 ("&#39;" . "\'") ("&amp;" . "&"))))
+    (dolist (pair pairs text)
+      ;; &amp; last, so an escaped "&amp;lt;" does not become "<"
+      (setq text (replace-regexp-in-string (regexp-quote (car pair))
+                                           (cdr pair) text t t)))))
+
+(defun parsi--compile-over-http (url file)
+  "POST FILE's contents to compiler.zt at URL and report what came back."
+  (let* ((source (with-temp-buffer (insert-file-contents file) (buffer-string)))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          '(("Content-Type" . "application/x-www-form-urlencoded")))
+         (url-request-data
+          (concat "code=" (url-hexify-string source)))
+         (endpoint (concat (string-remove-suffix "/" url) "/compiler.zt"))
+         (buffer (condition-case e
+                     (url-retrieve-synchronously endpoint t nil 120)
+                   (error (user-error "%s: %s" endpoint (error-message-string e))))))
+    (unless buffer
+      (user-error "No answer from %s" endpoint))
+    (with-current-buffer buffer
+      (goto-char (point-min))
+      (let ((status (when (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                      (string-to-number (match-string 1))))
+            (body (buffer-substring-no-properties (point-min) (point-max))))
+        (kill-buffer buffer)
+        (cond
+         ((and status (>= status 400))
+          (cons nil (format "%s answered HTTP %d" endpoint status)))
+         ;; CompilerDrawer writes the outcome into the first span of the form
+         ((string-match "<span[^>]*>\\([^<]*\\)</span>" body)
+          (let ((message (parsi--unescape-html (string-trim (match-string 1 body)))))
+            (cons (string-match-p "Compiled Successfully" message) message)))
+         (t (cons nil (format "unrecognised answer from %s" endpoint))))))))
+
 ;; What both commands do once they know which program to run.  Saving first is
 ;; not a convenience: the compiler reads the FILE, so an unsaved buffer compiles
 ;; the previous version and reports success about code that is not on screen.
@@ -585,7 +665,32 @@ default.  Refused, the answer says so and it appears here.
 
 Output goes to a compilation buffer; an error naming a line is a link to it."
   (interactive)
-  (parsi--run-compiler parsi-remote-executable "parsi-remote-executable" "parsic"))
+  (let ((url (parsi--config-value "connector.conf" "URL")))
+    (if (not url)
+        (parsi--run-compiler parsi-remote-executable "parsi-remote-executable" "parsic")
+      ;; URL set: the server is behind HTTP and parsic cannot reach it, so this
+      ;; goes through compiler.zt instead. Saved first for the same reason the
+      ;; other paths save -- what is sent is the file, not the buffer.
+      (unless buffer-file-name
+        (user-error "Buffer is not visiting a file; save it first"))
+      (when (buffer-modified-p) (save-buffer))
+      (message "compiling on %s ..." url)
+      (let* ((answer (parsi--compile-over-http url buffer-file-name))
+             (ok (car answer))
+             (text (cdr answer)))
+        (if ok
+            (message "%s: %s" (file-name-nondirectory buffer-file-name) text)
+          ;; an error, so it has to be impossible to miss -- a message in the
+          ;; echo area is gone by the time you look away
+          (with-current-buffer (get-buffer-create "*parsi compile*")
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert (format "%s\n%s on %s\n\n%s\n"
+                              buffer-file-name
+                              (format-time-string "%F %T") url text))
+              (goto-char (point-min))))
+          (display-buffer "*parsi compile*")
+          (user-error "%s" text))))))
 
 ;; NO ERROR RULE IS ADDED, and that is not an omission.  Both programs print
 ;;

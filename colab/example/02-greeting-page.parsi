@@ -1,0 +1,51 @@
+-- ---------------------------------------------------------------------------
+-- Step 2: the page. Compile this the same way, then open
+--
+--     https://<your-tunnel>.trycloudflare.com/greeting.zt
+--
+-- in a browser. Zeytun loads the object you just built and answers with it --
+-- which is the whole milestone: written here, compiled there, served back.
+--
+-- REQUIRES names what this links against, so 01-greeting.parsi has to be
+-- compiled first. Compile them out of order and this one fails to link, which
+-- is the error saying so rather than anything mysterious.
+-- ---------------------------------------------------------------------------
+
+-- request.query() needs HTTPRequest's declaration; demo/03-pages.parsi does not
+-- include it because it never asks the request for anything.
+INCLUDE '"httprequest.hpp"';
+
+PAGE greeting
+REQUIRES colab::greet, colab::greetings
+BEGIN
+PUBLIC:
+	OVERRIDE FUNCTION PAGE_LOAD() RETURNS Void
+	BEGIN
+		ECHO '<!DOCTYPE html><html><head><meta charset="UTF-8">';
+		ECHO '<title>Compiled through a tunnel</title>';
+		ECHO '<style>body{font-family:system-ui,sans-serif;margin:3em auto;';
+		ECHO 'max-width:40em;color:#222}h1{color:#37b82d}';
+		ECHO 'td,th{text-align:left;padding:.4em .7em;border-bottom:1px solid #ddd}';
+		ECHO 'table{border-collapse:collapse;width:100%}</style>';
+		ECHO '</head><body>';
+		ECHO '<h1>It worked.</h1>';
+		ECHO '<p>This page was written on your machine, compiled on a Colab VM ';
+		ECHO 'through a Cloudflare tunnel, and served back to you by Zeytun.</p>';
+
+		-- ?who=... adds a row, so the page does something rather than only
+		-- proving it loaded. Anything already stored is listed below it.
+		DECLARE who AS String = request.query('who');
+		IF who == '' BEGIN
+			ECHO '<p>Add a row: append <code>?who=yourname</code> to the URL.</p>';
+		END ELSE BEGIN
+			CALL colab::greet(who, 'said hello through a tunnel');
+			ECHO '<p>Added <b>', who, '</b>.</p>';
+		END
+
+		ECHO '<table><tr><th>id</th><th>who</th><th>saying</th></tr>';
+		SELECT '<tr><td>', id, '</td><td>', who, '</td><td>', saying, '</td></tr>'
+		FROM colab::greetings;
+		ECHO '</table>';
+		ECHO '</body></html>';
+	END
+END

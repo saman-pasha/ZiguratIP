@@ -97,6 +97,34 @@ Note that turning on `COMPILER/REMOTE_MODE` in `ziguratip.conf` is what gives
 `C-c C-r` a server to talk to at all, and it means anyone who can open the binary
 port can run the compiler. See `doc/security.md`.
 
+### `C-c C-r` over HTTP, for a server you cannot open a socket to
+
+Some servers you can reach, you cannot speak the binary protocol to. A Colab VM
+has no inbound port, and the tunnel that gives it one is an **HTTP** reverse
+proxy — so `HOST`/`PORT` have nothing to connect to and no port number fixes it.
+
+Set `URL` in `connector.conf` instead:
+
+```
+URL: https://wide-brave-yellow-cat.trycloudflare.com
+```
+
+`C-c C-r` then POSTs the file to `compiler.zt` there rather than running
+`parsic`. No port belongs in it — `https` is 443 and the hostname is the whole
+address.
+
+That endpoint is `System/compiler.parsi`, a page that hands what it is given to
+the compiler, so a server set up this way **will compile and run whatever anyone
+with the URL sends it**. It needs `COMPILER/REMOTE_MODE` on as well. Throwaway
+sandboxes only; [`colab/TUTORIAL.md`](../colab/TUTORIAL.md) walks the whole
+scenario through.
+
+The answer comes back as a rendered page rather than a status, because
+`compiler.zt` is a form a human fills in — the outcome is read out of the markup,
+which is as fragile as it sounds. Anything unrecognised is shown whole rather
+than guessed at, and any failure opens a `*parsi compile*` buffer with the
+server's answer in full.
+
 ---
 
 ## Indentation
