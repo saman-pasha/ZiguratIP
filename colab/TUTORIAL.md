@@ -16,7 +16,15 @@ needed at runtime; the notebook clones the repository itself.
 ## What you end up with
 
 A Colab VM running one process — ZiguratIP is a database, a language and a web server in
-the same binary — and a public HTTPS URL that reaches its web front end.
+the same binary — and two ways to look at what it serves.
+
+**By default, nothing is exposed.** `visit()` fetches each page over loopback and renders
+it inline, images and all. That is a whole run: build, start, browse the demo, stop.
+
+**Opt in with `TUNNEL = True`** (section 6) and `cloudflared` gives you a real public HTTPS
+URL instead — for opening in a browser, or handing to somebody. Read the warning below
+first; running a notebook top to bottom should not put a server on the internet as a side
+effect, which is why it is off.
 
 | part | what it is | port |
 |---|---|---|
@@ -51,6 +59,8 @@ meant.
 ---
 
 ## 🔓 Read this before you set `TUNNEL = True`
+
+The tunnel is **opt-in**. Everything below applies from the moment you turn it on.
 
 A Cloudflare *quick tunnel* — the kind that needs no account — has **no authentication
 and no access control of any kind**. Anyone with the URL reaches the server. The URL is
@@ -149,21 +159,23 @@ tunnel forwards to 2190 whether or not anything is listening, so **a dead server
 healthy one look identical from a browser** — both render a blank page. Asking over
 loopback first is what tells the two apart.
 
-### 6 · The tunnel
+### 6 · The tunnel — opt-in
 
-Downloads `cloudflared`, runs it against `http://localhost:2190`, and waits for the
-hostname to appear in its log. Re-running the cell stops the previous tunnel first, so a
+Does nothing until `TUNNEL = True`. Then it downloads `cloudflared`, runs it against
+`http://localhost:2190`, and waits for the hostname to appear in its log. Re-running the cell stops the previous tunnel first, so a
 second one does not quietly take a different hostname while the first still holds the port.
 
 If no URL appears it prints what `cloudflared` said, rather than leaving a dead cell. The
 usual causes are an egress policy blocking `api.trycloudflare.com`, or nothing listening
 on 2190.
 
-### 7 · Or no tunnel at all
+### 7 · No tunnel at all — the default
 
 `visit()` fetches a page **and every asset it references** over loopback, embeds them as
 `data:` URIs, and renders the result inline. Nothing is exposed, and what you see is what
 Zeytun actually served, images included.
+
+This is the whole demo without a tunnel, and it is where to start.
 
 ```python
 visit('/setup.zt')     # seed the catalogue -- run once
@@ -181,9 +193,10 @@ Only meaningful with `PERSIST = True`, and only **after** a clean stop — see b
 
 ### 9 and 10 · Stop the server, then the tunnel
 
-In that order, and stop both. The tunnel outlives the server: stopping ZiguratIP alone
-leaves `cloudflared` up and the URL answering 502, which reads as a broken server rather
-than a stopped one.
+In that order. If you opened a tunnel, stop both — the tunnel outlives the server, so
+stopping ZiguratIP alone leaves `cloudflared` up and the URL answering 502, which reads as
+a broken server rather than a stopped one. With `TUNNEL` left off, cell 10 has nothing to
+do and says so.
 
 Snapshot to Drive only **after** a clean stop — there is no write-ahead log, so a snapshot
 taken mid-write can be inconsistent.
