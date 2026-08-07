@@ -13,7 +13,7 @@ Emacs support for Parsi: syntax highlighting, indentation, and three commands.
 |---|---|---|
 | `C-c C-c` | `parsi-compile` | compiles this buffer **here**, with the local `parsi` |
 | `C-c C-r` | `parsi-compile-remote` | compiles it **on a running Zigurat**, through the connector |
-| `C-c C-f` | `parsi-open-config` | opens the `connector.conf` the remote one uses |
+| `C-c C-f` | `parsi-open-config` | opens `connector.conf` — `C-u C-c C-f` opens `ziguratip.conf` |
 
 ---
 
@@ -72,9 +72,30 @@ wrapper script that sets it. Both commands say which setting to fix and what it
 should point at, rather than reporting the loader's complaint as a compile
 failure.
 
-`parsic --config` prints the `connector.conf` it would use and nothing else,
-which is what `parsi-open-config` asks — so the file you edit is the one the
-next remote compile really connects with, even if the search order changes.
+### The two configurations
+
+`C-c C-f` opens the one belonging to whichever compile you are about to run:
+
+| | file | read by | holds |
+|---|---|---|---|
+| `C-c C-f` | `connector.conf` | `parsic` | HOST, PORT, TIMEOUT, TLS_MODE and the client certificate |
+| `C-u C-c C-f` | `ziguratip.conf` | `parsi` **and the server** | COMPILER/CPP and its flags, the catalogue and library paths, COMPILER/REMOTE_MODE |
+
+Both are looked for in the three places `Utility::config_path` walks, in the same
+order: `$ZIGURATIP_HOME/etc/`, then `~/ZiguratIP/etc/`, then `/etc/ZiguratIP/`.
+Not found, the error names all three rather than leaving you to guess which to
+create.
+
+`connector.conf` is asked for rather than searched when `parsic` is available:
+`parsic --config` prints exactly the file it will connect with, so what you edit
+is what the next remote compile really uses even if the search order changes.
+There is no equivalent question for `ziguratip.conf` — `parsi` prints its
+configuration path only while compiling, and running a compile to find out where
+the settings live is not a trade worth making — so that one is searched here.
+
+Note that turning on `COMPILER/REMOTE_MODE` in `ziguratip.conf` is what gives
+`C-c C-r` a server to talk to at all, and it means anyone who can open the binary
+port can run the compiler. See `doc/security.md`.
 
 ---
 

@@ -11,7 +11,7 @@
 ;;
 ;;   C-c C-c   `parsi-compile'         compile here, with the local parsi
 ;;   C-c C-r   `parsi-compile-remote'  compile on a running Zigurat
-;;   C-c C-f   `parsi-open-config'     open the connector.conf the remote one uses
+;;   C-c C-f   `parsi-open-config'     open connector.conf (C-u for ziguratip.conf)
 ;;
 ;; TWO COMPILERS, AND THEY ARE NOT INTERCHANGEABLE.  `parsi' compiles here,
 ;; reading ziguratip.conf and writing the .so, the generated header and the
@@ -465,47 +465,70 @@ the first line that is not."
 ;; is available (`parsic --config' prints exactly this), and this is the
 ;; fallback for when it is not, so the command still answers something useful
 ;; on a machine with only a checkout.
-(defun parsi--config-candidates ()
-  "Where connector.conf is looked for, most specific first."
+(defun parsi--config-candidates (name)
+  "Where NAME is looked for, most specific first.
+
+The same three places, in the same order, that Utility::config_path walks --
+Core/utility.cpp.  Both configuration files are found this way, which is why
+this takes the name rather than knowing one."
   (let ((home (getenv "ZIGURATIP_HOME"))
         (candidates '()))
     (when (and home (not (string= home "")))
-      (push (expand-file-name "etc/connector.conf" home) candidates))
-    (push (expand-file-name "~/ZiguratIP/etc/connector.conf") candidates)
+      (push (expand-file-name (concat "etc/" name) home) candidates))
+    (push (expand-file-name (concat "~/ZiguratIP/etc/" name)) candidates)
     (push (if (memq system-type '(windows-nt cygwin))
-              (expand-file-name "ZiguratIP/connector.conf"
+              (expand-file-name (concat "ZiguratIP/" name)
                                 (or (getenv "PROGRAMDATA") "C:/ProgramData"))
-            "/etc/ZiguratIP/connector.conf")
+            (concat "/etc/ZiguratIP/" name))
           candidates)
     (nreverse candidates)))
 
-(defun parsi--config-path ()
-  "The connector.conf that would be used, or nil.
-Asks the client first, so the answer is the one the compile will really use
-even if the search order changes underneath this file."
-  (or (let ((program (executable-find parsi-remote-executable)))
-        (when program
-          (with-temp-buffer
-            (when (zerop (call-process program nil t nil "--config"))
-              (let ((line (string-trim (buffer-string))))
-                (and (not (string= line "")) (file-readable-p line) line))))))
-      (seq-find #'file-readable-p (parsi--config-candidates))))
+(defun parsi--config-path (name)
+  "The NAME that would be used, or nil.
+
+For connector.conf the client is asked first -- `parsic --config' prints
+exactly the file it will connect with -- so the answer stays right even if the
+search order changes underneath this file.  ziguratip.conf has no such
+question to ask: `parsi' prints its configuration path only while compiling,
+and running a compile to find out where the settings live is not a trade worth
+making, so that one is searched here."
+  (or (when (string= name "connector.conf")
+        (let ((program (executable-find parsi-remote-executable)))
+          (when program
+            (with-temp-buffer
+              (when (zerop (call-process program nil t nil "--config"))
+                (let ((line (string-trim (buffer-string))))
+                  (and (not (string= line "")) (file-readable-p line) line)))))))
+      (seq-find #'file-readable-p (parsi--config-candidates name))))
 
 ;;;###autoload
-(defun parsi-open-config ()
-  "Open the connector.conf that `parsi-compile' would connect with.
+(defun parsi-open-config (&optional server)
+  "Open the configuration a compile would use.
 
-This is the file, not a copy of it: edit the host, the port or TLS_MODE here
-and the next compile goes wherever it now says."
-  (interactive)
-  (let ((path (parsi--config-path)))
+Without a prefix argument, connector.conf -- what `parsi-compile-remote\' reads
+to decide which server to ask.  Change the host, the port or TLS_MODE here and
+the next remote compile goes wherever it now says.
+
+With a prefix argument (\\[universal-argument]), ziguratip.conf instead --
+what `parsi-compile\' reads, and the server too.  That is where COMPILER/CPP
+and its flags live, where the catalogue and library paths are set, and where
+COMPILER/REMOTE_MODE is turned on for the other command to have anything to
+talk to.
+
+THE TWO PAIR WITH THE TWO COMPILE COMMANDS, which is the whole reason both are
+reachable from one key: whichever compile you are about to run, its settings
+are here.
+
+This opens the file itself, not a copy."
+  (interactive "P")
+  (let* ((name (if server "ziguratip.conf" "connector.conf"))
+         (path (parsi--config-path name)))
     (if path
         (find-file path)
       ;; Naming where it looked is the whole value of the message -- "not
-      ;; found" alone leaves the reader guessing which of three it should
-      ;; create.
-      (user-error "No connector.conf in any of: %s"
-                  (string-join (parsi--config-candidates) ", ")))))
+      ;; found" alone leaves the reader guessing which of three to create.
+      (user-error "No %s in any of: %s" name
+                  (string-join (parsi--config-candidates name) ", ")))))
 
 ;; What both commands do once they know which program to run.  Saving first is
 ;; not a convenience: the compiler reads the FILE, so an unsaved buffer compiles
