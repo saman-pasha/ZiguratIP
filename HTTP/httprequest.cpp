@@ -270,25 +270,33 @@ namespace Zigurat
     // up on the way became form variables. Give it the length we were told.
     if (!this->_content || this->_content_length == 0) return;
 
-    uint8_t ch;
-    bufferstream buffer(std::string(this->_content.get(), this->_content_length));
+    // WALKED BY INDEX, the way the query string above is, and not read off a
+    // stream. The stream version asked `is the buffer at EOF now' AFTER taking
+    // the two hex digits, which is a different question from `were there two to
+    // take' -- and it answers wrongly for the one case that matters, an escape
+    // at the very end of the body. Every POST whose last field ended in one was
+    // refused with 400.
+    //
+    // That is not an edge case here. A form field holding a source file ends
+    // with a newline, a newline encodes as %0A, so the compiler page could not
+    // accept ANY well-formed file: paste one in, press Compile, get 400. It was
+    // the query string's own rule -- are three characters left -- that got this
+    // right, so this is now the same loop over the same shape of data.
+    const std::string body(this->_content.get(), this->_content_length);
     std::string var_name, var_value;
-    while (!buffer.eof()) {
-      buffer.read_std_ubyte(ch);
+
+    for (size_t i = 0; i < body.size(); i++) {
+      const char ch = body[i];
       if (ch == '+') {
 	var_value.push_back(' ');
       } else if (ch == '%') {
-	// Same escape, same rule as the query string. The two reads were not
-	// checked either, so a body ending in '%' left both characters holding
-	// whatever the stack had in them and decoded that.
-	uint8_t ch1 = 0, ch2 = 0;
-	buffer.read_std_ubyte(ch1);
-	buffer.read_std_ubyte(ch2);
-	if (buffer.eof() || buffer.fail()) throw HTTPException("400 Bad Request");
-	const int hi = hex_digit((char)ch1);
-	const int lo = hex_digit((char)ch2);
+	// An escape is a % and exactly two hex digits.
+	if (body.size() - i < 3) throw HTTPException("400 Bad Request");
+	const int hi = hex_digit(body[i + 1]);
+	const int lo = hex_digit(body[i + 2]);
 	if (hi < 0 || lo < 0) throw HTTPException("400 Bad Request");
-	var_value.push_back((uint8_t)((hi << 4) | lo));
+	i += 2;
+	var_value.push_back((char)((hi << 4) | lo));
       } else if (ch == '=') {
 	var_name = var_value;
 	var_value.clear();
@@ -300,12 +308,12 @@ namespace Zigurat
 	var_value.push_back(ch);
       }
     }
+
     if (var_name.size() > 0) {
       this->_vars(var_name, var_value, this->_post_vars, this->_post_array_vars);
       var_name.clear();
       var_value.clear();
     }
-    buffer.clear();
   }
 
   HTTPRequest::~HTTPRequest()
