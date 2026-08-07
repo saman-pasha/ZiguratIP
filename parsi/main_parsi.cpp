@@ -84,7 +84,15 @@ namespace
   }
 }
 
-int main(int argc, char* argv[])
+namespace
+{
+  // The file being compiled, so the catch in main can name it.  It is set once
+  // the argument is known and stays empty until then -- a failure before that
+  // is about the configuration, not about any source.
+  std::string compiling;
+}
+
+static int run(int argc, char* argv[])
 {
   clock_t begin_time = clock();
 
@@ -169,6 +177,7 @@ int main(int argc, char* argv[])
   // report that it did not exist.
   std::string file_name;
   if (args.get("", file_name)) {
+    compiling = file_name;
     std::ifstream file(file_name);
     if (!file.good()) {
       throw ParsiException("file not found");
@@ -230,4 +239,31 @@ int main(int argc, char* argv[])
 
   std::cout << "parsi compilation time : " <<  1000.0  * (end_time - begin_time) / CLOCKS_PER_SEC << " ms" << std::endl;
   return 0;
+}
+
+// EVERY THROW USED TO REACH std::terminate.  main had no catch at all, so the
+// most ordinary thing that can happen -- a typo in the source -- ended as
+//
+//     terminate called after throwing an instance of 'Zigurat::ParseException'
+//       what():  syntax error at line 4 column 3 near 'RETRN'
+//     Aborted
+//
+// with status 134.  The message was there, but wrapped in a crash: a caller
+// cannot tell it from parsi actually falling over, and 134 is what a shell
+// reports for a signal.  It is an ordinary failure and exits 1 now, with the
+// file named in front of the position so an editor can open it -- the same
+// line parsic prints, from the same Utility::diagnostic.
+int main(int argc, char* argv[])
+{
+  try {
+    return run(argc, argv);
+  } catch (const ZiguratException& e) {
+    std::cerr << (compiling.empty() ? std::string("parsi: ") + e.what()
+                                    : Utility::diagnostic(compiling, e.what()))
+	      << std::endl;
+    return 1;
+  } catch (const std::exception& e) {
+    std::cerr << "parsi: " << e.what() << std::endl;
+    return 1;
+  }
 }

@@ -82,6 +82,25 @@ namespace Zigurat
     static std::string to_upper(const std::string&);
     static std::string config_path(std::string);
 
+    // A compiler diagnostic with the source file in front of it, in the form
+    // every editor already parses:
+    //
+    //     demo/01-schema.parsi:4:3: syntax error at line 4 column 3 near 'RETRN'
+    //
+    // The parser says "at line 4 column 3" and has no idea what the caller
+    // called the file, so the two halves only meet here. THE ORIGINAL TEXT IS
+    // KEPT WHOLE and the position is added rather than substituted: rewording a
+    // diagnostic to fit a format is how the detail that made it useful gets
+    // lost.
+    //
+    // A message with no position in it gets "file: " and no numbers, because
+    // 0:0 sends the reader to the top of a file that is not the problem.
+    //
+    // It is here, and not in one of the two programs that need it, because both
+    // parsi and parsic answer an editor and their answers have to look the
+    // same -- the same command parses both.
+    static std::string diagnostic(const std::string&, const std::string&);
+
     // Enough of a filesystem to keep a directory of small files. C++11 has no
     // <filesystem>, and pulling one in for four calls would cost more than it
     // saves.

@@ -9,29 +9,33 @@
 ;; Editing support for `.parsi' -- syntax highlighting, indentation, and two
 ;; commands:
 ;;
-;;   C-c C-f   `parsi-open-config'   open the connector.conf that would be used
-;;   C-c C-c   `parsi-compile'       compile this buffer on a running Zigurat
+;;   C-c C-c   `parsi-compile'         compile here, with the local parsi
+;;   C-c C-r   `parsi-compile-remote'  compile on a running Zigurat
+;;   C-c C-f   `parsi-open-config'     open the connector.conf the remote one uses
 ;;
-;; WHY COMPILING GOES OVER A CONNECTION.  There are two compilers and they are
-;; not interchangeable.  `parsi' compiles locally, writing the .so, the header
-;; and the catalogue entry into this machine's home tree; an object that lands
-;; in a home directory no server is reading does not answer a request.  `parsic'
-;; asks a running server to compile, so the object lands where that server will
-;; load it -- and it works when the server is not on this machine at all.  This
-;; mode drives the second, which is why it needs a connector.conf and not a
-;; ziguratip.conf.
+;; TWO COMPILERS, AND THEY ARE NOT INTERCHANGEABLE.  `parsi' compiles here,
+;; reading ziguratip.conf and writing the .so, the generated header and the
+;; catalogue entry into this machine's home tree.  `parsic' reads connector.conf
+;; and asks a running server, so the object lands where that server will load it
+;; -- and it works when the server is not on this machine at all.
 ;;
-;; The server must allow it: COMPILER/REMOTE_MODE in its ziguratip.conf, off by
-;; default.  Refused, it says so, and `parsi-compile' shows that answer.
+;; An object compiled into a home directory nobody is reading does not answer a
+;; request, which is what the remote one is for.  The local one is what you want
+;; while finding out whether the code is right at all.
+;;
+;; The server must allow the remote one: COMPILER/REMOTE_MODE in its
+;; ziguratip.conf, off by default.  Refused, it says so and the answer appears
+;; in the compilation buffer.
 ;;
 ;; Install:
 ;;
 ;;   (add-to-list 'load-path "/path/to/ZiguratIP/emacs")
 ;;   (require 'parsi-mode)
 ;;
-;; `parsic' has to be on PATH, or `parsi-executable' set to it.  It is built by
-;; the top-level Makefile into home/bin, and like every ZiguratIP binary it
-;; needs home/lib on the library path -- see `parsi-executable'.
+;; Both programs have to be on PATH, or `parsi-local-executable' and
+;; `parsi-remote-executable' set to them.  The top-level Makefile builds them
+;; into home/bin, and like every ZiguratIP binary they need home/lib on the
+;; library path -- see `parsi-remote-executable'.
 
 ;;; Code:
 
@@ -50,18 +54,28 @@ set both to match whichever file you are in."
   :type 'integer
   :group 'parsi)
 
-(defcustom parsi-executable "parsic"
-  "The remote-compile client `parsi-compile' runs.
+(defcustom parsi-local-executable "parsi"
+  "The compiler `parsi-compile' runs, here on this machine.
 
-Found on PATH by default.  ZiguratIP builds it into home/bin, which is not
-usually on one, and it links against the shared libraries in home/lib, which
-are not usually on the loader's path either -- so an absolute path alone may
-not be enough:
+It reads ziguratip.conf and writes the .so, the generated header and the
+catalogue entry into this machine's home tree.  See `parsi-remote-executable'
+for the other one, and `parsi-compile' for which to reach for."
+  :type 'string
+  :group 'parsi)
 
-  (setq parsi-executable \"/opt/ZiguratIP/home/bin/parsic\")
+(defcustom parsi-remote-executable "parsic"
+  "The client `parsi-compile-remote' runs, which asks a server to compile.
+
+Both of these are found on PATH by default.  ZiguratIP builds them into
+home/bin, which is not usually on one, and they link against the shared
+libraries in home/lib, which are not usually on the loader's path either -- so
+an absolute path alone may not be enough:
+
+  (setq parsi-local-executable  \"/opt/ZiguratIP/home/bin/parsi\")
+  (setq parsi-remote-executable \"/opt/ZiguratIP/home/bin/parsic\")
 
 with LD_LIBRARY_PATH (DYLD_LIBRARY_PATH on macOS) carrying home/lib, or a
-wrapper script that sets it.  `parsi-compile' says which of the two is missing
+wrapper script that sets it.  Both commands say which of the two is missing
 rather than reporting the loader's message as a compile failure."
   :type 'string
   :group 'parsi)
@@ -469,7 +483,7 @@ the first line that is not."
   "The connector.conf that would be used, or nil.
 Asks the client first, so the answer is the one the compile will really use
 even if the search order changes underneath this file."
-  (or (let ((program (executable-find parsi-executable)))
+  (or (let ((program (executable-find parsi-remote-executable)))
         (when program
           (with-temp-buffer
             (when (zerop (call-process program nil t nil "--config"))
@@ -493,30 +507,64 @@ and the next compile goes wherever it now says."
       (user-error "No connector.conf in any of: %s"
                   (string-join (parsi--config-candidates) ", ")))))
 
-;;;###autoload
-(defun parsi-compile ()
-  "Compile this buffer's file on a running Zigurat, and show what it answered.
+;; What both commands do once they know which program to run.  Saving first is
+;; not a convenience: the compiler reads the FILE, so an unsaved buffer compiles
+;; the previous version and reports success about code that is not on screen.
+(defun parsi--run-compiler (program variable default)
+  "Save this buffer and run PROGRAM on its file.
 
-Uses the connection in connector.conf -- `parsi-open-config' opens it.  The
-object is built on the SERVER, which is the point: compiling locally puts it
-in a home tree that a running server may not be reading.
-
-Output goes to a compilation buffer, so an error that names a line is a link
-to that line."
-  (interactive)
+VARIABLE is the setting to name when PROGRAM cannot be found, and DEFAULT the
+binary it should point at -- the message says where to look, not what was tried
+and failed, which the reader already knows."
   (unless buffer-file-name
     (user-error "Buffer is not visiting a file; save it first"))
-  (unless (executable-find parsi-executable)
-    (user-error "Cannot find %s -- set `parsi-executable' to ZiguratIP's home/bin/parsic"
-                parsi-executable))
+  (unless (executable-find program)
+    (user-error "Cannot find %s -- set `%s' to ZiguratIP's home/bin/%s"
+                program variable default))
   (when (buffer-modified-p)
     (save-buffer))
+  ;; from the file's own directory, so the name in a diagnostic is relative and
+  ;; compilation-mode resolves the link against the right place
   (let ((default-directory (file-name-directory buffer-file-name)))
-    (compile (concat (shell-quote-argument (executable-find parsi-executable))
+    (compile (concat (shell-quote-argument (executable-find program))
                      " "
-                     (shell-quote-argument (file-name-nondirectory buffer-file-name))))))
+                     (shell-quote-argument
+                      (file-name-nondirectory buffer-file-name))))))
 
-;; NO ERROR RULE IS ADDED, and that is not an omission.  parsic prints
+;;;###autoload
+(defun parsi-compile ()
+  "Compile this buffer HERE, with the local `parsi'.
+
+It reads ziguratip.conf and writes the .so, the generated header and the
+catalogue entry into this machine's home tree.  Nothing is sent anywhere.
+
+WHICH OF THE TWO YOU WANT.  This one when the server reading that home tree is
+on this machine, or when you are compiling to see whether the code is right at
+all and do not need it served.  `parsi-compile-remote' when the server is
+elsewhere, or when you want the object where a running server will load it --
+an object compiled into a home directory nobody is reading does not answer a
+request.
+
+Output goes to a compilation buffer; an error naming a line is a link to it."
+  (interactive)
+  (parsi--run-compiler parsi-local-executable "parsi-local-executable" "parsi"))
+
+;;;###autoload
+(defun parsi-compile-remote ()
+  "Compile this buffer on a running Zigurat, through the connector.
+
+Uses the connection in connector.conf -- `parsi-open-config' opens it.  The
+object is built on the SERVER, so it lands where that server will load it, and
+this works when the server is not on this machine at all.
+
+The server must allow it: COMPILER/REMOTE_MODE in its ziguratip.conf, off by
+default.  Refused, the answer says so and it appears here.
+
+Output goes to a compilation buffer; an error naming a line is a link to it."
+  (interactive)
+  (parsi--run-compiler parsi-remote-executable "parsi-remote-executable" "parsic"))
+
+;; NO ERROR RULE IS ADDED, and that is not an omission.  Both programs print
 ;;
 ;;     demo/01-schema.parsi:4:3: syntax error at line 4 column 3 near 'RETRN'
 ;;
@@ -524,8 +572,9 @@ to that line."
 ;; line does get a `compilation-message' property, so C-x ` and clicking both
 ;; land on the column.
 ;;
-;; A failure with no position in it -- the server refusing to compile at all --
-;; is printed as "parsic: ..." and stays plain text.  A rule for it was written
+;; A failure with no position in it -- the server refusing to compile at all,
+;; or a file that cannot be read -- is printed as "name: ..." and stays plain
+;; text.  A rule for it was written
 ;; and then removed: an entry whose FILE field is nil never matches, because
 ;; compile.el has nowhere to jump to, so it sat in the alist doing nothing.
 ;; What marks that run as failed is the exit status, which parsic sets and the
@@ -538,6 +587,7 @@ to that line."
 (defvar parsi-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'parsi-compile)
+    (define-key map (kbd "C-c C-r") #'parsi-compile-remote)
     (define-key map (kbd "C-c C-f") #'parsi-open-config)
     map)
   "Keymap for `parsi-mode'.")

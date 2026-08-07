@@ -9,6 +9,7 @@
 #include "zexception.hpp"
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #if defined(_WIN32) || defined(_WIN64)
 #include <winsock.h>
 #include <windows.h>
@@ -191,6 +192,25 @@ namespace Zigurat
       return etc_path + conf_name;
     }
     return "";
+  }
+
+  std::string Utility::diagnostic(const std::string& file, const std::string& message)
+  {
+    size_t at_line = message.find("line ");
+    size_t at_column = message.find("column ");
+    if (at_line == std::string::npos || at_column == std::string::npos || at_column < at_line)
+      return file + ": " + message;
+
+    long line = 0, column = 0;
+    std::istringstream line_stream(message.substr(at_line + 5));
+    std::istringstream column_stream(message.substr(at_column + 7));
+    line_stream >> line;
+    column_stream >> column;
+    if (line <= 0) return file + ": " + message;
+
+    std::ostringstream out;
+    out << file << ":" << line << ":" << (column > 0 ? column : 1) << ": " << message;
+    return out.str();
   }
 
   bool Utility::file_exists(const std::string& path)

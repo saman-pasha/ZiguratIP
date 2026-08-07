@@ -69,37 +69,6 @@ namespace
       << "off by default. See doc/security.md." << std::endl;
   }
 
-  // The server's message with the file in front of it, in the form every
-  // editor already parses:
-  //
-  //     demo/01-schema.parsi:4:3: syntax error at line 4 column 3 near 'RETRN'
-  //
-  // THE ORIGINAL TEXT IS KEPT WHOLE and the position is added rather than
-  // substituted. Rewording a compiler's diagnostic to fit a format is how the
-  // detail that made it useful gets lost; this only prefixes.
-  //
-  // A message with no position in it -- "compiling over the network is
-  // disabled" -- gets "file: " and no numbers, because 0:0 would send the
-  // reader to the top of a file that is not the problem.
-  std::string locate(const std::string& file, const std::string& message)
-  {
-    size_t at_line = message.find("line ");
-    size_t at_col  = message.find("column ");
-    if (at_line == std::string::npos || at_col == std::string::npos || at_col < at_line)
-      return file + ": " + message;
-
-    long line = 0, column = 0;
-    std::istringstream ls(message.substr(at_line + 5));
-    std::istringstream cs(message.substr(at_col + 7));
-    ls >> line;
-    cs >> column;
-    if (line <= 0) return file + ": " + message;
-
-    std::ostringstream out;
-    out << file << ":" << line << ":" << (column > 0 ? column : 1) << ": " << message;
-    return out.str();
-  }
-
   std::string read_all(const std::string& path)
   {
     std::ifstream source(path);
@@ -162,7 +131,7 @@ int main(int argc, char** argv)
 	// server says "syntax error at line 4 column 3 near 'RETRN'" and has no
 	// idea what the caller called the file, so without this an editor has a
 	// line number and nothing to open.
-	std::cerr << locate(files[i], e.what()) << std::endl;
+	std::cerr << Utility::diagnostic(files[i], e.what()) << std::endl;
 	return 1;
       }
 

@@ -1,6 +1,6 @@
 # parsi-mode
 
-Emacs support for Parsi: syntax highlighting, indentation, and two commands.
+Emacs support for Parsi: syntax highlighting, indentation, and three commands.
 
 ```elisp
 (add-to-list 'load-path "/path/to/ZiguratIP/emacs")
@@ -11,59 +11,70 @@ Emacs support for Parsi: syntax highlighting, indentation, and two commands.
 
 | key | command | what it does |
 |---|---|---|
-| `C-c C-f` | `parsi-open-config` | opens the `connector.conf` a compile would use |
-| `C-c C-c` | `parsi-compile` | compiles this buffer on a running Zigurat |
+| `C-c C-c` | `parsi-compile` | compiles this buffer **here**, with the local `parsi` |
+| `C-c C-r` | `parsi-compile-remote` | compiles it **on a running Zigurat**, through the connector |
+| `C-c C-f` | `parsi-open-config` | opens the `connector.conf` the remote one uses |
 
 ---
 
 ## Compiling
 
-`parsi-compile` saves the buffer and runs **`parsic`**, which connects the way
-`connector.conf` says to and asks the server to compile.
+Both commands save the buffer first — not as a convenience, but because the
+compiler reads the *file*: an unsaved buffer compiles the previous version and
+reports success about code that is not on screen.
 
-**It compiles on the server, not here, and that is the point.** There are two
-compilers and they are not interchangeable:
+**Two compilers, and they are not interchangeable.**
 
-* **`parsi`** reads `ziguratip.conf` and compiles locally, writing the `.so`,
-  the header and the catalogue entry into *this* machine's home tree.
-* **`parsic`** reads `connector.conf` and asks a server, so the object lands
-  where that server will load it.
+* **`parsi`** (`C-c C-c`) reads `ziguratip.conf` and compiles *here*, writing
+  the `.so`, the generated header and the catalogue entry into this machine's
+  home tree. Nothing is sent anywhere.
+* **`parsic`** (`C-c C-r`) reads `connector.conf` and asks a server, so the
+  object lands where that server will load it — and it works when the server is
+  not on this machine at all.
 
-An object compiled into a home directory no server is reading does not answer a
-request. `parsic` is also the only one of the two that works when the server is
-somewhere else.
+Which you want: the local one while finding out whether the code is right at
+all, and when the server reading that home tree is this machine. The remote one
+when the server is elsewhere, or when you want the object where a running server
+will pick it up — an object compiled into a home directory nobody is reading
+does not answer a request.
 
-Output goes to a compilation buffer. A failure that names a position is printed
-as `file:line:column: message`, which `compilation-mode` already understands, so
-`C-x \`` and clicking both land on the column:
+Output goes to a compilation buffer. Both print a positioned failure the same
+way, as `file:line:column: message`, which `compilation-mode` already
+understands — so `C-x \`` and clicking both land on the column:
 
 ```
 demo/01-schema.parsi:4:3: syntax error at line 4 column 3 near 'RETRN'
 ```
 
-**The server has to allow it.** `COMPILER/REMOTE_MODE` in its `ziguratip.conf`
-is `FALSE` by default, and a compile arriving over the network is refused before
-the code is read. Turned off, the answer says so and `parsi-compile` shows it.
-Turning it on means anyone who can open a connection can run the compiler — see
-`doc/security.md`.
+They agree because they share `Utility::diagnostic`: the parser says "at line 4
+column 3" and has no idea what the caller called the file, so the two halves
+only meet there, and one editor command parses both.
 
-### `parsic` has to be findable
+**The server has to allow the remote one.** `COMPILER/REMOTE_MODE` in its
+`ziguratip.conf` is `FALSE` by default, and a compile arriving over the network
+is refused before the code is read. Turned off, the answer says so and it
+appears in the compilation buffer. Turning it on means anyone who can open a
+connection can run the compiler — see `doc/security.md`.
 
-It is built by the top-level `Makefile` into `home/bin`, which is not usually on
-`PATH`, and it links against the shared libraries in `home/lib`, which are not
+### Both have to be findable
+
+The top-level `Makefile` builds them into `home/bin`, which is not usually on
+`PATH`, and they link against the shared libraries in `home/lib`, which are not
 usually on the loader's path either. An absolute path alone may not be enough:
 
 ```elisp
-(setq parsi-executable "/opt/ZiguratIP/home/bin/parsic")
+(setq parsi-local-executable  "/opt/ZiguratIP/home/bin/parsi")
+(setq parsi-remote-executable "/opt/ZiguratIP/home/bin/parsic")
 ```
 
 with `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) carrying `home/lib`, or a
-wrapper script that sets it. `parsi-compile` says which of the two is missing
-rather than reporting the loader's complaint as a compile failure.
+wrapper script that sets it. Both commands say which setting to fix and what it
+should point at, rather than reporting the loader's complaint as a compile
+failure.
 
 `parsic --config` prints the `connector.conf` it would use and nothing else,
 which is what `parsi-open-config` asks — so the file you edit is the one the
-next compile really connects with, even if the search order changes.
+next remote compile really connects with, even if the search order changes.
 
 ---
 
