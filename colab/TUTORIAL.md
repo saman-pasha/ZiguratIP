@@ -297,6 +297,32 @@ What does go through is HTTP, and ZiguratIP already has an HTTP way in:
 Zeytun loads the object you just built, inserts a row, and answers with the
 table. Written on your machine, compiled on theirs, served back.
 
+### Writing the page from Cicili instead
+
+Both example files are ordinary Parsi, written by hand, and their markup is
+quoted angle brackets inside `ECHO` strings. That is deliberate here — what this
+walkthrough is about is *where* the file is compiled, and a transpiler in the
+middle would be one more thing between the editor and the tunnel.
+
+If you would rather generate the page — and the C++ behind it — there is a
+second path. [Cicili](https://github.com/saman-pasha/cicili) can emit a whole
+`.parsi` from a Lisp source, with the markup as forms rather than as strings:
+
+```lisp
+(ECHO (h1) "It worked." (/h1))
+(SELECT ((tr) (td) id (/td) (td) who (/td) (/tr)) FROM greetings)
+```
+
+and `(cicili …)` inside a body lifts an expression into a C++ function of its
+own, which is how a numpy or libtorch computation reaches a page without anyone
+pasting C++ into one. `example/parsi-prefixed.cicili` and
+`example/parsi-unprefixed.cicili` there are the same page written both ways;
+`doc/DOC-CPP.md` has the whole of it.
+
+The output is a `.parsi` like the two here, so it compiles through the same
+`C-c C-r` and the same tunnel. It needs `sbcl` and a Cicili checkout on your
+machine, which is why it is not step 6.
+
 ### When it does not work
 
 | what you see | what it is |
