@@ -96,14 +96,33 @@ namespace Zigurat
     }
 
     if (echo_mode) {
+      // THE SAME SPLIT AS ECHO, and for the same reason -- see Compiler::_echo.
+      // A literal is markup the page's author typed and goes out as it stands;
+      // everything else is a value from somewhere, and a column is the most
+      // exposed value there is, so it is escaped on the way out.
+      //
+      // This branch used to write every listed expression straight to the
+      // stream, so a page's SELECT emitted its columns unescaped while the very
+      // same column ECHOed a line later was escaped. doc/page.md has always
+      // named a column as the case escaping is for; the cursor did not do it.
+      // Proven with a row whose title was <script>alert(1)</script>: the ECHO
+      // page answered &lt;script&gt;… and the SELECT page answered the tag.
+      //
+      // Utility::raw is still the way past, and still the only one.
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "FROM")
 	  break;
 	if (Compiler::_is_select_assignment(expr))
 	  continue;
-	code << tab << "*Globals::echo_stream() << ";
-	expr_compiler->compile(expr.args[0], code);
-	code << ';' << std::endl;
+	if (expr.args[0].token.type == TokenType::STR) {
+	  code << tab << "*Globals::echo_stream() << ";
+	  expr_compiler->compile(expr.args[0], code);
+	  code << ';' << std::endl;
+	} else {
+	  code << tab << "Zigurat::Utility::echo_escaped(*Globals::echo_stream(), ";
+	  expr_compiler->compile(expr.args[0], code);
+	  code << ");" << std::endl;
+	}
       }
     } else if (has_output) {
       code << tab << "Globals::client_stream()->write_std_ubyte((uint8_t)Zigurat::ResultType::CURSOR_FETCH);" << std::endl;

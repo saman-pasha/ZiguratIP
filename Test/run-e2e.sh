@@ -147,6 +147,32 @@ else
 fi
 rm -f "$HOME_DIR/log/missing-body.txt"
 
+# A SELECT's columns are escaped on the way out, and its literals are not.
+#
+# This is checked in the GENERATED C++ rather than over HTTP because the demo's
+# own data has nothing dangerous in it -- a page could render every row wrongly
+# and still look right. What can be asserted is the shape: demo::lookup lists
+# both literal markup and columns, so its cursor must show both forms.
+#
+# It is here because the unit test for this covers Utility::escape_html and
+# echo_escaped in isolation, which both passed the whole time the SELECT cursor
+# was writing columns straight to the stream. Proven with a row whose title was
+# <script>alert(1)</script>: the ECHO page escaped it and the SELECT page did
+# not, and doc/page.md had always named a column as the case escaping is for.
+echo
+echo "checking a SELECT escapes its columns"
+LOOKUP_CPP="$HOME_DIR/tmp/_LOOKUP_.cpp"
+if [ ! -f "$LOOKUP_CPP" ]; then
+  echo "  SKIP: $LOOKUP_CPP not built"
+elif grep -q 'Zigurat::Utility::echo_escaped(\*Globals::echo_stream(), BOOKS' "$LOOKUP_CPP" \
+  && grep -q '\*Globals::echo_stream() << R"ZIP0ML0S0(<li>' "$LOOKUP_CPP"; then
+  echo "  columns escaped, literals left alone: ok"
+else
+  echo "  SELECT escaping FAILED -- columns are reaching the page unescaped"
+  grep -n 'echo_stream' "$LOOKUP_CPP" | head -6
+  STATUS=1
+fi
+
 echo
 echo "server transcript:"
 sed -n '/Transaction Opened/,$p' "$LOG" | head -20

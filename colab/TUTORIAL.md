@@ -5,7 +5,7 @@ This explains what each step does and why, so you can change it rather than only
 
 **Open it in Colab:**
 
-<https://colab.research.google.com/github/saman-pasha/ZiguratIP/blob/colab/colab/ZiguratIP_Colab.ipynb>
+<https://colab.research.google.com/github/saman-pasha/ZiguratIP/blob/master/colab/ZiguratIP_Colab.ipynb>
 
 **Or download it:** the notebook is a single file — `colab/ZiguratIP_Colab.ipynb` — and
 Colab's *File → Upload notebook* takes it directly. Nothing else in this directory is
@@ -69,10 +69,13 @@ infrastructure.
 
 What is behind it is a sandbox:
 
-- **Cross-site scripting by construction.** Parsi's `ECHO` does not escape; a demo page
-  echoes what it is given.
+- **No authentication in front of any page.** Every page is public.
 - **No write-ahead log.** A hard kill mid-commit can corrupt the store.
-- **No authentication in front of any page.**
+- **`Utility::raw` is a hole you can open yourself.** `ECHO` and `SELECT` escape the
+  values they are given and leave the author's own literals alone, so a column holding
+  `<script>` arrives as text — see [`doc/page.md`](../doc/page.md). Wrapping a value in
+  `` `Zigurat::`Utility::`raw() `` is the one way past that, and a page that does it to
+  something a visitor supplied is handing the next visitor their markup.
 
 So: use it to look at the demo, keep it short, and stop it when you are done. Do not point
 one at data you care about.
@@ -121,10 +124,11 @@ good reason to set that is a tunnel nobody else can actually reach.
 
 ### 1 · Build
 
-Clones the `colab` branch and runs `make`. **Use that branch, not `master`** — `master`
-does not build on Linux, and worse, every recipe in the top-level `Makefile` is prefixed
-with `@-`, so failures are stepped over and the run still prints `******* all done *******`
-while having produced 2 of 14 libraries and no executables.
+Clones `master` and runs `make`. The Linux build fixes live there since the `colab`
+branch was merged in; before that merge `master` did not build on Linux at all, and worse,
+every recipe in the top-level `Makefile` was prefixed with `@-`, so failures were stepped
+over and the run still printed `******* all done *******` while having produced 2 of 14
+libraries and no executables. Point `BRANCH` at anything older and that is what you get.
 
 The cell checks the branch exists on the remote before cloning, because a clone of a
 missing branch fails quietly enough that every later cell blames something else.
