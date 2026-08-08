@@ -91,6 +91,11 @@ rather than reporting the loader's message as a compile failure."
 ;; parser itself reads.  Anything highlighted here is therefore something the
 ;; compiler actually knows, and a keyword added to the grammar shows up as a
 ;; word this mode does not colour rather than as a silent disagreement.
+;;
+;; Re-derive it with:
+;;
+;;   grep -oE '(\{[A-Za-z$]+\})?NAME\??:[[:space:]]+[A-Za-z_][A-Za-z_0-9]*' \
+;;        home/etc/patterns.conf | sed -E 's/.*NAME\??:[[:space:]]+//' | sort -u
 (defconst parsi-keywords
   '("AS" "ASC" "BASE" "BEGIN" "BREAK" "BY" "CALL" "CATCH" "CLASS" "COLUMN"
     "COMMIT" "COMMITTED" "COMPILE" "CONSTRUCTOR" "CONTINUE" "CPP" "DECLARE" "DEFAULT"
@@ -103,7 +108,35 @@ rather than reporting the loader's message as a compile failure."
     "SNAPSHOT" "STEP" "TABLE" "THREAD" "THROW" "TO" "TRANSACTION" "TRUNCATE"
     "TRY" "TYPE" "UNCOMMITTED" "UNIQUE" "UPDATE" "USING" "VALUES" "VIRTUAL"
     "WHERE" "WHILE")
-  "Every word the Parsi grammar matches literally.")
+  "Every word the Parsi grammar matches literally.
+NULL is in `parsi-constants' rather than here: it is a value everywhere, and a
+column modifier in COLUMN_EXTEND as well.")
+
+;; THE WORD-SHAPED OPERATORS, and they are a separate list because the grammar
+;; keeps them separate: these are OP directives rather than NAME ones, most of
+;; them inside an alternation --
+;;
+;;     {O}OP: [=<>]|==|<=|<>|>=|IS|LIKE
+;;     {O}OP: AND|OR
+;;     {O}OP: BETWEEN
+;;     {E}OP: NOT
+;;
+;; which is why a keyword list derived from the NAME directives alone missed
+;; every one of them.  They are not decoration: NOT NULL is on most columns in
+;; System/, AND joins nearly every WHERE, and demo/03-pages.parsi turns on LIKE.
+;;
+;;     python3 - <<'PY'
+;;     import re
+;;     for line in open('home/etc/patterns.conf'):
+;;         m = re.match(r'\s*(?:\{[A-Za-z$]+\})?OP\??:\s*(\S+)\s*$', line)
+;;         if not m: continue
+;;         v = re.sub(r'\[[^\]]*\]', '', m.group(1))   # drop [..], its \| is not a bar
+;;         for alt in v.split('|'):
+;;             if re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', alt.strip()): print(alt.strip())
+;;     PY
+(defconst parsi-operators
+  '("AND" "BETWEEN" "IS" "LIKE" "NOT" "OR")
+  "The operators Parsi spells as words rather than as punctuation.")
 
 (defconst parsi-types
   '("Auto" "Bool" "Byte" "Char" "Double" "Float" "Int" "Long" "Object" "Real"
@@ -251,6 +284,11 @@ START is just after the opening line, END is the line holding its END."
          'font-lock-type-face)
    (cons (concat "\\_<" (regexp-opt parsi-keywords t) "\\_>")
          'font-lock-keyword-face)
+
+   ;; After the keywords, so NOT NULL colours both words: NULL is matched as a
+   ;; constant above and NOT as an operator here, which is what they are.
+   (cons (concat "\\_<" (regexp-opt parsi-operators t) "\\_>")
+         'font-lock-builtin-face)
 
    ;; `this' is the only lower-case word the language gives you
    '("\\_<this\\_>" . font-lock-builtin-face)

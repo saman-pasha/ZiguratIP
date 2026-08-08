@@ -154,9 +154,19 @@ Four things are deliberately left alone:
 
 ### What it was tested against
 
-Every `.parsi` file in the repository — all 20 — re-indents **byte-identical**,
-tabs and spaces alike. That is the whole test, and it is a real one: it caught
-four separate mistakes, each of which had looked right.
+Every `.parsi` file in the repository — 21 of the 22 — re-indents
+**byte-identical**, tabs and spaces alike. That is the whole test, and it is a
+real one: it caught four separate mistakes, each of which had looked right.
+
+`tab-width` has to equal `parsi-indent-offset` for a tab-indented file, which is
+what "set both to match the file" above means in practice: with the stock
+`tab-width` of 8 and an offset of 4, a level is four columns and cannot be a
+tab, and every tab-indented file comes back different.
+
+The twenty-second is `System/compiler.parsi`, and it is the file that is odd
+rather than the indenter. One line there is indented `TAB SPC SPC SPC SPC TAB
+TAB TAB` where four tabs reach the same column; the rebuild writes the four
+tabs. Same width, different bytes.
 
 That a file is unchanged is not by itself proof the indenter does anything, so
 `demo/04-bulk.parsi` is also stripped of all indentation and rebuilt from
@@ -169,7 +179,26 @@ nothing; it comes back byte-identical too.
 The keyword list is not written from memory. It is every literal word the
 grammar matches, taken from `home/etc/patterns.conf` — the file the parser
 itself reads — so a keyword added to the grammar shows up as a word this mode
-does not colour, rather than as a silent disagreement.
+does not colour, rather than as a silent disagreement. Both lists carry the
+command that re-derives them, so the claim can be re-checked rather than taken
+on trust.
+
+**Both lists**, because the grammar keeps two kinds of word apart and a list
+built from one kind alone misses the other. Keywords are `NAME` directives;
+`AND`, `OR`, `IS`, `LIKE`, `BETWEEN` and `NOT` are `OP` directives, most of them
+inside an alternation:
+
+```
+{O}OP: [=<>]|==|<=|<>|>=|IS|LIKE
+{O}OP: AND|OR
+{E}OP: NOT
+```
+
+They went uncoloured until this was re-derived from the grammar rather than
+maintained by hand — and they are not rare: `NOT NULL` is on most columns in
+`System/`, `AND` joins nearly every `WHERE`, and `demo/03-pages.parsi` turns on
+`LIKE`. They take `font-lock-builtin-face`, so `NOT NULL` reads as an operator
+beside a constant, which is what it is.
 
 Backticked names (`` `std::`shared_ptr ``) are raw C++ reached from Parsi and
 are coloured differently, because they are not checked the same way.
