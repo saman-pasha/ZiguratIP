@@ -143,33 +143,29 @@ if [ -n "$LIBTORCH" ]; then
   fi
   echo "tier B: against the real libtorch at $LIBTORCH"
 
+  # THE OBJECT CARRIES ITS OWN FLAGS. COMPILE reaches the C++ compile of this
+  # object and LINK reaches its link, both scoped to the object
+  # (Compiler/compilerddl.cpp, ClauseScope), so neither is added to the
+  # server's home/etc/ziguratip.conf and taken out again.
+  #
+  # That is what this used to do, and it was the worst thing in the script: a
+  # global config file edited in place, restored by a trap, and wrong for every
+  # other object compiled while the run was in flight. -I in particular HAD to
+  # go that way -- parsi builds its compile line from COMPILER/CPP_FLAGS and
+  # reads no environment variable, so an exported CPPFLAGS was silently
+  # ignored, and it failed as a missing <torch/torch.h> that looked like a
+  # broken $LIBTORCH.
+  #
+  # -std=c++17 rather than the c++11 the config ships: libtorch 2.x does not
+  # compile under c++11 at all. The object's flags are appended after the
+  # configured ones and the last -std on the line wins.
   sed -e 's|#include "torch_stub.hpp"|#include <torch/torch.h>|' \
-      -e "s|INCLUDE '<memory>';|INCLUDE '<memory>';\n\tLINK '-L$LIBTORCH/lib';\n\tLINK '-Wl,-rpath,$LIBTORCH/lib';\n\tLINK '-ltorch';\n\tLINK '-ltorch_cpu';\n\tLINK '-lc10';|" \
+      -e "s|INCLUDE '<memory>';|INCLUDE '<memory>';\n\tCOMPILE '-std=c++17';\n\tCOMPILE '-I$LIBTORCH/include';\n\tCOMPILE '-I$LIBTORCH/include/torch/csrc/api/include';\n\tLINK '-L$LIBTORCH/lib';\n\tLINK '-Wl,-rpath,$LIBTORCH/lib';\n\tLINK '-ltorch';\n\tLINK '-ltorch_cpu';\n\tLINK '-lc10';|" \
       "$AI/classifier.parsi" > "$WORK/classifier.parsi"
 
-  # THE INCLUDE PATH HAS TO GO THROUGH THE CONFIG FILE. Parsi builds its
-  # compile line from COMPILER/CPP_FLAGS in home/etc/ziguratip.conf
-  # (Compiler/compiler.cpp:232) and reads no environment variable, so an
-  # exported CPPFLAGS is silently ignored -- which is what the first version of
-  # this script did, and it fails as a missing <torch/torch.h> that looks like
-  # a broken $LIBTORCH.
-  #
-  # And it is -std=c++17, not the c++11 the file ships: libtorch 2.x does not
-  # compile under c++11 at all. Only the OBJECT is built with these; ziguratip
-  # itself is already built.
-  #
-  # The file is restored on the way out, including on a failure -- see the trap.
-  CONF="$HOME_DIR/etc/ziguratip.conf"
-  cp "$CONF" "$WORK/ziguratip.conf.orig"
-  restore_conf() { cp "$WORK/ziguratip.conf.orig" "$CONF" 2>/dev/null || true; }
-  trap 'restore_conf; rm -rf "$WORK"' EXIT
-
-  TORCH_INC="-I$LIBTORCH/include -I$LIBTORCH/include/torch/csrc/api/include"
-  sed -i.bak "s|CPP_FLAGS: -Wall -std=c++11 -fPIC|CPP_FLAGS: -Wall -std=c++17 -fPIC $TORCH_INC|" "$CONF"
-  rm -f "$CONF.bak"
-  grep -q "std=c++17" "$CONF" || {
-    echo "FAIL could not patch CPP_FLAGS in $CONF -- has the line changed?"
-    grep -n "CPP_FLAGS" "$CONF"
+  grep -q "COMPILE '-std=c++17';" "$WORK/classifier.parsi" || {
+    echo "FAIL could not add COMPILE to classifier.parsi -- has the INCLUDE line changed?"
+    grep -n "INCLUDE" "$AI/classifier.parsi"
     exit 1
   }
 
@@ -253,12 +249,12 @@ stop_server() {
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
 }
-# restore_conf is a no-op in tier A; in tier B it puts ziguratip.conf back, and
-# it MUST stay in this trap -- installing the server trap without it is how a
-# patched -std=c++17 and a torch include path get left in the config file for
-# every later build in the tree.
-restore_conf() { [ -f "$WORK/ziguratip.conf.orig" ] && cp "$WORK/ziguratip.conf.orig" "$HOME_DIR/etc/ziguratip.conf" || true; }
-trap 'stop_server; restore_conf; rm -rf "$WORK"' EXIT
+# NOTHING TO RESTORE ANY MORE. This trap used to put home/etc/ziguratip.conf
+# back, because tier B patched the server's global CPP_FLAGS to reach libtorch;
+# forgetting it left -std=c++17 and a torch include path in the config for every
+# later build in the tree. The object now carries those flags in its own COMPILE
+# clauses, so the config is never written and there is nothing to undo.
+trap 'stop_server; rm -rf "$WORK"' EXIT
 
 # WAIT FOR ZEYTUN, NOT FOR "ready". The log says "Zigurat is ready" while the
 # HTTP listener is still coming up, so a plain grep for the word wins the race

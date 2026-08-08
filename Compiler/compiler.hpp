@@ -70,6 +70,11 @@ namespace Zigurat
     
     std::list<std::string> _includes;
     std::list<std::string> _links;
+    // Flags for the C++ compile of THIS object, so a model needing -std=c++17
+    // and two -I paths says so in the object rather than in the server's
+    // ziguratip.conf. Scoped like the other two: a neighbour in the same file
+    // compiles with the settings it asked for and no others.
+    std::list<std::string> _compiles;
     // Everything a generated object can reach: the row types alone pull in
     // Type, and the storage engine reaches Encoding, Compression and Threading.
     // A missing entry here surfaces as undefined symbols at link time in the
@@ -132,6 +137,7 @@ namespace Zigurat
 
     void _include(const Expression&);
     void _link(const Expression&);
+    void _compile_flag(const Expression&);
     void _body_clauses(const Expression&);
     std::vector<index_desc_t> _table_indexes(const Expression&);
     void _table(const Expression&);

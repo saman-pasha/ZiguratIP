@@ -67,17 +67,22 @@ namespace Zigurat
     {
       std::list<std::string>& includes;
       std::list<std::string>& links;
+      std::list<std::string>& compiles;
       const size_t include_mark;
       const size_t link_mark;
+      const size_t compile_mark;
 
-      ClauseScope(std::list<std::string>& incs, std::list<std::string>& lnks)
-	: includes(incs), links(lnks), include_mark(incs.size()), link_mark(lnks.size())
+      ClauseScope(std::list<std::string>& incs, std::list<std::string>& lnks,
+		  std::list<std::string>& cmps)
+	: includes(incs), links(lnks), compiles(cmps),
+	  include_mark(incs.size()), link_mark(lnks.size()), compile_mark(cmps.size())
       { }
 
       ~ClauseScope()
       {
 	while (this->includes.size() > this->include_mark) this->includes.pop_back();
 	while (this->links.size() > this->link_mark) this->links.pop_back();
+	while (this->compiles.size() > this->compile_mark) this->compiles.pop_back();
       }
     };
   }
@@ -89,6 +94,8 @@ namespace Zigurat
 	this->_include(expr);
       } else if (expr.token.value == "LINK") {
 	this->_link(expr);
+      } else if (expr.token.value == "COMPILE") {
+	this->_compile_flag(expr);
       }
     }
   }
@@ -101,6 +108,16 @@ namespace Zigurat
   void Compiler::_link(const Expression& ast)
   {
     this->_links.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
+  }
+
+  // A flag for the C++ compile rather than for the link. The two were never
+  // interchangeable -- -std=c++17 and -I reach the compiler, and putting them
+  // in LINK put them after the object file where they do nothing -- so an
+  // object needing either had to have them added to the server's global
+  // COMPILER/CPP_FLAGS and taken out again afterwards.
+  void Compiler::_compile_flag(const Expression& ast)
+  {
+    this->_compiles.push_back(ast.args[0].token.value.substr(1, ast.args[0].token.value.size() - 2));
   }
 
   std::vector<Compiler::index_desc_t> Compiler::_table_indexes(const Expression& ast)
@@ -625,7 +642,7 @@ namespace Zigurat
     std::list<std::string> requires;
 
     // Lives until _build has written the files, then puts the two lists back.
-    ClauseScope clauses(this->_includes, this->_links);
+    ClauseScope clauses(this->_includes, this->_links, this->_compiles);
     this->_body_clauses(ast);
 
     head << "#ifndef " << guard_name << std::endl;
@@ -815,7 +832,7 @@ namespace Zigurat
       throw CompileException("pages couldn't be template", ast);
 
     // Lives until _build has written the files, then puts the two lists back.
-    ClauseScope clauses(this->_includes, this->_links);
+    ClauseScope clauses(this->_includes, this->_links, this->_compiles);
     this->_body_clauses(ast);
 
     // header file

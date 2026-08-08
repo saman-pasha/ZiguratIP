@@ -72,6 +72,7 @@ namespace Zigurat
   {
     this->_includes.clear();
     this->_links.clear();
+    this->_compiles.clear();
     if (ast.token.value != "SUITE") {
       throw CompileException("wrong parse", ast);
     }
@@ -229,7 +230,22 @@ namespace Zigurat
       std::cout << impl.str() << std::endl;
     }
 
-    std::string cpp_compile_cmd = this->_cpp + " " + this->_cpp_flags + " -I" + this->_ld_path
+    // The object's own COMPILE flags go after the configured ones, so an object
+    // asking for -std=c++17 gets it whatever the server's default is: the last
+    // -std on a g++ or clang++ line wins.
+    //
+    // substr(11, size - 21) for the same reason the two loops above use it: a
+    // Parsi string is tokenized as a C++ RAW STRING, R"ZIP0ML0S0(…)ZIP0ML0S0",
+    // and the clause handler strips only the outer R and quote. What is left
+    // here is "ZIP0ML0S0( … )ZIP0ML0S0 -- 11 leading characters and 10 trailing
+    // ones. Skipping this put the delimiter into the compile line, where the
+    // shell answered `Syntax error: Unterminated quoted string'.
+    std::string object_flags;
+    for (const std::string& flag : this->_compiles)
+      object_flags += " " + flag.substr(11, flag.size() - 21);
+
+    std::string cpp_compile_cmd = this->_cpp + " " + this->_cpp_flags + object_flags
+      + " -I" + this->_ld_path
       + " -I" + this->_include_path + " -c " + impl_file_path + " -o " + obj_file_path;
     std::string echo_compile_cmd = "echo \"" + cpp_compile_cmd + "\" > " + out_file_path + ENDL;
     system(echo_compile_cmd.c_str());
@@ -335,6 +351,8 @@ namespace Zigurat
 	this->_include(suite);
       } else if (suite.token.value == "LINK") {
 	this->_link(suite);
+      } else if (suite.token.value == "COMPILE") {
+	this->_compile_flag(suite);
       } else if (suite.token.value == "TABLE") {
 	this->_table(suite);
       } else if (suite.token.value == "PROCEDURE") {

@@ -19,9 +19,44 @@ LINK clause links C++ library at build time.
 LINK '-llibrary|-Llibrary_full_path';
 ```
 
-## Where the two clauses go
+## COMPILE
 
-Both may be written at file scope or inside a `CLASS`, `PAGE` or `PROCEDURE`.
+COMPILE clause adds a flag to the C++ **compile** of this object.
+
+```ebnf
+COMPILE '-std=c++17|-Iinclude_path|-Dmacro';
+```
+
+`LINK` and `COMPILE` are not interchangeable. `LINK` reaches the linker, and a
+`-I` written there lands after the object file where it does nothing; `COMPILE`
+reaches the compiler, which is where a header search path and a language
+standard have to be.
+
+An object's flags are appended after the configured `COMPILER/CPP_FLAGS`, so
+`COMPILE '-std=c++17';` wins over a `-std=c++11` in the configuration — the last
+`-std` on a `g++` or `clang++` line is the one that applies. libtorch 2.x needs
+exactly that, and it is what `Test/ai/classifier.parsi` is compiled with:
+
+```
+CLASS Demo::Classifier
+BEGIN
+    COMPILE '-std=c++17';
+    COMPILE '-I/opt/torch/include';
+    COMPILE '-I/opt/torch/include/torch/csrc/api/include';
+    LINK '-L/opt/torch/lib';
+    LINK '-ltorch';
+    ...
+END
+```
+
+Before this clause existed the only way to reach a library's headers was to edit
+`COMPILER/CPP_FLAGS` in the server's `home/etc/ziguratip.conf` and put it back
+afterwards — a global setting changed for one object, wrong for everything else
+compiled while it was in place.
+
+## Where the three clauses go
+
+All three may be written at file scope or inside a `CLASS`, `PAGE` or `PROCEDURE`.
 
 At file scope they accumulate: a clause applies to every object declared after
 it in the same file. Inside an object it belongs to that object alone, and the
@@ -48,6 +83,8 @@ END
 An object-level `INCLUDE` lands in that object's generated header, so every
 object that `REQUIRES` it inherits the header too. To keep a heavy header out of
 the objects downstream, put it in a `BEGIN CPP` block instead — see below.
+`COMPILE` has no such reach: a flag compiles this object and nothing else, so
+the `-I` that finds a header stays with the object that needs it.
 
 ## BASE
 

@@ -93,7 +93,7 @@ rather than reporting the loader's message as a compile failure."
 ;; word this mode does not colour rather than as a silent disagreement.
 (defconst parsi-keywords
   '("AS" "ASC" "BASE" "BEGIN" "BREAK" "BY" "CALL" "CATCH" "CLASS" "COLUMN"
-    "COMMIT" "COMMITTED" "CONSTRUCTOR" "CONTINUE" "CPP" "DECLARE" "DEFAULT"
+    "COMMIT" "COMMITTED" "COMPILE" "CONSTRUCTOR" "CONTINUE" "CPP" "DECLARE" "DEFAULT"
     "DELETE" "DESC" "DESTRUCTOR" "DO" "ECHO" "ELSE" "END" "ENUM" "FROM"
     "FUNCTION" "GLOBAL" "HPP" "IF" "IN" "INCLUDE" "INDEX" "INHERITS"
     "INITIALIZE" "INOUT" "INSERT" "INTO" "ISOLATION" "KEY" "LEVEL" "LINK"
