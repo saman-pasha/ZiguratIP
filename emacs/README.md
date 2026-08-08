@@ -154,19 +154,21 @@ Four things are deliberately left alone:
 
 ### What it was tested against
 
-Every `.parsi` file in the repository — 21 of the 22 — re-indents
-**byte-identical**, tabs and spaces alike. That is the whole test, and it is a
-real one: it caught four separate mistakes, each of which had looked right.
+Every `.parsi` file in the repository — all 22 — re-indents **byte-identical**,
+tabs and spaces alike. That is the whole test, and it is a real one: it caught
+four separate mistakes, each of which had looked right, and one file the tree
+had been carrying with mixed indentation.
 
 `tab-width` has to equal `parsi-indent-offset` for a tab-indented file, which is
 what "set both to match the file" above means in practice: with the stock
 `tab-width` of 8 and an offset of 4, a level is four columns and cannot be a
-tab, and every tab-indented file comes back different.
+tab, and every tab-indented file comes back different — which reads as a broken
+indenter and is not one.
 
-The twenty-second is `System/compiler.parsi`, and it is the file that is odd
-rather than the indenter. One line there is indented `TAB SPC SPC SPC SPC TAB
-TAB TAB` where four tabs reach the same column; the rebuild writes the four
-tabs. Same width, different bytes.
+The file it caught was `System/compiler.parsi`, whose two `TAB SPC SPC TAB`
+lines are now tabs throughout. One of them was not merely untidy: at
+`tab-width 4` it sat at column 20 among neighbours at 16, a level deeper than
+the block it belonged to.
 
 That a file is unchanged is not by itself proof the indenter does anything, so
 `demo/04-bulk.parsi` is also stripped of all indentation and rebuilt from
