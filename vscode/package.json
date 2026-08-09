@@ -47,7 +47,7 @@
     ]
   },
   "scripts": {
-    "test": "node test/tokenize.mjs"
+    "test": "node test/tokenize.mjs && node test/indent.mjs"
   },
   "devDependencies": {
     "vscode-oniguruma": "^2.0.1",

@@ -33,12 +33,31 @@ VSCode bundles the C++ grammar so it resolves there; if it ever did not, the
 block would stop being protected. The test registers a stub `source.cpp` to
 exercise the rule, so a change that breaks the block boundary still fails here.
 
-## Known limit
+## Indentation
 
-Indentation uses `increaseIndentPattern` / `decreaseIndentPattern`, which cannot
-count net effect the way `parsi-mode.el` does. `BEGIN` and `END` may share a
-line — `END ELSE BEGIN` — and on such a line the indent will be wrong by one
-level. Re-indenting the block fixes it.
+Four rules, and they reproduce the corpus exactly: 22 files, 1017 line pairs,
+nothing mispredicted. `test/indent.mjs` is what says so — it applies the same
+increase/decrease logic VSCode does and compares against how the files are
+really indented.
+
+`BEGIN` opens a block unless the same line closes it again; `END` closes one.
+An access label opens and closes one at once, which is what puts `PUBLIC:` back
+at the level of its enclosing `BEGIN` while its members sit one in from it.
+
+`END ELSE BEGIN` needs no special case. Both rules fire on it — the line dedents
+because it starts with `END`, and the next line indents because it ends with
+`BEGIN` — which is the right answer.
+
+Continuation lines are the one thing left out, deliberately: a statement wrapped
+over several lines is aligned to its open bracket by the author, and an
+increase/decrease pair cannot predict that. The test excludes them rather than
+pretending, and it knows about the three kinds Parsi has — bracketed lists,
+multi-line `ECHO '…'` strings, and comma-continued `REQUIRES` clauses.
+
+**These are JavaScript regexes**, not Oniguruma. VSCode compiles a grammar with
+Oniguruma and a language configuration with JS `RegExp`, so `(?i)` is a syntax
+error here where it is fine next door. Case-insensitivity uses the
+`{ "pattern": …, "flags": "i" }` form.
 
 ## Working on it
 
