@@ -1,0 +1,181 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Parsi",
+  "scopeName": "source.parsi",
+  "fileTypes": [
+    "parsi"
+  ],
+  "patterns": [
+    {
+      "include": "#expression"
+    }
+  ],
+  "repository": {
+    "expression": {
+      "patterns": [
+        {
+          "include": "#verbatim-block"
+        },
+        {
+          "include": "#comment-line"
+        },
+        {
+          "include": "#comment-block"
+        },
+        {
+          "include": "#string"
+        },
+        {
+          "include": "#double-quoted"
+        },
+        {
+          "include": "#backtick"
+        },
+        {
+          "include": "#number"
+        },
+        {
+          "include": "#object-definition"
+        },
+        {
+          "include": "#access-label"
+        },
+        {
+          "include": "#constant"
+        },
+        {
+          "include": "#type"
+        },
+        {
+          "include": "#word-operator"
+        },
+        {
+          "include": "#keyword"
+        },
+        {
+          "include": "#qualified-name"
+        },
+        {
+          "include": "#operator"
+        }
+      ]
+    },
+    "verbatim-block": {
+      "name": "meta.embedded.parsi",
+      "begin": "(?i)^[ \\t]*(BEGIN)[ \\t]+(HPP|CPP)[ \\t]*$",
+      "beginCaptures": {
+        "1": {
+          "name": "keyword.control.parsi"
+        },
+        "2": {
+          "name": "keyword.control.parsi"
+        }
+      },
+      "end": "(?i)^[ \\t]*(END)[ \\t]*$",
+      "endCaptures": {
+        "1": {
+          "name": "keyword.control.parsi"
+        }
+      },
+      "contentName": "meta.embedded.block.cpp",
+      "patterns": [
+        {
+          "include": "source.cpp"
+        }
+      ]
+    },
+    "comment-line": {
+      "name": "comment.line.double-dash.parsi",
+      "begin": "--",
+      "end": "$"
+    },
+    "comment-block": {
+      "name": "comment.block.parsi",
+      "begin": "/\\*",
+      "end": "\\*/"
+    },
+    "string": {
+      "name": "string.quoted.single.parsi",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.parsi",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "double-quoted": {
+      "name": "string.quoted.double.parsi",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.parsi",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "backtick": {
+      "match": "(`)([A-Za-z_][A-Za-z_0-9]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.operator.cpp-escape.parsi"
+        },
+        "2": {
+          "name": "support.type.cpp.parsi"
+        }
+      }
+    },
+    "number": {
+      "name": "constant.numeric.parsi",
+      "match": "\\b\\d+(?:\\.\\d+)?\\b"
+    },
+    "object-definition": {
+      "match": "(?i)\\b(PROCEDURE|SEQUENCE|CLASS|TABLE|INDEX|PAGE|TYPE|ENUM)\\s+([A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.parsi"
+        },
+        "2": {
+          "name": "entity.name.type.parsi"
+        }
+      }
+    },
+    "access-label": {
+      "match": "(?i)^\\s*(PUBLIC|PRIVATE|PROTECTED)\\s*(:)",
+      "captures": {
+        "1": {
+          "name": "storage.modifier.parsi"
+        },
+        "2": {
+          "name": "punctuation.separator.parsi"
+        }
+      }
+    },
+    "constant": {
+      "name": "constant.language.parsi",
+      "match": "(?i)\\b(?:FALSE|TRUE|NULL)\\b"
+    },
+    "type": {
+      "name": "support.type.parsi",
+      "match": "(?i)\\b(?:Timestamp|Double|Object|String|UShort|Vector|Float|Short|UByte|ULong|Auto|Bool|Byte|Char|Long|Real|Text|UInt|Void|Int)\\b"
+    },
+    "word-operator": {
+      "name": "keyword.operator.word.parsi",
+      "match": "(?i)\\b(?:BETWEEN|LIKE|AND|NOT|IS|OR)\\b"
+    },
+    "keyword": {
+      "name": "keyword.control.parsi",
+      "match": "(?i)\\b(?:SERIALIZABLE|CONSTRUCTOR|TRANSACTION|UNCOMMITTED|DESTRUCTOR|INITIALIZE|REPEATABLE|COMMITTED|ISOLATION|PROCEDURE|PROTECTED|CONTINUE|FUNCTION|INHERITS|OVERRIDE|REQUIRES|ROLLBACK|SEQUENCE|SNAPSHOT|TRUNCATE|COMPILE|DECLARE|DEFAULT|INCLUDE|PRIMARY|PRIVATE|RETURNS|SESSION|VIRTUAL|COLUMN|COMMIT|DELETE|GLOBAL|INSERT|PUBLIC|RETURN|SELECT|THREAD|UNIQUE|UPDATE|VALUES|BEGIN|BREAK|CATCH|CLASS|INDEX|INOUT|LEVEL|LOCAL|ORDER|TABLE|THROW|USING|WHERE|WHILE|BASE|CALL|DESC|ECHO|ELSE|ENUM|FROM|INTO|LINK|PAGE|PURE|READ|STEP|TYPE|ASC|CPP|END|HPP|KEY|OUT|SET|TRY|AS|BY|DO|IF|IN|TO)\\b"
+    },
+    "qualified-name": {
+      "match": "\\b[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)+\\b",
+      "name": "entity.name.namespace.parsi"
+    },
+    "operator": {
+      "name": "keyword.operator.parsi",
+      "match": "(?:::|<=|==|<>|>=|[+\\-*/%&|^<=>])"
+    }
+  }
+}

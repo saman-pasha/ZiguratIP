@@ -136,3 +136,7 @@ Test/ai/train-labels-idx1-ubyte
 # Byte-compiled Emacs Lisp. parsi-mode.el is the source; the .elc is built by
 # whoever loads it.
 emacs/*.elc
+
+# VSCode extension build products
+vscode/node_modules/
+vscode/*.vsix

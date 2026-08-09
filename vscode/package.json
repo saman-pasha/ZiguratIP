@@ -1,0 +1,56 @@
+{
+  "name": "parsi",
+  "displayName": "Parsi",
+  "description": "Syntax highlighting and editor support for the Parsi language.",
+  "version": "0.1.0",
+  "publisher": "saman-pasha",
+  "license": "SEE LICENSE IN ../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saman-pasha/ZiguratIP"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "parsi",
+    "ziguratip",
+    "sql",
+    "server-side"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "parsi",
+        "aliases": [
+          "Parsi",
+          "parsi"
+        ],
+        "extensions": [
+          ".parsi"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "parsi",
+        "scopeName": "source.parsi",
+        "path": "./syntaxes/parsi.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.cpp": "cpp"
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node test/tokenize.mjs"
+  },
+  "devDependencies": {
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}
