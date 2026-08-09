@@ -35,37 +35,81 @@ exercise the rule, so a change that breaks the block boundary still fails here.
 
 ## Indentation
 
-Four rules, and they reproduce the corpus exactly: 22 files, 1017 line pairs,
-nothing mispredicted. `test/indent.mjs` is what says so — it applies the same
-increase/decrease logic VSCode does and compares against how the files are
-really indented.
+The extension indents in code, not with rules.
 
-`BEGIN` opens a block unless the same line closes it again; `END` closes one.
-An access label opens and closes one at once, which is what puts `PUBLIC:` back
-at the level of its enclosing `BEGIN` while its members sit one in from it.
+A VSCode language configuration indents with one lever: `increaseIndentPattern`
+puts the next line a level in, `decreaseIndentPattern` puts this line a level
+out. That lever describes the easy half of Parsi — `BEGIN` opens, `END` closes,
+and `END ELSE BEGIN` even falls out of it correctly. What it cannot describe is
+anything that needs to know where a **statement** began rather than what the
+line above looked like, and that is most of what makes Parsi awkward:
 
-`END ELSE BEGIN` needs no special case. Both rules fire on it — the line dedents
-because it starts with `END`, and the next line indents because it ends with
-`BEGIN` — which is the right answer.
+- a wrapped call aligned under its opening paren by the author, where the line
+  *after* it must return to the statement's level and not to the column the
+  arguments happened to sit at;
+- `REQUIRES a,` and `SELECT obj_id,`, which continue with no bracket at all;
+- a multi-line `ECHO '…'` — `System/catalog_pages.parsi` keeps a whole HTML
+  table in one string, every byte of which the server will send;
+- a `BEGIN CPP` block, which is C++ copied through untouched.
 
-Continuation lines are the one thing left out, deliberately: a statement wrapped
-over several lines is aligned to its open bracket by the author, and an
-increase/decrease pair cannot predict that. The test excludes them rather than
-pretending, and it knows about the three kinds Parsi has — bracketed lists,
-multi-line `ECHO '…'` strings, and comma-continued `REQUIRES` clauses.
+Measured over all 22 files, every line predicted from the text above it
+(`node test/indent.mjs`):
 
-**These are JavaScript regexes**, not Oniguruma. VSCode compiles a grammar with
-Oniguruma and a language configuration with JS `RegExp`, so `(?i)` is a syntax
-error here where it is fine next door. Case-insensitivity uses the
-`{ "pattern": …, "flags": "i" }` form.
+| model | mispredicted | |
+|---|---|---|
+| the increase/decrease pair this extension used to ship | 1.6 % | 22 lines, every one a continuation |
+| shipping no `indentationRules` at all | 41.6 % | VSCode's bracket default |
+| `src/indent.js` | **0 %** | what ships now |
+
+The 1.6% is not a new discovery so much as the previously excluded case: the
+earlier version of this test skipped continuation lines, because a regex pair
+genuinely cannot predict them, and reported 0 over what was left. Counting them
+is what the number above does.
+
+`src/indent.js` is a port of `../emacs/parsi-mode.el` — the same three
+"leave this line alone" cases, the same walk back to the statement, the same
+net-`BEGIN`-minus-`END` count over the whole statement rather than over the
+previous line. `parsi-mode` reproduces this corpus **exactly** (0 of 1617
+lines), so it is a real authority, and the port is checked against it line by
+line rather than against the files:
+
+```sh
+emacs -Q --batch -l tools/probe.el ../emacs \
+      $(cd .. && git ls-files '*.parsi' | sed 's|^|../|')
+```
+
+`tools/probe.el` re-indents each line, records the answer and puts the line
+straight back, so no line's answer shifts the next line's input. The port and
+`parsi-mode` agree on all 1617.
+
+`src/extension.js` registers it as on-type (`Enter`, and the last letter of
+`END` / `ELSE` / `CATCH` so a closing line pulls itself back as it is typed),
+range and document formatting. `formatOnType` is off by VSCode default, so the
+manifest turns it on under `[parsi]` only. It does **not** set `insertSpaces` or
+`tabSize`: the tree is split — `System/`, `Test/` and `colab/` are written with
+tabs, `demo/` with four spaces — so the indenter takes each file's unit from the
+file itself, and formatting the whole corpus produces zero edits.
+
+**Language configuration regexes are JavaScript**, not Oniguruma. VSCode
+compiles a grammar with Oniguruma and a language configuration with JS
+`RegExp`, so `(?i)` is a syntax error here where it is fine next door. Nothing
+in this extension needs it now that the indentation rules are gone, but the
+`{ "pattern": …, "flags": "i" }` form is how you would ask.
 
 ## Working on it
 
 ```sh
 npm install
 node tools/build-grammar.mjs   # regenerate syntaxes/parsi.tmLanguage.json
-node test/tokenize.mjs         # tokenize the real corpus and assert scopes
+npm test                       # tokenize the real corpus and assert scopes,
+                               # then the indentation
 ```
 
 The grammar JSON is generated and committed. Edit the lists in
 `tools/build-grammar.mjs`, not the JSON.
+
+`test/indent.mjs` leads with hand-written cases rather than the corpus, on
+purpose: 22 files is not many and the awkward shapes are the rare ones. There
+are two verbatim blocks in the whole tree and neither holds a C++ `begin` or
+`end`, so the guard that keeps C++ out of the block count cannot be checked by
+any real file — the test says so in place of pretending otherwise.

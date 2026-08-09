@@ -44,7 +44,12 @@
           "meta.embedded.block.cpp": "cpp"
         }
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "[parsi]": {
+        "editor.formatOnType": true
+      }
+    }
   },
   "scripts": {
     "test": "node test/tokenize.mjs && node test/indent.mjs"
@@ -52,5 +57,9 @@
   "devDependencies": {
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"
-  }
+  },
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onLanguage:parsi"
+  ]
 }

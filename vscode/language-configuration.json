@@ -55,15 +55,5 @@
       "\""
     ]
   ],
-  "wordPattern": "[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*",
-  "indentationRules": {
-    "increaseIndentPattern": {
-      "pattern": "\\bBEGIN\\b(?!.*\\bEND\\b)|^\\s*(PUBLIC|PRIVATE|PROTECTED)\\s*:",
-      "flags": "i"
-    },
-    "decreaseIndentPattern": {
-      "pattern": "^\\s*END\\b|^\\s*(PUBLIC|PRIVATE|PROTECTED)\\s*:",
-      "flags": "i"
-    }
-  }
+  "wordPattern": "[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*"
 }
