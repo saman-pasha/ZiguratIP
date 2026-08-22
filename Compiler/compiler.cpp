@@ -703,16 +703,26 @@ namespace Zigurat
       code << tab << "});" << std::endl;
       code << tab << obj << ".join();" << std::endl;
     } else if (ast.args[0].token.value == "ISOLATION") {
+      // Memory::transaction is a static thread_local Transaction -- a value, not
+      // a pointer. This emitted `transaction->' and so every procedure carrying
+      // a TRANSACTION ISOLATION LEVEL clause failed to compile, with an error
+      // about `->' on a non-pointer type pointing at the PROCEDURE line rather
+      // than at the clause. The documented syntax has never worked; nothing in
+      // the tree used it, so nothing said so.
+      std::string setter = "Zigurat::Memory::transaction.set_isolation_level(Zigurat::IsolationLevel::";
+
       if (ast.args[0].args[0].token.value == "UNCOMMITTED") {
-	code << tab << "Globals::memory()->transaction->set_isolation_level(Zigurat::IsolationLevel::READ_UNCOMMITTED);" << std::endl;
+	code << tab << setter << "READ_UNCOMMITTED);" << std::endl;
       } else if (ast.args[0].args[0].token.value == "COMMITTED") {
-	code << tab << "Globals::memory()->transaction->set_isolation_level(Zigurat::IsolationLevel::READ_COMMITTED);" << std::endl;
+	code << tab << setter << "READ_COMMITTED);" << std::endl;
       } else if (ast.args[0].args[0].token.value == "REPEATABLE") {
-	code << tab << "Globals::memory()->transaction->set_isolation_level(Zigurat::IsolationLevel::REPEATABLE_READ);" << std::endl;
+	code << tab << setter << "REPEATABLE_READ);" << std::endl;
       } else if (ast.args[0].args[0].token.value == "SNAPSHOT") {
-	code << tab << "Globals::memory()->transaction->set_isolation_level(Zigurat::IsolationLevel::SNAPSHOT);" << std::endl;
+	code << tab << setter << "SNAPSHOT);" << std::endl;
       } else if (ast.args[0].args[0].token.value == "SERIALIZABLE") {
-	code << tab << "Globals::memory()->transaction->set_isolation_level(Zigurat::IsolationLevel::SERIALIZABLE);" << std::endl;
+	code << tab << setter << "SERIALIZABLE);" << std::endl;
+      } else {
+	throw CompileException("unknown isolation level '" + ast.args[0].args[0].token.value + "'", ast);
       }
     }
   }

@@ -75,7 +75,72 @@ namespace Zigurat
 
     typedef char* buffer_t;
     typedef std::unique_lock<std::mutex> lock_t;
-  
+
+    // ---- serialising the two shared streams --------------------------------
+    //
+    // _hexmap_io and _data_io are ONE PAIR, shared by every connection. Each
+    // connection gets its own thread and its own transaction --
+    // Memory::transaction is static thread_local -- but not its own streams, so
+    // everything that seeks or reads them has to hold both mutexes. A seek and
+    // the read after it are one operation: let another thread in between and
+    // the read comes back from that thread's file position instead. Those bytes
+    // are then taken for a chunk header, a size, an address. What surfaces is
+    // `hexmap ends inside the chunk at NNNNN' with an impossible address, and
+    // further in, a walk through a Pointer built out of somebody else's file
+    // offset.
+    //
+    // WHY THIS IS A CLASS AND NOT TWO lock_guards AT EACH ENTRY POINT. Two
+    // things stop that working, and both are real paths through this engine:
+    //
+    //   NESTING. online_insert holds both mutexes and then calls object.map(),
+    //   which is the row's indexes -- and a BTreeIndex has to take them too,
+    //   because procedure code reaches it directly through cursor_equal with
+    //   nothing held. std::mutex is not recursive, so an index that locked
+    //   unconditionally would deadlock the write path, and one that never
+    //   locked would leave the read path unguarded. It was the second of those.
+    //
+    //   HANDING THEM BACK. A scan cannot hold these across a caller's callback:
+    //   the callback is procedure code, and it updates the row it was handed.
+    //   _cursor and BTreeIndex::_cursor_output therefore release them around
+    //   it, and _check_lock releases them while it waits on somebody else's row
+    //   lock. Anything reached during those windows has to take them itself.
+    //
+    // So a guard is the real holder only when this thread is not already
+    // holding them, and `held()' answers that honestly at every moment -- it is
+    // null exactly while this thread holds nothing. A nested guard is then a
+    // no-op, and a guard built inside a released window really does lock.
+    class Streams
+    {
+    private:
+      lock_t _hexmap;
+      lock_t _data;
+      bool   _mine;
+
+      // The guard holding the streams on this thread, or null. Published on
+      // lock and withdrawn on unlock, so it never claims a hold that has
+      // already been handed back.
+      static thread_local Streams* _held;
+
+    public:
+      explicit Streams(Memory*);
+      ~Streams();
+
+      Streams(const Streams&) = delete;
+      Streams& operator=(const Streams&) = delete;
+
+      // Did this guard take them, or was this thread already holding them?
+      bool mine() const;
+
+      // Both are safe to call twice: locking what is locked, or releasing what
+      // has been released, does nothing.
+      void lock();
+      void unlock();
+
+      // What this thread holds, for code that must hand it back around a
+      // callback and cannot see the guard that took it.
+      static Streams* held();
+    };
+
   private:
     binarystream& _hexmap_io;
     binarystream& _data_io;
@@ -125,9 +190,9 @@ namespace Zigurat
     void _load_control(const Pointer&, Control&);
     
     void _control_insert(BaseTable*);
-    void _control_select(BaseTable*, lock_t*, lock_t*);
-    void _control_update(BaseTable*, BaseTable*, lock_t*, lock_t*);
-    void _control_delete(BaseTable*, lock_t*, lock_t*);
+    void _control_select(BaseTable*, Streams*);
+    void _control_update(BaseTable*, BaseTable*, Streams*);
+    void _control_delete(BaseTable*, Streams*);
 
     void _transaction_push(const Pointer&);
     void _write_transaction(size_t, time_t);
@@ -135,7 +200,7 @@ namespace Zigurat
     void _commit_pointer(const Pointer&, time_t);
     void _rollback_pointer(const Pointer&);
     
-    bool _check_lock(RowLock, const Pointer&, Control&, lock_t*, lock_t*);
+    bool _check_lock(RowLock, const Pointer&, Control&, Streams*);
 
     // Flush both files and then push them to the disk, data before hexmap.
     // Every durability point in the store goes through this.
@@ -159,10 +224,10 @@ namespace Zigurat
     // changed under a repeatable read makes _cursor roll back to the start of
     // the query and walk the whole hash key again, which is a scan's answer to
     // the problem and means nothing when a single record was asked about.
-    bool _visible(Pointer&, lock_t*, lock_t*);
+    bool _visible(Pointer&, Streams*);
 
     // Cursor
-    void _cursor(hashkey_ptr, lock_t*, lock_t*, std::function<bool (const Pointer&)>);
+    void _cursor(hashkey_ptr, Streams*, std::function<bool (const Pointer&)>);
     
     // Pointer Helper Functions
     int64_t _pointer_data_count(int64_t);
@@ -326,8 +391,10 @@ namespace Zigurat
     
     object.prepare();
 
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);    
+    // object.map() below is this row's indexes, and a BTreeIndex takes these
+    // itself when procedure code reaches it directly. Its guard nests inside
+    // this one and does nothing, which is the whole reason Streams exists.
+    Streams streams(this);
 
     object.pointer = this->_allocate(T::hash_key, object.pack_size());
     this->_transaction_push(object.pointer);
@@ -352,13 +419,12 @@ namespace Zigurat
     
     new_object.prepare();
 
-    std::unique_lock<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::unique_lock<std::mutex> data_lock(this->_data_access);    
+    Streams streams(this);
 
     new_object.pointer = this->_allocate(T::hash_key, new_object.pack_size());
     this->_transaction_push(old_object.pointer);
     this->_transaction_push(new_object.pointer);
-    this->_control_update(&old_object, &new_object, &hexmap_lock, &data_lock);
+    this->_control_update(&old_object, &new_object, &streams);
 
     this->_full_hexmap(new_object.pointer);
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);
@@ -378,11 +444,10 @@ namespace Zigurat
       this->dba_watch("Online Delete: (hash_key: " + T::name + ", " + std::to_string(object.pointer.address) + ")");
     }
     
-    std::unique_lock<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::unique_lock<std::mutex> data_lock(this->_data_access);    
+    Streams streams(this);
 
     this->_transaction_push(object.pointer);
-    this->_control_delete(&object, &hexmap_lock, &data_lock);
+    this->_control_delete(&object, &streams);
 
     object.unmap();
     
@@ -410,22 +475,22 @@ namespace Zigurat
       this->dba_watch("Cursor: (" + T::name + ")");
     }
     
-    std::unique_lock<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::unique_lock<std::mutex> data_lock(this->_data_access);    
+    Streams streams(this);
 
-    this->_cursor(hash_key, &hexmap_lock, &data_lock, [&] (const Pointer& pointer) -> bool {
+    // _cursor hands the streams back before it calls this, so reading the row
+    // out takes them again -- and gives them back before the caller's callback,
+    // which is free to update the very row it is being handed.
+    this->_cursor(hash_key, &streams, [&] (const Pointer& pointer) -> bool {
 
 	T object(pointer);
-	
-	hexmap_lock.lock();
-	data_lock.lock();
+
+	streams.lock();
 
 	this->_data_io.seekg(this->_pointer_data_address(object.pointer), std::ios::beg);
 	this->_data_io >> object;
 
-	hexmap_lock.unlock();
-	data_lock.unlock();
-	
+	streams.unlock();
+
 	return callback(object);
       });
   }

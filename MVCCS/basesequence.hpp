@@ -147,8 +147,7 @@ namespace Zigurat
       _Derived sequence;
       sequence._current = _Derived::FROM;
 
-      std::lock_guard<std::mutex> hexmap_lock(Globals::memory()->_hexmap_access);
-      std::lock_guard<std::mutex> data_lock(Globals::memory()->_data_access);
+      Memory::Streams streams(Globals::memory());
       Globals::memory()->_offline_insert(sequence);
     }
 
@@ -199,8 +198,7 @@ namespace Zigurat
       _Derived sequence;
       sequence._current = current;
       _Derived::_with_current([&] (_Derived& current_sequence) -> bool {
-	  std::lock_guard<std::mutex> hexmap_lock(Globals::memory()->_hexmap_access);
-	  std::lock_guard<std::mutex> data_lock(Globals::memory()->_data_access);
+	  Memory::Streams streams(Globals::memory());
 	  Globals::memory()->_offline_update(current_sequence, sequence);
 	  return true;
 	});
@@ -223,8 +221,7 @@ namespace Zigurat
 	_Derived sequence;
         sequence._current = current_sequence._current + _Derived::STEP;
 	
-	std::lock_guard<std::mutex> hexmap_lock(Globals::memory()->_hexmap_access);
-	std::lock_guard<std::mutex> data_lock(Globals::memory()->_data_access);
+	Memory::Streams streams(Globals::memory());
 	Globals::memory()->_offline_update(current_sequence, sequence);
 	return true;
       });
@@ -245,8 +242,7 @@ namespace Zigurat
 	_Derived sequence;
         sequence._current = current_sequence._current - _Derived::STEP;
 	
-	std::lock_guard<std::mutex> hexmap_lock(Globals::memory()->_hexmap_access);
-	std::lock_guard<std::mutex> data_lock(Globals::memory()->_data_access);
+	Memory::Streams streams(Globals::memory());
 	Globals::memory()->_offline_update(current_sequence, sequence);
 	return true;
       });
@@ -261,8 +257,7 @@ namespace Zigurat
     _Derived sequence;
     sequence._current = _Derived::FROM;
     _Derived::_with_current([&] (_Derived& current_sequence) -> bool {
-	std::lock_guard<std::mutex> hexmap_lock(Globals::memory()->_hexmap_access);
-	std::lock_guard<std::mutex> data_lock(Globals::memory()->_data_access);
+	Memory::Streams streams(Globals::memory());
 	Globals::memory()->_offline_update(current_sequence, sequence);
 	return true;
       });

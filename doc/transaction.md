@@ -48,4 +48,29 @@ Zeytun is different — an HTTP request is already one transaction, opened befor
 the page runs and committed when it returns cleanly — so a page needs no
 `TRANSACTION COMMIT;`.
 
-See also: [Connector](connector.md), [Configuration](configuration.md)
+## The isolation level belongs to the transaction, not the connection
+
+`TRANSACTION ISOLATION LEVEL ...;` applies to the transaction that runs it and
+no further. Commit or roll back, and the next transaction on that connection is
+back at `TRANSACTION/ISOLATION_LEVEL` from the configuration. A procedure that
+needs a stronger level therefore says so every time it runs, and cannot leave a
+connection stronger than the client asked for.
+
+That is worth stating because it was not true until recently: a connection kept
+whatever level a procedure had set until it hung up. With `SERIALIZABLE` the
+consequence was not subtle — see below.
+
+## What SERIALIZABLE costs
+
+`SERIALIZABLE` admits **one transaction at a time across the whole server**, and
+only against other `SERIALIZABLE` transactions: a `READ COMMITTED` transaction
+never waits for one. So it is affordable over a short critical section — the
+read-then-write of a queue claim, say — and ruinous over a long one, because
+everything else at that level queues behind it.
+
+A transaction waiting for its turn gives up after `lock_wait_timeout_ms` and
+raises `serializable wait timeout`, the same way a row lock does. A client that
+takes the level and then goes quiet delays others for that long and no longer.
+
+See also: [Connector](connector.md), [Configuration](configuration.md),
+[Concurrency](concurrency.md)

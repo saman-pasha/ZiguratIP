@@ -205,6 +205,8 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_insert_btreeindex()
   {
+    Memory::Streams streams(this->_memory);
+
     String hash_name_(this->_hash_name);
     Bool is_unique_(this->_is_unique);
     Short branching_factor_(this->_branching_factor);
@@ -246,15 +248,18 @@ namespace Zigurat
     bool found = false;
     if (this->_is_catalogue) {
 
-      std::unique_lock<std::mutex> hexmap_lock(this->_memory->_hexmap_access);
-      std::unique_lock<std::mutex> data_lock(this->_memory->_data_access);    
+      Memory::Streams streams(this->_memory);
 
-      this->_memory->_cursor(Memory::INDICES_HASHKEY, &hexmap_lock, &data_lock, [&] (const Pointer& index_pointer) -> bool {
+      this->_memory->_cursor(Memory::INDICES_HASHKEY, &streams, [&] (const Pointer& index_pointer) -> bool {
 
 	  String hash_name_;
 	  Bool is_unique_;
 	  Short branching_factor_;
 	  Long root_address_;
+
+	  // _cursor hands the streams back before calling this, so reading the
+	  // index row out has to take them again.
+	  Memory::Streams row(this->_memory);
 
 	  this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(index_pointer), std::ios::beg);
 	  this->_memory->_data_io.unpack(hash_name_, is_unique_, branching_factor_, root_address_);
@@ -292,6 +297,8 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_update_btreeindex()
   {
+    Memory::Streams streams(this->_memory);
+
     String hash_name_(this->_hash_name);
     Bool is_unique_(this->_is_unique);
     Short branching_factor_(this->_branching_factor);
@@ -391,7 +398,7 @@ namespace Zigurat
   void BTreeIndex<_Table, _First>::_delete_btreevalue(BTreeValue& value)
   {
     this->_memory->_transaction_push(value.pointer);
-    this->_memory->_control_delete(&value, nullptr, nullptr);
+    this->_memory->_control_delete(&value, Memory::Streams::held());
 
     this->_memory->_hexmap_io.flush();
     this->_memory->_data_io.flush();
@@ -446,8 +453,11 @@ namespace Zigurat
       // Asked after the record is read and the chain has been advanced, because
       // under SNAPSHOT the answer is an older version of it: the pointer moves,
       // and the value has to be read again from wherever it moved to.
+      // The guard is handed on so that a wait for somebody else's row lock
+      // gives the streams back while it waits. Passing null here made every
+      // such wait hold the whole store still for the length of it.
       Pointer visible_pointer = pointer;
-      if (!this->_memory->_visible(visible_pointer, nullptr, nullptr)) continue;
+      if (!this->_memory->_visible(visible_pointer, Memory::Streams::held())) continue;
 
       if (visible_pointer.address != pointer.address) {
 	this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(visible_pointer), std::ios::beg);
@@ -759,7 +769,12 @@ namespace Zigurat
   {
     if (this->_memory->_watcher) {
       this->_memory->dba_watch("BTreeIndex::map: (" + this->_name + ", " + (object.*this->_column).to_string().value() + ")");
-    }    
+    }
+
+    // Reached from Memory::online_insert, which is already holding these, and
+    // also from BTreeRecord's own catalogue registration, which is not. The
+    // guard is a no-op in the first case and the real thing in the second.
+    Memory::Streams streams(this->_memory);
 
     if (this->_root_address == -1) {
 
@@ -843,7 +858,9 @@ namespace Zigurat
   {
     if (this->_memory->_watcher) {
       this->_memory->dba_watch("BTreeIndex::unmap: (" + this->_name + ", " + (object.*this->_column).to_string().value() + ")");
-    }    
+    }
+
+    Memory::Streams streams(this->_memory);
 
     if (this->_root_address != -1) {
 
@@ -931,6 +948,8 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_unlink_dead()
   {
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address == -1) return;
 
     this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1154,7 +1173,9 @@ namespace Zigurat
   {
     if (this->_memory->_watcher) {
       this->_memory->dba_watch("BTreeIndex::unmap_key: (" + this->_name + ", " + (object.*this->_column).to_string().value() + ")");
-    }    
+    }
+
+    Memory::Streams streams(this->_memory);
 
     if (this->_root_address != -1) {
 
@@ -1179,7 +1200,17 @@ namespace Zigurat
 	this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(object.pointer), std::ios::beg);
 	this->_memory->_data_io >> object;
 
+	// THE STREAMS GO BACK BEFORE THE CALLER'S CALLBACK, exactly as
+	// Memory::_cursor does for a table scan. The callback is procedure code
+	// and the ordinary thing for it to do is update the row it has just been
+	// handed -- which takes these same two mutexes. Holding them across it
+	// would deadlock every UPDATE ... WHERE that goes through an index.
+	Memory::Streams* streams = Memory::Streams::held();
+	if (streams) streams->unlock();
+
 	do_continue = callback(object);
+
+	if (streams) streams->lock();
 	return do_continue;
       });
 
@@ -1228,6 +1259,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor(const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1278,6 +1316,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_equal(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1318,6 +1363,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_not_equal(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_not_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1362,6 +1414,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_less_than(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_less_than(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1406,6 +1465,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_less_than_equal(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_less_than_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1463,6 +1529,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_greater_than(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_greater_than(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1514,6 +1587,13 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::cursor_greater_than_equal(const _First key, const std::function<bool (_Table&)> callback)
   {
+    // EVERY WALK OF THIS TREE IS UNDER THE STREAMS. It reads nodes, keys and
+    // values out of the same _hexmap_io and _data_io every table does, and
+    // procedure code arrives here holding nothing -- so without this, an
+    // indexed WHERE ran straight through the store while another connection
+    // was writing it. _cursor_output hands them back around the callback.
+    Memory::Streams streams(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_greater_than_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1614,6 +1694,9 @@ namespace Zigurat
 
     void cursor(std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1630,6 +1713,9 @@ namespace Zigurat
 
     void cursor_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1646,6 +1732,9 @@ namespace Zigurat
 
     void cursor_not_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_not_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1662,6 +1751,9 @@ namespace Zigurat
 
     void cursor_less_than(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_less_than(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1678,6 +1770,9 @@ namespace Zigurat
 
     void cursor_less_than_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_less_than_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1694,6 +1789,9 @@ namespace Zigurat
 
     void cursor_greater_than(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_greater_than(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
@@ -1710,6 +1808,9 @@ namespace Zigurat
 
     void cursor_greater_than_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
+      // Under the streams, for the reason given on the single-column cursors.
+      Memory::Streams streams(this->_memory);
+
       if (this->_root_address > -1) {
 	this->_cursor_greater_than_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
 	  
