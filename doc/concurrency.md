@@ -65,7 +65,7 @@ more like it.
 | level | what a scan does |
 |---|---|
 | `READ UNCOMMITTED` | takes rows as it finds them, staged or not |
-| `READ COMMITTED` | takes the committed version of every row, and waits for nobody |
+| `READ COMMITTED` | takes the version of every row that was current when the statement began, and waits for nobody |
 | `REPEATABLE READ` | marks the rows it reads, and restarts the query if one changed underneath |
 | `SNAPSHOT` | follows each row back to the version that was current when the transaction began |
 | `SERIALIZABLE` | one transaction at a time, server wide |
@@ -90,6 +90,41 @@ was told, for the whole length of the rewrite, that it did not exist.
 counts, anybody else's does not, and what is left is whatever was committed at
 this address. A writer still waits for a writer — that is `_check_lock`, and it
 still times out rather than wedging.
+
+### A statement sees one version of the store
+
+Not waiting is not enough on its own, because **a scan spans time**. It visits
+addresses in order and takes a while about it, while a writer puts a replacement
+row wherever the allocator has room. If the two interleave freely, a scan can
+pass a replacement before it is committed and then find the original retired —
+the row missing — or see the original and then reach the committed replacement,
+and count the same row twice. Neither is a torn read; both are wrong. Measured
+before the fix: 865 double counts in a single run of three scanners against one
+writer.
+
+So a reader decides every row against a single point in time, taken once when the
+statement begins (`Memory::Statement`, held by table scans and index walks
+alike). Each version of a row carries when it was committed and when it was
+superseded, and `Memory::_alive_at` asks the obvious question of the two. An
+update stamps the old version's death and the new one's birth with the **same**
+commit time, so the two conditions change over at the same instant: exactly one
+version of a row satisfies them for any given time, and never both.
+
+**That needed a better clock.** The stamps were `std::time(0)` — one second — and
+two versions of a row born and retired inside the same second are
+indistinguishable, which under any load at all is all of them.
+`Memory::version_time` is microseconds and strictly increasing within the
+process, so no two commits ever share a stamp. It goes in the same 8-byte
+`time_t` fields, so the on-disk control block is the shape it always was; a store
+written by an older build has second-scale stamps in it, which read as "committed
+long ago" and "retired long ago" — both the right answer.
+
+One trap worth knowing about, because it cost an afternoon: `modify_time` only
+means *died* when `offline_state` says so. `_offline_update` rewrites a row in
+place and stamps `modify_time` on it while it is still perfectly current — that
+is how the index catalogue records a root address and how a B-tree key records
+its value chain. Reading that stamp as a death makes every index invisible, so a
+reopened store looks empty and quietly builds itself a fresh, blank one.
 
 `SERIALIZABLE` is a semaphore of one and only against other `SERIALIZABLE`
 transactions — `READ COMMITTED` never waits for it. That makes it affordable
@@ -133,14 +168,14 @@ retry.
 
 ## What is still true and worth knowing
 
-* **A scan spans time, and a row rewritten during one can still be counted twice
-  or not at all.** Not through waiting any more — that is fixed — but because a
-  scan visits addresses in order while an update puts the replacement wherever
-  the allocator has room. If the writer commits in the middle of a scan, the
-  scan may have passed the replacement while it was uncommitted and then find the
-  original retired, or seen the original and then reach the replacement. The
-  window is now a genuine race of microseconds rather than the length of a whole
-  transaction, and a reader that must not see either is asking for `SNAPSHOT`.
+* **A statement is the unit of consistency at `READ COMMITTED`, not a
+  transaction.** Two scans in one transaction can see different states of the
+  store, which is what the level means; a transaction that needs one view
+  throughout is asking for `SNAPSHOT` or `REPEATABLE READ`.
+* **`_offline_update` is outside MVCC.** It rewrites a row in place rather than
+  writing a new version, so a reader holding an older statement sees the new
+  bytes. It is for metadata that is true the moment it is written — an index's
+  root address, a B-tree key's value chain — and not for rows.
 * **An exception ends the connection.** The request loop writes
   `EXCEPTION_THROWN` and breaks, so any refusal — including a lock timeout — is
   fatal to that connection rather than to the call. A client that means to carry
