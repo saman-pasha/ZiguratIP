@@ -43,6 +43,27 @@ between rows, it removes what `DELETE` already removed.
 - **Index storage.** A table's indexes keep their own pages under their own
   keys, and truncating the table does not compact them.
 
+## When to run it
+
+**Whenever the application rewrites rows, on a schedule.** Nothing calls
+`TRUNCATE` for you: there is no background vacuum, and a store that is never
+truncated grows for as long as it is used.
+
+It is easy to miss because the workload does not look like deleting. A
+procedure that updates a row by removing the old version and inserting a
+replacement leaves a dead row behind every time it runs. The table's live
+contents stay the same size; what grows is the number of dead versions every
+index entry has to walk past to reach them, and so every read gets slower.
+
+**Measured.** cocolog keeps a suspended interpreter's state in a table and
+rewrites it once per turn. Twelve interpreters over four such states took
+**12 seconds against an empty store and 60 against one a few hundred test runs
+had been through** — identical work, identical live data, five times the wall
+clock. One `TRUNCATE` over its four tables brought it back to 16 seconds.
+
+If the answer to "when was this store last truncated" is "never", that is
+almost certainly where an unexplained slowdown is coming from.
+
 ## What it costs
 
 The store cannot be rolled back to a time before the truncate for the rows it

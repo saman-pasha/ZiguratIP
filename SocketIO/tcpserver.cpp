@@ -83,6 +83,10 @@ namespace Zigurat
       else {
 	if (info[0].revents & Socket::PollEvent::IN) {
 	  Socket::handle_t client_handle = Socket::accept(this->_handle, NULL, NULL);
+	  // Before the handler sees it, and best effort: a connection that will
+	  // not take the option still works, it is merely slow. See
+	  // Socket::set_nodelay for why every reply this server writes needs it.
+	  Socket::set_nodelay(client_handle, true);
 	  try {
 	    this->_pool.execute([handler, client_handle] () { handler(client_handle); });
 	  } catch (const std::exception&) {

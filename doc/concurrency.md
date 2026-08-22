@@ -166,6 +166,54 @@ Neither waits for ever, because both can be held by a client that has simply
 stopped talking. A transaction that gives up rolls back and the caller may
 retry.
 
+## Latency: Nagle is off on every accepted connection
+
+Both protocols this server speaks are conversations of small messages — read a
+request, write a reply, wait for the next. That is precisely the pattern
+Nagle's algorithm coalesces and the peer's delayed ACK then stalls, and neither
+side is at fault alone:
+
+* Nagle holds a small write until the previous one is acknowledged.
+* Delayed ACK holds the acknowledgement for up to 40ms, hoping to piggyback it
+  on a reply.
+* The reply is the write being held.
+
+Nothing is wrong, nothing errors, nothing times out — and every exchange costs
+40ms. `TCPServer::run` therefore calls `Socket::set_nodelay` on each connection
+before handing it to the handler, best effort: a socket that will not take the
+option still works, it is merely slow.
+
+**What it cost before that line existed.** One turn of a cocolog worker is a few
+dozen exchanges. Twelve of them took a minute to do a second's work, and the
+test that runs twelve at once failed on its own timeout with no error anywhere
+to say why. A client that speaks this protocol should set `TCP_NODELAY` at its
+end too; the server setting it fixes only the half the server sends.
+
+## Deleted rows are kept, and `TRUNCATE` is what reclaims them
+
+Under MVCC a deleted row is not gone: it is kept so that a transaction entitled
+to an earlier view of the store can still read it. **Nothing removes it
+afterwards.** There is no background vacuum — `TRUNCATE` is the vacuum, and
+something has to call it.
+
+This is easy to miss because it does not look like deleting. A workload that
+rewrites a row — delete the old version, insert a replacement — leaves a dead
+row behind every time it does so, and a workload that rewrites the same row
+thirty times leaves twenty-nine. The table's live contents never grow; what
+grows is everything an index entry has to walk past to reach them.
+
+**Measured, in cocolog:** the same twelve interpreters over the same four
+machine states took **12 seconds against an empty store and 60 against one a
+few hundred test runs had been through**, doing identical work with identical
+live data. One `TRUNCATE` over its four tables took it back to 16 seconds.
+
+`TRUNCATE` frees only rows that are committed as deleted and that no running
+transaction can still be entitled to; live rows are untouched. It is therefore
+safe against a table in use, and is a vacuum rather than an emptying — see
+`doc/truncate.md`. **An application that rewrites rows needs to run it on a
+schedule.** The freed space returns to the allocator's free list for reuse; the
+file does not shrink.
+
 ## What is still true and worth knowing
 
 * **A statement is the unit of consistency at `READ COMMITTED`, not a
