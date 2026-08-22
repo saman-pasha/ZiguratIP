@@ -593,6 +593,231 @@ ZTEST(Contention, find_by_index_then_update_holds_up_from_many_threads)
 }
 
 
+// --- a row that is being rewritten ------------------------------------------
+
+// READ COMMITTED promises the last committed version of a row. Not a newer one,
+// not a half-written one -- but not NOTHING either, and nothing is what a reader
+// used to get for the whole length of somebody else's update.
+//
+// An update writes the new version to a NEW address and marks the old one
+// UPDATED and locked. A reader arriving at the old one waited for that lock, and
+// by the time the wait ended the old version had been retired and the new one
+// was somewhere the reader had already been. Both versions gone, from a
+// transaction that had done nothing but read.
+//
+// This is the shape a queue poller takes -- "is the row still there?" -- and it
+// is where it was found: a worker asking after a job its partner happened to be
+// saving was told the job did not exist.
+ZTEST(Contention, a_row_being_updated_is_never_missing_from_an_index)
+{
+  Indexed db("cont-rewrite-index");
+  if (!db.ready()) { ZCHECK(false); return; }
+
+  db.load(4);
+
+  Trouble trouble;
+  std::atomic<bool> writing(true);
+  std::atomic<int> looks(0);
+  std::atomic<int> missing(0);
+  std::atomic<int> doubled(0);
+
+  // One row rewritten over and over. Its id never changes, so every lookup of
+  // that id has exactly one answer at every instant.
+  std::thread writer([&] () {
+      try {
+	for (int n = 0; n < 200; n++) {
+	  session(db.memory());
+	  Part current;
+	  bool hit = false;
+	  Part::IDX_ID->cursor_equal(Long(1), [&] (Part& row) -> bool {
+	      current = row; hit = true; return false;
+	    });
+	  if (hit) {
+	    Part next(1, current.kind.to_std_string(), current.weight.value() + 1);
+	    db.memory()->online_update(current, next);
+	  }
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("writer: " + e.message());
+      }
+      writing = false;
+    });
+
+  fan_out(4, [&] (int) {
+      try {
+	while (writing.load()) {
+	  session(db.memory());
+	  int hits = 0;
+	  Part::IDX_ID->cursor_equal(Long(1), [&] (Part& row) -> bool {
+	      hits++;
+	      // Whichever version it is, it has to be a whole one.
+	      if (row.id.value() != 1) missing++;
+	      return true;
+	    });
+	  if (hits == 0) missing++;
+	  if (hits > 1) doubled++;
+	  looks++;
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("reader: " + e.message());
+	try { db.memory()->rollback_transaction(); } catch (...) { }
+      }
+    });
+
+  writer.join();
+
+  ZCHECK_STR(trouble.say(), "none");
+  ZCHECK(looks.load() > 0);
+  ZCHECK_EQ(missing.load(), 0);
+  ZCHECK_EQ(doubled.load(), 0);
+}
+
+// The same thing through a table scan rather than an index. A scan visits
+// addresses in order and an update puts the new version wherever the allocator
+// has room -- which can be somewhere the scan has already been -- so this is the
+// harder half.
+ZTEST(Contention, a_row_being_updated_is_never_missing_from_a_scan)
+{
+  Indexed db("cont-rewrite-scan");
+  if (!db.ready()) { ZCHECK(false); return; }
+
+  const int64_t ROWS = 6;
+  db.load(ROWS);
+
+  Trouble trouble;
+  std::atomic<bool> writing(true);
+  std::atomic<int> scans(0);
+  std::atomic<int> short_counts(0);
+  std::atomic<int> long_counts(0);
+
+  std::thread writer([&] () {
+      try {
+	for (int n = 0; n < 200; n++) {
+	  const int64_t which = (n % ROWS) + 1;
+	  session(db.memory());
+	  Part current;
+	  bool hit = false;
+	  db.memory()->cursor<Part>([&] (Part& row) -> bool {
+	      if (row.id.value() == which) { current = row; hit = true; return false; }
+	      return true;
+	    });
+	  if (hit) {
+	    Part next(which, current.kind.to_std_string(), current.weight.value() + 1);
+	    db.memory()->online_update(current, next);
+	  }
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("writer: " + e.message());
+      }
+      writing = false;
+    });
+
+  fan_out(4, [&] (int) {
+      try {
+	while (writing.load()) {
+	  session(db.memory());
+	  std::set<int64_t> ids;
+	  db.memory()->cursor<Part>([&] (Part& row) -> bool {
+	      ids.insert(row.id.value());
+	      return true;
+	    });
+	  if ((int64_t)ids.size() < ROWS) short_counts++;
+	  if ((int64_t)ids.size() > ROWS) long_counts++;
+	  scans++;
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("reader: " + e.message());
+	try { db.memory()->rollback_transaction(); } catch (...) { }
+      }
+    });
+
+  writer.join();
+
+  ZCHECK_STR(trouble.say(), "none");
+  ZCHECK(scans.load() > 0);
+  ZCHECK_EQ(short_counts.load(), 0);
+  ZCHECK_EQ(long_counts.load(), 0);
+}
+
+// A reader must not be made to wait by a writer at all at this level. Waiting is
+// what turned one slow update into every reader's problem, and it is not what
+// READ COMMITTED asks for: the committed version is sitting at the address the
+// reader is already looking at.
+ZTEST(Contention, a_reader_does_not_wait_for_a_writer_at_read_committed)
+{
+  Indexed db("cont-nowait");
+  if (!db.ready()) { ZCHECK(false); return; }
+
+  db.load(3);
+
+  const int original = Memory::lock_wait_timeout_ms;
+  Memory::lock_wait_timeout_ms = 10000;
+
+  std::atomic<bool> staged(false);
+  std::atomic<bool> release(false);
+  std::atomic<int> hits(0);
+  std::atomic<long long> took_ms(0);
+  Trouble trouble;
+
+  // A writer that stages an update and sits on it.
+  std::thread writer([&] () {
+      try {
+	session(db.memory());
+	Part current;
+	db.memory()->cursor<Part>([&] (Part& row) -> bool {
+	    if (row.id.value() == 1) { current = row; return false; }
+	    return true;
+	  });
+	Part next(1, "held", 999);
+	db.memory()->online_update(current, next);
+	staged = true;
+	while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	db.memory()->rollback_transaction();
+      } catch (ZiguratException& e) {
+	trouble.note("writer: " + e.message());
+      }
+    });
+
+  for (int waited = 0; waited < 5000 && !staged.load(); waited += 5)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  std::thread reader([&] () {
+      try {
+	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	session(db.memory());
+	db.memory()->cursor<Part>([&] (Part& row) -> bool {
+	    if (row.id.value() == 1) {
+	      hits++;
+	      // The committed version, not the one being staged.
+	      if (row.weight.value() != 10) hits += 100;
+	    }
+	    return true;
+	  });
+	db.memory()->commit_transaction();
+	took_ms = std::chrono::duration_cast<std::chrono::milliseconds>
+	  (std::chrono::steady_clock::now() - t0).count();
+      } catch (ZiguratException& e) {
+	trouble.note("reader: " + e.message());
+	try { db.memory()->rollback_transaction(); } catch (...) { }
+      }
+    });
+
+  reader.join();
+  release = true;
+  writer.join();
+  Memory::lock_wait_timeout_ms = original;
+
+  ZCHECK_STR(trouble.say(), "none");
+  ZCHECK_EQ(hits.load(), 1);
+  // Well under the lock wait timeout: it did not queue behind the writer.
+  ZCHECK(took_ms.load() < 1000);
+}
+
+
 // --- the transaction, not the store -----------------------------------------
 
 // A level one transaction asked for must not be the next transaction's level.

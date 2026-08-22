@@ -65,10 +65,31 @@ more like it.
 | level | what a scan does |
 |---|---|
 | `READ UNCOMMITTED` | takes rows as it finds them, staged or not |
-| `READ COMMITTED` | waits for a row another transaction has locked, then takes what it committed |
+| `READ COMMITTED` | takes the committed version of every row, and waits for nobody |
 | `REPEATABLE READ` | marks the rows it reads, and restarts the query if one changed underneath |
 | `SNAPSHOT` | follows each row back to the version that was current when the transaction began |
 | `SERIALIZABLE` | one transaction at a time, server wide |
+
+### READ COMMITTED does not wait, and that matters
+
+A reader at this level never queues behind a writer. It does not need to: an
+update writes the new version to a *new* address and leaves the old one where it
+is until it commits, so the version the reader is entitled to see is already
+sitting at the address it is looking at.
+
+It used to wait, because reads went through `_check_lock` — which is a *writer's*
+question, "may I have this row?", and the only answer to that is to wait. The
+cost was not just latency. The wait was long enough for the writer to commit
+while the reader stood there, so the version being waited on was retired and its
+replacement was at an address the scan had already gone past: **a transaction
+that had done nothing but read saw neither version of a row that existed
+throughout**. A client polling for the presence of a row that was being rewritten
+was told, for the whole length of the rewrite, that it did not exist.
+
+`Memory::_read_committed` is the rule now, and it is short: your own staged work
+counts, anybody else's does not, and what is left is whatever was committed at
+this address. A writer still waits for a writer — that is `_check_lock`, and it
+still times out rather than wedging.
 
 `SERIALIZABLE` is a semaphore of one and only against other `SERIALIZABLE`
 transactions — `READ COMMITTED` never waits for it. That makes it affordable
@@ -112,13 +133,14 @@ retry.
 
 ## What is still true and worth knowing
 
-* **A row being rewritten is briefly invisible to a concurrent reader.** An
-  update is a delete and an insert, and the replacement can land at an address a
-  scan already went past — so a reader at `READ COMMITTED` can see neither
-  version for the length of the writer's transaction. It is consistent, in that
-  no reader sees a half-written row; it is not the last committed version, which
-  is what `READ COMMITTED` normally promises. A client polling for the presence
-  of a row that is being rewritten has to ask more than once.
+* **A scan spans time, and a row rewritten during one can still be counted twice
+  or not at all.** Not through waiting any more — that is fixed — but because a
+  scan visits addresses in order while an update puts the replacement wherever
+  the allocator has room. If the writer commits in the middle of a scan, the
+  scan may have passed the replacement while it was uncommitted and then find the
+  original retired, or seen the original and then reach the replacement. The
+  window is now a genuine race of microseconds rather than the length of a whole
+  transaction, and a reader that must not see either is asking for `SNAPSHOT`.
 * **An exception ends the connection.** The request loop writes
   `EXCEPTION_THROWN` and breaks, so any refusal — including a lock timeout — is
   fatal to that connection rather than to the call. A client that means to carry

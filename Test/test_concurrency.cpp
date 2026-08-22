@@ -274,10 +274,19 @@ ZTEST(Concurrency, concurrent_readers_never_see_staged_work)
   ZCHECK_EQ(count_rows(store.memory), (size_t)0);
 }
 
-// Sessions that each hold a lock the others want form a genuine cycle. The
-// engine has no deadlock detector, so the lock wait timeout is what has to stop
-// the whole store wedging.
-ZTEST(Concurrency, a_lock_cycle_times_out_instead_of_wedging)
+// Everyone holds a lock and everyone then reads. At READ COMMITTED there is no
+// cycle here to break, and that is the point of the case now: a reader at this
+// level does not wait for a writer at all, because the version it is entitled to
+// see is the committed one already sitting at the address it is looking at.
+//
+// IT USED TO ASSERT THE OPPOSITE -- that some of the four timed out -- because
+// reads went through _check_lock, which is a writer's question, and so a scan
+// queued behind every staged row it walked past. That wait was not just slow: it
+// was long enough for the writer to commit while the reader stood there, so the
+// version the reader was waiting on was retired and its replacement was at an
+// address the scan had already gone by. The reader ended up seeing neither.
+// Memory::_read_committed is what it goes through now.
+ZTEST(Concurrency, readers_do_not_queue_behind_staged_writes)
 {
   Store store("conc-deadlock");
   if (!store.ready()) { ZCHECK(false); return; }
@@ -301,7 +310,7 @@ ZTEST(Concurrency, a_lock_cycle_times_out_instead_of_wedging)
       for (int waited = 0; waited < 5000 && staged.load() < SESSIONS; waited += 5)
 	std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-      // Everyone now scans while everyone holds a lock: the cycle.
+      // Everyone scans while everyone holds a lock.
       try {
 	std::vector<Account> rows = select_all(store.memory);
 	for (size_t i = 0; i < rows.size(); i++)
@@ -316,14 +325,76 @@ ZTEST(Concurrency, a_lock_cycle_times_out_instead_of_wedging)
 
   Memory::lock_wait_timeout_ms = original_timeout;
 
-  // The point is that all four threads came back at all.
+  // All four came back, none of them saw anybody else's staged row, and none of
+  // them waited long enough to be given up on.
   ZCHECK_EQ(finished.load(), SESSIONS);
   ZCHECK_EQ(dirty.load(), 0);
-  ZCHECK(timed_out.load() > 0);
+  ZCHECK_EQ(timed_out.load(), 0);
 
   // And nothing uncommitted survived the pile-up.
   session(store.memory);
   ZCHECK_EQ(count_rows(store.memory), (size_t)0);
+}
+
+// A WRITER still waits, and still gives up rather than wedging. Two sessions
+// that each hold a row the other wants to write is a real cycle, and the engine
+// has no deadlock detector -- the lock wait timeout is the whole of its answer.
+ZTEST(Concurrency, a_writer_cycle_times_out_instead_of_wedging)
+{
+  Store store("conc-writer-deadlock");
+  if (!store.ready()) { ZCHECK(false); return; }
+
+  session(store.memory);
+  for (int32_t i = 1; i <= 2; i++) { Account row(i, "seed", i); store.memory->online_insert(row); }
+  store.memory->commit_transaction();
+
+  const int original_timeout = Memory::lock_wait_timeout_ms;
+  Memory::lock_wait_timeout_ms = 400;
+
+  std::atomic<int> took(0);
+  std::atomic<int> finished(0);
+  std::atomic<int> timed_out(0);
+
+  // Two sessions take one row each and then reach for the other's.
+  fan_out(2, [&] (int t) {
+      const int32_t mine = (int32_t)(t + 1);
+      const int32_t theirs = (int32_t)(((t + 1) % 2) + 1);
+      try {
+	session(store.memory);
+
+	Account row;
+	if (find_by_id(store.memory, mine, row)) {
+	  Account next(mine, "held", row.balance.value() + 1);
+	  store.memory->online_update(row, next);
+	}
+	took++;
+
+	for (int waited = 0; waited < 5000 && took.load() < 2; waited += 5)
+	  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+	Account other;
+	if (find_by_id(store.memory, theirs, other)) {
+	  Account next(theirs, "grabbed", other.balance.value() + 1);
+	  store.memory->online_update(other, next);
+	}
+      } catch (...) {
+	timed_out++;
+      }
+
+      try { store.memory->rollback_transaction(); } catch (...) { }
+      finished++;
+    });
+
+  Memory::lock_wait_timeout_ms = original_timeout;
+
+  ZCHECK_EQ(finished.load(), 2);
+  ZCHECK(timed_out.load() > 0);
+
+  // Both rolled back, so the seeded rows are as they were.
+  session(store.memory);
+  ZCHECK_EQ(count_rows(store.memory), (size_t)2);
+  ZCHECK_EQ(total_balance(store.memory), (int64_t)3);
+  store.memory->commit_transaction();
 }
 
 ZTEST(Concurrency, mixed_workload_leaves_a_consistent_store)
