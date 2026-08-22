@@ -26,6 +26,25 @@ namespace Zigurat
   public:
     Transaction();
     void initialize(Pointer);
+
+    // Puts everything that belongs to ONE transaction back to its starting
+    // state, keeping what belongs to the connection. Commit and rollback end a
+    // transaction, so both call it.
+    //
+    // WHY IT HAS TO EXIST. A connection holds one thread and one Transaction
+    // for its whole life, and initialize() ran once, when the connection was
+    // made. So anything a transaction changed about itself outlived it: a
+    // procedure carrying TRANSACTION ISOLATION LEVEL SERIALIZABLE left the
+    // connection serializable for ever after, and -- because SERIALIZABLE is a
+    // semaphore of one -- left it holding that slot after the commit. Every
+    // other connection that asked for SERIALIZABLE then waited on a slot whose
+    // owner had long since finished with it, which looks from the outside like
+    // one client doing all the work and the rest hanging. init_time is the same
+    // kind of leak with a quieter symptom: it is what SNAPSHOT compares against,
+    // so a second transaction on one connection went on seeing the first one's
+    // view of the store.
+    void reset();
+
     size_t id;
     time_t init_time;
     Pointer pointer;

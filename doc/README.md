@@ -10,6 +10,8 @@ client interfaces. Converted from the ziguratip.com documentation.
 - [Configuration](configuration.md)
 - [Locales](locales.md)
 - [Connector](connector.md)
+- [Concurrency](concurrency.md) — several clients at once: what holds, what it
+  costs, and where the limits are
 - [Server security](security.md) — certificates, and the
   [permissions](security.md#permissions) they carry
 - [C++ API](cpp.md)

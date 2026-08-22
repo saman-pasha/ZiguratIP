@@ -21,6 +21,7 @@ SOURCES := main_test.cpp \
 	test_acid.cpp \
 	test_isolation.cpp \
 	test_concurrency.cpp \
+	test_contention.cpp \
 	test_zeytun.cpp \
 	test_grammar.cpp \
 	test_permissions.cpp

@@ -100,7 +100,23 @@ Defines port number of TCP type server. Default is 2160 like ZIGO.
 
 ## SERVER/BACKLOG
 
-Defines limit the number of concurrent clients connections or transactions.
+How many connections the kernel will hold waiting to be accepted. Beyond it a
+client is refused at connect time.
+
+## SERVER/POOL_SIZE
+
+Worker threads, and so **the most clients that can be connected to the binary
+port at once**.
+
+This is not a throughput setting to be tuned later. A connection holds one of
+these threads for its whole life — the transaction *is* the connection, see
+[transaction.md](transaction.md) — so `POOL_SIZE` is a hard limit on how many
+clients the server will talk to. Connections past it are not refused: they sit
+in the accept queue with no greeting until a thread frees, which the client can
+only see as its own socket timing out. Nothing appears in the server log.
+
+So set it above the number of clients you expect to be connected at the same
+time, not the number of requests per second. It ships as 32.
 
 ## SERVER/TIMEOUT
 

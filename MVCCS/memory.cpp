@@ -51,8 +51,64 @@ namespace Zigurat
     return (std::memcmp(src, dst, HASHKEY_SIZE) < 0);
   }
 
-  thread_local Transaction Memory::transaction;  
-  
+  thread_local Transaction Memory::transaction;
+
+  // ---- Memory::Streams -----------------------------------------------------
+  // What it is for is in memory.hpp, above the declaration.
+
+  thread_local Memory::Streams* Memory::Streams::_held = nullptr;
+
+  // Built deferred and then locked through lock(), so that publishing happens
+  // in exactly one place. A guard on a thread that is already holding them owns
+  // nothing at all: it never locks, never unlocks, and never publishes, so the
+  // real holder's state is left alone.
+  Memory::Streams::Streams(Memory* memory)
+    : _hexmap(memory->_hexmap_access, std::defer_lock),
+      _data(memory->_data_access, std::defer_lock),
+      _mine(_held == nullptr)
+  {
+    this->lock();
+  }
+
+  Memory::Streams::~Streams()
+  {
+    this->unlock();
+  }
+
+  bool Memory::Streams::mine() const
+  {
+    return this->_mine;
+  }
+
+  void Memory::Streams::lock()
+  {
+    if (!this->_mine || this->_hexmap.owns_lock()) return;
+
+    // Always hexmap then data. Every site in the engine takes them in this
+    // order, which is why two mutexes never deadlock against each other.
+    this->_hexmap.lock();
+    this->_data.lock();
+    _held = this;
+  }
+
+  void Memory::Streams::unlock()
+  {
+    if (!this->_mine || !this->_hexmap.owns_lock()) return;
+
+    // WITHDRAWN BEFORE RELEASING, not after. Between the two the streams are
+    // still held but no longer claimed, which is harmless; the other order
+    // would leave a window where this thread claims a hold it has given up,
+    // and anything nesting in that window would run unguarded.
+    _held = nullptr;
+    this->_data.unlock();
+    this->_hexmap.unlock();
+  }
+
+  Memory::Streams* Memory::Streams::held()
+  {
+    return _held;
+  }
+
   Memory::Memory(binarystream& hexmap_io, binarystream& data_io, int64_t page_size)
     : _hexmap_io(hexmap_io), _data_io(data_io), _page_size(page_size), _hbpp(page_size / CHUNK_SIZE)
   {
@@ -88,7 +144,7 @@ namespace Zigurat
     time_t* commit_time_ptr = nullptr;    
     std::map<size_t, time_t> transactions;
     
-    this->_cursor(TRANSACTIONS_HASHKEY, nullptr, nullptr, [&] (const Pointer pointer) -> bool {
+    this->_cursor(TRANSACTIONS_HASHKEY, Streams::held(), [&] (const Pointer pointer) -> bool {
 
 	this->_data_io.seekg(this->_pointer_data_address(pointer), std::ios::beg);
 	this->_data_io.read(buffer, length);
@@ -189,7 +245,7 @@ namespace Zigurat
       // free list, and it can hand a whole page back to FREE_HASHKEY -- so
       // freeing from inside the walk mutates what the walk is standing on.
       std::list<Pointer> spent;
-      this->_cursor(TRANSACTIONS_HASHKEY, nullptr, nullptr, [&] (const Pointer& pointer) -> bool {
+      this->_cursor(TRANSACTIONS_HASHKEY, Streams::held(), [&] (const Pointer& pointer) -> bool {
 	  spent.push_back(pointer);
 	  return true;
 	});
@@ -603,8 +659,7 @@ namespace Zigurat
       this->dba_watch("Truncate: (hash_key)");
     }
 
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);
+    Streams streams(this);
 
     // Collected in full before anything is freed: _free rewrites the hexmap and
     // moves entries between the page and free lists, which is exactly what the
@@ -720,7 +775,7 @@ namespace Zigurat
     this->_hexmap_io.sync_to_disk();
   }
 
-  bool Memory::_visible(Pointer& pointer, lock_t* hexmap_lock, lock_t* data_lock)
+  bool Memory::_visible(Pointer& pointer, Streams* streams)
   {
     uint8_t hex_byte = 0;
 
@@ -748,7 +803,7 @@ namespace Zigurat
 
     case IsolationLevel::READ_COMMITTED:
       if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
-	is_visible = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, hexmap_lock, data_lock);
+	is_visible = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, streams);
       }
       break;
 
@@ -768,7 +823,7 @@ namespace Zigurat
 	  this->_transaction_push(pointer);
 	  is_visible = true;
 	} else {
-	  is_visible = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, hexmap_lock, data_lock);
+	  is_visible = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, streams);
 	}
       }
       break;
@@ -827,7 +882,7 @@ namespace Zigurat
     return is_visible;
   }
 
-  bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, lock_t* hexmap_lock, lock_t* data_lock)
+  bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, Streams* streams)
   {
     if (this->_watcher) {
       this->dba_watch("Check Lock: (address: " + std::to_string(pointer.address) + ")");
@@ -838,8 +893,7 @@ namespace Zigurat
     do {
       this->_load_control(pointer, control);
 
-      if (hexmap_lock) hexmap_lock->unlock();
-      if (data_lock) data_lock->unlock();
+      if (streams) streams->unlock();
 	  
       if ( (control.online_lock & lock) != RowLock::NONE) { // pointer is locked
 
@@ -863,16 +917,14 @@ namespace Zigurat
 	    // rather than spin forever: the caller rolls back and retries, which
 	    // is what breaks the cycle.
 	    if (Memory::lock_wait_timeout_ms > 0 && waited_ms >= Memory::lock_wait_timeout_ms) {
-	      if (hexmap_lock) hexmap_lock->lock();
-	      if (data_lock) data_lock->lock();
+	      if (streams) streams->lock();
 	      throw MemoryException("lock wait timeout");
 	    }
 
 	    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	    waited_ms += 10;
 
-	    if (hexmap_lock) hexmap_lock->lock();
-	    if (data_lock) data_lock->lock();
+	    if (streams) streams->lock();
 	  }
 
 	}
@@ -883,8 +935,7 @@ namespace Zigurat
 
     } while (true); // wait until lock is freed
 
-    if (hexmap_lock) hexmap_lock->lock();
-    if (data_lock) data_lock->lock();
+    if (streams) streams->lock();
 
     // The wait ends either because the writer committed or because it rolled
     // back. A row with nothing left online is only readable if it actually
@@ -902,7 +953,7 @@ namespace Zigurat
     return do_read;
   }
 
-  void Memory::_cursor(hashkey_ptr hash_key, lock_t* hexmap_lock, lock_t* data_lock, std::function<bool (const Pointer&)> callback)
+  void Memory::_cursor(hashkey_ptr hash_key, Streams* streams, std::function<bool (const Pointer&)> callback)
   {
     thread_local static uint8_t cursor_id = 0;
     if (++cursor_id >= MAX_CURSOR_COUNT) {
@@ -983,7 +1034,7 @@ namespace Zigurat
 		
 	      case IsolationLevel::READ_COMMITTED:
 		if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {		  
-		  do_callback = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, hexmap_lock, data_lock);
+		  do_callback = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, streams);
 		}		
 		break;
 		
@@ -1002,23 +1053,22 @@ namespace Zigurat
 		    this->_transaction_push(pointer);
 		    do_callback = true;
 		  } else {
-		    do_callback = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, hexmap_lock, data_lock);
+		    do_callback = this->_check_lock(RowLock::EXCLUSIVE | RowLock::SHARED, pointer, control, streams);
 		    if ( (!do_callback && control.transaction_id > 0 && control.transaction_id != Memory::transaction.id) ||
 			 (do_callback && control.create_time > Memory::transaction.query_time)) {
-		      // rollback_transaction_to() takes the same two mutexes this
-		      // scan is already holding, so they have to be handed back
-		      // before the retry or the scan deadlocks against itself.
-		      if (hexmap_lock) hexmap_lock->unlock();
-		      if (data_lock) data_lock->unlock();
+		      // rollback_transaction_to() takes the same streams this scan
+		      // is already holding, so they have to be handed back before
+		      // the retry -- its own guard then finds nothing held and
+		      // takes them properly.
+		      if (streams) streams->unlock();
 
 		      this->rollback_transaction_to(Memory::transaction.query_time);
 		      std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-		      if (hexmap_lock) hexmap_lock->lock();
-		      if (data_lock) data_lock->lock();
+		      if (streams) streams->lock();
 
 		      cursor_id--;
-		      this->_cursor(hash_key, hexmap_lock, data_lock, callback);
+		      this->_cursor(hash_key, streams, callback);
 		      return;
 		    }
 		  }
@@ -1082,15 +1132,13 @@ namespace Zigurat
     
 	      if (do_callback) {
 
-		if (hexmap_lock) hexmap_lock->unlock();
-		if (data_lock) data_lock->unlock();
+		if (streams) streams->unlock();
 		
 		if ( !callback( pointer ) ) {
 		  i = this->_hbpp;
 		}
 
-		if (hexmap_lock) hexmap_lock->lock();
-		if (data_lock) data_lock->lock();
+		if (streams) streams->lock();
 
 	      }
 	      
@@ -1127,7 +1175,7 @@ namespace Zigurat
     this->_dump_control(object->pointer, control);
   }
   
-  void Memory::_control_update(BaseTable* old_object, BaseTable* new_object, lock_t* hexmap_lock, lock_t* data_lock)
+  void Memory::_control_update(BaseTable* old_object, BaseTable* new_object, Streams* streams)
   {
     if (this->_watcher) {
       this->dba_watch("Control Update: (address: " + std::to_string(old_object->pointer.address) + ")");
@@ -1135,7 +1183,7 @@ namespace Zigurat
 
     Control control;
     
-    if (!this->_check_lock(RowLock::EXCLUSIVE, old_object->pointer, control, hexmap_lock, data_lock))
+    if (!this->_check_lock(RowLock::EXCLUSIVE, old_object->pointer, control, streams))
       return;
 
     control.online_state = RowState::UPDATED;
@@ -1160,7 +1208,7 @@ namespace Zigurat
     this->_dump_control(new_object->pointer, control);
   }
   
-  void Memory::_control_delete(BaseTable* object, lock_t* hexmap_lock, lock_t* data_lock)
+  void Memory::_control_delete(BaseTable* object, Streams* streams)
   {
     if (this->_watcher) {
       this->dba_watch("Control Delete: (address: " + std::to_string(object->pointer.address) + ")");
@@ -1168,7 +1216,7 @@ namespace Zigurat
 
     Control control;
  
-    if (!this->_check_lock(RowLock::EXCLUSIVE, object->pointer, control, hexmap_lock, data_lock))
+    if (!this->_check_lock(RowLock::EXCLUSIVE, object->pointer, control, streams))
       return;
     
     control.online_state = RowState::DELETED;
@@ -1293,8 +1341,7 @@ namespace Zigurat
     // Allocating the transaction record touches the hexmap and the data file
     // exactly as commit and rollback do, so it needs the same two mutexes.
     // Without them concurrent sessions raced here and lost each other's pages.
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);
+    Streams streams(this);
 
     //                                                                   transaction_id , commit_time
     Memory::transaction.initialize(this->_allocate(TRANSACTIONS_HASHKEY, sizeof(size_t) + sizeof(time_t)));
@@ -1317,8 +1364,12 @@ namespace Zigurat
       this->dba_watch("Commit Transaction: ()");
     }
 
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);    
+    // Scoped, because Transaction::reset() below must not run under it: reset
+    // can wait on the SERIALIZABLE semaphore, and the thread that would release
+    // that semaphore has to get through its own commit to do so -- which needs
+    // these. Streams then semaphore, in that order, and never the other way.
+    {
+    Streams streams(this);
 
     time_t commit_time = std::time(0);
 
@@ -1349,6 +1400,13 @@ namespace Zigurat
     // middle of the loop would have been recovered from.
     this->_write_transaction(Memory::transaction.id, (time_t)0);
     this->_sync();
+    }
+
+    // THE TRANSACTION IS OVER, so what belonged to it goes back to the
+    // connection's defaults -- the isolation level above all, which is how a
+    // SERIALIZABLE slot is given back. Without this a connection kept whatever
+    // level one procedure asked for until it closed.
+    Memory::transaction.reset();
   }
   
   void Memory::commit_transaction_until(time_t)
@@ -1362,8 +1420,11 @@ namespace Zigurat
       this->dba_watch("Rollback Transaction: ()");
     }
 
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);    
+    // Scoped for the same reason commit_transaction's is: reset() below can
+    // wait on the SERIALIZABLE semaphore and must not be holding these while
+    // it does.
+    {
+    Streams streams(this);
 
     auto e_iter = Memory::transaction.context.crend();
     for (auto iter = Memory::transaction.context.crbegin(); iter != e_iter; iter++) {
@@ -1393,16 +1454,19 @@ namespace Zigurat
     Memory::transaction.pointer = Pointer();
 
     this->_sync();
+    }
+
+    // A rolled back transaction is as over as a committed one.
+    Memory::transaction.reset();
   }
-  
+
   void Memory::rollback_transaction_to(time_t time)
   {
     if (this->_watcher) {
       this->dba_watch("Rollback Transaction to: (" + std::string(asctime(gmtime(&time))) + ")");
     }
 
-    std::lock_guard<std::mutex> hexmap_lock(this->_hexmap_access);
-    std::lock_guard<std::mutex> data_lock(this->_data_access);    
+    Streams streams(this);    
 
     for (auto iter = Memory::transaction.context.crbegin(); iter != Memory::transaction.context.crend(); ) {
       if (iter->first >= time) {

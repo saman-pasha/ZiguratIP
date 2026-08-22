@@ -1,7 +1,9 @@
 #include "transaction.hpp"
 #include "memory.hpp"
+#include "memoryexception.hpp"
 #include "globals.hpp"
 #include "utility.hpp"
+#include <chrono>
 
 
 namespace Zigurat
@@ -22,8 +24,18 @@ namespace Zigurat
   void Transaction::initialize(Pointer pointer)
   {
     this->pointer = pointer;
+    this->reset();
+  }
+
+  void Transaction::reset()
+  {
     this->init_time = std::time(0);
     this->query_time = 0;
+    this->query_id = 0;
+
+    // The connection's settings, not the last transaction's. Restoring the
+    // isolation level here is also what gives back a SERIALIZABLE slot -- see
+    // set_isolation_level, and the note in the header.
     this->auto_commit = Globals::default_autocommit_mode();
     this->set_isolation_level(Globals::default_isolation_level());
   }
@@ -48,7 +60,28 @@ namespace Zigurat
       Transaction::_serialize_counter--;
 
     if (iso_lvl == IsolationLevel::SERIALIZABLE) {
-      Transaction::_serialize_cv.wait(serialize_lock, [] () { return Transaction::_serialize_counter == 0; });
+      // BOUNDED, for the same reason row locks are. The slot is given back when
+      // its transaction commits or rolls back -- but a client is entitled to
+      // open a transaction, take it, and then say nothing for an hour, and an
+      // unbounded wait here made that one client's silence into every other
+      // connection's hang, with nothing in the log to say why. Giving up says
+      // so, and the caller can retry or carry on at a weaker level.
+      const int timeout_ms = Memory::lock_wait_timeout_ms;
+      const bool got = (timeout_ms > 0)
+	? Transaction::_serialize_cv.wait_for(serialize_lock, std::chrono::milliseconds(timeout_ms),
+					      [] () { return Transaction::_serialize_counter == 0; })
+	: (Transaction::_serialize_cv.wait(serialize_lock,
+					   [] () { return Transaction::_serialize_counter == 0; }), true);
+
+      if (!got) {
+	// Nothing has been taken and nothing changed, but the slot this
+	// transaction used to hold was given up on the way in, so whoever is
+	// waiting for it has to be told.
+	serialize_lock.unlock();
+	if (was_serializable) Transaction::_serialize_cv.notify_one();
+	throw MemoryException("serializable wait timeout");
+      }
+
       Transaction::_serialize_counter++;
     }
 

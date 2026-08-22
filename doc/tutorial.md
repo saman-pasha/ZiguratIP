@@ -215,6 +215,12 @@ HTTP:                   # Zeytun
 lives — Zeytun keeps connections alive for `TIMEOUT` seconds. Raise it if you
 expect more concurrent clients than five.
 
+The same is true of `SERVER/POOL_SIZE` on the binary port, and there it bites
+harder: a binary connection holds its thread until the client hangs up, so that
+number is the most clients that can be connected at once. Past it they wait in
+the accept queue with no greeting at all, which a client sees only as its own
+socket timing out. See [concurrency.md](concurrency.md).
+
 Full reference: [configuration.md](configuration.md).
 
 ## 7. Securing it with the CA
