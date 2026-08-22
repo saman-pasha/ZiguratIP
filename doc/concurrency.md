@@ -202,10 +202,14 @@ row behind every time it does so, and a workload that rewrites the same row
 thirty times leaves twenty-nine. The table's live contents never grow; what
 grows is everything an index entry has to walk past to reach them.
 
-**Measured, in cocolog:** the same twelve interpreters over the same four
-machine states took **12 seconds against an empty store and 60 against one a
-few hundred test runs had been through**, doing identical work with identical
-live data. One `TRUNCATE` over its four tables took it back to 16 seconds.
+**Measured, in cocolog:** twelve interpreters over four machine states took
+**14 seconds on one run and 32 on the fifth**, identical work each time, while
+the store file grew 72KB. Not more data to find — more dead data to walk past.
+
+**And it could not be reclaimed**, because `TRUNCATE` refuses any table holding
+a NULL column: see `doc/truncate.md`. A store that has been written to for long
+enough therefore has no way back, which makes reading a NULL column the more
+urgent of the two bugs.
 
 `TRUNCATE` frees only rows that are committed as deleted and that no running
 transaction can still be entitled to; live rows are untouched. It is therefore
@@ -213,6 +217,53 @@ safe against a table in use, and is a vacuum rather than an emptying — see
 `doc/truncate.md`. **An application that rewrites rows needs to run it on a
 schedule.** The freed space returns to the allocator's free list for reuse; the
 file does not shrink.
+
+## A scan copies the page list before it walks it
+
+`_page_list` is a `std::multimap` that `_allocate_page` and `_free_key` modify
+under `_page_list_access`. `Memory::_cursor` and `Memory::_dead_pointers` walked
+it holding **no lock at all**.
+
+Inserting into a multimap does not invalidate an iterator, which is what makes
+this easy to get wrong. But it does rotate the red-black tree, and an iterator
+being incremented follows the very parent and child pointers a rotation is
+rewriting — so a walk running beside an insert can land in a subtree belonging to
+a different hash key. A scan then reads rows that are not its table's, and a
+`TRUNCATE` frees rows belonging to a table nobody named.
+
+Both now copy the matching entries under the lock and walk the copy. The lock is
+held across the **copy and not the walk**: the callback runs with the streams
+handed back and is free to insert, which takes this same lock, so holding it for
+the length of a scan would deadlock against the first callback that allocates a
+page. A page allocated after the copy is not scanned, which is what a statement's
+fixed view means anyway.
+
+## Open: a reader can see another session's staged row
+
+`Test/test_concurrency.cpp`'s `readers_do_not_queue_behind_staged_writes` fails
+about **one run in three**, and has since well before the page-list fix above —
+measured at `416b86f` as 8 failures in 24 runs.
+
+Four sessions each stage an insert at `READ COMMITTED` and then scan; each must
+see only its own row. Intermittently one sees another's. What is established:
+
+* **It is not a transaction-id collision.** All four ids print distinct on a
+  failing run.
+* **It is not the page-list race.** Fixing that left the rate unchanged.
+* **`_read_committed` approves it legitimately.** Logged at the moment of the
+  dirty read, the control block reads `offline_state = INSERTED` with a
+  `create_time` earlier than the reader's snapshot — so `_alive_at` is right to
+  call it alive. A row that is only staged is presenting a control block that
+  says committed.
+
+So the fault is upstream of the visibility rules, in what a staged insert leaves
+in its control block or in when that becomes durable — not in the rules
+themselves.
+
+**This matters beyond the bug.** At a one-in-three false-failure rate this suite
+cannot validate a concurrency change: it reports a failure often enough that any
+new work looks broken, and a genuine regression looks like the usual flake. It
+should be fixed before anything else in this file is touched.
 
 ## What is still true and worth knowing
 

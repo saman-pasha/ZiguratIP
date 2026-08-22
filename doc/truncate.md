@@ -31,6 +31,21 @@ TRUNCATE demo::sales;
 It names a table and nothing else. There is no `WHERE`: it does not choose
 between rows, it removes what `DELETE` already removed.
 
+## It cannot truncate a table that holds a NULL
+
+`TRUNCATE` reads whole rows to unlink their index entries, and **a NULL column
+cannot be read back at all** — the engine refuses the row with `NULL value`. So a
+table with a nullable column that anything ever left NULL can never be reclaimed,
+and the call fails outright rather than skipping the row.
+
+Two things make this easy to walk into. An **empty String is stored as NULL**, so
+writing `""` into a nullable column is enough. And nothing else notices: an
+ordinary `SELECT` naming other columns reads fine, so a table can look healthy
+for as long as nobody truncates it.
+
+Until reading a NULL column works, a table meant to be reclaimable needs every
+column `NOT NULL`, and its writers need to send something rather than nothing.
+
 ## What it will not touch
 
 - **Live rows.** A row that has not been deleted is never reclaimed. Running

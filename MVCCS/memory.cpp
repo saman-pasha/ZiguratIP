@@ -1,3 +1,5 @@
+#include <utility>
+#include <vector>
 #include "memory.hpp"
 #include "memoryexception.hpp"
 #include <cmath>
@@ -662,11 +664,23 @@ namespace Zigurat
   {
     uint8_t hex_byte = 0;
 
-    auto pair_iter = this->_page_list.equal_range(hash_key);
-    for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
+    // Copied under the lock before it is walked, for the reason spelled out in
+    // _cursor: another thread allocating a page rotates this multimap's tree
+    // while the iterator is following it. Here the walk feeds TRUNCATE, so
+    // wandering into another key's pages would free rows belonging to a table
+    // nobody asked about.
+    std::vector<std::pair<hashkey_ptr, int64_t> > pages;
+    {
+      std::lock_guard<std::mutex> page_list_lock(this->_page_list_access);
+      auto pair_iter = this->_page_list.equal_range(hash_key);
+      for (auto iter = pair_iter.first; iter != pair_iter.second; iter++)
+	pages.push_back(std::make_pair(iter->first, iter->second));
+    }
 
-      hashkey_ptr page_hashkey = iter->first;
-      int64_t page_address = iter->second;
+    for (size_t page_n = 0; page_n < pages.size(); page_n++) {
+
+      hashkey_ptr page_hashkey = pages[page_n].first;
+      int64_t page_address = pages[page_n].second;
       int64_t i = PAGEFILE_CONTROL_COUNT;
 
       while (i < this->_hbpp) {
@@ -1121,11 +1135,38 @@ namespace Zigurat
     RowLock online_lock = RowLock::NONE;
     Control control;
 
-    auto pair_iter = this->_page_list.equal_range(hash_key);
-    for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
+    // THE PAGE LIST IS COPIED BEFORE IT IS WALKED, and that is a correctness
+    // fix rather than a tidying.
+    //
+    // `_page_list' is a std::multimap that _allocate_page and _free_key modify
+    // under _page_list_access. This walk took no lock at all. Inserting into a
+    // multimap does not invalidate an iterator, which is what makes the mistake
+    // easy to make -- but it does rotate the red-black tree, and an iterator
+    // being incremented follows the very parent and child pointers a rotation
+    // is rewriting. The walk then lands in a subtree belonging to some other
+    // hash key, and the scan reads rows that are not its table's at all.
+    //
+    // That is `readers_do_not_queue_behind_staged_writes' failing about one run
+    // in three: four sessions insert, each allocating pages while the others
+    // scan, and a scan comes back holding somebody else's staged row.
+    //
+    // HELD ACROSS THE COPY AND NOT THE WALK. The callback below runs with the
+    // streams handed back and is free to insert, which takes this same lock --
+    // so holding it for the length of the scan would deadlock against the first
+    // callback that allocates a page. A page allocated after this copy is not
+    // scanned, which is what a statement's fixed view means anyway.
+    std::vector<std::pair<hashkey_ptr, int64_t> > pages;
+    {
+      std::lock_guard<std::mutex> page_list_lock(this->_page_list_access);
+      auto pair_iter = this->_page_list.equal_range(hash_key);
+      for (auto iter = pair_iter.first; iter != pair_iter.second; iter++)
+	pages.push_back(std::make_pair(iter->first, iter->second));
+    }
 
-      hashkey_ptr page_hashkey = iter->first;
-      int64_t page_address = iter->second;
+    for (size_t page_n = 0; page_n < pages.size(); page_n++) {
+
+      hashkey_ptr page_hashkey = pages[page_n].first;
+      int64_t page_address = pages[page_n].second;
       int64_t i = PAGEFILE_CONTROL_COUNT;
 
       while (i < this->_hbpp) {
