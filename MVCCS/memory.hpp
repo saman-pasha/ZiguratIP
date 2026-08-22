@@ -202,6 +202,23 @@ namespace Zigurat
     
     bool _check_lock(RowLock, const Pointer&, Control&, Streams*);
 
+    // Whether a row is visible at READ COMMITTED. Answers without waiting for
+    // anything, which is the whole point of it.
+    //
+    // WHY IT IS NOT _check_lock. _check_lock is a WRITER's question -- "may I
+    // have this row?" -- and the only answer to that is to wait until whoever
+    // holds it is finished. A reader at READ COMMITTED is asking something else:
+    // "what was committed here?", and the answer is sitting at the address it is
+    // already looking at, because an update writes the new version somewhere
+    // else and leaves this one alone until it commits.
+    //
+    // Reading through _check_lock made a reader wait for a writer it had no
+    // business waiting for, and that wait is what lost the row: by the time it
+    // ended the old version had been retired and the new one was at an address
+    // the scan had already passed. A transaction that had done nothing but read
+    // saw neither version of a row that existed throughout.
+    bool _read_committed(const Pointer&, Control&);
+
     // Flush both files and then push them to the disk, data before hexmap.
     // Every durability point in the store goes through this.
     void _sync();

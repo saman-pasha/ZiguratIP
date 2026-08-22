@@ -803,7 +803,7 @@ namespace Zigurat
 
     case IsolationLevel::READ_COMMITTED:
       if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
-	is_visible = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, streams);
+	is_visible = this->_read_committed(pointer, control);
       }
       break;
 
@@ -880,6 +880,52 @@ namespace Zigurat
     }
 
     return is_visible;
+  }
+
+  // Only rows that reach the READ COMMITTED branches of _cursor and _visible get
+  // here, and those have already filtered on the hexmap: a row is here because
+  // it has a committed version (offline INSERTED) or because it has none and
+  // something is staged on it (offline NONE, online not NONE). Rows whose
+  // committed state is UPDATED -- superseded -- or DELETED never arrive.
+  //
+  // So the question reduces to: is there a committed version at this address,
+  // and has this transaction itself done something that changes what it should
+  // see? Nothing else matters, and in particular the lock does not: another
+  // transaction's staged work is not this one's to see, whether it is still
+  // holding it or not.
+  bool Memory::_read_committed(const Pointer& pointer, Control& control)
+  {
+    this->_load_control(pointer, control);
+
+    // What this transaction has staged itself, it is entitled to see the effect
+    // of. The rules are the ones _check_lock has always applied to an own lock.
+    if (control.online_lock != RowLock::NONE &&
+	control.transaction_id == Memory::transaction.id) {
+
+      // An insert THIS query made is hidden from it, so that an update cursor
+      // does not walk over its own output and go round for ever.
+      if (control.online_state == RowState::INSERTED &&
+	  Memory::transaction.query_time > 0 &&
+	  Memory::transaction.query_id == control.query_id)
+	return false;
+
+      // Superseded or removed by us: what is at this address is the version we
+      // have already replaced.
+      if (control.online_state == RowState::UPDATED ||
+	  control.online_state == RowState::DELETED)
+	return false;
+
+      // Our own insert from earlier in this transaction.
+      if (control.online_state == RowState::INSERTED)
+	return true;
+    }
+
+    // Anybody else's staged work is invisible, and what is left is whatever was
+    // committed here. A row another transaction is updating or deleting still
+    // has its committed version at this address -- that is the one to show, and
+    // showing it needs no wait. A row that has never been committed has nothing
+    // to show.
+    return (control.offline_state == RowState::INSERTED);
   }
 
   bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, Streams* streams)
@@ -1033,9 +1079,9 @@ namespace Zigurat
 		break;
 		
 	      case IsolationLevel::READ_COMMITTED:
-		if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {		  
-		  do_callback = this->_check_lock(RowLock::EXCLUSIVE, pointer, control, streams);
-		}		
+		if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+		  do_callback = this->_read_committed(pointer, control);
+		}
 		break;
 		
 	      case IsolationLevel::REPEATABLE_READ:
