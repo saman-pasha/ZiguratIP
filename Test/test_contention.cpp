@@ -743,6 +743,87 @@ ZTEST(Contention, a_row_being_updated_is_never_missing_from_a_scan)
   ZCHECK_EQ(long_counts.load(), 0);
 }
 
+// A SCAN SPANS TIME, and that is the harder half of the same problem. It visits
+// addresses in order; an update puts the replacement wherever the allocator has
+// room. So if the writer commits in the middle of a scan, the scan can have
+// passed the replacement while it was uncommitted and then find the original
+// retired -- the row missing -- or seen the original and then reach the
+// committed replacement, and count the same row twice.
+//
+// The case above only catches this when the window happens to line up. This one
+// makes it certain: enough rows that a scan takes long enough for commits to
+// land inside it, and a writer doing nothing else.
+//
+// EXACTLY ONCE is the whole assertion. Which version a scan sees is its own
+// business -- the row may be mid-rewrite and either answer is a real one -- but
+// a row that exists throughout has to be counted once.
+ZTEST(Contention, a_scan_counts_every_row_exactly_once_while_a_writer_commits)
+{
+  Indexed db("cont-scan-snapshot");
+  if (!db.ready()) { ZCHECK(false); return; }
+
+  const int64_t ROWS = 400;
+  db.load(ROWS);
+
+  Trouble trouble;
+  std::atomic<bool> writing(true);
+  std::atomic<int> scans(0);
+  std::atomic<int> missed(0);
+  std::atomic<int> counted_twice(0);
+
+  std::thread writer([&] () {
+      try {
+	for (int n = 0; n < 400; n++) {
+	  const int64_t which = (n % ROWS) + 1;
+	  session(db.memory());
+	  Part current;
+	  bool hit = false;
+	  Part::IDX_ID->cursor_equal(Long(which), [&] (Part& row) -> bool {
+	      current = row; hit = true; return false;
+	    });
+	  if (hit) {
+	    Part next(which, current.kind.to_std_string(), current.weight.value() + 1);
+	    db.memory()->online_update(current, next);
+	  }
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("writer: " + e.message());
+      }
+      writing = false;
+    });
+
+  fan_out(3, [&] (int) {
+      try {
+	while (writing.load()) {
+	  session(db.memory());
+	  std::vector<int> seen((size_t)ROWS + 1, 0);
+	  db.memory()->cursor<Part>([&] (Part& row) -> bool {
+	      const int64_t id = row.id.value();
+	      if (id >= 1 && id <= ROWS) seen[(size_t)id]++;
+	      return true;
+	    });
+	  for (int64_t id = 1; id <= ROWS; id++) {
+	    if (seen[(size_t)id] == 0) missed++;
+	    if (seen[(size_t)id] > 1) counted_twice++;
+	  }
+	  scans++;
+	  db.memory()->commit_transaction();
+	}
+      } catch (ZiguratException& e) {
+	trouble.note("reader: " + e.message());
+	try { db.memory()->rollback_transaction(); } catch (...) { }
+      }
+    });
+
+  writer.join();
+
+  ZCHECK_STR(trouble.say(), "none");
+  ZCHECK(scans.load() > 0);
+  ZCHECK_EQ(missed.load(), 0);
+  ZCHECK_EQ(counted_twice.load(), 0);
+}
+
 // A reader must not be made to wait by a writer at all at this level. Waiting is
 // what turned one slow update into every reader's problem, and it is not what
 // READ COMMITTED asks for: the committed version is sitting at the address the

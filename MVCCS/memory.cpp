@@ -3,6 +3,7 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <atomic>
 #include <iterator>
 #include "shahelper.hpp"
 #include "control.hpp"
@@ -107,6 +108,69 @@ namespace Zigurat
   Memory::Streams* Memory::Streams::held()
   {
     return _held;
+  }
+
+  // ---- the version clock ---------------------------------------------------
+
+  time_t Memory::version_time()
+  {
+    static std::atomic<int64_t> last(0);
+
+    const int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>
+      (std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // Strictly increasing, whatever the clock says. Two commits inside the same
+    // microsecond -- or a wall clock that steps backwards -- must not be able to
+    // produce the same stamp twice, because a stamp is what tells one version of
+    // a row from the next.
+    int64_t previous = last.load(std::memory_order_relaxed);
+    int64_t next = 0;
+    do {
+      next = (now > previous) ? now : (previous + 1);
+    } while (!last.compare_exchange_weak(previous, next, std::memory_order_relaxed));
+
+    return (time_t)next;
+  }
+
+  // ---- Memory::Statement ---------------------------------------------------
+
+  Memory::Statement::Statement(Memory* memory)
+    : _mine(false)
+  {
+    // Only the outermost one starts a statement. An inner cursor -- a scan
+    // driving an index lookup, say -- belongs to the statement already running,
+    // and taking a fresh time for it would be the very interleaving this exists
+    // to stop.
+    //
+    // Nothing before the store has finished loading has a statement either: the
+    // walk _initialize does reads at READ UNCOMMITTED and predates the machinery
+    // this feeds.
+    if (memory == nullptr || !memory->_initialized) return;
+    if (Memory::transaction.query_time != 0) return;
+
+    this->_mine = true;
+
+    // Written into the store and read back, so that rows THIS query inserted can
+    // be told from rows that were already there and an update cursor does not
+    // walk over its own output. std::rand() with nobody calling std::srand
+    // returns the same sequence on every start of the process.
+    uint64_t drawn = 0;
+    Utility::random_bytes((uint8_t*)&drawn, sizeof(drawn));
+    Memory::transaction.query_id = (int64_t)(drawn >> 1);   // stays positive
+
+    Memory::transaction.query_time = Memory::version_time();
+  }
+
+  Memory::Statement::~Statement()
+  {
+    if (!this->_mine) return;
+    Memory::transaction.query_id = 0;
+    Memory::transaction.query_time = 0;
+  }
+
+  bool Memory::Statement::mine() const
+  {
+    return this->_mine;
   }
 
   Memory::Memory(binarystream& hexmap_io, binarystream& data_io, int64_t page_size)
@@ -802,7 +866,10 @@ namespace Zigurat
       break;
 
     case IsolationLevel::READ_COMMITTED:
-      if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+      // Every address that holds anything at all, because a version that has
+      // been superseded may still be the one this read is entitled to. The
+      // hexmap cannot answer that -- only the times in the control block can.
+      if (offline_state != RowState::NONE || online_state != RowState::NONE) {
 	is_visible = this->_read_committed(pointer, control);
       }
       break;
@@ -816,7 +883,7 @@ namespace Zigurat
 
 	  control.online_state = RowState::NONE;
 	  control.online_lock = RowLock::SHARED;
-	  control.online_time = std::time(0);
+	  control.online_time = Memory::version_time();
 	  control.transaction_id = Memory::transaction.id;
 	  control.query_id = Memory::transaction.query_id;
 	  this->_dump_control(pointer, control);
@@ -921,11 +988,46 @@ namespace Zigurat
     }
 
     // Anybody else's staged work is invisible, and what is left is whatever was
-    // committed here. A row another transaction is updating or deleting still
-    // has its committed version at this address -- that is the one to show, and
-    // showing it needs no wait. A row that has never been committed has nothing
-    // to show.
-    return (control.offline_state == RowState::INSERTED);
+    // committed here -- as of when this read began, not as of this instant. A
+    // row another transaction is updating or deleting still has its committed
+    // version at this address, and that is the one to show; showing it needs no
+    // wait.
+    return this->_alive_at(control, this->_snapshot_time());
+  }
+
+  bool Memory::_alive_at(const Control& control, time_t at)
+  {
+    // Never committed: there is nothing at this address anybody else may see.
+    if (control.offline_state == RowState::NONE) return false;
+
+    // Born after this read began. A committed row with no create_time at all is
+    // one an older build wrote, and the honest reading of that is "long ago".
+    if (control.create_time != (time_t)0 && control.create_time > at) return false;
+
+    // Died at or before it -- but modify_time only MEANS died when the state
+    // says so. _offline_update rewrites a row in place and stamps modify_time on
+    // it while it is still perfectly current: that is how the index catalogue
+    // records its root address, and how a B-tree key records its value chain.
+    // Reading that stamp as a death made every index invisible to the reader
+    // that came after the first write to it, so a reopened store looked empty
+    // and built itself a fresh, blank index.
+    //
+    // An update or a delete is the only thing that retires a version, and both
+    // set the state alongside the stamp.
+    if ((control.offline_state == RowState::UPDATED ||
+	 control.offline_state == RowState::DELETED) &&
+	control.modify_time != (time_t)0 &&
+	control.modify_time <= at)
+      return false;
+
+    return true;
+  }
+
+  time_t Memory::_snapshot_time()
+  {
+    return (Memory::transaction.query_time != (time_t)0)
+      ? Memory::transaction.query_time
+      : Memory::version_time();
   }
 
   bool Memory::_check_lock(RowLock lock, const Pointer& pointer, Control& control, Streams* streams)
@@ -1006,23 +1108,10 @@ namespace Zigurat
       throw MemoryException("maximum cursor count");
     }
 
-    bool is_query = false;
-    if (this->_initialized && Memory::transaction.query_time == 0) {
-      is_query = true;
-
-      // This is written into the store and read back to tell rows the current
-      // query inserted from rows that were already there, so an update cursor
-      // does not walk over its own output. std::rand() with nobody calling
-      // std::srand returns the same sequence on every start of the process --
-      // it only ever varied because generating a key seeded the global state as
-      // a side effect, and that seeding is gone now. A value that decides what
-      // an update sees should not be the same on every run.
-      uint64_t drawn = 0;
-      Utility::random_bytes((uint8_t*)&drawn, sizeof(drawn));
-      Memory::transaction.query_id = (int64_t)(drawn >> 1);   // stays positive
-
-      Memory::transaction.query_time = std::time(0);
-    }
+    // Where this scan's view of the store is fixed. Nested cursors -- and the
+    // retry below, which calls back into here -- belong to the statement that is
+    // already running rather than starting one of their own.
+    Statement statement(this);
 
     uint8_t hex_byte = 0;
     int64_t hexmap_address = -1;
@@ -1079,7 +1168,8 @@ namespace Zigurat
 		break;
 		
 	      case IsolationLevel::READ_COMMITTED:
-		if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
+		// Every address that holds anything at all -- see _visible.
+		if (offline_state != RowState::NONE || online_state != RowState::NONE) {
 		  do_callback = this->_read_committed(pointer, control);
 		}
 		break;
@@ -1092,7 +1182,7 @@ namespace Zigurat
 		  if (online_lock == RowLock::NONE) {
 		    control.online_state = RowState::NONE;
 		    control.online_lock = RowLock::SHARED;
-		    control.online_time = std::time(0);
+		    control.online_time = Memory::version_time();
 		    control.transaction_id = Memory::transaction.id;    
 		    control.query_id = Memory::transaction.query_id;
 		    this->_dump_control(pointer, control);
@@ -1195,11 +1285,6 @@ namespace Zigurat
       } // while
     }// for pages
 
-    if (is_query) {
-      Memory::transaction.query_id = 0;
-      Memory::transaction.query_time = 0;
-    }
-
     --cursor_id;
   }
 
@@ -1214,7 +1299,7 @@ namespace Zigurat
     control.online_state = RowState::INSERTED;
     control.online_lock = RowLock::EXCLUSIVE;
 
-    control.online_time = std::time(0);
+    control.online_time = Memory::version_time();
     control.transaction_id = Memory::transaction.id;
     control.query_id = Memory::transaction.query_id;
     
@@ -1235,7 +1320,7 @@ namespace Zigurat
     control.online_state = RowState::UPDATED;
     control.online_lock = RowLock::EXCLUSIVE;
 
-    control.online_time = std::time(0);
+    control.online_time = Memory::version_time();
     control.transaction_id = Memory::transaction.id;
     control.query_id = Memory::transaction.query_id;
     
@@ -1246,7 +1331,7 @@ namespace Zigurat
     control.online_state = RowState::INSERTED;
     control.online_lock = RowLock::EXCLUSIVE;
     
-    control.online_time = std::time(0);
+    control.online_time = Memory::version_time();
     control.transaction_id = Memory::transaction.id;
     control.query_id = Memory::transaction.query_id;
     control.reference_address = old_object->pointer.address;
@@ -1268,7 +1353,7 @@ namespace Zigurat
     control.online_state = RowState::DELETED;
     control.online_lock = RowLock::EXCLUSIVE;
 
-    control.online_time = std::time(0);
+    control.online_time = Memory::version_time();
     control.transaction_id = Memory::transaction.id;
     control.query_id = Memory::transaction.query_id;
     
@@ -1281,7 +1366,8 @@ namespace Zigurat
       this->dba_watch("Transaction Push: (address: " + std::to_string(pointer.address) + ")");
     }
 
-    Memory::transaction.context.emplace_back(std::time(0), pointer);
+    // Same clock as query_time, because rollback_transaction_to compares the two.
+    Memory::transaction.context.emplace_back(Memory::version_time(), pointer);
   }
 
   void Memory::_commit_pointer(const Pointer& pointer, time_t commit_time)
@@ -1347,7 +1433,7 @@ namespace Zigurat
       // next to it.
       if (control.offline_state == RowState::NONE) {
 	control.offline_state = RowState::DELETED;
-	control.modify_time = std::time(0);
+	control.modify_time = Memory::version_time();
       }
 
       this->_dump_control(pointer, control);
@@ -1417,7 +1503,11 @@ namespace Zigurat
     {
     Streams streams(this);
 
-    time_t commit_time = std::time(0);
+    // ONE stamp for the whole transaction, and every version it touches gets it.
+    // That is what makes an update change over cleanly: the old version's
+    // modify_time and the new one's create_time are the same instant, so a
+    // reader at any time sees exactly one of them.
+    time_t commit_time = Memory::version_time();
 
     // Three writes in an order that has to survive the power going out.
     //

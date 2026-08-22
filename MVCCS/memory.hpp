@@ -76,6 +76,52 @@ namespace Zigurat
     typedef char* buffer_t;
     typedef std::unique_lock<std::mutex> lock_t;
 
+    // ---- the version clock -------------------------------------------------
+    //
+    // Every version of a row carries the time it was committed (create_time) and
+    // the time it was superseded or deleted (modify_time, zero while it is the
+    // current one), and a reader decides what it may see by comparing those with
+    // a time of its own. That comparison is only as good as the clock, and the
+    // clock was std::time(0): ONE SECOND. Two versions of a row born and retired
+    // inside the same second are indistinguishable, which under any load at all
+    // is all of them.
+    //
+    // This is microseconds, and strictly increasing within the process, so that
+    // no two commits ever share a stamp and `before' and `after' always mean
+    // something. It is stored in the same time_t fields -- 8 bytes, unchanged --
+    // so the on-disk control block is the shape it always was. A store written
+    // by an older build has second-scale stamps in it, which read as "committed
+    // long ago" and "retired long ago": both the right answer.
+    static time_t version_time();
+
+    // ---- the statement, for readers that span time -------------------------
+    //
+    // A scan visits addresses in order and takes a while about it, while a
+    // writer puts a replacement row wherever the allocator has room. If the two
+    // are allowed to interleave freely, a scan can pass a replacement before it
+    // is committed and then find the original retired -- the row missing -- or
+    // see the original and then reach the committed replacement, and count the
+    // same row twice. Neither is a torn read; both are wrong.
+    //
+    // The answer is the ordinary one: a reader decides every row against a
+    // single point in time, taken once when the statement starts. This marks
+    // where a statement begins, and nests -- an inner cursor belongs to the
+    // statement that is already running rather than starting one of its own.
+    class Statement
+    {
+    private:
+      bool _mine;
+    public:
+      explicit Statement(Memory*);
+      ~Statement();
+
+      Statement(const Statement&) = delete;
+      Statement& operator=(const Statement&) = delete;
+
+      // Did this object start the statement, or was one already running?
+      bool mine() const;
+    };
+
     // ---- serialising the two shared streams --------------------------------
     //
     // _hexmap_io and _data_io are ONE PAIR, shared by every connection. Each
@@ -219,6 +265,17 @@ namespace Zigurat
     // saw neither version of a row that existed throughout.
     bool _read_committed(const Pointer&, Control&);
 
+    // Was this version of the row the current one at time AT? Committed by then,
+    // and not yet superseded or deleted by then. Exactly one version of a row
+    // satisfies it for any given time: an update stamps the old version's
+    // modify_time and the new one's create_time with the SAME commit time, so
+    // the two conditions change over at the same instant and never overlap.
+    bool _alive_at(const Control&, time_t);
+
+    // The point in time this read is against: the statement's, when one is
+    // running, and otherwise now.
+    time_t _snapshot_time();
+
     // Flush both files and then push them to the disk, data before hexmap.
     // Every durability point in the store goes through this.
     void _sync();
@@ -325,7 +382,7 @@ namespace Zigurat
 
     Control control;
     control.offline_state = RowState::INSERTED;
-    control.create_time = std::time(0);
+    control.create_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
     this->_full_hexmap(object.pointer);
@@ -358,7 +415,7 @@ namespace Zigurat
     
     Control control;
     this->_load_control(object.pointer, control);
-    control.modify_time = std::time(0);
+    control.modify_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
     this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
@@ -379,7 +436,7 @@ namespace Zigurat
 
     Control control;
     this->_load_control(old_object.pointer, control);
-    control.modify_time = std::time(0);
+    control.modify_time = Memory::version_time();
     this->_dump_control(new_object.pointer, control);
 
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);

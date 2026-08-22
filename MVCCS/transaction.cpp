@@ -29,7 +29,10 @@ namespace Zigurat
 
   void Transaction::reset()
   {
-    this->init_time = std::time(0);
+    // The version clock, not the wall clock: this is compared against the
+    // create_time and modify_time of row versions, and a second's resolution
+    // cannot tell two of those apart.
+    this->init_time = Memory::version_time();
     this->query_time = 0;
     this->query_id = 0;
 

@@ -217,7 +217,7 @@ namespace Zigurat
     
     Control control;
     control.offline_state = RowState::INSERTED;
-    control.create_time = std::time(0);
+    control.create_time = Memory::version_time();
     this->_memory->_dump_control(this->_pointer, control);
 
     this->_memory->_full_hexmap(this->_pointer);
@@ -306,7 +306,7 @@ namespace Zigurat
 
     Control control;
     this->_memory->_load_control(this->_pointer, control);
-    control.modify_time = std::time(0);
+    control.modify_time = Memory::version_time();
     this->_memory->_dump_control(this->_pointer, control);
 
     this->_memory->_data_io.seekp(this->_memory->_pointer_data_address(this->_pointer), std::ios::beg);
@@ -374,7 +374,7 @@ namespace Zigurat
       // Chaining the values off the key is what made it visible.
       Control control;
       control.offline_state = RowState::INSERTED;
-      control.create_time = std::time(0);
+      control.create_time = Memory::version_time();
       this->_memory->_dump_control(btreevalue.pointer, control);
 
     } else {
@@ -1266,6 +1266,12 @@ namespace Zigurat
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
 
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1323,6 +1329,12 @@ namespace Zigurat
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
 
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1369,6 +1381,12 @@ namespace Zigurat
     // indexed WHERE ran straight through the store while another connection
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
+
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
 
     if (this->_root_address > -1) {
       this->_cursor_not_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1421,6 +1439,12 @@ namespace Zigurat
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
 
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_less_than(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1471,6 +1495,12 @@ namespace Zigurat
     // indexed WHERE ran straight through the store while another connection
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
+
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
 
     if (this->_root_address > -1) {
       this->_cursor_less_than_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1536,6 +1566,12 @@ namespace Zigurat
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
 
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
+
     if (this->_root_address > -1) {
       this->_cursor_greater_than(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
 	  return this->_cursor_output(current_key, callback);
@@ -1593,6 +1629,12 @@ namespace Zigurat
     // indexed WHERE ran straight through the store while another connection
     // was writing it. _cursor_output hands them back around the callback.
     Memory::Streams streams(this->_memory);
+
+    // And it is a statement, like a table scan is: one view of the store for the
+    // whole walk, so a row rewritten while it is going on is met once rather
+    // than twice or not at all. Nested inside a table scan this does nothing --
+    // the scan's view is already the one that counts.
+    Memory::Statement statement(this->_memory);
 
     if (this->_root_address > -1) {
       this->_cursor_greater_than_equal(this->_root_address, key, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1694,8 +1736,10 @@ namespace Zigurat
 
     void cursor(std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor(this->_root_address, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1713,8 +1757,10 @@ namespace Zigurat
 
     void cursor_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1732,8 +1778,10 @@ namespace Zigurat
 
     void cursor_not_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_not_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1751,8 +1799,10 @@ namespace Zigurat
 
     void cursor_less_than(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_less_than(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1770,8 +1820,10 @@ namespace Zigurat
 
     void cursor_less_than_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_less_than_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1789,8 +1841,10 @@ namespace Zigurat
 
     void cursor_greater_than(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_greater_than(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
@@ -1808,8 +1862,10 @@ namespace Zigurat
 
     void cursor_greater_than_equal(const _First first, std::function<bool (BTreeIndex<_Table, _Rest...>&)> callback)
     {
-      // Under the streams, for the reason given on the single-column cursors.
+      // Under the streams and one statement, for the reasons given on the
+      // single-column cursors.
       Memory::Streams streams(this->_memory);
+      Memory::Statement statement(this->_memory);
 
       if (this->_root_address > -1) {
 	this->_cursor_greater_than_equal(this->_root_address, first, [&] (BTreeKey<_First>& current_key) -> bool {
