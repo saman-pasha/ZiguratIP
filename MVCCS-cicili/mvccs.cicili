@@ -1,0 +1,1966 @@
+;;;; MVCCS, written again in Cicili -- a C++ target (:cpp #t).
+;;;;
+;;;; This is the storage engine of ZiguratIP/MVCCS re-expressed in Cicili's
+;;;; C++ layer, against the REAL StreamIO and Core libraries. What it keeps,
+;;;; what it trades, and why is in README.md beside it; the ground truth it
+;;;; was written from is RESPONSIBILITIES.md.
+;;;;
+;;;; The shape is C++: structs, RAII guards (ctor/dtor), inheritance with
+;;;; virtual dispatch (BaseTable), real exceptions (try / throw*). The
+;;;; plumbing is C: pthread mutexes, intrusive lists instead of std::multimap,
+;;;; function-pointer + context callbacks instead of capturing lambdas --
+;;;; Cicili lambdas are lifted and cannot capture, and every std:: container
+;;;; walk would be an unresolvable escape. The table tier that C++ did with
+;;;; templates is done with Cicili macros: see deftable at the bottom.
+;;;;
+;;;; Build:  sh MVCCS-cicili/build.sh   (or see build.sh for the one command)
+
+(source "mvccs.cpp"
+  (make :cpp #t :compile #t
+        :link ("-lmvccs.o" "-o" "mvccs_test"
+               "-L/home/user/ZiguratIP/home/lib" "-lCore" "-lStreamIO"
+               "-lpthread"
+               "-Wl,-rpath,/home/user/ZiguratIP/home/lib"))
+
+  (include <cstdio>)
+  (include <cstdint>)
+  (include <cstring>)
+  (include <string>)
+  (include <pthread.h>)
+  (include <unistd.h>)
+  (include <time.h>)
+  (include "/home/user/ZiguratIP/Core/zexception.hpp")
+  (include "/home/user/ZiguratIP/Core/utility.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/binarystream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/filestream.hpp")
+
+  ;; ------------------------------------------------------------------
+  ;; Declaration bindings: emit nothing, buy member resolution on the
+  ;; real Zigurat::binarystream. Only single-signature members are
+  ;; declared -- Cicili has one signature per name -- and only the ones
+  ;; this engine calls.
+  ;; ------------------------------------------------------------------
+  (DEFMACRO stream-decls ()
+    `($$$
+      (decl) (struct Zigurat::binarystream
+        (method seekg ((int64_t off) (std::ios_base::seekdir dir)) (out void))
+        (method seekp ((int64_t off) (std::ios_base::seekdir dir)) (out void))
+        (method tellg () (out int64_t))
+        (method tellp () (out int64_t))
+        (method read ((char * buffer) (int64_t n)) (out void))
+        (method write ((const char * buffer) (int64_t n)) (out void))
+        (method read_std_ubyte ((uint8_t & v)) (out void))
+        (method write_std_ubyte ((uint8_t && v)) (out void))
+        (method read_std_long ((int64_t & v)) (out void))
+        (method write_std_long ((int64_t && v)) (out void))
+        (method read_std_size ((size_t & v)) (out void))
+        (method write_std_size ((size_t && v)) (out void))
+        (method read_std_time ((time_t & v)) (out void))
+        (method write_std_time ((time_t && v)) (out void))
+        (method fill_n ((size_t count) (char c)) (out void))
+        (method flush () (out void))
+        (method good () (out bool))
+        (method clear () (out void))
+        (method sync_to_disk () (out bool)))))
+  (stream-decls)
+
+  ;; The wall clock in microseconds, one leaf of real C++ text: Cicili has no
+  ;; binding for struct timespec and does not need one for a single call site.
+  (code "int64_t mvccs_wall_micros() { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000; }")
+  (decl) (func mvccs_wall_micros () (out int64_t))
+
+  ;; No namespace: `module' under :cpp mangles top-level vars (an unexercised
+  ;; corner of the transpiler), and this unit links against nothing that could
+  ;; collide. Names are the original ones, at file scope.
+  (using namespace Zigurat)
+
+    ;; ----------------------------------------------------------------
+    ;; The vocabulary
+    ;; ----------------------------------------------------------------
+
+    ;; memory.cpp:20-37 -- the layout constants
+    (var const int64_t CHUNK_SIZE . 16)
+    (var const int64_t HASHKEY_SIZE . 20)
+    (var const int64_t PAGEFILE_CONTROL_COUNT . 3)
+    (var const int64_t PAGEFILE_CONTROL_SIZE . 48)
+    (var const int64_t CONTROL_COUNT . 3)
+    (var const int64_t CONTROL_SIZE . 48)
+
+    ;; the hexmap byte: bit7 allocated, bit6 standalone, bit5 control,
+    ;; bit4 tail-size, bits2-3 RowState, bits0-1 RowLock
+    (var const uint8_t FREE_CHUNK . 0)
+    (var const uint8_t FREE_STANDALONE_CHUNK . 64)
+    (var const uint8_t DATA_CHUNK . 144)
+    (var const uint8_t DATA_STANDALONE_CHUNK . 192)
+    (var const uint8_t CONTROL_CHUNK . 176)
+    (var const uint8_t CONTROL_STANDALONE_CHUNK . 240)
+
+    (var const uint8_t MAX_CURSOR_COUNT . 16)
+    (var int lock_wait_timeout_ms . 10000)
+
+    ;; rowstate.hpp / rowlock.hpp / isolationlevel.hpp. Cicili's enum is a
+    ;; plain C enum, so the members carry prefixes instead of scope.
+    (enum RowState (ROW_NONE . 0) (ROW_INSERTED . 4) (ROW_UPDATED . 8) (ROW_DELETED . 12))
+    (enum RowLock (LOCK_NONE . 0) (LOCK_SHARED . 1) (LOCK_EXCLUSIVE . 2))
+    (enum IsolationLevel
+      (READ_UNCOMMITTED . 0) (READ_COMMITTED . 1) (REPEATABLE_READ . 2)
+      (SNAPSHOT . 3) (SERIALIZABLE . 4))
+
+    ;; The engine-internal hash keys, byte for byte the ones in memory.cpp.
+    (var uint8_t FREE_HASHKEY [20]
+         . '{ 180 244 146 224 9 24 213 160 47 17 250 182 7 67 179 136 24 251 20 152 })
+    (var uint8_t TRANSACTIONS_HASHKEY [20]
+         . '{ 249 41 16 85 114 106 86 121 50 152 173 159 116 212 167 172 100 237 62 14 })
+
+    ;; memoryexception.hpp, code 9390 -- the real base class, really thrown.
+    (struct MemoryException (inherits ZiguratException)
+      (ctor ((const char * msg))
+        (init (ZiguratException 9390 (std::string msg)))))
+
+    ;; pointer.hpp. A plain aggregate: C++'s generated copy is exactly what
+    ;; the five hand-written members did.
+    (struct Pointer
+      (member const uint8_t * hash_key)
+      (member int64_t address)
+      (member int64_t size))
+
+    (func pointer_make ((const uint8_t * hash_key) (int64_t address) (int64_t size))
+          (out Pointer)
+      (let ((Pointer p))
+        (set ($ p hash_key) hash_key
+             ($ p address) address
+             ($ p size) size)
+        (return p)))
+
+    (func pointer_null () (out Pointer)
+      (return (pointer_make nil 0 0)))
+
+    ;; control.hpp -- one row version's whole story.
+    (struct Control
+      (member RowState online_state)
+      (member RowLock online_lock)
+      (member RowState offline_state)
+      (member RowLock offline_lock)
+      (member time_t online_time)
+      (member size_t transaction_id)
+      (member int64_t query_id)
+      (member int64_t reference_address)
+      (member time_t modify_time)
+      (member time_t create_time))
+
+    (func control_clear ((Control * c)) (out void)
+      (set (-> c online_state) ROW_NONE
+           (-> c online_lock) LOCK_NONE
+           (-> c offline_state) ROW_NONE
+           (-> c offline_lock) LOCK_NONE
+           (-> c online_time) (cast time_t 0)
+           (-> c transaction_id) 0
+           (-> c query_id) 0
+           (-> c reference_address) -1
+           (-> c modify_time) (cast time_t 0)
+           (-> c create_time) (cast time_t 0)))
+
+    ;; ----------------------------------------------------------------
+    ;; The version clock -- memory.cpp version_time(). Microseconds,
+    ;; strictly increasing across the process. The C++ used an atomic CAS
+    ;; loop; a mutex says the same thing in Cicili's reach and the clock
+    ;; is not on the hot path this rewrite is measuring.
+    ;; ----------------------------------------------------------------
+    (var pthread_mutex_t clock_access . PTHREAD_MUTEX_INITIALIZER)
+    (var int64_t clock_last . 0)
+
+    (func version_time () (out time_t)
+      (pthread_mutex_lock (aof clock_access))
+      (let ((int64_t now . #'(mvccs_wall_micros))
+            (int64_t next . 0))
+        (set next (? (> now clock_last) now (+ clock_last 1)))
+        (set clock_last next)
+        (pthread_mutex_unlock (aof clock_access))
+        (return (cast time_t next))))
+
+    ;; ----------------------------------------------------------------
+    ;; Layout arithmetic -- the _pointer_* helpers. Integer arithmetic
+    ;; instead of floor/ceil over doubles: exact for every non-negative
+    ;; size, and honest about being integer work.
+    ;; ----------------------------------------------------------------
+    (func size_data_count ((int64_t size)) (out int64_t)
+      (return (/ (+ size (- CHUNK_SIZE 1)) CHUNK_SIZE)))
+    (func size_actual_count ((int64_t size)) (out int64_t)
+      (return (+ (size_data_count size) CONTROL_COUNT)))
+    (func size_round ((int64_t size)) (out int64_t)
+      (return (* (size_data_count size) CHUNK_SIZE)))
+    (func size_actual ((int64_t size)) (out int64_t)
+      (return (* (size_actual_count size) CHUNK_SIZE)))
+
+    (func addr_hexmap ((int64_t address)) (out int64_t)
+      (return (/ address CHUNK_SIZE)))
+    (func addr_hexmap_data ((int64_t address)) (out int64_t)
+      (return (+ (/ address CHUNK_SIZE) CONTROL_COUNT)))
+    (func addr_data ((int64_t address)) (out int64_t)
+      (return (+ address CONTROL_SIZE)))
+
+    (func ptr_data_count ((const Pointer * p)) (out int64_t)
+      (return (size_data_count (-> p size))))
+    (func ptr_actual_count ((const Pointer * p)) (out int64_t)
+      (return (+ (ptr_data_count p) CONTROL_COUNT)))
+    (func ptr_actual_size ((const Pointer * p)) (out int64_t)
+      (return (* (ptr_actual_count p) CHUNK_SIZE)))
+    (func ptr_hexmap ((const Pointer * p)) (out int64_t)
+      (return (/ (-> p address) CHUNK_SIZE)))
+    (func ptr_hexmap_data ((const Pointer * p)) (out int64_t)
+      (return (+ (/ (-> p address) CHUNK_SIZE) CONTROL_COUNT)))
+    (func ptr_data ((const Pointer * p)) (out int64_t)
+      (return (+ (-> p address) CONTROL_SIZE)))
+
+
+  ;; ==================================================================
+  ;; BaseTable -- basetable.hpp, minus the per-class statics (those are
+  ;; deftable's job, done with macros instead of templates) and minus
+  ;; the stream operator<</>> (Cicili has no `operator'; pack/unpack
+  ;; virtuals carry the row across the stream instead).
+  ;; ==================================================================
+  (struct BaseTable
+    (member Pointer pointer)
+    (virtual) (method prepare () (out void))
+    (virtual) (method map ((void * m)) (out void))
+    (virtual) (method unmap ((void * m)) (out void))
+    (virtual) (method pack_size () (out int64_t) (return 0))
+    (virtual) (method pack ((binarystream & io)) (out void))
+    (virtual) (method unpack ((binarystream & io)) (out void))
+    (virtual) (dtor ()))
+
+  ;; ==================================================================
+  ;; Interned hash keys. Every Pointer's hash_key aims at one canonical
+  ;; 20-byte copy that lives for the process, which removes the whole
+  ;; class of who-owns-this-key lifetime questions the multimaps had.
+  ;; ==================================================================
+  (struct KeyIntern
+    (member uint8_t key [20])
+    (member KeyIntern * next))
+
+  (var pthread_mutex_t intern_access . PTHREAD_MUTEX_INITIALIZER)
+  (var KeyIntern * intern_head . nil)
+
+  (func intern_key ((const uint8_t * key)) (out const uint8_t *)
+    (pthread_mutex_lock (aof intern_access))
+    (let ((KeyIntern * e . #'intern_head))
+      (while (!= e nil)
+        (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+            (block
+              (pthread_mutex_unlock (aof intern_access))
+              (return (-> e key))))
+        (set e (-> e next)))
+      (let ((KeyIntern * fresh . #'(new* KeyIntern)))
+        (memcpy (-> fresh key) key (cast size_t HASHKEY_SIZE))
+        (set (-> fresh next) intern_head)
+        (set intern_head fresh)
+        (pthread_mutex_unlock (aof intern_access))
+        (return (-> fresh key)))))
+
+  ;; ==================================================================
+  ;; The page list and the free list -- std::multimap in the original,
+  ;; intrusive singly-linked lists here. Only equal_range walks and
+  ;; insert/erase were ever asked of them; a linear list answers both.
+  ;; ==================================================================
+  (struct PageEntry
+    (member const uint8_t * key)
+    (member int64_t address)
+    (member PageEntry * next))
+
+  (struct FreeEntry
+    (member const uint8_t * key)
+    (member int64_t address)
+    (member int64_t size)          ;; the WHOLE span, control chunks included
+    (member FreeEntry * next))
+
+  ;; ==================================================================
+  ;; Transaction -- transaction.hpp/.cpp. One per session thread, held
+  ;; through a thread-local pointer (Cicili's thread-local is __thread,
+  ;; which cannot run constructors -- so the lifecycle is explicit:
+  ;; memory_begin_transaction creates it, thread end abandons it).
+  ;; ==================================================================
+  (struct TxnEntry
+    (member time_t at)
+    (member Pointer ptr)
+    (member TxnEntry * next)
+    (member TxnEntry * prev))
+
+  (struct Transaction
+    (member size_t id)
+    (member time_t init_time)
+    (member Pointer pointer)
+    (member int64_t query_id)
+    (member time_t query_time)
+    (member IsolationLevel isolation_level)
+    (member TxnEntry * ctx_head)
+    (member TxnEntry * ctx_tail))
+
+  (thread-local) (var Transaction * tl_txn . nil)
+
+  (var IsolationLevel default_isolation_level . READ_COMMITTED)
+
+  ;; the SERIALIZABLE semaphore of one -- Transaction::_serialize_* done
+  ;; with pthreads. Counter and wait under one mutex; the slot is taken
+  ;; only after the wait; a held slot is given back before waiting.
+  (var pthread_mutex_t serialize_access . PTHREAD_MUTEX_INITIALIZER)
+  (var pthread_cond_t serialize_cv . PTHREAD_COND_INITIALIZER)
+  (var size_t serialize_counter . 0)
+
+  (func set_isolation_level ((Transaction * t) (IsolationLevel iso_lvl)) (out void)
+    (if (== (-> t isolation_level) iso_lvl) (return))
+
+    (pthread_mutex_lock (aof serialize_access))
+    (let ((bool was_serializable . #'(== (-> t isolation_level) SERIALIZABLE)))
+      (if (and was_serializable (> serialize_counter 0))
+          (set serialize_counter (- serialize_counter 1)))
+
+      (if (== iso_lvl SERIALIZABLE)
+          (block
+            ;; BOUNDED, like a row lock: an unbounded wait turns one silent
+            ;; client into every other connection's hang.
+            (let ((int waited_ms . 0)
+                  (bool got . #t))
+              (while (!= serialize_counter 0)
+                (if (and (> lock_wait_timeout_ms 0) (>= waited_ms lock_wait_timeout_ms))
+                    (block (set got #f) break))
+                (pthread_mutex_unlock (aof serialize_access))
+                (usleep 10000)
+                (set waited_ms (+ waited_ms 10))
+                (pthread_mutex_lock (aof serialize_access)))
+              (if (not got)
+                  (block
+                    (pthread_mutex_unlock (aof serialize_access))
+                    (if was_serializable (pthread_cond_signal (aof serialize_cv)))
+                    (throw* (MemoryException "serializable wait timeout"))))
+              (set serialize_counter (+ serialize_counter 1)))))
+
+      (set (-> t isolation_level) iso_lvl)
+      (pthread_mutex_unlock (aof serialize_access))
+      (if was_serializable (pthread_cond_signal (aof serialize_cv)))))
+
+  (func transaction_reset ((Transaction * t)) (out void)
+    ;; The version clock, not the wall clock -- SNAPSHOT compares init_time
+    ;; against create_time/modify_time stamps.
+    (set (-> t init_time) (version_time))
+    (set (-> t query_time) (cast time_t 0))
+    (set (-> t query_id) 0)
+    (set_isolation_level t default_isolation_level))
+
+  (func txn () (out Transaction *)
+    (if (== tl_txn nil)
+        (throw* (MemoryException "no transaction on this thread")))
+    (return tl_txn))
+
+  ;; ==================================================================
+  ;; Memory -- the store. Data only; the operations are the free
+  ;; functions below (Cicili checks struct methods top-down, and the
+  ;; engine's call graph is recursive).
+  ;; ==================================================================
+  (struct Memory
+    (member binarystream * hexmap_io)
+    (member binarystream * data_io)
+    (member int64_t page_size)
+    (member int64_t hbpp)                 ;; hex bytes per page
+    (member int64_t page_count)
+    (member bool initialized)
+    (member PageEntry * pages)
+    (member FreeEntry * frees)
+    (member pthread_mutex_t hexmap_access)
+    (member pthread_mutex_t data_access)
+    (member pthread_mutex_t page_list_access)
+    (member pthread_mutex_t free_list_access))
+
+  ;; ==================================================================
+  ;; Streams -- THE guard. One pair of shared streams for the whole
+  ;; process; a seek and its read are one operation. Re-entrant by
+  ;; thread through tl_streams_held; idempotent lock/unlock because
+  ;; scans hand the pair back around procedure callbacks. This is the
+  ;; C++ layer earning its keep: a ctor/dtor pair IS the discipline.
+  ;; ==================================================================
+  (thread-local) (var void * tl_streams_held . nil)
+
+  (struct Streams
+    (member Memory * m)
+    (member bool mine_)
+    (member bool locked_)
+
+    (method lock () (out void)
+      (if (or (not ($ this mine_)) ($ this locked_)) (return))
+      ;; always hexmap then data -- one order at every site, no deadlock
+      (pthread_mutex_lock (aof (-> ($ this m) hexmap_access)))
+      (pthread_mutex_lock (aof (-> ($ this m) data_access)))
+      (set tl_streams_held (cast (void *) this))
+      (set ($ this locked_) #t))
+
+    (method unlock () (out void)
+      (if (or (not ($ this mine_)) (not ($ this locked_))) (return))
+      ;; withdrawn BEFORE releasing: never claim a hold already given back
+      (set tl_streams_held nil)
+      (set ($ this locked_) #f)
+      (pthread_mutex_unlock (aof (-> ($ this m) data_access)))
+      (pthread_mutex_unlock (aof (-> ($ this m) hexmap_access))))
+
+    (ctor ((Memory * mem))
+      (init (m mem) (mine_ (== tl_streams_held nil)) (locked_ #f))
+      (($ this lock)))
+
+    (dtor ()
+      (($ this unlock))))
+
+  ;; ==================================================================
+  ;; Statement -- where a reader's single point in time is fixed. The
+  ;; outermost one starts the statement; inner ones nest silently.
+  ;; ==================================================================
+  (struct Statement
+    (member bool mine_)
+
+    (ctor ((Memory * mem))
+      (init (mine_ #f))
+      (if (and (!= mem nil) (-> mem initialized))
+          (if (and (!= tl_txn nil) (== (-> tl_txn query_time) (cast time_t 0)))
+              (block
+                (set ($ this mine_) #t)
+                ;; a random positive query id, so an update cursor can tell
+                ;; its own freshly inserted rows from the rows it is walking
+                (let ((uint64_t drawn . 0))
+                  (Utility::random_bytes (cast (uint8_t *) (aof drawn)) (sizeof uint64_t))
+                  (set (-> tl_txn query_id) (cast int64_t (>> drawn 1))))
+                (set (-> tl_txn query_time) (version_time))))))
+
+    (dtor ()
+      (if ($ this mine_)
+          (block
+            (set (-> tl_txn query_id) 0)
+            (set (-> tl_txn query_time) (cast time_t 0))))))
+
+  ;; ==================================================================
+  ;; Control block I/O -- _dump_control / _load_control
+  ;; ==================================================================
+  (func dump_control ((Memory * m) (const Pointer * p) (const Control * c)) (out void)
+    (let ((uint8_t online_hexmap . #'(cast uint8_t (+ CONTROL_CHUNK
+                                       (+ (cast int (-> c online_state)) (cast int (-> c online_lock))))))
+          (uint8_t offline_hexmap . #'(cast uint8_t (+ CONTROL_CHUNK
+                                        (+ (cast int (-> c offline_state)) (cast int (-> c offline_lock)))))))
+      ((-> (-> m hexmap_io) seekp) (ptr_hexmap p) std::ios::beg)
+      ((-> (-> m hexmap_io) write_std_ubyte) online_hexmap)
+      ((-> (-> m hexmap_io) write_std_ubyte) offline_hexmap)
+      ((-> (-> m hexmap_io) write_std_ubyte) CONTROL_STANDALONE_CHUNK)
+
+      ((-> (-> m data_io) seekp) (-> p address) std::ios::beg)
+      ((-> (-> m data_io) write_std_time) (cast time_t (-> c online_time)))
+      ((-> (-> m data_io) write_std_size) (cast size_t (-> c transaction_id)))
+      ((-> (-> m data_io) write_std_long) (cast int64_t (-> c query_id)))
+      ((-> (-> m data_io) write_std_long) (cast int64_t (-> c reference_address)))
+      ((-> (-> m data_io) write_std_time) (cast time_t (-> c modify_time)))
+      ((-> (-> m data_io) write_std_time) (cast time_t (-> c create_time)))))
+
+  (func load_control ((Memory * m) (const Pointer * p) (Control * c)) (out void)
+    (let ((uint8_t online_hexmap . 0)
+          (uint8_t offline_hexmap . 0)
+          (uint8_t skip . 0))
+      ((-> (-> m hexmap_io) seekg) (ptr_hexmap p) std::ios::beg)
+      ((-> (-> m hexmap_io) read_std_ubyte) online_hexmap)
+      ((-> (-> m hexmap_io) read_std_ubyte) offline_hexmap)
+      ((-> (-> m hexmap_io) read_std_ubyte) skip)
+
+      (set (-> c online_state) (cast RowState (bitand online_hexmap 12)))
+      (set (-> c online_lock) (cast RowLock (bitand online_hexmap 3)))
+      (set (-> c offline_state) (cast RowState (bitand offline_hexmap 12)))
+      (set (-> c offline_lock) (cast RowLock (bitand offline_hexmap 3)))
+
+      ((-> (-> m data_io) seekg) (-> p address) std::ios::beg)
+      ((-> (-> m data_io) read_std_time) (-> c online_time))
+      ((-> (-> m data_io) read_std_size) (-> c transaction_id))
+      ((-> (-> m data_io) read_std_long) (-> c query_id))
+      ((-> (-> m data_io) read_std_long) (-> c reference_address))
+      ((-> (-> m data_io) read_std_time) (-> c modify_time))
+      ((-> (-> m data_io) read_std_time) (-> c create_time))))
+
+  ;; ==================================================================
+  ;; Hexmap runs
+  ;; ==================================================================
+  (func full_hexmap_at ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
+    ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
+    ((-> (-> m hexmap_io) write_std_ubyte) DATA_STANDALONE_CHUNK))
+
+  (func full_hexmap ((Memory * m) (const Pointer * p)) (out void)
+    (let ((int64_t hex_address . #'(ptr_hexmap_data p))
+          (int64_t count . #'(ptr_data_count p)))
+      ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
+      ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
+      ((-> (-> m hexmap_io) write_std_ubyte)
+       (cast uint8_t (+ DATA_STANDALONE_CHUNK (% (-> p size) CHUNK_SIZE))))))
+
+  (func free_hexmap ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
+    ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char FREE_CHUNK))
+    ((-> (-> m hexmap_io) write_std_ubyte) FREE_STANDALONE_CHUNK))
+
+  ;; how many chunks the free run at ADDRESS spans, read from the hexmap
+  ;; and stopped at the page boundary whatever the bytes claim
+  (func free_run_count ((Memory * m) (int64_t address) (int64_t end_address)) (out int64_t)
+    (let ((uint8_t hex_byte . 0)
+          (int64_t count . 0))
+      ((-> (-> m hexmap_io) seekg) (addr_hexmap address) std::ios::beg)
+      (while (< (+ address (* count CHUNK_SIZE)) end_address)
+        ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+        (if (not ((-> (-> m hexmap_io) good)))
+            (block
+              ((-> (-> m hexmap_io) clear))
+              (throw* (MemoryException "hexmap ends inside the free run"))))
+        ;; an allocated chunk is not part of this run
+        (if (== (bitand hex_byte 128) 128) break)
+        (set count (+ count 1))
+        (if (== (bitand hex_byte 64) 64) break))   ;; standalone: run ends here
+      (return count)))
+
+  ;; a Pointer read back from the hexmap chain at ADDRESS -- _pointer
+  (func pointer_at ((Memory * m) (const uint8_t * key) (int64_t address)) (out Pointer)
+    (let ((uint8_t hex_byte . 0)
+          (int64_t size . 0))
+      ((-> (-> m hexmap_io) seekg) (addr_hexmap_data address) std::ios::beg)
+      (while #t
+        ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+        (if (not ((-> (-> m hexmap_io) good)))
+            (block
+              ((-> (-> m hexmap_io) clear))
+              (throw* (MemoryException "hexmap ends inside the chunk"))))
+        (if (== (bitand hex_byte 64) 64)
+            (return (pointer_make key address (+ size (bitand hex_byte 31)))))
+        (set size (+ size CHUNK_SIZE)))
+      (return (pointer_null))))
+
+  ;; the startup variant that also answers is-data and the online flags
+  (func pointer_at_state ((Memory * m) (const uint8_t * key) (int64_t address)
+                          (bool * is_data) (RowState * online_state) (RowLock * online_lock))
+        (out Pointer)
+    (let ((uint8_t hex_byte . 0)
+          (int64_t size . 0))
+      ((-> (-> m hexmap_io) seekg) (addr_hexmap address) std::ios::beg)
+      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+      (set (cof online_state) (cast RowState (bitand hex_byte 12)))
+      (set (cof online_lock) (cast RowLock (bitand hex_byte 3)))
+      ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 1) std::ios::cur)
+      (while #t
+        ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+        (if (== (bitand hex_byte 64) 64)
+            (block
+              (set (cof is_data) (== (bitand hex_byte 128) 128))
+              (return (pointer_make key address (+ size (bitand hex_byte 31))))))
+        (set size (+ size CHUNK_SIZE)))
+      (return (pointer_null))))
+
+  ;; ==================================================================
+  ;; Allocation
+  ;; ==================================================================
+  (func free_list_insert ((Memory * m) (const uint8_t * key)
+                          (int64_t address) (int64_t size)) (out void)
+    (let ((FreeEntry * e . #'(new* FreeEntry)))
+      (set (-> e key) (intern_key key))
+      (set (-> e address) address)
+      (set (-> e size) size)
+      (set (-> e next) (-> m frees))
+      (set (-> m frees) e)))
+
+  (func page_list_insert ((Memory * m) (const uint8_t * key) (int64_t address)) (out void)
+    (let ((PageEntry * e . #'(new* PageEntry)))
+      (set (-> e key) (intern_key key))
+      (set (-> e address) address)
+      (set (-> e next) (-> m pages))
+      (set (-> m pages) e)))
+
+  ;; writes a fresh page header: control chunks full, the rest free, the
+  ;; hash key at the front, zeroes behind it
+  (func allocate_page ((Memory * m) (const uint8_t * key) (int64_t address)) (out void)
+    (full_hexmap_at m (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
+    (free_hexmap m (+ (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
+                 (- (-> m hbpp) PAGEFILE_CONTROL_COUNT))
+    ((-> (-> m data_io) seekp) address std::ios::beg)
+    ((-> (-> m data_io) write) (cast (char *) key) HASHKEY_SIZE)
+    ((-> (-> m data_io) fill_n) (cast size_t (- (-> m page_size) HASHKEY_SIZE)) (cast char 0)))
+
+  ;; a page for KEY: a __FREE__ page rekeyed, or a fresh one appended.
+  ;; DIVERGENCE (a fix): the original inserted the reused page into the
+  ;; page list under a second entry and left the __FREE__ entry behind;
+  ;; here the entry is rekeyed in place.
+  (func allocate_new_page ((Memory * m) (const uint8_t * key)) (out int64_t)
+    (let ((PageEntry * e . #'(-> m pages)))
+      (while (!= e nil)
+        (if (== (memcmp (-> e key) FREE_HASHKEY (cast size_t HASHKEY_SIZE)) 0)
+            (block
+              (allocate_page m key (-> e address))
+              (set (-> e key) (intern_key key))
+              (return (-> e address))))
+        (set e (-> e next))))
+    ((-> (-> m data_io) seekp) 0 std::ios::end)
+    (let ((int64_t start . #'((-> (-> m data_io) tellp))))
+      (allocate_page m key start)
+      (page_list_insert m key start)
+      (set (-> m page_count) (+ (-> m page_count) 1))
+      (return start)))
+
+  (func allocate ((Memory * m) (const uint8_t * key) (int64_t size)) (out Pointer)
+    (let ((int64_t actual_size . #'(size_actual size)))
+      (if (> actual_size (- (-> m page_size) (+ PAGEFILE_CONTROL_SIZE CONTROL_SIZE)))
+          (throw* (MemoryException "allocation overflow")))
+
+      (pthread_mutex_lock (aof (-> m page_list_access)))
+      (pthread_mutex_lock (aof (-> m free_list_access)))
+
+      ;; first fit from the free list. A free entry measures the WHOLE
+      ;; span; the Pointer handed out measures the DATA -- see _allocate
+      ;; in memory.cpp for the corruption confusing the two caused.
+      (let ((FreeEntry * prev . nil)
+            (FreeEntry * e . #'(-> m frees)))
+        (while (!= e nil)
+          (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+              (block
+                (if (== actual_size (-> e size))
+                    (let ((Pointer p . #'(pointer_make (-> e key) (-> e address) size)))
+                      (if (== prev nil)
+                          (set (-> m frees) (-> e next))
+                        (set (-> prev next) (-> e next)))
+                      (delete* e)
+                      (pthread_mutex_unlock (aof (-> m free_list_access)))
+                      (pthread_mutex_unlock (aof (-> m page_list_access)))
+                      (return p)))
+                (if (< actual_size (-> e size))
+                    (let ((Pointer p . #'(pointer_make (-> e key) (-> e address) size)))
+                      ;; split: the tail keeps its place in the list
+                      (set (-> e address) (+ (-> e address) actual_size))
+                      (set (-> e size) (- (-> e size) actual_size))
+                      (pthread_mutex_unlock (aof (-> m free_list_access)))
+                      (pthread_mutex_unlock (aof (-> m page_list_access)))
+                      (return p)))))
+          (set prev e)
+          (set e (-> e next))))
+
+      ;; nothing fits: a new page, its tail registered free
+      (let ((const uint8_t * key_interned . #'(intern_key key))
+            (int64_t start . 0))
+        (set start (allocate_new_page m key_interned))
+        (free_list_insert m key_interned
+                          (+ start (+ PAGEFILE_CONTROL_SIZE actual_size))
+                          (- (-> m page_size) (+ PAGEFILE_CONTROL_SIZE actual_size)))
+        (pthread_mutex_unlock (aof (-> m free_list_access)))
+        (pthread_mutex_unlock (aof (-> m page_list_access)))
+        (return (pointer_make key_interned (+ start PAGEFILE_CONTROL_SIZE) size)))))
+
+
+  ;; ==================================================================
+  ;; Freeing -- _free and its two hexmap probes. A freed run coalesces
+  ;; with the free run before and after it; a fully free page goes back
+  ;; to __FREE__.
+  ;; ==================================================================
+  (func free_prev_count ((Memory * m)) (out int64_t)
+    (let ((uint8_t hexbyte . 0)
+          (int64_t counter . 0))
+      (if (> (% ((-> (-> m hexmap_io) tellg)) (-> m hbpp)) 0)
+          (block
+            ((-> (-> m hexmap_io) seekg) -1 std::ios::cur)
+            ((-> (-> m hexmap_io) read_std_ubyte) hexbyte)
+            (cond
+              ((== (>> hexbyte 7) 0)
+               (block
+                 (set counter (+ counter 1))
+                 (if (== ((-> (-> m hexmap_io) tellg)) 1) (return counter))))
+              ((or (== ((-> (-> m hexmap_io) tellg)) 1) (== (>> hexbyte 7) 1))
+               (return counter))
+              (#t (return 0)))))
+      (while (> (% ((-> (-> m hexmap_io) tellg)) (-> m hbpp)) 0)
+        ((-> (-> m hexmap_io) seekg) -2 std::ios::cur)
+        ((-> (-> m hexmap_io) read_std_ubyte) hexbyte)
+        (cond
+          ((== (>> hexbyte 7) 0)
+           (block
+             (set counter (+ counter 1))
+             (if (== ((-> (-> m hexmap_io) tellg)) 1) (return counter))))
+          ((or (== ((-> (-> m hexmap_io) tellg)) 1) (== (>> hexbyte 7) 1))
+           (return counter))
+          (#t (return 0))))
+      (return 0)))
+
+  (func free_next_count ((Memory * m)) (out int64_t)
+    (let ((uint8_t hexbyte . 0)
+          (int64_t counter . 0))
+      (while (> (% ((-> (-> m hexmap_io) tellg)) (-> m hbpp)) 0)
+        ((-> (-> m hexmap_io) read_std_ubyte) hexbyte)
+        (if (== (>> hexbyte 7) 0)
+            (block
+              (set counter (+ counter 1))
+              (if (== (>> hexbyte 6) 1) (return counter)))
+          (return 0)))
+      (return 0)))
+
+  (func free_list_erase_at ((Memory * m) (const uint8_t * key) (int64_t address)) (out void)
+    (let ((FreeEntry * prev . nil)
+          (FreeEntry * e . #'(-> m frees)))
+      (while (!= e nil)
+        (if (and (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+                 (== (-> e address) address))
+            (block
+              (if (== prev nil)
+                  (set (-> m frees) (-> e next))
+                (set (-> prev next) (-> e next)))
+              (delete* e)
+              (return)))
+        (set prev e)
+        (set e (-> e next)))))
+
+  (func free_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (let ((int64_t from . #'(ptr_hexmap p))
+          (int64_t count . #'(ptr_actual_count p))
+          (int64_t full_count . 0)
+          (int64_t begin . 0))
+      (set full_count count)
+      (set begin from)
+
+      (pthread_mutex_lock (aof (-> m page_list_access)))
+      (pthread_mutex_lock (aof (-> m free_list_access)))
+
+      ((-> (-> m hexmap_io) seekp) from std::ios::beg)
+      ((-> (-> m hexmap_io) seekg) from std::ios::beg)
+      (let ((int64_t prev_count . #'(free_prev_count m)))
+        (if (> prev_count 0)
+            (block
+              (set full_count (+ full_count prev_count))
+              (set begin (- begin prev_count))
+              (free_list_erase_at m (-> p hash_key) (* (- from prev_count) CHUNK_SIZE)))))
+
+      ((-> (-> m hexmap_io) seekg) (+ from count) std::ios::beg)
+      (let ((int64_t next_count . #'(free_next_count m)))
+        (if (> next_count 0)
+            (block
+              (set full_count (+ full_count next_count))
+              (free_list_erase_at m (-> p hash_key) (* (+ from count) CHUNK_SIZE)))))
+
+      (free_hexmap m begin full_count)
+
+      (if (== (-> m page_size) (* full_count CHUNK_SIZE))
+          ;; the whole page is free: hand it back to the allocator.
+          ;; DIVERGENCE (a fix): the original left the page listed under its
+          ;; old key AND never keyed it __FREE__ in the list, so a returned
+          ;; page was unusable until restart. Here the entry is rekeyed.
+          (block
+            (allocate_page m FREE_HASHKEY (* begin CHUNK_SIZE))
+            (let ((PageEntry * e . #'(-> m pages)))
+              (while (!= e nil)
+                (if (== (-> e address) (* begin CHUNK_SIZE))
+                    (block
+                      (set (-> e key) (intern_key FREE_HASHKEY))
+                      break))
+                (set e (-> e next)))))
+        (free_list_insert m (-> p hash_key) (* begin CHUNK_SIZE) (* full_count CHUNK_SIZE)))
+
+      (pthread_mutex_unlock (aof (-> m free_list_access)))
+      (pthread_mutex_unlock (aof (-> m page_list_access)))))
+
+  ;; ==================================================================
+  ;; Transaction plumbing
+  ;; ==================================================================
+  (func transaction_push ((Memory * m) (const Pointer * p)) (out void)
+    (cast void m)
+    (let ((Transaction * t . #'(txn))
+          (TxnEntry * e . #'(new* TxnEntry)))
+      ;; same clock as query_time: rollback_transaction_to compares the two
+      (set (-> e at) (version_time))
+      (set (-> e ptr) (cof p))
+      (set (-> e next) nil)
+      (set (-> e prev) (-> t ctx_tail))
+      (if (== (-> t ctx_tail) nil)
+          (set (-> t ctx_head) e)
+        (set (-> (-> t ctx_tail) next) e))
+      (set (-> t ctx_tail) e)))
+
+  (func write_transaction ((Memory * m) (size_t transaction_id) (time_t commit_time)) (out void)
+    (let ((Transaction * t . #'(txn)))
+      ((-> (-> m data_io) seekp) (ptr_data (aof (-> t pointer))) std::ios::beg)
+      ((-> (-> m data_io) write_std_size) (cast size_t transaction_id))
+      ((-> (-> m data_io) write_std_time) (cast time_t commit_time))))
+
+  (func commit_pointer ((Memory * m) (const Pointer * p) (time_t commit_time)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (load_control m p (aof control))
+
+      (cond
+        ((== ($ control online_state) ROW_INSERTED)
+         (block (set ($ control offline_state) ROW_INSERTED)
+                (set ($ control create_time) commit_time)))
+        ((== ($ control online_state) ROW_UPDATED)
+         (block (set ($ control offline_state) ROW_UPDATED)
+                (set ($ control modify_time) commit_time)))
+        ((== ($ control online_state) ROW_DELETED)
+         (block (set ($ control offline_state) ROW_DELETED)
+                (set ($ control modify_time) commit_time))))
+
+      (set ($ control online_state) ROW_NONE)
+      (set ($ control online_lock) LOCK_NONE)
+      (set ($ control online_time) (cast time_t 0))
+      (set ($ control transaction_id) 0)
+      (set ($ control query_id) 0)
+
+      (dump_control m p (aof control))))
+
+  (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (load_control m p (aof control))
+
+      (set ($ control online_state) ROW_NONE)
+      (set ($ control online_lock) LOCK_NONE)
+      (set ($ control online_time) (cast time_t 0))
+      (set ($ control transaction_id) 0)
+      (set ($ control query_id) 0)
+
+      ;; a row that was never committed is flagged deleted rather than freed:
+      ;; rows are never reclaimed except by TRUNCATE
+      (if (== ($ control offline_state) ROW_NONE)
+          (block
+            (set ($ control offline_state) ROW_DELETED)
+            (set ($ control modify_time) (version_time))))
+
+      (dump_control m p (aof control))))
+
+  ;; data before hexmap, every durability point -- the hexmap is the claim,
+  ;; the data the substance
+  (func sync_disk ((Memory * m)) (out void)
+    ((-> (-> m hexmap_io) flush))
+    ((-> (-> m data_io) flush))
+    ((-> (-> m data_io) sync_to_disk))
+    ((-> (-> m hexmap_io) sync_to_disk)))
+
+  (func begin_transaction ((Memory * m)) (out void)
+    (if (== tl_txn nil)
+        (block
+          (set tl_txn (new* Transaction))
+          (set (-> tl_txn id) 0)
+          (set (-> tl_txn pointer) (pointer_null))
+          (set (-> tl_txn isolation_level) READ_COMMITTED)
+          (set (-> tl_txn ctx_head) nil)
+          (set (-> tl_txn ctx_tail) nil)))
+    (set (-> tl_txn id) (Utility::generate_id))
+    (transaction_reset tl_txn)
+
+    (letin* ((streams (Streams m)))
+      (set (-> tl_txn pointer)
+           (allocate m TRANSACTIONS_HASHKEY
+                     (cast int64_t (+ (sizeof size_t) (sizeof time_t)))))
+      (let ((Control control))
+        (control_clear (aof control))
+        (set ($ control offline_state) ROW_INSERTED)
+        (dump_control m (aof (-> tl_txn pointer)) (aof control)))
+      (full_hexmap m (aof (-> tl_txn pointer)))
+      (write_transaction m (-> tl_txn id) (cast time_t 0))))
+
+  (func transaction_context_clear ((Transaction * t)) (out void)
+    (let ((TxnEntry * e . #'(-> t ctx_head)))
+      (while (!= e nil)
+        (let ((TxnEntry * dead . e))
+          (set e (-> e next))
+          (delete* dead))))
+    (set (-> t ctx_head) nil)
+    (set (-> t ctx_tail) nil))
+
+  (func commit_transaction ((Memory * m)) (out void)
+    (let ((Transaction * t . #'(txn)))
+      ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
+      ;; not hold the streams while it does
+      (block
+        (letin* ((streams (Streams m)))
+          ;; ONE stamp for the whole transaction
+          (let ((time_t commit_time . #'(version_time)))
+            ;; the intention, on disk before any control block moves
+            (write_transaction m (-> t id) commit_time)
+            (sync_disk m)
+            ;; then the control blocks it licenses
+            (let ((TxnEntry * e . #'(-> t ctx_head)))
+              (while (!= e nil)
+                (commit_pointer m (aof (-> e ptr)) commit_time)
+                (set e (-> e next))))
+            (transaction_context_clear t)
+            (sync_disk m)
+            ;; only then is the intention retired
+            (write_transaction m (-> t id) (cast time_t 0))
+            (sync_disk m))))
+      (transaction_reset t)))
+
+  (func rollback_transaction ((Memory * m)) (out void)
+    (let ((Transaction * t . #'(txn)))
+      (block
+        (letin* ((streams (Streams m)))
+          ;; backwards, and the record freed exactly once
+          (let ((TxnEntry * e . #'(-> t ctx_tail)))
+            (while (!= e nil)
+              (rollback_pointer m (aof (-> e ptr)))
+              (set e (-> e prev))))
+          (transaction_context_clear t)
+          (if (!= ($ (-> t pointer) hash_key) nil)
+              (free_pointer m (aof (-> t pointer))))
+          (set (-> t pointer) (pointer_null))
+          (sync_disk m)))
+      (transaction_reset t)))
+
+  ;; the partial rollback the repeatable-read retry uses
+  (func rollback_transaction_to ((Memory * m) (time_t at)) (out void)
+    (letin* ((streams (Streams m)))
+      (let ((Transaction * t . #'(txn))
+            (TxnEntry * e . #'(-> t ctx_tail)))
+        (while (and (!= e nil) (>= (-> e at) at))
+          (rollback_pointer m (aof (-> e ptr)))
+          (let ((TxnEntry * dead . e))
+            (set e (-> e prev))
+            (if (== e nil)
+                (set (-> t ctx_head) nil)
+              (set (-> e next) nil))
+            (set (-> t ctx_tail) e)
+            (delete* dead))))
+      ((-> (-> m hexmap_io) flush))
+      ((-> (-> m data_io) flush))
+      (cast void 0)))
+
+  ;; ==================================================================
+  ;; Visibility
+  ;; ==================================================================
+  (func snapshot_time ((Memory * m)) (out time_t)
+    (cast void m)
+    (let ((Transaction * t . #'(txn)))
+      (if (!= (-> t query_time) (cast time_t 0))
+          (return (-> t query_time)))
+      (return (version_time))))
+
+  (func alive_at ((const Control * c) (time_t at)) (out bool)
+    ;; never committed: nothing here anybody else may see
+    (if (== (-> c offline_state) ROW_NONE) (return #f))
+    ;; born after this read began
+    (if (and (!= (-> c create_time) (cast time_t 0)) (> (-> c create_time) at))
+        (return #f))
+    ;; died at or before it -- but modify_time only MEANS died when the
+    ;; state says so (an in-place offline update stamps current rows)
+    (if (and (or (== (-> c offline_state) ROW_UPDATED)
+                 (== (-> c offline_state) ROW_DELETED))
+             (and (!= (-> c modify_time) (cast time_t 0))
+                  (<= (-> c modify_time) at)))
+        (return #f))
+    (return #t))
+
+  ;; the READ COMMITTED reader: answers without waiting for anything
+  (func read_committed ((Memory * m) (const Pointer * p) (Control * c)) (out bool)
+    (load_control m p c)
+    (let ((Transaction * t . #'(txn)))
+      (if (and (!= (-> c online_lock) LOCK_NONE)
+               (== (-> c transaction_id) (-> t id)))
+          (block
+            ;; an insert THIS query made is hidden from it
+            (if (and (== (-> c online_state) ROW_INSERTED)
+                     (and (> (-> t query_time) (cast time_t 0))
+                          (== (-> t query_id) (-> c query_id))))
+                (return #f))
+            ;; superseded or removed by us
+            (if (or (== (-> c online_state) ROW_UPDATED)
+                    (== (-> c online_state) ROW_DELETED))
+                (return #f))
+            ;; our own insert from earlier in this transaction
+            (if (== (-> c online_state) ROW_INSERTED)
+                (return #t)))))
+    ;; anybody else's staged work is invisible; what is left is what was
+    ;; committed here as of when this read began
+    (return (alive_at c (snapshot_time m))))
+
+  ;; the writer's wait -- bounded, streams handed back while sleeping
+  (func check_lock ((Memory * m) (int lock_mask) (const Pointer * p)
+                    (Control * c) (Streams * streams)) (out bool)
+    (let ((bool do_read . #t)
+          (int waited_ms . 0)
+          (bool looping . #t))
+      (while looping
+        (load_control m p c)
+        (if (!= streams nil) ((-> streams unlock)))
+
+        (if (!= (bitand (cast int (-> c online_lock)) lock_mask) 0)
+            ;; the pointer is locked
+            (if (== (-> c transaction_id) (-> tl_txn id))
+                ;; by this transaction itself
+                (block
+                  (if (and (== (-> c online_state) ROW_INSERTED)
+                           (and (> (-> tl_txn query_time) (cast time_t 0))
+                                (== (-> tl_txn query_id) (-> c query_id))))
+                      (set do_read #f)
+                    (if (or (== (-> c online_state) ROW_UPDATED)
+                            (== (-> c online_state) ROW_DELETED))
+                        (set do_read #f)))
+                  (set looping #f))
+              ;; by somebody else
+              (if (and (== (-> c online_state) ROW_INSERTED)
+                       (> (-> c reference_address) -1))
+                  (block
+                    (set do_read #f)
+                    (set looping #f))
+                (block
+                  ;; two sessions can each hold what the other wants: give up
+                  ;; rather than spin forever
+                  (if (and (> lock_wait_timeout_ms 0)
+                           (>= waited_ms lock_wait_timeout_ms))
+                      (block
+                        (if (!= streams nil) ((-> streams lock)))
+                        (throw* (MemoryException "lock wait timeout"))))
+                  (usleep 10000)
+                  (set waited_ms (+ waited_ms 10))
+                  (if (!= streams nil) ((-> streams lock))))))
+          (set looping #f)))    ;; no lock: proceed
+
+      (if (!= streams nil) ((-> streams lock)))
+
+      ;; the wait ended by commit or by rollback; only a landed row is
+      ;; readable -- anything else would be a dirty read
+      (if (and do_read
+               (and (== (-> c online_lock) LOCK_NONE)
+                    (and (== (-> c online_state) ROW_NONE)
+                         (and (!= (-> c offline_state) ROW_INSERTED)
+                              (!= (-> c offline_state) ROW_UPDATED)))))
+          (set do_read #f))
+      (return do_read)))
+
+  ;; whether ONE record is visible to the transaction now running -- the
+  ;; index's question. Under SNAPSHOT the pointer may be moved to an older
+  ;; version, exactly as the cursor moves it.
+  (func visible ((Memory * m) (Pointer * p) (Streams * streams)) (out bool)
+    (let ((uint8_t hex_byte . 0)
+          (RowState online_state . ROW_NONE)
+          (RowLock online_lock . LOCK_NONE)
+          (RowState offline_state . ROW_NONE)
+          (Control control)
+          (bool is_visible . #f)
+          (bool settled . #f)
+          (IsolationLevel level . READ_UNCOMMITTED))
+      (control_clear (aof control))
+
+      ((-> (-> m hexmap_io) seekg) (addr_hexmap (-> p address)) std::ios::beg)
+      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+      (set online_state (cast RowState (bitand hex_byte 12)))
+      (set online_lock (cast RowLock (bitand hex_byte 3)))
+      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+      (set offline_state (cast RowState (bitand hex_byte 12)))
+
+      (if (-> m initialized) (set level (-> tl_txn isolation_level)))
+
+      (cond
+        ((== level READ_UNCOMMITTED)
+         (if (or (and (== offline_state ROW_NONE) (== online_state ROW_INSERTED))
+                 (and (== offline_state ROW_INSERTED) (== online_state ROW_NONE)))
+             (set is_visible #t)))
+
+        ((== level READ_COMMITTED)
+         ;; every address that holds anything at all -- the hexmap cannot
+         ;; tell whether a superseded version is still the one to show
+         (if (or (!= offline_state ROW_NONE) (!= online_state ROW_NONE))
+             (set is_visible (read_committed m p (aof control)))))
+
+        ((or (== level REPEATABLE_READ) (== level SERIALIZABLE))
+         ;; a read WRITES: it takes a shared row lock, or waits
+         (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
+                 (== offline_state ROW_INSERTED))
+             (if (== online_lock LOCK_NONE)
+                 (block
+                   (load_control m p (aof control))
+                   (set ($ control online_state) ROW_NONE)
+                   (set ($ control online_lock) LOCK_SHARED)
+                   (set ($ control online_time) (version_time))
+                   (set ($ control transaction_id) (-> tl_txn id))
+                   (set ($ control query_id) (-> tl_txn query_id))
+                   (dump_control m p (aof control))
+                   (transaction_push m p)
+                   (set is_visible #t))
+               (set is_visible
+                    (check_lock m (bitor (cast int LOCK_EXCLUSIVE) (cast int LOCK_SHARED))
+                                p (aof control) streams)))))
+
+        ((== level SNAPSHOT)
+         ;; follow the version chain back to the version alive at init_time
+         (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
+                 (or (== offline_state ROW_INSERTED) (== offline_state ROW_DELETED)))
+             (while (not settled)
+               (load_control m p (aof control))
+
+               (if (and (> ($ control transaction_id) 0)
+                        (== (-> tl_txn id) ($ control transaction_id)))
+                   (block
+                     (set is_visible (== ($ control online_state) ROW_INSERTED))
+                     (set settled #t))
+                 (cond
+                   ((== ($ control offline_state) ROW_NONE)
+                    (set settled #t))
+
+                   ((or (== ($ control offline_state) ROW_INSERTED)
+                        (== ($ control offline_state) ROW_UPDATED))
+                    (if (<= ($ control create_time) (-> tl_txn init_time))
+                        (block (set is_visible #t) (set settled #t))
+                      (if (> ($ control reference_address) -1)
+                          (set (cof p) (pointer_at m (-> p hash_key)
+                                                   ($ control reference_address)))
+                        (set settled #t))))
+
+                   ((== ($ control offline_state) ROW_DELETED)
+                    (if (> ($ control modify_time) (-> tl_txn init_time))
+                        (block (set is_visible #t) (set settled #t))
+                      (if (> ($ control reference_address) -1)
+                          (set (cof p) (pointer_at m (-> p hash_key)
+                                                   ($ control reference_address)))
+                        (set settled #t))))
+
+                   (#t (throw* (MemoryException "invalid row state"))))))))
+
+        (#t (throw* (MemoryException "invalid isolation level"))))
+
+      (return is_visible)))
+
+  ;; ==================================================================
+  ;; The cursor -- one hash key's records, page by page, chunk by chunk,
+  ;; each judged by the isolation rules, the streams handed back around
+  ;; every callback. Recursive: the repeatable-read retry re-walks.
+  ;; ==================================================================
+  (thread-local) (var uint8_t tl_cursor_id . 0)
+
+  (decl) (func cursor_walk ((Memory * m) (const uint8_t * hash_key) (Streams * streams)
+                            (void * ctx)
+                            (func callback ((void * c) (Pointer * p)) (out bool)))
+         (out void))
+
+  (func cursor_walk ((Memory * m) (const uint8_t * hash_key) (Streams * streams)
+                     (void * ctx)
+                     (func callback ((void * c) (Pointer * p)) (out bool)))
+        (out void)
+    (set tl_cursor_id (+ tl_cursor_id 1))
+    (if (>= tl_cursor_id MAX_CURSOR_COUNT)
+        (throw* (MemoryException "maximum cursor count")))
+
+    ;; where this scan's view of the store is fixed
+    (letin* ((statement (Statement m)))
+
+      ;; THE PAGE LIST IS COPIED BEFORE IT IS WALKED -- the lesson the
+      ;; original learnt the hard way, kept here: entries snapshotted
+      ;; under the lock, walked without it, because the callback is free
+      ;; to allocate pages
+      (let ((int64_t page_total . 0)
+            (const uint8_t * page_keys [512])
+            (int64_t page_addrs [512]))
+        (pthread_mutex_lock (aof (-> m page_list_access)))
+        (let ((PageEntry * e . #'(-> m pages)))
+          (while (and (!= e nil) (< page_total 512))
+            (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
+                (block
+                  (set (nth page_total page_keys) (-> e key))
+                  (set (nth page_total page_addrs) (-> e address))
+                  (set page_total (+ page_total 1))))
+            (set e (-> e next))))
+        (pthread_mutex_unlock (aof (-> m page_list_access)))
+
+        (let ((int64_t page_n . 0))
+          (while (< page_n page_total)
+            (let ((const uint8_t * page_hashkey . #'(nth page_n page_keys))
+                  (int64_t page_address . #'(nth page_n page_addrs))
+                  (int64_t i . PAGEFILE_CONTROL_COUNT))
+
+              (while (< i (-> m hbpp))
+                (let ((int64_t hexmap_address . #'(+ (addr_hexmap page_address) i))
+                      (int64_t pointer_address . 0)
+                      (uint8_t hex_byte . 0)
+                      (RowState online_state . ROW_NONE)
+                      (RowState offline_state . ROW_NONE)
+                      (RowLock online_lock . LOCK_NONE)
+                      (Control control))
+                  (control_clear (aof control))
+                  (set pointer_address (* hexmap_address CHUNK_SIZE))
+
+                  ((-> (-> m hexmap_io) seekg) hexmap_address std::ios::beg)
+                  ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                  (set online_state (cast RowState (bitand hex_byte 12)))
+                  (set online_lock (cast RowLock (bitand hex_byte 3)))
+                  ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                  (set offline_state (cast RowState (bitand hex_byte 12)))
+                  ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 2) std::ios::cur)
+
+                  (set i (+ i CONTROL_COUNT))
+                  (let ((int64_t pointer_size . 0)
+                        (bool at_end . #f))
+                    (while (and (not at_end) (< i (-> m hbpp)))
+                      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                      (set i (+ i 1))
+
+                      (if (and (!= hex_byte CONTROL_STANDALONE_CHUNK)
+                               (== (bitand hex_byte 64) 64))
+                          ;; the record's last chunk
+                          (block
+                            (set at_end #t)
+                            (if (and (!= hex_byte CONTROL_CHUNK)
+                                     (== (bitand hex_byte 128) 128))
+                                ;; and it is data: judge the record
+                                (block
+                                  (set pointer_size (+ pointer_size (bitand hex_byte 31)))
+                                  (let ((Pointer pointer . #'(pointer_make page_hashkey pointer_address pointer_size))
+                                        (bool do_callback . #f)
+                                        (bool break_while . #f)
+                                        (IsolationLevel level . READ_UNCOMMITTED))
+                                    (if (-> m initialized)
+                                        (set level (-> tl_txn isolation_level)))
+
+                                    (cond
+                                      ((== level READ_UNCOMMITTED)
+                                       (if (or (and (== offline_state ROW_NONE) (== online_state ROW_INSERTED))
+                                               (and (== offline_state ROW_INSERTED) (== online_state ROW_NONE)))
+                                           (set do_callback #t)))
+
+                                      ((== level READ_COMMITTED)
+                                       (if (or (!= offline_state ROW_NONE) (!= online_state ROW_NONE))
+                                           (set do_callback (read_committed m (aof pointer) (aof control)))))
+
+                                      ((or (== level REPEATABLE_READ) (== level SERIALIZABLE))
+                                       (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
+                                               (== offline_state ROW_INSERTED))
+                                           (block
+                                             (load_control m (aof pointer) (aof control))
+                                             (if (== online_lock LOCK_NONE)
+                                                 (block
+                                                   (set ($ control online_state) ROW_NONE)
+                                                   (set ($ control online_lock) LOCK_SHARED)
+                                                   (set ($ control online_time) (version_time))
+                                                   (set ($ control transaction_id) (-> tl_txn id))
+                                                   (set ($ control query_id) (-> tl_txn query_id))
+                                                   (dump_control m (aof pointer) (aof control))
+                                                   (transaction_push m (aof pointer))
+                                                   (set do_callback #t))
+                                               (block
+                                                 (set do_callback
+                                                      (check_lock m (bitor (cast int LOCK_EXCLUSIVE) (cast int LOCK_SHARED))
+                                                                  (aof pointer) (aof control) streams))
+                                                 (if (or (and (not do_callback)
+                                                              (and (> ($ control transaction_id) 0)
+                                                                   (!= ($ control transaction_id) (-> tl_txn id))))
+                                                         (and do_callback
+                                                              (> ($ control create_time) (-> tl_txn query_time))))
+                                                     ;; the row changed under a repeatable read: roll back
+                                                     ;; to the statement's start and walk again
+                                                     (block
+                                                       (if (!= streams nil) ((-> streams unlock)))
+                                                       (rollback_transaction_to m (-> tl_txn query_time))
+                                                       (usleep 10000)
+                                                       (if (!= streams nil) ((-> streams lock)))
+                                                       (set tl_cursor_id (- tl_cursor_id 1))
+                                                       (cursor_walk m hash_key streams ctx callback)
+                                                       (return))))))))
+
+                                      ((== level SNAPSHOT)
+                                       (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
+                                               (or (== offline_state ROW_INSERTED) (== offline_state ROW_DELETED)))
+                                           (while (not break_while)
+                                             (load_control m (aof pointer) (aof control))
+                                             (if (and (> ($ control transaction_id) 0)
+                                                      (== (-> tl_txn id) ($ control transaction_id)))
+                                                 (block
+                                                   (set do_callback (== ($ control online_state) ROW_INSERTED))
+                                                   (set break_while #t))
+                                               (cond
+                                                 ((== ($ control offline_state) ROW_NONE)
+                                                  (set break_while #t))
+                                                 ((or (== ($ control offline_state) ROW_INSERTED)
+                                                      (== ($ control offline_state) ROW_UPDATED))
+                                                  (if (<= ($ control create_time) (-> tl_txn init_time))
+                                                      (block (set do_callback #t) (set break_while #t))
+                                                    (if (> ($ control reference_address) -1)
+                                                        (set pointer (pointer_at m hash_key ($ control reference_address)))
+                                                      (set break_while #t))))
+                                                 ((== ($ control offline_state) ROW_DELETED)
+                                                  (if (> ($ control modify_time) (-> tl_txn init_time))
+                                                      (block (set do_callback #t) (set break_while #t))
+                                                    (if (> ($ control reference_address) -1)
+                                                        (set pointer (pointer_at m hash_key ($ control reference_address)))
+                                                      (set break_while #t))))
+                                                 (#t (throw* (MemoryException "invalid row state"))))))))
+
+                                      (#t (throw* (MemoryException "invalid isolation level"))))
+
+                                    (if do_callback
+                                        (block
+                                          ;; the streams go back before the caller's
+                                          ;; callback: it is procedure code, and the
+                                          ;; ordinary thing for it to do is update the
+                                          ;; row it was handed
+                                          (if (!= streams nil) ((-> streams unlock)))
+                                          (if (not (callback ctx (aof pointer)))
+                                              (set i (-> m hbpp)))
+                                          (if (!= streams nil) ((-> streams lock)))))))))
+                        ;; not the last chunk yet
+                        (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
+              (set page_n (+ page_n 1)))))))
+
+    (set tl_cursor_id (- tl_cursor_id 1)))
+
+  ;; read one row's bytes into OBJ (which carries its Pointer), under a
+  ;; guard of its own -- the cursor has handed the streams back by the
+  ;; time anything calls this
+  (func read_row ((Memory * m) (BaseTable * obj)) (out void)
+    (letin* ((streams (Streams m)))
+      ((-> (-> m data_io) seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+      ((-> obj unpack) (cof (-> m data_io)))))
+
+  ;; ==================================================================
+  ;; ISUD -- the staged writes
+  ;; ==================================================================
+  (func control_insert ((Memory * m) (BaseTable * obj)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (set ($ control online_state) ROW_INSERTED)
+      (set ($ control online_lock) LOCK_EXCLUSIVE)
+      (set ($ control online_time) (version_time))
+      (set ($ control transaction_id) (-> tl_txn id))
+      (set ($ control query_id) (-> tl_txn query_id))
+      (dump_control m (aof (-> obj pointer)) (aof control))))
+
+  (func control_update ((Memory * m) (BaseTable * old_obj) (BaseTable * new_obj)
+                        (Streams * streams)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (if (not (check_lock m (cast int LOCK_EXCLUSIVE) (aof (-> old_obj pointer))
+                           (aof control) streams))
+          (return))
+
+      (set ($ control online_state) ROW_UPDATED)
+      (set ($ control online_lock) LOCK_EXCLUSIVE)
+      (set ($ control online_time) (version_time))
+      (set ($ control transaction_id) (-> tl_txn id))
+      (set ($ control query_id) (-> tl_txn query_id))
+      (dump_control m (aof (-> old_obj pointer)) (aof control))
+
+      (control_clear (aof control))
+      (set ($ control online_state) ROW_INSERTED)
+      (set ($ control online_lock) LOCK_EXCLUSIVE)
+      (set ($ control online_time) (version_time))
+      (set ($ control transaction_id) (-> tl_txn id))
+      (set ($ control query_id) (-> tl_txn query_id))
+      (set ($ control reference_address) ($ (-> old_obj pointer) address))
+      (dump_control m (aof (-> new_obj pointer)) (aof control))))
+
+  (func control_delete ((Memory * m) (BaseTable * obj) (Streams * streams)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (if (not (check_lock m (cast int LOCK_EXCLUSIVE) (aof (-> obj pointer))
+                           (aof control) streams))
+          (return))
+      (set ($ control online_state) ROW_DELETED)
+      (set ($ control online_lock) LOCK_EXCLUSIVE)
+      (set ($ control online_time) (version_time))
+      (set ($ control transaction_id) (-> tl_txn id))
+      (set ($ control query_id) (-> tl_txn query_id))
+      (dump_control m (aof (-> obj pointer)) (aof control))))
+
+  (func online_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
+    ((-> obj prepare))
+    ;; obj->map() below is this row's indexes; their guard nests inside
+    ;; this one and does nothing -- the whole reason Streams exists
+    (letin* ((streams (Streams m)))
+      (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
+      (transaction_push m (aof (-> obj pointer)))
+      (control_insert m obj)
+      (full_hexmap m (aof (-> obj pointer)))
+      ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+      ((-> obj pack) (cof (-> m data_io)))
+      ((-> obj map) (cast (void *) m))
+      ((-> (-> m hexmap_io) flush))
+      ((-> (-> m data_io) flush))
+      (cast void 0)))
+
+  (func online_update ((Memory * m) (const uint8_t * hash_key)
+                       (BaseTable * old_obj) (BaseTable * new_obj)) (out void)
+    ((-> new_obj prepare))
+    (letin* ((streams (Streams m)))
+      (set (-> new_obj pointer) (allocate m hash_key ((-> new_obj pack_size))))
+      (transaction_push m (aof (-> old_obj pointer)))
+      (transaction_push m (aof (-> new_obj pointer)))
+      (control_update m old_obj new_obj (aof streams))
+      (full_hexmap m (aof (-> new_obj pointer)))
+      ((-> (-> m data_io) seekp) (ptr_data (aof (-> new_obj pointer))) std::ios::beg)
+      ((-> new_obj pack) (cof (-> m data_io)))
+      ((-> old_obj unmap) (cast (void *) m))
+      ((-> new_obj map) (cast (void *) m))
+      ((-> (-> m hexmap_io) flush))
+      ((-> (-> m data_io) flush))
+      (cast void 0)))
+
+  (func online_delete ((Memory * m) (BaseTable * obj)) (out void)
+    (letin* ((streams (Streams m)))
+      (transaction_push m (aof (-> obj pointer)))
+      (control_delete m obj (aof streams))
+      ((-> obj unmap) (cast (void *) m))
+      ((-> (-> m hexmap_io) flush))
+      ((-> (-> m data_io) flush))
+      (cast void 0)))
+
+  ;; the raw engine writes -- no transaction, no rollback; what indexes
+  ;; and sequences use for their own records
+  (func offline_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
+    (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
+    (let ((Control control))
+      (control_clear (aof control))
+      (set ($ control offline_state) ROW_INSERTED)
+      (set ($ control create_time) (version_time))
+      (dump_control m (aof (-> obj pointer)) (aof control)))
+    (full_hexmap m (aof (-> obj pointer)))
+    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+    ((-> obj pack) (cof (-> m data_io)))
+    ((-> (-> m hexmap_io) flush))
+    ((-> (-> m data_io) flush)))
+
+  (func offline_update ((Memory * m) (BaseTable * obj)) (out void)
+    (let ((Control control))
+      (control_clear (aof control))
+      (load_control m (aof (-> obj pointer)) (aof control))
+      (set ($ control modify_time) (version_time))
+      (dump_control m (aof (-> obj pointer)) (aof control)))
+    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+    ((-> obj pack) (cof (-> m data_io)))
+    ((-> (-> m hexmap_io) flush))
+    ((-> (-> m data_io) flush)))
+
+  ;; ==================================================================
+  ;; TRUNCATE -- the one reclaimer: every settled dead row of one hash
+  ;; key, collected in full before anything is freed
+  ;; ==================================================================
+  (struct DeadList
+    (member Pointer ptr)
+    (member DeadList * next))
+
+  (func dead_pointers ((Memory * m) (const uint8_t * hash_key)) (out DeadList *)
+    (let ((DeadList * head . nil)
+          (uint8_t hex_byte . 0)
+          (int64_t page_total . 0)
+          (const uint8_t * page_keys [512])
+          (int64_t page_addrs [512]))
+
+      (pthread_mutex_lock (aof (-> m page_list_access)))
+      (let ((PageEntry * e . #'(-> m pages)))
+        (while (and (!= e nil) (< page_total 512))
+          (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
+              (block
+                (set (nth page_total page_keys) (-> e key))
+                (set (nth page_total page_addrs) (-> e address))
+                (set page_total (+ page_total 1))))
+          (set e (-> e next))))
+      (pthread_mutex_unlock (aof (-> m page_list_access)))
+
+      (let ((int64_t page_n . 0))
+        (while (< page_n page_total)
+          (let ((const uint8_t * page_hashkey . #'(nth page_n page_keys))
+                (int64_t page_address . #'(nth page_n page_addrs))
+                (int64_t i . PAGEFILE_CONTROL_COUNT))
+            (while (< i (-> m hbpp))
+              (let ((int64_t hexmap_address . #'(+ (addr_hexmap page_address) i))
+                    (int64_t pointer_address . 0)
+                    (RowState online_state . ROW_NONE)
+                    (RowState offline_state . ROW_NONE)
+                    (RowLock online_lock . LOCK_NONE))
+                (set pointer_address (* hexmap_address CHUNK_SIZE))
+
+                ((-> (-> m hexmap_io) seekg) hexmap_address std::ios::beg)
+                ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                (set online_state (cast RowState (bitand hex_byte 12)))
+                (set online_lock (cast RowLock (bitand hex_byte 3)))
+                ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                (set offline_state (cast RowState (bitand hex_byte 12)))
+                ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 2) std::ios::cur)
+
+                (set i (+ i CONTROL_COUNT))
+                (let ((int64_t pointer_size . 0)
+                      (bool at_end . #f))
+                  (while (and (not at_end) (< i (-> m hbpp)))
+                    ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                    (set i (+ i 1))
+                    (if (and (!= hex_byte CONTROL_STANDALONE_CHUNK)
+                             (== (bitand hex_byte 64) 64))
+                        (block
+                          (set at_end #t)
+                          (if (and (!= hex_byte CONTROL_CHUNK)
+                                   (== (bitand hex_byte 128) 128))
+                              (block
+                                (set pointer_size (+ pointer_size (bitand hex_byte 31)))
+                                ;; settled: delete committed, nobody mid-flight
+                                (if (and (== offline_state ROW_DELETED)
+                                         (and (== online_state ROW_NONE)
+                                              (== online_lock LOCK_NONE)))
+                                    (let ((DeadList * d . #'(new* DeadList)))
+                                      (set (-> d ptr) (pointer_make page_hashkey pointer_address pointer_size))
+                                      (set (-> d next) head)
+                                      (set head d))))))
+                      (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
+            (set page_n (+ page_n 1)))))
+      (return head)))
+
+  (func truncate_key ((Memory * m) (const uint8_t * hash_key)) (out size_t)
+    (letin* ((streams (Streams m)))
+      ;; collected in full before anything is freed: free_pointer rewrites
+      ;; the hexmap and moves entries the walk stands on
+      (let ((DeadList * dead . #'(dead_pointers m hash_key))
+            (size_t rows . 0))
+        (while (!= dead nil)
+          (free_pointer m (aof (-> dead ptr)))
+          (set rows (+ rows 1))
+          (let ((DeadList * spent . dead))
+            (set dead (-> dead next))
+            (delete* spent)))
+        ((-> (-> m hexmap_io) flush))
+        ((-> (-> m data_io) flush))
+        (return rows))))
+
+  ;; ==================================================================
+  ;; Startup -- _initialize: load the page list, finish what interrupted
+  ;; transactions left, register the holes
+  ;; ==================================================================
+  (struct TxnSeen
+    (member size_t id)
+    (member time_t commit_time)
+    (member TxnSeen * next))
+
+  (struct InitCtx
+    (member Memory * m)
+    (member TxnSeen * seen)
+    (member DeadList * spent))
+
+  (func initialize_txn_cb ((void * c) (Pointer * p)) (out bool)
+    (let ((InitCtx * ctx . #'(cast (InitCtx *) c))
+          (size_t transaction_id . 0)
+          (time_t commit_time . 0))
+      (let ((Memory * m . #'(-> ctx m)))
+      ((-> (-> m data_io) seekg) (ptr_data p) std::ios::beg)
+      ((-> (-> m data_io) read_std_size) transaction_id)
+      ((-> (-> m data_io) read_std_time) commit_time)
+      (let ((TxnSeen * t . #'(new* TxnSeen)))
+        (set (-> t id) transaction_id)
+        (set (-> t commit_time) commit_time)
+        (set (-> t next) (-> ctx seen))
+        (set (-> ctx seen) t))
+      (return #t))))
+
+  (func initialize_spent_cb ((void * c) (Pointer * p)) (out bool)
+    (let ((InitCtx * ctx . #'(cast (InitCtx *) c))
+          (DeadList * d . #'(new* DeadList)))
+      (set (-> d ptr) (cof p))
+      (set (-> d next) (-> ctx spent))
+      (set (-> ctx spent) d)
+      (return #t)))
+
+  (func memory_initialize ((Memory * m)) (out void)
+    ;; every page's hash key into the page list
+    (let ((int64_t i . 0))
+      (while (< i (-> m page_count))
+        (let ((int64_t begin_address . #'(* i (-> m page_size)))
+              (uint8_t key [20]))
+          ((-> (-> m data_io) seekg) begin_address std::ios::beg)
+          ((-> (-> m data_io) read) (cast (char *) key) HASHKEY_SIZE)
+          (page_list_insert m key begin_address))
+        (set i (+ i 1))))
+
+    ;; the transactions that were mid-flight when the store closed
+    (let ((InitCtx ctx))
+      (set ($ ctx m) m)
+      (set ($ ctx seen) nil)
+      (set ($ ctx spent) nil)
+      (cursor_walk m TRANSACTIONS_HASHKEY nil (cast (void *) (aof ctx)) initialize_txn_cb)
+
+      ;; walk every page: finish uncommitted records the way their
+      ;; transaction's intention says; register every hole
+      (let ((PageEntry * e . #'(-> m pages)))
+        (while (!= e nil)
+          (let ((int64_t begin_address . #'(+ (-> e address) PAGEFILE_CONTROL_SIZE))
+                (int64_t end_address . #'(+ (-> e address) (-> m page_size)))
+                (bool is_data . #f)
+                (RowState online_state . ROW_NONE)
+                (RowLock online_lock . LOCK_NONE)
+                (Control control))
+            (control_clear (aof control))
+            (while (< begin_address end_address)
+              (let ((Pointer pointer . #'(pointer_at_state m (-> e key) begin_address
+                                            (aof is_data) (aof online_state) (aof online_lock))))
+                (if is_data
+                    (block
+                      (if (!= online_lock LOCK_NONE)
+                          (block
+                            (load_control m (aof pointer) (aof control))
+                            (let ((TxnSeen * t . #'($ ctx seen))
+                                  (bool resolved . #f))
+                              (while (and (!= t nil) (not resolved))
+                                (if (and (== (-> t id) ($ control transaction_id))
+                                         (> (-> t commit_time) (cast time_t 0)))
+                                    (block
+                                      (commit_pointer m (aof pointer) (-> t commit_time))
+                                      (set resolved #t)))
+                                (set t (-> t next)))
+                              (if (not resolved)
+                                  (rollback_pointer m (aof pointer))))))
+                      (set begin_address (+ begin_address (ptr_actual_size (aof pointer)))))
+                  ;; a free run is not a record: measure it from the hexmap
+                  (let ((int64_t run . #'(free_run_count m begin_address end_address)))
+                    (if (<= run 0)
+                        (set begin_address end_address)   ;; must advance
+                      (block
+                        (free_list_insert m (-> e key) begin_address (* run CHUNK_SIZE))
+                        ;; AND KEEP WALKING: free space is not always the tail
+                        (set begin_address (+ begin_address (* run CHUNK_SIZE))))))))))
+          (set e (-> e next))))
+
+      ;; the spent transaction records go back to the allocator
+      (if (!= ($ ctx seen) nil)
+          (block
+            (cursor_walk m TRANSACTIONS_HASHKEY nil (cast (void *) (aof ctx)) initialize_spent_cb)
+            (while (!= ($ ctx spent) nil)
+              (free_pointer m (aof (-> ($ ctx spent) ptr)))
+              (let ((DeadList * d . #'($ ctx spent)))
+                (set ($ ctx spent) (-> d next))
+                (delete* d)))))
+
+      (while (!= ($ ctx seen) nil)
+        (let ((TxnSeen * t . #'($ ctx seen)))
+          (set ($ ctx seen) (-> t next))
+          (delete* t))))
+
+    (set (-> m initialized) #t))
+
+  ;; the constructor's work -- Memory(hexmap, data, page_size)
+  (func memory_open ((Memory * m) (binarystream * hexmap_io) (binarystream * data_io)
+                     (int64_t page_size)) (out void)
+    (set (-> m hexmap_io) hexmap_io)
+    (set (-> m data_io) data_io)
+    (set (-> m page_size) page_size)
+    (set (-> m hbpp) (/ page_size CHUNK_SIZE))
+    (set (-> m page_count) 0)
+    (set (-> m initialized) #f)
+    (set (-> m pages) nil)
+    (set (-> m frees) nil)
+    (pthread_mutex_init (aof (-> m hexmap_access)) nil)
+    (pthread_mutex_init (aof (-> m data_access)) nil)
+    (pthread_mutex_init (aof (-> m page_list_access)) nil)
+    (pthread_mutex_init (aof (-> m free_list_access)) nil)
+
+    ((-> data_io seekg) 0 std::ios::end)
+    (set (-> m page_count) (/ ((-> data_io tellg)) page_size))
+    ((-> data_io clear))
+
+    (memory_initialize m)
+    (begin_transaction m))
+
+
+  ;; ==================================================================
+  ;; deftable -- Cicili metaprogramming where C++ used templates.
+  ;;
+  ;; The original instantiates Memory::online_insert<T> and friends per
+  ;; generated table, with per-class statics for the name and hash key.
+  ;; Here one macro expands the table definition into the struct (a real
+  ;; BaseTable subclass with pack/unpack/pack_size written out), a
+  ;; 20-byte hash key computed AT EXPANSION TIME in Lisp, and the typed
+  ;; insert/update/delete/cursor/truncate wrappers. What a template
+  ;; would have stamped out at instantiation, the macro stamps out at
+  ;; read time -- checkable, greppable, and no template in sight.
+  ;;
+  ;; Columns are int64_t. The real engine's nullable Type layer is out
+  ;; of scope here -- and the store cannot read a NULL back anyway, as
+  ;; doc/truncate.md records.
+  ;; ==================================================================
+  (DEFMACRO deftable (name sqlname &REST columns)
+    (LET* ((sname   (SYMBOL-NAME name))
+           (harr    (INTERN (CONCATENATE 'STRING sname "_HASHKEY")))
+           (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
+           (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_CursorCtx")))
+           (shim    (INTERN (CONCATENATE 'STRING sname "_cursor_shim")))
+           (icur    (INTERN (CONCATENATE 'STRING sname "_cursor")))
+           (iins    (INTERN (CONCATENATE 'STRING sname "_insert")))
+           (iupd    (INTERN (CONCATENATE 'STRING sname "_update")))
+           (idel    (INTERN (CONCATENATE 'STRING sname "_delete")))
+           (itrunc  (INTERN (CONCATENATE 'STRING sname "_truncate")))
+           ;; a 20-byte digest of the table's SQL name, derived in Lisp.
+           ;; DIVERGENCE: the real engine uses SHA-1; equality and
+           ;; stability are all the engine ever asks of it.
+           (bytes (LET ((h 2166136261) (out NIL))
+                    (LOOP FOR ch ACROSS sqlname
+                          DO (SETF h (LOGAND (* (LOGXOR h (CHAR-CODE ch)) 16777619)
+                                             #xFFFFFFFF)))
+                    (LOOP FOR i FROM 0 BELOW 20
+                          DO (SETF h (LOGAND (+ (* h 1103515245) (+ 12345 i))
+                                             #xFFFFFFFF))
+                             (PUSH (LOGAND (ASH h -16) #xFF) out))
+                    (NREVERSE out))))
+      `($$$
+        (struct ,name (inherits BaseTable)
+          ,@(LOOP FOR c IN columns COLLECT `(member int64_t ,c))
+          (override)
+          (method pack_size () (out int64_t)
+            (return ,(* 8 (LENGTH columns))))
+          (override)
+          (method pack ((binarystream & io)) (out void)
+            ,@(LOOP FOR c IN columns
+                    COLLECT `(($ io write_std_long) (cast int64_t ($ this ,c)))))
+          (override)
+          (method unpack ((binarystream & io)) (out void)
+            ,@(LOOP FOR c IN columns
+                    COLLECT `(($ io read_std_long) ($ this ,c)))))
+
+        ;; no dotted inits here: a macro-produced dotted var breaks the
+        ;; reader path, and namespace-scope C++ zero-initializes both anyway
+        (var uint8_t ,harr [20])
+        (var int ,hready)
+
+        (func ,kname () (out const uint8_t *)
+          (if (== ,hready 0)
+              (block
+                ,@(LOOP FOR b IN bytes FOR i FROM 0
+                        COLLECT `(set (nth ,i ,harr) ,b))
+                (set ,hready 1)))
+          (return (cast (uint8_t *) ,harr)))
+
+        (struct ,ctxname
+          (member Memory * m)
+          (member void * user)
+          (member func cb ((void * u) (,name * r)) (out bool)))
+
+        (func ,shim ((void * c) (Pointer * p)) (out bool)
+          (let ((,ctxname * cc . #'(cast (,ctxname *) c)))
+            (let ((,name row))
+              (set ($ row pointer) (cof p))
+              (read_row (-> cc m) (cast (BaseTable *) (aof row)))
+              (return ((-> cc cb) (-> cc user) (aof row))))))
+
+        (func ,icur ((Memory * m) (void * user)
+                     (func cb ((void * u) (,name * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (letin* ((streams (Streams m)))
+              (cursor_walk m (,kname) (aof streams) (cast (void *) (aof cc)) ,shim)
+              (cast void 0))))
+
+        (func ,iins ((Memory * m) (,name * row)) (out void)
+          (online_insert m (,kname) (cast (BaseTable *) row)))
+
+        (func ,iupd ((Memory * m) (,name * old_row) (,name * new_row)) (out void)
+          (online_update m (,kname) (cast (BaseTable *) old_row) (cast (BaseTable *) new_row)))
+
+        (func ,idel ((Memory * m) (,name * row)) (out void)
+          (online_delete m (cast (BaseTable *) row)))
+
+        (func ,itrunc ((Memory * m)) (out size_t)
+          (return (truncate_key m (,kname)))))))
+
+  ;; ==================================================================
+  ;; The smoke tests. A Book table, one store, the ACID walk-through,
+  ;; a restart, and a two-session race.
+  ;; ==================================================================
+  (deftable Book "smoke::Book" id value)
+
+  (var int failures . 0)
+
+  (func check ((const char * what) (int64_t got) (int64_t want)) (out void)
+    (if (== got want)
+        (printf "ok   %-42s %ld\n" what (cast long got))
+      (block
+        (printf "FAIL %-42s got %ld want %ld\n" what (cast long got) (cast long want))
+        (set failures (+ failures 1)))))
+
+  ;; count and sum through the typed cursor
+  (struct CountCtx
+    (member int64_t rows)
+    (member int64_t value_sum))
+
+  (func count_cb ((void * u) (Book * r)) (out bool)
+    (let ((CountCtx * c . #'(cast (CountCtx *) u)))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (set (-> c value_sum) (+ (-> c value_sum) ($ (cof r) value)))
+      (return #t)))
+
+  (func book_count ((Memory * m) (int64_t * value_sum)) (out int64_t)
+    (let ((CountCtx c))
+      (set ($ c rows) 0)
+      (set ($ c value_sum) 0)
+      (Book_cursor m (cast (void *) (aof c)) count_cb)
+      (if (!= value_sum nil) (set (cof value_sum) ($ c value_sum)))
+      (return ($ c rows))))
+
+  ;; find one row by id
+  (struct FindCtx
+    (member int64_t id)
+    (member Book row)
+    (member bool found))
+
+  (func find_cb ((void * u) (Book * r)) (out bool)
+    (let ((FindCtx * c . #'(cast (FindCtx *) u)))
+      (if (== ($ (cof r) id) (-> c id))
+          (block
+            (set (-> c row) (cof r))
+            (set (-> c found) #t)
+            (return #f)))
+      (return #t)))
+
+  (func book_find ((Memory * m) (int64_t id) (Book * out_row)) (out bool)
+    (let ((FindCtx c))
+      (set ($ c id) id)
+      (set ($ c found) #f)
+      (Book_cursor m (cast (void *) (aof c)) find_cb)
+      (if ($ c found) (set (cof out_row) ($ c row)))
+      (return ($ c found))))
+
+  ;; a session that updates one row and commits, for the SNAPSHOT test
+  (func update_worker ((void * arg)) (out void *)
+    (let ((Memory * m . #'(cast (Memory *) arg)))
+      (begin_transaction m)
+      (let ((Book old_row) (Book new_row))
+        (if (book_find m 100 (aof old_row))
+            (block
+              (set new_row old_row)
+              (set ($ new_row value) 500)
+              (Book_update m (aof old_row) (aof new_row)))))
+      (commit_transaction m))
+    (return nil))
+
+  ;; one concurrent session: its own transaction, ten inserts, commit
+  (func session_worker ((void * arg)) (out void *)
+    (let ((Memory * m . #'(cast (Memory *) arg)))
+      (begin_transaction m)
+      (let ((int64_t i . 0))
+        (while (< i 10)
+          (let ((Book b))
+            (set ($ b id) (+ 100 i))
+            (set ($ b value) 1)
+            (Book_insert m (aof b)))
+          (set i (+ i 1))))
+      (commit_transaction m))
+    (return nil))
+
+  (main
+    ;; a fresh pair of store files
+    (remove "/tmp/mvccs-cicili-hexmap.bin")
+    (remove "/tmp/mvccs-cicili-data.bin")
+    ;; in|out|trunc creates the pair fresh
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-cicili-hexmap.bin")
+                                 (bitor std::ios::in (bitor std::ios::out std::ios::trunc))))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-cicili-data.bin")
+                               (bitor std::ios::in (bitor std::ios::out std::ios::trunc)))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+
+        ;; ---- insert three, commit, read back --------------------------
+        (let ((int64_t i . 1))
+          (while (<= i 3)
+            (let ((Book b))
+              (set ($ b id) i)
+              (set ($ b value) (* i 10))
+              (Book_insert (aof mem) (aof b)))
+            (set i (+ i 1))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (let ((int64_t sum . 0))
+          (check "three rows committed" (book_count (aof mem) (aof sum)) 3)
+          (check "their values landed" sum 60))
+
+        ;; ---- update one, commit; the new version is the one shown -----
+        (let ((Book old_row) (Book new_row))
+          (if (book_find (aof mem) 2 (aof old_row))
+              (block
+                (set new_row old_row)
+                (set ($ new_row value) 42)
+                (Book_update (aof mem) (aof old_row) (aof new_row)))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (let ((int64_t sum . 0))
+          (check "update kept the row count" (book_count (aof mem) (aof sum)) 3)
+          (check "the new version shows" sum 82))
+
+        ;; ---- a rolled back delete never happened ----------------------
+        (let ((Book doomed))
+          (if (book_find (aof mem) 3 (aof doomed))
+              (Book_delete (aof mem) (aof doomed))))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "rollback undid the delete" (book_count (aof mem) nil) 3)
+
+        ;; ---- the same delete, committed, is real ----------------------
+        (let ((Book doomed))
+          (if (book_find (aof mem) 3 (aof doomed))
+              (Book_delete (aof mem) (aof doomed))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "committed delete holds" (book_count (aof mem) nil) 2)
+
+        ;; ---- TRUNCATE reclaims exactly the settled dead ---------------
+        (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 1)
+        (check "truncate spares the living" (book_count (aof mem) nil) 2)
+
+        ;; ---- an allocation past a page is refused ---------------------
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((Pointer p . #'(allocate (aof mem) (Book_key) 9000)))
+                   (cast void p)))
+               (catch ((const MemoryException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "allocation overflow refused" refused 1))
+
+        ;; ---- two sessions race their inserts --------------------------
+        (let ((pthread_t t1) (pthread_t t2))
+          (pthread_create (aof t1) nil session_worker (cast (void *) (aof mem)))
+          (pthread_create (aof t2) nil session_worker (cast (void *) (aof mem)))
+          (pthread_join t1 nil)
+          (pthread_join t2 nil))
+        (check "two sessions landed their rows" (book_count (aof mem) nil) 22)
+
+        ;; ---- REPEATABLE READ takes and releases its shared locks ------
+        (set_isolation_level tl_txn REPEATABLE_READ)
+        (check "repeatable read sees the same store" (book_count (aof mem) nil) 22)
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the locks went back" (book_count (aof mem) nil) 22)
+
+        ;; ---- SERIALIZABLE gate admits and releases --------------------
+        (set_isolation_level tl_txn SERIALIZABLE)
+        (check "serializable admits one" (book_count (aof mem) nil) 22)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        ;; ---- SNAPSHOT: a read anchored before a concurrent commit ------
+        ;; Main anchors its snapshot, another session updates a row and
+        ;; commits, and main still reads the store as it was.
+        (set_isolation_level tl_txn SNAPSHOT)
+        (let ((pthread_t tu))
+          (pthread_create (aof tu) nil update_worker (cast (void *) (aof mem)))
+          (pthread_join tu nil))
+        (let ((int64_t sum . 0)
+              (int64_t rows . 0))
+          (set rows (book_count (aof mem) (aof sum)))
+          (check "snapshot holds its point in time (rows)" rows 22)
+          (check "snapshot holds its point in time (sum)" sum 72))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((int64_t sum . 0))
+          (check "a fresh read sees the update" (book_count (aof mem) (aof sum)) 22)
+          (check "the updated value" sum 571))
+
+        (sync_disk (aof mem))
+        (cast void 0)))
+
+    ;; ---- a fresh Memory over the same files: recovery ---------------
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-cicili-hexmap.bin")
+                                 (bitor std::ios::in std::ios::out)))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-cicili-data.bin")
+                               (bitor std::ios::in std::ios::out))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+        (check "the store survives a restart" (book_count (aof mem) nil) 22)
+        (cast void 0)))
+
+    (if (== failures 0)
+        (printf "\nmvccs-cicili: all green\n")
+      (printf "\nmvccs-cicili: %d FAILED\n" failures))
+    (return failures)))
+

@@ -1,0 +1,5 @@
+mvccs.cpp
+mvccs_test
+*.o
+*.lo
+.libs/
