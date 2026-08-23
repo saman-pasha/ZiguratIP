@@ -16,6 +16,25 @@ namespace Zigurat
     using std::basic_iostream<char>::read;
     using std::basic_iostream<char>::write;
     using std::basic_iostream<char>::getline;
+
+    // A SEEK STATES THE INTENT TO REPOSITION, so a stale failure must not
+    // veto it. A read at end-of-file sets eofbit|failbit, and std::seekg
+    // refuses while failbit stands -- after which every write down the
+    // same stream is a silent no-op. That is how a store lost the hexmap
+    // bytes of a freshly allocated page while its data page was written:
+    // an unguarded read had touched end-of-file pages earlier, and the
+    // allocation's hexmap extension never reached the file. Clearing here
+    // covers every caller of both engines at one seam; a site that wants
+    // to see a read failure checks good() before it seeks, which is what
+    // the guarded readers already do.
+    std::basic_istream<char>& seekg(std::streampos pos)
+    { this->clear(); return std::basic_iostream<char>::seekg(pos); }
+    std::basic_istream<char>& seekg(std::streamoff off, std::ios_base::seekdir dir)
+    { this->clear(); return std::basic_iostream<char>::seekg(off, dir); }
+    std::basic_ostream<char>& seekp(std::streampos pos)
+    { this->clear(); return std::basic_iostream<char>::seekp(pos); }
+    std::basic_ostream<char>& seekp(std::streamoff off, std::ios_base::seekdir dir)
+    { this->clear(); return std::basic_iostream<char>::seekp(off, dir); }
     
     virtual std::streamsize length();
     virtual char_type at(std::streampos);
