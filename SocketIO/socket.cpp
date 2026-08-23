@@ -77,6 +77,26 @@ namespace Zigurat
     return Socket::set_option(handle, SOL_SOCKET, SO_REUSEADDR, (const char*)&value, sizeof(value));
   }
 
+  // NAGLE OFF, and it is a correctness-of-latency fix rather than a tuning
+  // knob. Both protocols this server speaks are conversations of small
+  // messages -- read a request, write a reply, wait for the next -- which is
+  // precisely the pattern Nagle's algorithm coalesces and the peer's delayed
+  // ACK then stalls. Neither side is at fault alone: Nagle holds a small write
+  // until the previous one is acknowledged, delayed ACK holds the
+  // acknowledgement for up to 40ms hoping to piggyback it on a reply, and the
+  // reply is the write being held. Nothing is wrong, nothing times out, and
+  // every exchange costs 40ms.
+  //
+  // What that cost here: one turn of a cocolog worker is a few dozen
+  // exchanges, so twelve of them took a minute to do a second's work, and the
+  // test that runs twelve at once failed on a timeout with no error anywhere
+  // to say why. See doc/concurrency.md.
+  int Socket::set_nodelay(Socket::handle_t handle, bool nodelay)
+  {
+    const int value = (nodelay) ? 1 : 0;
+    return Socket::set_option(handle, IPPROTO_TCP, TCP_NODELAY, (const char*)&value, sizeof(value));
+  }
+
   // The timeout is in seconds, matching /SERVER/TIMEOUT and /HTTP/TIMEOUT in
   // the configuration file. Zero leaves the socket waiting indefinitely.
   int Socket::set_timeout(Socket::handle_t handle, int timeout)

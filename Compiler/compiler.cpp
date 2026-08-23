@@ -121,6 +121,13 @@ namespace Zigurat
     return std::vector<std::string>(reached.begin(), reached.end());
   }
 
+  void Compiler::_cicili_file(const std::string& name, const std::string& content)
+  {
+    std::ofstream cicili_file(this->_ld_path + name + ".cicili", std::ios::trunc);
+    cicili_file << content;
+    cicili_file.flush();
+  }
+
   void Compiler::_build(std::string name, std::list<std::string>& requires,
 			std::stringstream& head, std::stringstream& impl, std::stringstream& conf, const Expression& expr,
 			const std::string& type_name, bool named)

@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -98,6 +99,7 @@ namespace Zigurat
     static bool input_available(handle_t);
     static int  set_timeout(handle_t, int);
     static int  set_reusable(handle_t, bool);
+    static int  set_nodelay(handle_t, bool);
     static int  set_blocking_mode(handle_t, bool);
 
     enum Error {

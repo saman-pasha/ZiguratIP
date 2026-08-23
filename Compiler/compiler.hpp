@@ -90,6 +90,12 @@ namespace Zigurat
 		std::stringstream&, std::stringstream&, std::stringstream&, const Expression&,
 		const std::string&, bool);
 
+    // Beside the generated header goes a .cicili of the same name: ONE file
+    // playing header and source both, defining the object through the def...
+    // macros of the Cicili MVCCS. The C++ pair stays what the server compiles
+    // and loads; this is the same object for a Cicili target to import.
+    void _cicili_file(const std::string&, const std::string&);
+
     // The named objects a unit reaches without passing through another named
     // one. A table, a sequence and a procedure are named, so theirs is just
     // themselves. A page, a class, a type and an enum are not -- nobody can be
