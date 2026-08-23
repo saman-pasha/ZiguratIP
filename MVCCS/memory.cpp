@@ -1465,6 +1465,15 @@ namespace Zigurat
 
     Control control;
     this->_load_control(pointer, control);
+
+    // ONLY A STAGE THIS TRANSACTION STILL OWNS IS ITS TO FLIP. A writer that
+    // does not conflict with a shared stamp can stage over it, and the
+    // displaced transaction's commit arriving later would flip the
+    // DISPLACER'S uncommitted work with its own timestamp. Startup recovery
+    // stands outside the rule: it executes crashed transactions' recorded
+    // intentions, so foreign ids are exactly its job.
+    if (this->_initialized && control.transaction_id != Memory::transaction.id)
+      return;
   
     switch (control.online_state) {
     case RowState::NONE:
@@ -1501,6 +1510,12 @@ namespace Zigurat
 
     Control control;
     this->_load_control(pointer, control);
+
+    // The same ownership rule as _commit_pointer -- a partial rollback
+    // 'restoring' a row whose stage now belongs to another transaction
+    // erased that transaction's staged delete and resurrected the row.
+    if (this->_initialized && control.transaction_id != Memory::transaction.id)
+      return;
 
     switch (control.online_state) {
     case RowState::NONE:

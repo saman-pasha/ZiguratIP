@@ -1111,6 +1111,19 @@
       (control_clear (aof control))
       (load_control m p (aof control))
 
+      ;; ONLY A STAGE THIS TRANSACTION STILL OWNS IS ITS TO FLIP. A writer
+      ;; that does not conflict with a shared stamp can stage over it, and
+      ;; the displaced transaction's commit arriving later would then flip
+      ;; the DISPLACER'S uncommitted work with its own timestamp. The row
+      ;; carries its stager's id; a mismatch means this transaction was
+      ;; displaced here, and the row is no longer its business. Startup
+      ;; recovery stands outside the rule: it executes CRASHED transactions'
+      ;; recorded intentions, so foreign ids are exactly its job.
+      (if (and (-> m initialized)
+               (and (!= tl_txn nil)
+                    (!= ($ control transaction_id) (-> tl_txn id))))
+          (return))
+
       (cond
         ((== ($ control online_state) ROW_INSERTED)
          (block (set ($ control offline_state) ROW_INSERTED)
@@ -1135,6 +1148,19 @@
     (let ((Control control))
       (control_clear (aof control))
       (load_control m p (aof control))
+
+      ;; the same ownership rule as commit_pointer, and it is what a claim
+      ;; retry's partial rollback was violating: it 'restored' a row whose
+      ;; stage now belonged to a SAVE that had staged a delete over the
+      ;; claim's shared stamp -- the restore erased the staged delete, the
+      ;; save's commit then found nothing of its own to flip, and the row
+      ;; came back from the dead as a TWIN the twelve workers bounced their
+      ;; saves between forever. Startup recovery stands outside the rule,
+      ;; exactly as at commit_pointer.
+      (if (and (-> m initialized)
+               (and (!= tl_txn nil)
+                    (!= ($ control transaction_id) (-> tl_txn id))))
+          (return))
 
       (set ($ control online_state) ROW_NONE)
       (set ($ control online_lock) LOCK_NONE)
