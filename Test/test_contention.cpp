@@ -1086,12 +1086,16 @@ ZTEST(Contention, a_dead_transactions_lock_breaks_on_contact)
   store.memory->online_insert(seed);
   store.memory->commit_transaction();
 
-  // The abandonment, exactly as a pooled connection does it: stage an update
-  // -- the row is now EXCLUSIVE-locked on disk -- then begin a fresh
-  // transaction on the same thread with the staged work neither committed nor
-  // rolled back. The new commit must NOT adopt the orphan (the ownership
-  // guard skips a stage whose id is not its own), so the lock stays behind as
-  // debris whose owner the registry no longer knows.
+  // The abandonment: stage an update -- the row is now EXCLUSIVE-locked on
+  // disk -- and then have the registry lose the owner, exactly as it does
+  // when the owning thread or process dies without commit or rollback (a
+  // nested begin is NOT that: it continues the open transaction). The thread
+  // then parks, holding its stage on disk, so the debris is real while the
+  // second writer meets it; releasing it afterwards runs the best-effort
+  // rollback a dying thread would run, which the ownership guard makes
+  // harmless against the already-broken row.
+  std::atomic<bool> staged(false);
+  std::atomic<bool> release(false);
   std::thread abandoner([&] () {
       try {
 	session(store.memory);
@@ -1100,13 +1104,17 @@ ZTEST(Contention, a_dead_transactions_lock_breaks_on_contact)
 	Account doomed(1, "doomed", 11);
 	store.memory->online_update(current, doomed);
 
-	store.memory->begin_transaction();
-	store.memory->commit_transaction();
+	Memory::transaction_retire(Memory::transaction.id);
+	staged = true;
+	while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	store.memory->rollback_transaction();
       } catch (ZiguratException& e) {
 	trouble.note("abandoner: " + e.message());
+	staged = true;
       }
     });
-  abandoner.join();
+  for (int waited = 0; waited < 5000 && !staged.load(); waited += 5)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
   // A second writer meets the debris. On the old code this is ten seconds of
   // waiting on a corpse and a `lock wait timeout'; with the breaker the stale
@@ -1133,6 +1141,8 @@ ZTEST(Contention, a_dead_transactions_lock_breaks_on_contact)
       }
     });
   writer.join();
+  release = true;
+  abandoner.join();
 
   Memory::lock_wait_timeout_ms = original;
 

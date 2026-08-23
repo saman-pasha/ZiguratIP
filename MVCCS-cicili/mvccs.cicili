@@ -236,11 +236,17 @@
       (commit_transaction m))
     (return nil))
 
-  ;; stages an update on row 300 and ABANDONS it, exactly as a pooled
-  ;; connection does: a fresh begin with the staged work neither
-  ;; committed nor rolled back, then the thread ends. The ownership
-  ;; guard keeps the new commit from adopting the orphan, so the row's
-  ;; EXCLUSIVE lock stays behind on disk as debris.
+  ;; stages an update on row 300 and is ABANDONED: the registry loses
+  ;; the owner, exactly as it does when the owning thread or process
+  ;; dies without commit or rollback (a nested begin is NOT that -- it
+  ;; continues the open transaction). The thread then parks holding its
+  ;; stage on disk, so the row's EXCLUSIVE lock is real debris while
+  ;; the second writer meets it, and ends without any cleanup at all,
+  ;; as a dying thread here would.
+  (var pthread_mutex_t abandon_gate . PTHREAD_MUTEX_INITIALIZER)
+  (var int abandon_staged . 0)
+  (var int abandon_release . 0)
+
   (func abandon_worker ((void * arg)) (out void *)
     (let ((Memory * m . #'(cast (Memory *) arg)))
       (begin_transaction m)
@@ -250,9 +256,17 @@
               (set new_row old_row)
               (set ($ new_row value) 701)
               (Book_update m (aof old_row) (aof new_row)))))
-      ;; the abandonment
-      (begin_transaction m)
-      (commit_transaction m))
+      ;; the abandonment: the registry no longer knows the owner
+      (transaction_retire (-> tl_txn id))
+      (pthread_mutex_lock (aof abandon_gate))
+      (set abandon_staged 1)
+      (pthread_mutex_unlock (aof abandon_gate))
+      (let ((int held . 1))
+        (while (== held 1)
+          (pthread_mutex_lock (aof abandon_gate))
+          (if (== abandon_release 1) (set held 0))
+          (pthread_mutex_unlock (aof abandon_gate))
+          (usleep 5000))))
     (return nil))
 
   ;; one concurrent session: its own transaction, ten inserts, commit
@@ -665,20 +679,29 @@
         (begin_transaction (aof mem))
         (let ((pthread_t ta))
           (pthread_create (aof ta) nil abandon_worker (cast (void *) (aof mem)))
+          (let ((int ready . 0))
+            (while (== ready 0)
+              (pthread_mutex_lock (aof abandon_gate))
+              (if (== abandon_staged 1) (set ready 1))
+              (pthread_mutex_unlock (aof abandon_gate))
+              (usleep 5000)))
+          (let ((int64_t t0 . #'(mvccs_wall_micros)))
+            (let ((Book old_row) (Book new_row))
+              (check "the debris hides nothing committed"
+                     (? (book_find (aof mem) 300 (aof old_row)) 1 0) 1)
+              (check "and the committed version is what reads"
+                     ($ old_row value) 700)
+              (set new_row old_row)
+              (set ($ new_row value) 702)
+              (Book_update (aof mem) (aof old_row) (aof new_row)))
+            (commit_transaction (aof mem))
+            (begin_transaction (aof mem))
+            (check "the stale lock broke on contact, not by timeout"
+                   (? (< (- (mvccs_wall_micros) t0) 1000000) 1 0) 1))
+          (pthread_mutex_lock (aof abandon_gate))
+          (set abandon_release 1)
+          (pthread_mutex_unlock (aof abandon_gate))
           (pthread_join ta nil))
-        (let ((int64_t t0 . #'(mvccs_wall_micros)))
-          (let ((Book old_row) (Book new_row))
-            (check "the debris hides nothing committed"
-                   (? (book_find (aof mem) 300 (aof old_row)) 1 0) 1)
-            (check "and the committed version is what reads"
-                   ($ old_row value) 700)
-            (set new_row old_row)
-            (set ($ new_row value) 702)
-            (Book_update (aof mem) (aof old_row) (aof new_row)))
-          (commit_transaction (aof mem))
-          (begin_transaction (aof mem))
-          (check "the stale lock broke on contact, not by timeout"
-                 (? (< (- (mvccs_wall_micros) t0) 1000000) 1 0) 1))
         (check "the abandoned stage never landed" (book_equal_count (aof mem) 701) 0)
         (check "the second writer's update did" (book_equal_count (aof mem) 702) 1)
         ;; and the row leaves, so every later count stands

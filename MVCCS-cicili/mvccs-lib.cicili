@@ -295,13 +295,15 @@
   ;; ---- the live-transaction registry ------------------------------
   ;; Which transaction ids are between begin and commit-or-rollback
   ;; right now, process-wide. A lock whose owner is not in here belongs
-  ;; to a transaction nothing will ever finish -- a crashed client, an
-  ;; abandoned pool slot -- and check_lock breaks it in place instead
-  ;; of waiting on a corpse until a restart's recovery would have swept
-  ;; it. One slot per thread: begin_transaction registers the fresh id
-  ;; and retires the thread's previous one, so a transaction ABANDONED
-  ;; by its thread (a new begin with no commit or rollback between)
-  ;; drops out at that moment and its locks become breakable debris.
+  ;; to a transaction nothing will ever finish, and check_lock breaks
+  ;; it in place instead of waiting on a corpse until a restart's
+  ;; recovery would have swept it. What makes an id dead: commit and
+  ;; rollback retire it after every lock is cleared, and a process that
+  ;; dies takes its registry with it, so after the restart's recovery
+  ;; anything it left stamped reads as breakable. A begin on a thread
+  ;; whose transaction is still open CONTINUES it -- the id and its
+  ;; registration stand, see begin_transaction -- so an open
+  ;; transaction is never orphaned by beginning again.
   ;; 512 slots holds one live transaction per thread plus every slot a
   ;; thread abandoned and has not yet re-begun over -- far above any
   ;; real thread count here. A full table would leave a live id
@@ -1269,23 +1271,31 @@
           (set (-> tl_txn isolation_level) READ_COMMITTED)
           (set (-> tl_txn ctx_head) nil)
           (set (-> tl_txn ctx_tail) nil)))
-    ;; A FRESH ID PER BEGIN, unique within the process: generate_id
-    ;; hashes the thread and the wall second, so two begins in one
-    ;; second on one thread collided -- and "is the transaction that
-    ;; stamped this lock still running" needs an id to name exactly one
-    ;; begin..commit-or-rollback span. The serial makes every begin
-    ;; distinct; the hashed base keeps ids from different runs from
-    ;; colliding in a store that outlives them.
-    (block
-      (pthread_mutex_lock (aof live_txn_access))
-      (if (== txn_id_base (cast size_t 0))
-          (set txn_id_base (Utility::generate_id)))
-      (set txn_id_serial (+ txn_id_serial 1))
-      (set (-> tl_txn id) (+ txn_id_base txn_id_serial))
-      (if (== (-> tl_txn id) (cast size_t 0))
-          (set (-> tl_txn id) txn_id_serial))
-      (pthread_mutex_unlock (aof live_txn_access)))
-    (transaction_register (-> tl_txn id))
+    ;; A FRESH ID PER FRESH BEGIN, not per begin: a begin on a thread
+    ;; whose transaction is STILL OPEN continues that transaction -- the
+    ;; server begins once per request while a turn's transaction spans
+    ;; many -- so the id and its registration stand there; commit and
+    ;; rollback null the record pointer, which is the test. Handing such
+    ;; a begin a fresh id orphaned every stage the turn had already made
+    ;; (the commit's ownership guard skipped them all). Before this the
+    ;; id came from generate_id, hashed from the thread and the wall
+    ;; second: two FRESH begins in one second collided, and a nested
+    ;; begin kept its id only by that same second-resolution accident.
+    ;; The serial makes every fresh begin distinct; the hashed base
+    ;; keeps ids from different runs from colliding in a store that
+    ;; outlives them.
+    (if (== ($ (-> tl_txn pointer) hash_key) nil)
+        (block
+          (block
+            (pthread_mutex_lock (aof live_txn_access))
+            (if (== txn_id_base (cast size_t 0))
+                (set txn_id_base (Utility::generate_id)))
+            (set txn_id_serial (+ txn_id_serial 1))
+            (set (-> tl_txn id) (+ txn_id_base txn_id_serial))
+            (if (== (-> tl_txn id) (cast size_t 0))
+                (set (-> tl_txn id) txn_id_serial))
+            (pthread_mutex_unlock (aof live_txn_access)))
+          (transaction_register (-> tl_txn id))))
     (transaction_reset tl_txn)
     (dba_watch0 m "Begin Transaction")
 

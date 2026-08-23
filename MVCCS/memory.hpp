@@ -72,14 +72,17 @@ namespace Zigurat
     //
     // Which transaction ids are between begin and commit-or-rollback right
     // now, process-wide. A lock whose owner is not in here belongs to a
-    // transaction nothing will ever finish -- a crashed client, an abandoned
-    // pool slot -- and _check_lock breaks it in place instead of waiting on a
-    // corpse until a restart's recovery would have swept it.
+    // transaction nothing will ever finish, and _check_lock breaks it in
+    // place instead of waiting on a corpse until a restart's recovery would
+    // have swept it.
     //
-    // One slot per thread: begin_transaction registers the fresh id and
-    // retires the thread's previous one, so a transaction ABANDONED by its
-    // thread (a new begin with no commit or rollback between) drops out of
-    // the registry at that moment and its locks become breakable debris.
+    // What makes an id dead: commit and rollback retire it after every lock
+    // is cleared; a thread that dies retires it in ~Transaction after the
+    // best-effort rollback; and a process that dies takes its registry with
+    // it, so after the restart's recovery anything it left stamped reads as
+    // breakable. A begin on a thread whose transaction is still open
+    // CONTINUES it -- id and registration stand, see begin_transaction --
+    // so an open transaction is never orphaned by beginning again.
     static bool transaction_live(size_t transaction_id);
     static void transaction_retire(size_t transaction_id);
     

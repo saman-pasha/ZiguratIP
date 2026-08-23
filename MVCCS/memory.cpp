@@ -1630,15 +1630,25 @@ namespace Zigurat
     if (beginning) return;
     ReentryGuard guard(beginning);
 
-    // A FRESH ID PER BEGIN, not per thread. The constructor's per-thread id
-    // meant every transaction a pooled connection ever ran shared one id, so
-    // "is the transaction that stamped this lock still running" had no
-    // answer -- the id outlived every one of them. Now an id names exactly
-    // one begin..commit-or-rollback span, which is what the live registry
-    // and the stale-lock breaker in _check_lock key on. The serial makes two
-    // begins distinct even within one clock second; the hashed base keeps
-    // ids from different runs from colliding in a store that outlives them.
-    {
+    // A FRESH ID PER FRESH BEGIN, not per thread and not per begin. The
+    // constructor's per-thread id meant every transaction a pooled
+    // connection ever ran shared one id, so "is the transaction that
+    // stamped this lock still running" had no answer -- the id outlived
+    // every one of them. But a begin on a thread whose transaction is
+    // STILL OPEN continues that transaction: the server begins once per
+    // request while a turn's transaction spans many, and per-thread ids
+    // made that harmless -- one commit flipped the whole merged context.
+    // Handing such a begin a fresh id orphaned every stage the turn had
+    // already made (the commit's ownership guard skipped them all), and
+    // a fresh store grew ghost machine rows and torn index chains within
+    // a handful of runs. So the id changes only when no transaction is
+    // open -- commit and rollback null the record pointer, which is the
+    // test -- and an id then names exactly one transaction, which is what
+    // the live registry and the stale-lock breaker in _check_lock key on.
+    // The serial makes two begins distinct even within one clock second;
+    // the hashed base keeps ids from different runs from colliding in a
+    // store that outlives them.
+    if (Memory::transaction.pointer.hash_key == nullptr) {
       static const size_t id_base = Utility::generate_id();
       static std::atomic<size_t> id_serial{0};
       Memory::transaction.id = id_base + (++id_serial);
