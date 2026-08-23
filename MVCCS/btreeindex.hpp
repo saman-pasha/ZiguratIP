@@ -899,7 +899,12 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_free_key_values(BTreeKey<_First>& key)
   {
+    // A NULL address in a value chain is a link that never finished landing --
+    // a stage abandoned mid-write, reachable once the lazy lock breaker
+    // settles such debris. Nothing lies beyond it: it ends the chain exactly
+    // as -1 does, rather than refusing the whole walk with `NULL value'.
     Long tmp_address = key.values_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
     while (tmp_address.value() > -1) {
 
@@ -910,6 +915,7 @@ namespace Zigurat
       this->_memory->_data_io >> value;
 
       tmp_address = value.next_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       this->_memory->_free(pointer);
     }
@@ -927,7 +933,12 @@ namespace Zigurat
   {
     bool has_previous = false;
     BTreeValue previous;
+    // The same NULL-ends-the-chain rule as _free_key_values, and it was
+    // measured here first: one torn link in a machines-state chain made every
+    // `cocolog vacuum' refuse with `NULL value' until the store was thrown
+    // away, because the one walk that visits EVERY entry is this one.
     Long tmp_address = key.values_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
     while (tmp_address.value() > -1) {
 
@@ -939,6 +950,7 @@ namespace Zigurat
       value.pointer = pointer;
 
       tmp_address = value.next_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       Control control;
       this->_memory->_load_control(pointer, control);

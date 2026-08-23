@@ -38,6 +38,12 @@ cannot be read back at all** — the engine refuses the row with `NULL value`. S
 table with a nullable column that anything ever left NULL can never be reclaimed,
 and the call fails outright rather than skipping the row.
 
+One shape of NULL is exempt: a **link address in an index value chain** that
+never finished landing — a stage cut off mid-write, settled later as debris.
+Nothing lies beyond a link that never landed, so the walk treats it as the end
+of the chain rather than refusing the pass; one torn link used to make every
+truncate of that table fail forever, with a fresh store the only cure.
+
 Two things make this easy to walk into. An **empty String is stored as NULL**, so
 writing `""` into a nullable column is enough. And nothing else notices: an
 ordinary `SELECT` naming other columns reads fine, so a table can look healthy
