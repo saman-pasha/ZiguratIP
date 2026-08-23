@@ -36,6 +36,13 @@ namespace Zigurat
   const uint8_t Memory::CONTROL_CHUNK            = 176; // 128,0,32,16
   const uint8_t Memory::CONTROL_STANDALONE_CHUNK = 240; // 128,64,32,16
 
+  static inline int64_t _size_remainder(uint8_t hex_byte)
+  {
+    int64_t r = (int64_t)(hex_byte & (uint8_t)31);
+    if ( (hex_byte & (uint8_t)128) == 128 && r == 0 ) return Memory::CHUNK_SIZE;
+    return r;
+  }
+
   // SHA1 Checksums
   hashkey_t Memory::FREE_HASHKEY         = {0xb4, 0xf4, 0x92, 0xe0, 0x09, 0x18, 0xd5, 0xa0, 0x2f, 0x11, 
 					    0xfa, 0xb6, 0x07, 0x43, 0xb3, 0x88, 0x18, 0xfb, 0x14, 0x98}; // __FREE__
@@ -644,9 +651,10 @@ namespace Zigurat
 
     this->_free_hexmap(begin, full_count);
 
-    if (this->_page_size == full_count * CHUNK_SIZE) {
+    if (full_count * CHUNK_SIZE == this->_page_size - PAGEFILE_CONTROL_SIZE) {
 
-      this->_allocate_page(FREE_HASHKEY, begin * CHUNK_SIZE);
+      int64_t page_address = begin * CHUNK_SIZE - PAGEFILE_CONTROL_SIZE;
+      this->_allocate_page(FREE_HASHKEY, page_address);
 
       // REKEYED IN THE LIST, NOT LISTED TWICE. The page is __FREE__ on disk
       // now, and _allocate_new_page finds returnable pages by looking the
@@ -662,7 +670,7 @@ namespace Zigurat
       // guessing which one this was.
       auto page_iter = this->_page_list.equal_range(pointer.hash_key);
       for (auto iter = page_iter.first; iter != page_iter.second; iter++) {
-	if (iter->second == begin * CHUNK_SIZE) {
+	if (iter->second == page_address) {
 	  this->_page_list.erase(iter);
 	  break;
 	}
@@ -670,7 +678,7 @@ namespace Zigurat
 
       auto free_key = new hashkey_t;
       std::memcpy(free_key, FREE_HASHKEY, HASHKEY_SIZE);
-      this->_page_list.insert({free_key, begin * CHUNK_SIZE});
+      this->_page_list.insert({free_key, page_address});
 
     } else {
       
@@ -731,7 +739,7 @@ namespace Zigurat
 	  if ( hex_byte != CONTROL_STANDALONE_CHUNK && (hex_byte & (uint8_t)64) == 64 ) { // last chunk is standalone
 	    if ( hex_byte != CONTROL_CHUNK && (hex_byte & (uint8_t)128) == 128 ) {        // last chunk is data
 
-	      pointer_size += (hex_byte & (uint8_t)31);
+	      pointer_size += _size_remainder(hex_byte);
 
 	      // Settled means the delete is committed and nobody is mid-flight on
 	      // the row. A row a live transaction still holds is left where it is.
@@ -810,7 +818,7 @@ namespace Zigurat
       }
 
       if ( (hex_byte & (uint8_t)64) == 64) { // last chunk is standalone
-	return Pointer(hash_key, address, size + (hex_byte & (uint8_t)31));
+	return Pointer(hash_key, address, size + _size_remainder(hex_byte));
       }
       size += CHUNK_SIZE;
     } while (true);
@@ -832,7 +840,7 @@ namespace Zigurat
       this->_hexmap_io.read_std_ubyte(hex_byte);
       if ( (hex_byte & (uint8_t)64) == 64) { // last chunk is standalone
 	is_data = ( (hex_byte & (uint8_t)128) == 128 ) ? true : false;
-	return Pointer(hash_key, address, size + (hex_byte & (uint8_t)31) );
+	return Pointer(hash_key, address, size + _size_remainder(hex_byte));
       }
       size += CHUNK_SIZE;
     } while (true);
@@ -857,7 +865,7 @@ namespace Zigurat
       this->_hexmap_io.read_std_ubyte(hex_byte);
       if ( (hex_byte & (uint8_t)64) == 64) { // last chunk is standalone
 	is_data = ( (hex_byte & (uint8_t)128) == 128 ) ? true : false;
-        return  Pointer(hash_key, address, size + (hex_byte & (uint8_t)31) );
+        return  Pointer(hash_key, address, size + _size_remainder(hex_byte));
       }
       size += CHUNK_SIZE;
     } while (true);
@@ -1217,7 +1225,7 @@ namespace Zigurat
 	  if ( hex_byte != CONTROL_STANDALONE_CHUNK && (hex_byte & (uint8_t)64) == 64 ) { // last chunk is standalone
 	    if ( hex_byte != CONTROL_CHUNK && (hex_byte & (uint8_t)128) == 128 ) { // last chunk is data
 
-	      pointer_size += (hex_byte & (uint8_t)31);
+	      pointer_size += _size_remainder(hex_byte);
 	      Pointer pointer(page_hashkey, pointer_address, pointer_size);
 
 	      bool do_callback = false;
@@ -1560,6 +1568,28 @@ namespace Zigurat
       this->dba_watch("Commit Transaction: ()");
     }
 
+    // A transaction that wrote nothing has nothing to make durable: no
+    // control block moved, so there is no intention to record and no sync to
+    // pay. Its record stays open on disk and _initialize treats an intention
+    // that licenses nothing as the no-op rollback it is, then frees it with
+    // the other spent records. This is not a nicety: a polling client COMMITS
+    // ITS READS, and the full dance below is three syncs of two files per
+    // poll.
+    // The record itself is freed here, exactly as rollback frees its own --
+    // without it every poll left a 64-byte record behind that only a restart
+    // would sweep. No sync: a crash resurrects an open record that licenses
+    // nothing, and startup already treats that as the no-op it is.
+    if (Memory::transaction.context.empty()) {
+      {
+	Streams streams(this);
+	if (Memory::transaction.pointer.hash_key != nullptr)
+	  this->_free(Memory::transaction.pointer);
+	Memory::transaction.pointer = Pointer();
+      }
+      Memory::transaction.reset();
+      return;
+    }
+
     // Scoped, because Transaction::reset() below must not run under it: reset
     // can wait on the SERIALIZABLE semaphore, and the thread that would release
     // that semaphore has to get through its own commit to do so -- which needs
@@ -1834,7 +1864,7 @@ namespace Zigurat
 	  stream.write_std_bool(true);
 	  stream.write_std_ubyte(is_data); 
 	  stream.write_std_long(begin_address);
-	  stream.write_std_long(size + (hex_byte & (uint8_t)31));
+	  stream.write_std_long(size + _size_remainder(hex_byte));
 	  stream.write_std_long(actual_size + CHUNK_SIZE);
 
 	  if (is_data) {

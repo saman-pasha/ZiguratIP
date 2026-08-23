@@ -170,6 +170,22 @@
     (func size_actual ((int64_t size)) (out int64_t)
       (return (* (size_actual_count size) CHUNK_SIZE)))
 
+    ;; The size a standalone hexmap byte contributes when a pointer is read
+    ;; back. The writer stores SIZE % CHUNK_SIZE in the low five bits, so for
+    ;; a record whose size is an exact multiple of the chunk the byte says 0
+    ;; -- and 0 there means A WHOLE CHUNK, not an empty one. Decoding it as 0
+    ;; is how a 16-byte transaction record measured 3 chunks instead of its 4:
+    ;; every free of such a record leaked its last chunk forever, no freed
+    ;; span of it ever fit a fresh allocation of the same record, and a store
+    ;; only ever grew -- ~32KB per consult/forget cycle that netted zero rows,
+    ;; vacuum or no vacuum. The rule applies to DATA standalones only: a FREE
+    ;; standalone's low bits are always written 0 and its size is counted in
+    ;; whole chunks by the run walks, never through this remainder.
+    (func size_remainder ((uint8_t hex_byte)) (out int64_t)
+      (let ((int64_t r . #'(cast int64_t (bitand hex_byte 31))))
+        (if (and (== (bitand hex_byte 128) 128) (== r 0)) (return CHUNK_SIZE))
+        (return r)))
+
     (func addr_hexmap ((int64_t address)) (out int64_t)
       (return (/ address CHUNK_SIZE)))
     (func addr_hexmap_data ((int64_t address)) (out int64_t)
@@ -708,7 +724,7 @@
               ((-> (-> m hexmap_io) clear))
               (throw* (MemoryException "hexmap ends inside the chunk"))))
         (if (== (bitand hex_byte 64) 64)
-            (return (pointer_make key address (+ size (bitand hex_byte 31)))))
+            (return (pointer_make key address (+ size (size_remainder hex_byte)))))
         (set size (+ size CHUNK_SIZE)))
       (return (pointer_null))))
 
@@ -741,7 +757,7 @@
         (if (== (bitand hex_byte 64) 64)
             (block
               (set (cof is_data) (== (bitand hex_byte 128) 128))
-              (return (pointer_make key address (+ size (bitand hex_byte 31))))))
+              (return (pointer_make key address (+ size (size_remainder hex_byte))))))
         (set size (+ size CHUNK_SIZE)))
       (return (pointer_null))))
 
@@ -932,16 +948,24 @@
 
       (free_hexmap m begin full_count)
 
-      (if (== (-> m page_size) (* full_count CHUNK_SIZE))
-          ;; the whole page is free: hand it back to the allocator.
-          ;; DIVERGENCE (a fix): the original left the page listed under its
-          ;; old key AND never keyed it __FREE__ in the list, so a returned
-          ;; page was unusable until restart. Here the entry is rekeyed.
-          (block
-            (allocate_page m FREE_HASHKEY (* begin CHUNK_SIZE))
+      ;; The whole page is free: hand it back to the allocator. The test is
+      ;; against the page's DATA AREA, not the page -- the three pagefile
+      ;; control chunks at its front are full for as long as the page
+      ;; exists, so a span can never equal page_size and the original
+      ;; comparison was a branch that could not fire. What that cost: a
+      ;; page, once keyed to a table, stayed that table's forever, cursor
+      ;; walks visited every page a workload had EVER needed at its worst,
+      ;; and the twelve-worker choreography paid its own history until it
+      ;; timed out. `begin' points at the first data chunk, so the page
+      ;; starts one pagefile-control earlier.
+      ;; DIVERGENCE (a fix, kept): the original also left the page listed
+      ;; under its old key; here the entry is rekeyed in place.
+      (if (== (* full_count CHUNK_SIZE) (- (-> m page_size) PAGEFILE_CONTROL_SIZE))
+          (let ((int64_t page_address . #'(- (* begin CHUNK_SIZE) PAGEFILE_CONTROL_SIZE)))
+            (allocate_page m FREE_HASHKEY page_address)
             (let ((PageEntry * e . #'(-> m pages)))
               (while (!= e nil)
-                (if (== (-> e address) (* begin CHUNK_SIZE))
+                (if (== (-> e address) page_address)
                     (block
                       (set (-> e key) (intern_key FREE_HASHKEY))
                       break))
@@ -1064,6 +1088,31 @@
   (func commit_transaction ((Memory * m)) (out void)
     (dba_watch0 m "Commit Transaction")
     (let ((Transaction * t . #'(txn)))
+      ;; A transaction that wrote nothing has nothing to make durable: no
+      ;; control block moved, so there is no intention to record and no
+      ;; sync to pay. This is not a nicety: a polling worker COMMITS ITS
+      ;; READS -- twelve of them, several times a second -- and the full
+      ;; dance is three syncs of two files per poll, which under one
+      ;; global stream guard was most of what the twelve-worker
+      ;; choreography did with its time. The record itself is freed here,
+      ;; exactly as rollback frees its own -- without that, every poll
+      ;; left a 64-byte record behind that only the next startup's spent
+      ;; sweep would take, and the transactions table grew by the poll
+      ;; count of every run. No sync: a crash resurrects an open record
+      ;; that licenses nothing, which startup treats as the no-op it is.
+      ;; NOT a record reuse across begins -- the Transaction is
+      ;; thread-local and outlives the Memory, so a kept pointer would
+      ;; dangle into the previous store after a close and reopen.
+      (if (== (-> t ctx_head) nil)
+          (block
+            (block
+              (letin* ((streams (Streams m)))
+                (if (!= ($ (-> t pointer) hash_key) nil)
+                    (free_pointer m (aof (-> t pointer))))
+                (set (-> t pointer) (pointer_null))
+                (cast void 0)))
+            (transaction_reset t)
+            (return)))
       ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
       ;; not hold the streams while it does
       (block
@@ -1400,7 +1449,7 @@
                                      (== (bitand hex_byte 128) 128))
                                 ;; and it is data: judge the record
                                 (block
-                                  (set pointer_size (+ pointer_size (bitand hex_byte 31)))
+                                  (set pointer_size (+ pointer_size (size_remainder hex_byte)))
                                   (let ((Pointer pointer . #'(pointer_make page_hashkey pointer_address pointer_size))
                                         (bool do_callback . #f)
                                         (bool break_while . #f)
@@ -1693,7 +1742,7 @@
                           (if (and (!= hex_byte CONTROL_CHUNK)
                                    (== (bitand hex_byte 128) 128))
                               (block
-                                (set pointer_size (+ pointer_size (bitand hex_byte 31)))
+                                (set pointer_size (+ pointer_size (size_remainder hex_byte)))
                                 ;; settled: delete committed, nobody mid-flight
                                 (if (and (== offline_state ROW_DELETED)
                                          (and (== online_state ROW_NONE)
@@ -3375,7 +3424,7 @@
                       ((-> stream write_std_bool) #t)
                       ((-> stream write_std_ubyte) (cast uint8_t is_data))
                       ((-> stream write_std_long) (cast int64_t begin_address))
-                      ((-> stream write_std_long) (cast int64_t (+ size (bitand hex_byte 31))))
+                      ((-> stream write_std_long) (cast int64_t (+ size (size_remainder hex_byte))))
                       ((-> stream write_std_long) (cast int64_t (+ actual_size CHUNK_SIZE)))
                       (if (== is_data 1)
                           (block
