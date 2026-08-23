@@ -7,7 +7,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 
 ## What is here
 
-* **`mvccs.cicili`** (~3,630 lines) — the storage engine core **and the
+* **`mvccs.cicili`** (~4,150 lines) — the storage engine core **and the
   B-tree index tier**, written in Cicili's C++ layer, compiled against
   the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
   `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
@@ -15,7 +15,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 * **`build.sh`** — `CICILI=$HOME/cicili sh build.sh`; the binary prints
   a check line per behaviour and exits with the failure count.
 
-Forty-eight checks, all green, five runs in a row: insert/commit/read-back,
+Seventy-one checks, all green, five runs in a row: insert/commit/read-back,
 update versioning (the old version retired and the new adopted at one
 commit instant), rollback undoing a staged delete, TRUNCATE reclaiming
 exactly the settled dead row and sparing the superseded one, allocation
@@ -35,7 +35,16 @@ restart — including a **two-column composite index** over a five-by-six
 grid: tuple lookups, one cell holding a bucketed pair, deletion of one
 of the pair, whole-tuple uniqueness (a shared first column is no
 duplicate), and the grid intact after reopening, which is the proof of
-the dependent-root fix below.
+the dependent-root fix below. The fourth pass adds **sequences** (NEXT
+answers FROM first and advances; refusals for out-of-range, below-FROM
+and exhaustion are loud `SequenceException`s; a drawn value survives
+rollback because a sequence is outside transactions by design; the
+counter survives a restart) and **true key deletion** (`unmap_key`:
+the ten lowest keys leave a thirty-key tree through leftmost-leaf
+unlinks, underflow merges and root shrinks; twenty remain in order;
+the deletions are durable across another reopen, where two mid-tree
+separators then go through successor replacement against reloaded
+pages).
 
 ## What was rewritten, and what was not
 
@@ -78,10 +87,28 @@ the **dependent index** everywhere else — `bt_cursor_dep`,
 `bt_cursor_equal_multi` for the common whole-tree and whole-tuple
 questions.
 
-**Not rewritten:** `unmap_key`/`_combine_nodes` (true key deletion —
-present upstream, documented there as reached by nothing),
-`BaseSequence`, `Globals`, and the DBA plumbing (watcher,
-`dba_pagefiles`, `dba_pointers`).
+Fourth pass: **sequences and true key deletion**. `defsequence`
+replaces `BaseSequence`'s CRTP statics with expansion-time arguments —
+
+    (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
+
+expands the instance, its hash key, an attach, and argument-free
+`_current` / `_next` / `_back` / `_set_current` / `_reset` wrappers.
+Every write is offline (a sequence never rolls back), each operation
+runs under a per-sequence RAII `MutexGuard`, and every refusal names
+its cause, as the upstream header insists. `bt_unmap_key` is the
+operation upstream ships but never calls: a key leaves the tree
+wholesale and its records — the key, its value chain, an emptied
+node — go back to the allocator, the second reclaimer beside
+TRUNCATE. Leaf unlink, in-order successor replacement for internal
+keys, underflow merging through the parent's separator
+(`bt_combine_nodes`), re-split of an over-full merge, root shrink.
+The composite form is refused loudly — upstream's own is unfinished
+(the outer key goes wholesale, taking other tuples with it).
+
+**Not rewritten:** `Globals`, the DBA plumbing (watcher,
+`dba_pagefiles`, `dba_pointers`), and composite `unmap_key`
+semantics.
 
 ## The experiment's answer
 
@@ -160,6 +187,23 @@ whole engine: `clock_gettime` on a `struct timespec`.
   `pack`/`unpack` virtuals instead of `operator<</>>`.
 
 ## Found upstream while porting
+
+`BTreeIndex::_unmap_key` / `_combine_nodes` (btreeindex.hpp): shipped
+but called by nothing, and unfinished in ways a port would inherit:
+the internal-key path recurses into the right child looking for a key
+that is not there (a no-op), then lifts that child's *first* key as
+the successor — correct only when the child is a leaf; the replaced
+key's right neighbour is relinked to the old key's left neighbour
+instead of the replacement; `second_child_key.left_address = nullptr`
+assigns a NULL `Long` into a store that cannot read NULLs back; the
+underflow combine is invoked on the just-freed key, resurrecting a
+record the allocator now owns into the tree; the demoted separator's
+child links are zeroed, which loses the two boundary subtrees on an
+internal merge; and the root is reassigned on *any* node reaching
+degree zero, root or not. The rewrite keeps the structure and corrects
+each: successor from the leftmost leaf, payload moved before the leaf
+copy is deleted, combine on the live separator, boundary children
+adopted, root shrink only for the root.
 
 `BTreeIndex` dependent root splits (btreeindex.hpp): when a *dependent*
 level's root splits, `_split_node` calls `_update_btreeindex()`

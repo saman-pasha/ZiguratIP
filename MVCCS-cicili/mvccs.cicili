@@ -2343,6 +2343,229 @@
                       (bt_unmap_multi (aof dep) (aof (nth 1 ks)) value))))))
       (cast void 0)))
 
+  ;; ==================================================================
+  ;; unmap_key -- TRUE key deletion, the operation the original ships
+  ;; but never calls ("reached from unmap_key, which nothing calls
+  ;; yet"). Unlike unmap, which marks a value dead and keeps history,
+  ;; this removes the key from the tree and gives its records back to
+  ;; the allocator. The upstream body has the defects of unfinished
+  ;; work (see README); this port keeps its structure -- leaf unlink,
+  ;; successor replacement, underflow merge through the parent's
+  ;; separator, re-split on overflow -- with those corrected.
+  ;; ==================================================================
+
+  ;; the whole chain back to the allocator, for a key leaving the tree
+  (func bt_free_key_values ((BTreeIndex * idx) (BTKey * key)) (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (int64_t tmp . #'(-> key values_address)))
+      (while (> tmp -1)
+        (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
+              (BTValue v))
+          ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
+          (($ v unpack) (cof (-> m data_io)))
+          ;; one link ahead of the freeing, as the original insists
+          (set tmp ($ v next_address))
+          (free_pointer m (aof pointer))))
+      (set (-> key values_address) -1)))
+
+  ;; the in-order successor: the leftmost leaf key of a subtree
+  (decl) (func bt_leftmost_key ((BTreeIndex * idx) (int64_t node_address) (BTKey * out)) (out void))
+  (func bt_leftmost_key ((BTreeIndex * idx) (int64_t node_address) (BTKey * out)) (out void)
+    (let ((BTNode n))
+      (bt_node_read idx node_address (aof n))
+      (let ((BTKey first))
+        (bt_key_read idx ($ n keys_address) (aof first))
+        (if (!= ($ n is_internal) 0)
+            (bt_leftmost_key idx ($ first left_node_address) out)
+          (set (cof out) first)))))
+
+  ;; merge the two children around one separator: the separator leaves
+  ;; the parent, demotes between the left child's last key and the right
+  ;; child's first, ADOPTING the boundary children (the original zeroes
+  ;; them, which loses two subtrees on an internal merge), and the right
+  ;; child's node record goes back to the allocator.
+  (func bt_combine_nodes ((BTreeIndex * idx) (BTNode * node) (BTKey * sep)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      ;; out of the parent's key list
+      (if (!= (-> sep left_address) -1)
+          (let ((BTKey left_key))
+            (bt_key_read idx (-> sep left_address) (aof left_key))
+            (set ($ left_key right_address) (-> sep right_address))
+            (offline_update m (cast (BaseTable *) (aof left_key))))
+        (set (-> node keys_address) (-> sep right_address)))
+      (if (!= (-> sep right_address) -1)
+          (let ((BTKey right_key))
+            (bt_key_read idx (-> sep right_address) (aof right_key))
+            ;; the merged node is the one the right neighbour now hangs on
+            (set ($ right_key left_node_address) (-> sep left_node_address))
+            (set ($ right_key left_address) (-> sep left_address))
+            (offline_update m (cast (BaseTable *) (aof right_key)))))
+
+      (let ((BTNode left_node)
+            (BTNode right_node))
+        (bt_node_read idx (-> sep left_node_address) (aof left_node))
+        (bt_node_read idx (-> sep right_node_address) (aof right_node))
+
+        ;; the left child's last key
+        (let ((BTKey llast)
+              (int64_t tmp . #'($ left_node keys_address)))
+          (bt_key_read idx tmp (aof llast))
+          (while (!= ($ llast right_address) -1)
+            (bt_key_read idx ($ llast right_address) (aof llast)))
+
+          ;; the right child's first key
+          (let ((BTKey rfirst))
+            (bt_key_read idx ($ right_node keys_address) (aof rfirst))
+
+            ;; the separator demotes between them, adopting the boundary
+            ;; children (both -1 when the children are leaves)
+            (set (-> sep left_address) ($ ($ llast pointer) address))
+            (set (-> sep right_address) ($ ($ rfirst pointer) address))
+            (set (-> sep left_node_address) ($ llast right_node_address))
+            (set (-> sep right_node_address) ($ rfirst left_node_address))
+            (offline_update m (cast (BaseTable *) sep))
+
+            (set ($ llast right_address) ($ (-> sep pointer) address))
+            (offline_update m (cast (BaseTable *) (aof llast)))
+            (set ($ rfirst left_address) ($ (-> sep pointer) address))
+            (offline_update m (cast (BaseTable *) (aof rfirst)))))
+
+        (set (-> node degree) (- (-> node degree) 1))
+        (offline_update m (cast (BaseTable *) node))
+
+        (set ($ left_node degree) (+ (+ ($ left_node degree) 1) ($ right_node degree)))
+        (offline_update m (cast (BaseTable *) (aof left_node)))
+
+        ;; the right child's NODE record goes back; its keys moved by list
+        (free_pointer m (aof ($ right_node pointer)))
+
+        ;; a merge that overflowed is re-split -- only the immediate
+        ;; parent is known here, which is as much as this path ever had
+        (if (> ($ left_node degree) (-> idx max_degree))
+            (let ((BTNode * one [1]))
+              (set (nth 0 one) node)
+              (bt_split_node idx one 1 (aof left_node))))
+
+        ;; the root shrinks only when the emptied parent IS the root --
+        ;; the original sets the root on any degree-zero node
+        (if (and (== (-> node degree) 0)
+                 (== ($ (-> node pointer) address) (-> idx root_address)))
+            (block
+              (set (-> idx root_address) ($ ($ left_node pointer) address))
+              (if (== (-> idx is_dependent) 0)
+                  (bt_update_record idx)))))))
+
+  (decl) (func bt_unmap_key_rec ((BTreeIndex * idx) (BTNode * parent_node) (BTKey * parent_key)
+                                 (BTNode * node) (int64_t k)) (out void))
+  (func bt_unmap_key_rec ((BTreeIndex * idx) (BTNode * parent_node) (BTKey * parent_key)
+                          (BTNode * node) (int64_t k)) (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (BTKey left_key)
+          (int64_t tmp . #'(-> node keys_address))
+          (int64_t index . 0)
+          (int stop . 0))
+      (while (and (> tmp -1) (== stop 0))
+        (let ((BTKey cur))
+          (bt_key_read idx tmp (aof cur))
+          (set tmp ($ cur right_address))
+
+          (cond
+            ((< k ($ cur key))
+             (block
+               (if (!= (-> node is_internal) 0)
+                   (let ((BTNode child))
+                     (bt_node_read idx ($ cur left_node_address) (aof child))
+                     (bt_unmap_key_rec idx node (aof cur) (aof child) k)))
+               (set stop 1)))
+
+            ((== k ($ cur key))
+             (block
+               (if (!= (-> node is_internal) 0)
+                   ;; an internal key: its own values go back, then the
+                   ;; in-order successor's payload takes its place and
+                   ;; the successor is deleted out of the right subtree.
+                   ;; (The original lifts the right child's FIRST key,
+                   ;; which is the successor only when that child is a
+                   ;; leaf, and then combines with the freed key.)
+                   (block
+                     (bt_free_key_values idx (aof cur))
+                     (let ((BTKey succ))
+                       (bt_leftmost_key idx ($ cur right_node_address) (aof succ))
+                       (set ($ cur key) ($ succ key))
+                       (set ($ cur values_address) ($ succ values_address))
+                       (set ($ cur dependents_address) ($ succ dependents_address))
+                       (offline_update m (cast (BaseTable *) (aof cur)))
+                       ;; the payload moved: strip the leaf copy so its
+                       ;; deletion frees nothing that is now the key's
+                       (set ($ succ values_address) -1)
+                       (set ($ succ dependents_address) -1)
+                       (offline_update m (cast (BaseTable *) (aof succ)))
+                       (let ((BTNode child))
+                         (bt_node_read idx ($ cur right_node_address) (aof child))
+                         (bt_unmap_key_rec idx node (aof cur) (aof child) ($ cur key)))))
+                 ;; a leaf key: unlink, free the chain, free the record
+                 (block
+                   (bt_free_key_values idx (aof cur))
+                   (cond
+                     ((== index 0)
+                      (block
+                        (set (-> node degree) (- (-> node degree) 1))
+                        (set (-> node keys_address) ($ cur right_address))
+                        (offline_update m (cast (BaseTable *) node))
+                        (if (!= ($ cur right_address) -1)
+                            (let ((BTKey right_key))
+                              (bt_key_read idx ($ cur right_address) (aof right_key))
+                              (set ($ right_key left_address) -1)
+                              (offline_update m (cast (BaseTable *) (aof right_key)))))))
+                     ((== index (- (-> node degree) 1))
+                      (block
+                        (set (-> node degree) (- (-> node degree) 1))
+                        (offline_update m (cast (BaseTable *) node))
+                        (set ($ left_key right_address) -1)
+                        (offline_update m (cast (BaseTable *) (aof left_key)))))
+                     (#t
+                      (block
+                        (set (-> node degree) (- (-> node degree) 1))
+                        (offline_update m (cast (BaseTable *) node))
+                        (set ($ left_key right_address) ($ cur right_address))
+                        (offline_update m (cast (BaseTable *) (aof left_key)))
+                        (let ((BTKey right_key))
+                          (bt_key_read idx ($ cur right_address) (aof right_key))
+                          (set ($ right_key left_address) ($ cur left_address))
+                          (offline_update m (cast (BaseTable *) (aof right_key)))))))
+                   (free_pointer m (aof ($ cur pointer)))))
+               (set stop 1)))
+
+            (#t
+             (if (and (!= (-> node is_internal) 0)
+                      (== ($ cur right_address) -1))
+                 (block
+                   (let ((BTNode child))
+                     (bt_node_read idx ($ cur right_node_address) (aof child))
+                     (bt_unmap_key_rec idx node (aof cur) (aof child) k))
+                   (set stop 1)))))
+
+          (set left_key cur)
+          (set index (+ index 1))))
+
+      ;; the underflow ripples up: each frame asks about its own node
+      ;; once the work below it is done
+      (if (and (< (-> node degree) (-> idx min_degree))
+               (!= parent_node nil))
+          (bt_combine_nodes idx parent_node parent_key))))
+
+  (func bt_unmap_key ((BTreeIndex * idx) (int64_t k)) (out void)
+    ;; the composite semantics upstream are unfinished (the outer key
+    ;; goes wholesale, taking other tuples with it); refuse loudly
+    (if (> (-> idx levels) 1)
+        (throw* (IndexException "unmap_key is single-level only")))
+    (letin* ((streams (Streams (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (let ((BTNode root))
+            (bt_node_read idx (-> idx root_address) (aof root))
+            (bt_unmap_key_rec idx nil nil (aof root) k)))
+      (cast void 0)))
+
   ;; ---- the in-order key walk every cursor is built on ----------------
   ;;
   ;;     c0   k0   c1   k1   c2   k2   c3
@@ -2836,6 +3059,150 @@
       (return freed)))
 
   ;; ==================================================================
+  ;; Sequences -- basesequence.hpp. One row per sequence under its own
+  ;; hash key, guarded by a per-sequence mutex, every write OFFLINE:
+  ;; a sequence never rolls back, by design. The CRTP statics of the
+  ;; original (NAME, FROM, TO, STEP per generated class) are macro
+  ;; parameters here -- see defsequence below -- and the null checks on
+  ;; them vanish: a macro argument is present by construction.
+  ;; ==================================================================
+
+  ;; sequenceexception.hpp, code 5330
+  (struct SequenceException (inherits ZiguratException)
+    (ctor ((const char * msg))
+      (init (ZiguratException 5330 (std::string msg)))))
+
+  ;; the one row a sequence keeps
+  (struct SeqRow (inherits BaseTable)
+    (member int64_t current)
+    (override) (method pack_size () (out int64_t) (return 8))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this current))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this current))))
+
+  ;; a lock the way the original holds its _guard: RAII, so a refusal
+  ;; thrown from under it still lets the next caller in
+  (struct MutexGuard
+    (member pthread_mutex_t * mtx)
+    (ctor ((pthread_mutex_t * mx))
+      (init (mtx mx))
+      (pthread_mutex_lock ($ this mtx)))
+    (dtor ()
+      (pthread_mutex_unlock ($ this mtx))))
+
+  (struct Sequence
+    (member Memory * m)
+    (member const char * name)
+    (member const uint8_t * hash_key)
+    (member int64_t from)
+    (member int64_t to)
+    (member int64_t step)
+    (member int64_t initialized)
+    (member pthread_mutex_t guard))
+
+  (struct SeqFetchCtx
+    (member Memory * m)
+    (member SeqRow row)
+    (member int found))
+
+  (func seq_fetch_cb ((void * c) (Pointer * p)) (out bool)
+    (let ((SeqFetchCtx * fc . #'(cast (SeqFetchCtx *) c)))
+      (set ($ (-> fc row) pointer) (cof p))
+      (read_row (-> fc m) (cast (BaseTable *) (aof (-> fc row))))
+      (set (-> fc found) 1)
+      (return #f)))
+
+  ;; find the row, or create it at FROM -- and say so when there is no
+  ;; store at all, which beats the segmentation fault it replaces
+  (func seq_initialize ((Sequence * s)) (out void)
+    (if (== (-> s m) nil)
+        (throw* (SequenceException "sequence has no memory to read")))
+    (let ((SeqFetchCtx fc))
+      (set ($ fc m) (-> s m))
+      (set ($ fc found) 0)
+      (letin* ((streams (Streams (-> s m))))
+        (cursor_walk (-> s m) (-> s hash_key) (aof streams)
+                     (cast (void *) (aof fc)) seq_fetch_cb)
+        (cast void 0))
+      (if (== ($ fc found) 0)
+          (let ((SeqRow row))
+            (set ($ row current) (-> s from))
+            (letin* ((streams (Streams (-> s m))))
+              (offline_insert (-> s m) (-> s hash_key) (cast (BaseTable *) (aof row)))
+              (cast void 0)))))
+    (set (-> s initialized) 1))
+
+  ;; the row, or a refusal that names the sequence -- a silent default
+  ;; became "not null column" crashes several frames away upstream
+  (func seq_with_current ((Sequence * s) (SeqRow * out)) (out void)
+    (if (== (-> s initialized) 0)
+        (seq_initialize s))
+    (let ((SeqFetchCtx fc))
+      (set ($ fc m) (-> s m))
+      (set ($ fc found) 0)
+      (letin* ((streams (Streams (-> s m))))
+        (cursor_walk (-> s m) (-> s hash_key) (aof streams)
+                     (cast (void *) (aof fc)) seq_fetch_cb)
+        (cast void 0))
+      (if (== ($ fc found) 0)
+          (throw* (SequenceException "sequence has no row: it was never created, or this transaction cannot see it")))
+      (set (cof out) ($ fc row))))
+
+  (func seq_write ((Sequence * s) (SeqRow * row)) (out void)
+    (letin* ((streams (Streams (-> s m))))
+      (offline_update (-> s m) (cast (BaseTable *) row))
+      (cast void 0)))
+
+  (func seq_current ((Sequence * s)) (out int64_t)
+    (letin* ((g (MutexGuard (aof (-> s guard)))))
+      (let ((SeqRow row))
+        (seq_with_current s (aof row))
+        (return ($ row current)))))
+
+  (func seq_set_current ((Sequence * s) (int64_t v)) (out void)
+    (letin* ((g (MutexGuard (aof (-> s guard)))))
+      (if (or (< v (-> s from)) (> v (-> s to)))
+          (throw* (SequenceException "not in range")))
+      (let ((SeqRow row))
+        (seq_with_current s (aof row))
+        (set ($ row current) v)
+        (seq_write s (aof row)))
+      (cast void 0)))
+
+  ;; NEXT answers the value it stands on and then advances -- the first
+  ;; NEXT of a fresh sequence is FROM, exactly as upstream
+  (func seq_next ((Sequence * s)) (out int64_t)
+    (letin* ((g (MutexGuard (aof (-> s guard)))))
+      (let ((SeqRow row))
+        (seq_with_current s (aof row))
+        (if (> (+ ($ row current) (-> s step)) (-> s to))
+            (throw* (SequenceException "maximum exceeds")))
+        (let ((int64_t answer . #'($ row current)))
+          (set ($ row current) (+ ($ row current) (-> s step)))
+          (seq_write s (aof row))
+          (return answer)))))
+
+  (func seq_back ((Sequence * s)) (out int64_t)
+    (letin* ((g (MutexGuard (aof (-> s guard)))))
+      (let ((SeqRow row))
+        (seq_with_current s (aof row))
+        (if (< (- ($ row current) (-> s step)) (-> s from))
+            (throw* (SequenceException "minimum exceeds")))
+        (let ((int64_t answer . #'($ row current)))
+          (set ($ row current) (- ($ row current) (-> s step)))
+          (seq_write s (aof row))
+          (return answer)))))
+
+  (func seq_reset ((Sequence * s)) (out void)
+    (letin* ((g (MutexGuard (aof (-> s guard)))))
+      (let ((SeqRow row))
+        (seq_with_current s (aof row))
+        (set ($ row current) (-> s from))
+        (seq_write s (aof row)))
+      (cast void 0)))
+
+  ;; ==================================================================
   ;; deftable -- Cicili metaprogramming where C++ used templates.
   ;;
   ;; The original instantiates Memory::online_insert<T> and friends per
@@ -3167,8 +3534,80 @@
                     (bt_cursor_greater_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim))))
               '())
 
+        ;; true key deletion, single-level only -- the composite
+        ;; semantics upstream are unfinished and the engine refuses them
+        ,@(IF (= nlev 1)
+              `((func ,(INTERN (CONCATENATE 'STRING iname "_unmap_key"))
+                      ((Memory * m) (int64_t k)) (out void)
+                  (cast void m)
+                  (bt_unmap_key (aof ,idxname) k)))
+              '())
+
         (func ,itrunc ((Memory * m)) (out size_t)
           (return (bt_truncate (aof ,idxname) m))))))
+
+  ;; ==================================================================
+  ;; defsequence -- the sequence tier's macro. The original's generated
+  ;; sequence class is CRTP over BaseSequence with NAME/FROM/TO/STEP as
+  ;; per-class statics; here they are expansion-time arguments, and the
+  ;; instance, its hash key and the argument-free wrappers come out of
+  ;; one form:
+  ;;
+  ;;   (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
+  ;; ==================================================================
+  (DEFMACRO defsequence (seqname sqlname from to step)
+    (LET* ((qname   (SYMBOL-NAME seqname))
+           (harr    (INTERN (CONCATENATE 'STRING qname "_HASHKEY")))
+           (hready  (INTERN (CONCATENATE 'STRING qname "_hashkey_ready")))
+           (keyfn   (INTERN (CONCATENATE 'STRING qname "_key")))
+           (attach  (INTERN (CONCATENATE 'STRING qname "_attach")))
+           (wcur    (INTERN (CONCATENATE 'STRING qname "_current")))
+           (wset    (INTERN (CONCATENATE 'STRING qname "_set_current")))
+           (wnext   (INTERN (CONCATENATE 'STRING qname "_next")))
+           (wback   (INTERN (CONCATENATE 'STRING qname "_back")))
+           (wreset  (INTERN (CONCATENATE 'STRING qname "_reset")))
+           (bytes (LET ((h 2166136261) (out NIL))
+                    (LOOP FOR ch ACROSS sqlname
+                          DO (SETF h (LOGAND (* (LOGXOR h (CHAR-CODE ch)) 16777619)
+                                             #xFFFFFFFF)))
+                    (LOOP FOR i FROM 0 BELOW 20
+                          DO (SETF h (LOGAND (+ (* h 1103515245) (+ 12345 i))
+                                             #xFFFFFFFF))
+                             (PUSH (LOGAND (ASH h -16) #xFF) out))
+                    (NREVERSE out))))
+      `($$$
+        (var uint8_t ,harr [20])
+        (var int ,hready)
+        (func ,keyfn () (out const uint8_t *)
+          (if (== ,hready 0)
+              (block
+                ,@(LOOP FOR b IN bytes FOR i FROM 0
+                        COLLECT `(set (nth ,i ,harr) ,b))
+                (set ,hready 1)))
+          (return (cast (uint8_t *) ,harr)))
+
+        (var Sequence ,seqname)
+
+        (func ,attach ((Memory * m)) (out void)
+          (set ($ ,seqname m) m)
+          (set ($ ,seqname name) ,qname)
+          (set ($ ,seqname hash_key) (intern_key (,keyfn)))
+          (set ($ ,seqname from) ,from)
+          (set ($ ,seqname to) ,to)
+          (set ($ ,seqname step) ,step)
+          (set ($ ,seqname initialized) 0)
+          (pthread_mutex_init (aof ($ ,seqname guard)) nil))
+
+        (func ,wcur () (out int64_t)
+          (return (seq_current (aof ,seqname))))
+        (func ,wset ((int64_t v)) (out void)
+          (seq_set_current (aof ,seqname) v))
+        (func ,wnext () (out int64_t)
+          (return (seq_next (aof ,seqname))))
+        (func ,wback () (out int64_t)
+          (return (seq_back (aof ,seqname))))
+        (func ,wreset () (out void)
+          (seq_reset (aof ,seqname))))))
 
   ;; ==================================================================
   ;; The smoke tests. A Book table, one store, the ACID walk-through,
@@ -3185,6 +3624,8 @@
 
   (deftable Pair "smoke::Pair" a b)
   (defindex IDX_PAIR_AB Pair (a b) 1 3)
+
+  (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
 
   (var int failures . 0)
 
@@ -3592,6 +4033,48 @@
         (check "a shared first column is no duplicate" (pair_equal_count (aof mem) 1 1) 1)
         (check "the refused tuple left one behind" (pair_equal_count (aof mem) 1 2) 1)
 
+        ;; ---- the sequence: FROM first, refusals loud, never rolls back
+        (SEQ_ORDER_attach (aof mem))
+        (check "next answers FROM first" (SEQ_ORDER_next) 100)
+        (check "and advances" (SEQ_ORDER_next) 101)
+        (check "current stands past it" (SEQ_ORDER_current) 102)
+        (SEQ_ORDER_set_current 200)
+        (check "set_current lands" (SEQ_ORDER_current) 200)
+        (let ((int64_t refused . 0))
+          (try (SEQ_ORDER_set_current 1000)
+               (catch ((const SequenceException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "out of range refused" refused 1))
+        (check "back answers where it stood" (SEQ_ORDER_back) 200)
+        (check "and stepped down" (SEQ_ORDER_current) 199)
+        (SEQ_ORDER_reset)
+        (check "reset returns to FROM" (SEQ_ORDER_current) 100)
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((int64_t v . #'(SEQ_ORDER_back)))
+                   (cast void v)))
+               (catch ((const SequenceException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "below FROM refused" refused 1))
+        ;; a sequence is outside transactions: the draw survives rollback
+        (let ((int64_t drawn . #'(SEQ_ORDER_next)))
+          (cast void drawn))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "a sequence never rolls back" (SEQ_ORDER_current) 101)
+        ;; exhaustion says so
+        (SEQ_ORDER_set_current 999)
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((int64_t v . #'(SEQ_ORDER_next)))
+                   (cast void v)))
+               (catch ((const SequenceException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "maximum exceeds refused" refused 1))
+
         (sync_disk (aof mem))
         (cast void 0)))
 
@@ -3619,6 +4102,55 @@
           (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
           (check "the tree survives it too" ($ oc rows) 30)
           (check "and still walks in order" (cast int64_t ($ oc ascending)) 1))
+
+        (SEQ_ORDER_attach (aof mem))
+        (check "the sequence survives it too" (SEQ_ORDER_current) 999)
+
+        ;; ---- unmap_key: the lowest ten keys leave the tree wholesale,
+        ;; every deletion of the minimum walking the leftmost leaf, the
+        ;; underflow merges and the root shrinks
+        (let ((int64_t k . 0))
+          (while (< k 10)
+            (IDX_TAG_K_unmap_key (aof mem) k)
+            (set k (+ k 1))))
+        (check "a deleted key answers nothing" (tag_equal_count (aof mem) 5) 0)
+        (check "its neighbour above survives" (tag_equal_count (aof mem) 15) 1)
+        (let ((TagOrdCtx oc))
+          (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
+          (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
+          (check "twenty keys remain" ($ oc rows) 20)
+          (check "in order through the merges" (cast int64_t ($ oc ascending)) 1))
+        (sync_disk (aof mem))
+        (cast void 0)))
+
+    ;; ---- and a third opening: the deletions are durable --------------
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-cicili-hexmap.bin")
+                                 (bitor std::ios::in std::ios::out)))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-cicili-data.bin")
+                               (bitor std::ios::in std::ios::out))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+        (IDX_TAG_K_attach (aof mem))
+        (let ((TagOrdCtx oc))
+          (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
+          (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
+          (check "the deletions survive a restart" ($ oc rows) 20)
+          (check "and the tree still walks in order" (cast int64_t ($ oc ascending)) 1))
+
+        ;; two more out of the middle, on the reopened store -- keys deep
+        ;; enough to sit as internal separators, so the successor
+        ;; replacement runs against reloaded pages
+        (IDX_TAG_K_unmap_key (aof mem) 15)
+        (IDX_TAG_K_unmap_key (aof mem) 20)
+        (check "a mid-tree key deleted" (tag_equal_count (aof mem) 15) 0)
+        (check "and another" (tag_equal_count (aof mem) 20) 0)
+        (check "their neighbours stand" (tag_equal_count (aof mem) 16) 1)
+        (let ((TagOrdCtx oc))
+          (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
+          (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
+          (check "eighteen remain, ordered" ($ oc rows) 18)
+          (check "order held through replacement" (cast int64_t ($ oc ascending)) 1))
         (cast void 0)))
 
     (if (== failures 0)
