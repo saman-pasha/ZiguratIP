@@ -241,14 +241,27 @@ pair, **one `.cicili` per TABLE and SEQUENCE** — a macro file
 `defsequence` forms for the same object, columns and index shapes and
 bounds carried over (a `LONG::MAX` bound becomes the literal). The
 files under `generated/` are byte-for-byte what it wrote for cocolog's
-`machines` table and its sequence; `schema-test.cicili` imports them
-untouched and runs eight checks green — three machines through the
-generated table, ids drawn from the generated sequence, the UNIQUE
-NAME index refusing a duplicate, and both objects coming back through
-the catalogue after a restart. The generated forms carry the object's
-schema-qualified name bare — `(deftable COCOLOG::MACHINES ID …)` —
-because Cicili's `::` is a name; no string rides beside it. A Parsi
-schema now compiles to either engine from one source.
+whole schema — `clauses`, `props`, `machines`, `machine_state` and
+their four sequences; `schema-test.cicili` imports the machines pair
+untouched and runs twelve checks green — three machines through the
+generated table, ids drawn from the generated sequence, the PRIMARY
+ID index refusing a duplicate, and rows, index and sequence coming
+back through the catalogue after a restart. The generated forms carry
+the object's schema-qualified name bare —
+`(deftable COCOLOG::MACHINES ID …)` — because Cicili's `::` is a name;
+no string rides beside it.
+
+Two mappings make a real schema fit. A Parsi STRING/TEXT column emits
+as `(TEXT col)`: a `std::string` member, packed as a 2-byte length and
+the bytes, the row's pack size folded from what each string actually
+holds. And an index over such a column emits **commented out** — the
+Cicili B-tree keys int64 and nothing else — so a consumer scans for
+by-name lookups, which is what cocolog's embedded backend
+(`cocolog/embed/embed.cicili`) does: it imports these very files, runs
+the eighteen `cocolog::*` procedures over them in-process, and passes
+the same twelve-worker group test the server passes. A Parsi schema
+now compiles to either engine from one source, and cocolog runs on
+both.
 
 ## Found upstream while porting — and now fixed in the C++ too
 
