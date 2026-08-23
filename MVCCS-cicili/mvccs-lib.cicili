@@ -725,6 +725,19 @@
       ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 1) std::ios::cur)
       (while #t
         ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+        ;; Reading past the end of the hexmap leaves the stream failed and
+        ;; every further read a no-op, so without this the loop spins
+        ;; forever on a truncated store rather than reporting the problem.
+        ;; The C++ engine throws here in the same words (memory.cpp,
+        ;; _pointer_state); the port had dropped the guard, and a wedged
+        ;; store took the process with it instead of refusing.
+        (if (not ((-> (-> m hexmap_io) good)))
+            (block
+              ((-> (-> m hexmap_io) clear))
+              (let ((char msg [96]))
+                (snprintf msg 96 "hexmap ends inside the chunk at %lld"
+                          (cast llong address))
+                (throw* (MemoryException msg)))))
         (if (== (bitand hex_byte 64) 64)
             (block
               (set (cof is_data) (== (bitand hex_byte 128) 128))
