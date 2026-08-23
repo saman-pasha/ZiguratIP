@@ -162,6 +162,14 @@ them per operation; real `try`/`throw*`/`catch` against the real
 Here `deftable`:
 
     (deftable Book "smoke::Book" id value)
+    (deftable COCOLOG::MACHINES ID NAME KB STATUS CHUNKS NOTE)
+
+The second spelling is the one the generated files use: Cicili's `::`
+is a name, so a schema-qualified object needs no string beside it —
+the SQL name is the spelling itself, and the identifiers fold the
+`::` to `_` (`COCOLOG_MACHINES_insert`, and so on). A string after
+the name still overrides, which is what the unqualified test tables
+use.
 
 expands at read time into the `BaseTable` subclass with `pack`/`unpack`/
 `pack_size` written out, the 20-byte hash key computed **in Lisp at
@@ -237,8 +245,10 @@ files under `generated/` are byte-for-byte what it wrote for cocolog's
 untouched and runs eight checks green — three machines through the
 generated table, ids drawn from the generated sequence, the UNIQUE
 NAME index refusing a duplicate, and both objects coming back through
-the catalogue after a restart. A Parsi schema now compiles to either
-engine from one source.
+the catalogue after a restart. The generated forms carry the object's
+schema-qualified name bare — `(deftable COCOLOG::MACHINES ID …)` —
+because Cicili's `::` is a name; no string rides beside it. A Parsi
+schema now compiles to either engine from one source.
 
 ## Found upstream while porting — and now fixed in the C++ too
 

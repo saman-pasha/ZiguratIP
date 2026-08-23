@@ -560,7 +560,9 @@ namespace Zigurat
       // macro: the importing target says (define-NAME) where its forms go
       cicili << "(DEFMACRO define-" << full_name << " ()" << std::endl;
       cicili << "  '($$$" << std::endl;
-      cicili << "    (deftable " << full_name << " \"" << type_name << "\"";
+      // the qualified spelling is the name AND the SQL name: Cicili's ::
+      // is a name of its own, so no string rides beside it
+      cicili << "    (deftable " << type_name << "";
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "COLUMN")
 	  cicili << " " << expr.args[0].token.value;
@@ -570,7 +572,7 @@ namespace Zigurat
       // branching 65 is the Long-key factor the C++ engine derives from the
       // key type's width; the Cicili engine takes it as a parameter
       for (const index_desc_t& index : indexes) {
-	cicili << "    (defindex " << std::get<3>(index) << " " << full_name << " ";
+	cicili << "    (defindex " << std::get<3>(index) << " " << type_name << " ";
 	const std::vector<std::string>& columns = std::get<0>(index);
 	if (columns.size() == 1) {
 	  cicili << columns[0];
@@ -1446,7 +1448,7 @@ namespace Zigurat
 
       cicili << "(DEFMACRO define-" << full_name << " ()" << std::endl;
       cicili << "  '($$$" << std::endl;
-      cicili << "    (defsequence " << full_name << " \"" << type_name << "\" ";
+      cicili << "    (defsequence " << type_name << " ";
       cicili << cicili_expr(ast.args[offset + 1].args[0]) << " ";
       cicili << cicili_expr(ast.args[offset + 2].args[0]) << " ";
       cicili << cicili_expr(ast.args[offset + 3].args[0]) << ")))" << std::endl;

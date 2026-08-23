@@ -3542,8 +3542,32 @@
   ;; of scope here -- and the store cannot read a NULL back anyway, as
   ;; doc/truncate.md records.
   ;; ==================================================================
-  (DEFMACRO deftable (name sqlname &REST columns)
-    (LET* ((sname   (SYMBOL-NAME name))
+  ;; The name may be the object's own qualified spelling -- Cicili's ::
+  ;; is a name, so (deftable COCOLOG::MACHINES ID ...) needs no string:
+  ;; the SQL name is the spelling itself, and the identifiers fold the
+  ;; :: to _. A string after the name still overrides, which is what the
+  ;; unqualified test tables use.
+  (DEFMACRO deftable (name &REST args)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           ;; COCOLOG::MACHINES -> "COCOLOG_MACHINES": the C identifier the
+           ;; generated functions and structs carry
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (qname   (FUNCALL qjoin name))
+           (sqlname (IF (STRINGP (FIRST args)) (FIRST args) qname))
+           (columns (IF (STRINGP (FIRST args)) (REST args) args))
+           (sname   (FUNCALL qfold qname))
+           (name    (INTERN sname))
            (harr    (INTERN (CONCATENATE 'STRING sname "_HASHKEY")))
            (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
            (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
@@ -3669,8 +3693,25 @@
   ;; where a second index would go.
   ;; ==================================================================
   (DEFMACRO defindex (idxname table column unique branching)
-    (LET* ((iname    (SYMBOL-NAME idxname))
-           (tname    (SYMBOL-NAME table))
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           ;; COCOLOG::MACHINES -> "COCOLOG_MACHINES": the C identifier the
+           ;; generated functions and structs carry
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (iname    (FUNCALL qfold (FUNCALL qjoin idxname)))
+           (tname    (FUNCALL qfold (FUNCALL qjoin table)))
+           (idxname  (INTERN iname))
+           (table    (INTERN tname))
            (cols     (IF (LISTP column) column (LIST column)))
            (nlev     (LENGTH cols))
            (harr     (INTERN (CONCATENATE 'STRING iname "_HASHKEY")))
@@ -3902,8 +3943,30 @@
   ;;
   ;;   (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
   ;; ==================================================================
-  (DEFMACRO defsequence (seqname sqlname from to step)
-    (LET* ((qname   (SYMBOL-NAME seqname))
+  (DEFMACRO defsequence (seqname &REST args)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           ;; COCOLOG::MACHINES -> "COCOLOG_MACHINES": the C identifier the
+           ;; generated functions and structs carry
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (fullq   (FUNCALL qjoin seqname))
+           (sqlname (IF (STRINGP (FIRST args)) (FIRST args) fullq))
+           (bounds  (IF (STRINGP (FIRST args)) (REST args) args))
+           (from    (FIRST bounds))
+           (to      (SECOND bounds))
+           (step    (THIRD bounds))
+           (qname   (FUNCALL qfold fullq))
+           (seqname (INTERN qname))
            (harr    (INTERN (CONCATENATE 'STRING qname "_HASHKEY")))
            (hready  (INTERN (CONCATENATE 'STRING qname "_hashkey_ready")))
            (keyfn   (INTERN (CONCATENATE 'STRING qname "_key")))
