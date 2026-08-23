@@ -46,17 +46,35 @@ for as long as nobody truncates it.
 Until reading a NULL column works, a table meant to be reclaimable needs every
 column `NOT NULL`, and its writers need to send something rather than nothing.
 
+## What it reclaims
+
+Both kinds of dead version, not just the obvious one:
+
+- **Settled deletes** — rows `DELETE` removed, once the delete has committed.
+- **Superseded versions** — the old version an `UPDATE` leaves behind. Only a
+  superseded version ever carries the `UPDATED` state (a commit stamps the new
+  version `INSERTED`), so the state alone marks it dead. Skipping these was
+  measured before it was fixed: a row claimed and released a thousand times
+  left a thousand old versions no truncate would touch — 22 pages carrying
+  4 live rows — and a polling workload paid for all of them on every read.
+
 ## What it will not touch
 
-- **Live rows.** A row that has not been deleted is never reclaimed. Running
-  `TRUNCATE` on a table with no deleted rows does nothing at all.
-- **Deletes that are still open.** Only a committed delete is reclaimable, since
-  an open one may still roll back and the rollback would have nothing to restore.
-  A `DELETE` and a `TRUNCATE` in the same transaction therefore reclaim nothing —
-  the truncate has to come after the delete commits, in a later transaction.
+- **Live rows.** A row's current version is never reclaimed. Running
+  `TRUNCATE` on a table with no dead versions does nothing at all.
+- **Deaths that are still open.** Only a committed delete or update is
+  reclaimable, since an open one may still roll back and the rollback would
+  have nothing to restore. A `DELETE` and a `TRUNCATE` in the same
+  transaction therefore reclaim nothing — the truncate has to come after the
+  commit, in a later transaction.
 - **Rows a running transaction holds.** Anything under a lock is left alone.
-- **Index storage.** A table's indexes keep their own pages under their own
-  keys, and truncating the table does not compact them.
+- **Index storage — in the C++ engine.** Its indexes keep their own pages
+  under their own keys, and truncating the table only unlinks the dead value
+  entries; the keys and nodes of every id the table ever held stay. The
+  Cicili engine (`MVCCS-cicili/`) goes further: a truncate is the one moment
+  the table is at its smallest, so each of its indexes is REBUILT there —
+  storage dropped wholesale, pages handed back to the allocator, and the
+  surviving rows mapped into a fresh tree.
 
 ## When to run it
 
