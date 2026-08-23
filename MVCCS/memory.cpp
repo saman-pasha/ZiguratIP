@@ -6,7 +6,6 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
-#include <unordered_map>
 #include <iterator>
 #include "shahelper.hpp"
 #include "control.hpp"
@@ -64,26 +63,9 @@ namespace Zigurat
   std::unordered_set<size_t> Memory::_live_txn_ids;
 
   // The thread's slot: the one id this thread has begun and not yet ended.
+  // begin_transaction retiring it before registering the fresh id is what
+  // makes an abandoned transaction's debris breakable.
   static thread_local size_t _thread_live_txn = 0;
-
-  // FATE-LEDGER (temporary instrumentation): how each id last left or
-  // entered the registry, so a breaker false-fire can name the path.
-  // 1=registered 5=erased-by-own-thread's-next-begin; retire callers pass
-  // 10+ codes through transaction_retire_why.
-  static std::unordered_map<size_t, int> _txn_fate;
-  void Memory::transaction_retire_why(size_t transaction_id, int why)
-  {
-    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
-    Memory::_live_txn_ids.erase(transaction_id);
-    _txn_fate[transaction_id] = why;
-    if (_thread_live_txn == transaction_id) _thread_live_txn = 0;
-  }
-  int Memory::transaction_fate(size_t transaction_id)
-  {
-    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
-    auto it = _txn_fate.find(transaction_id);
-    return (it == _txn_fate.end()) ? 0 : it->second;
-  }
 
   bool Memory::transaction_live(size_t transaction_id)
   {
@@ -93,18 +75,16 @@ namespace Zigurat
 
   void Memory::transaction_retire(size_t transaction_id)
   {
-    Memory::transaction_retire_why(transaction_id, 10);
+    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
+    Memory::_live_txn_ids.erase(transaction_id);
+    if (_thread_live_txn == transaction_id) _thread_live_txn = 0;
   }
 
   void Memory::_transaction_register(size_t fresh_id)
   {
     std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
-    if (_thread_live_txn != 0) {
-      Memory::_live_txn_ids.erase(_thread_live_txn);
-      _txn_fate[_thread_live_txn] = 5;
-    }
+    if (_thread_live_txn != 0) Memory::_live_txn_ids.erase(_thread_live_txn);
     Memory::_live_txn_ids.insert(fresh_id);
-    _txn_fate[fresh_id] = 1;
     _thread_live_txn = fresh_id;
   }
 
@@ -980,6 +960,11 @@ namespace Zigurat
       if ((offline_state == RowState::NONE && online_state != RowState::NONE) || offline_state == RowState::INSERTED) {
 
 	if (online_lock == RowLock::NONE) {
+	  // A stamp is a stage too -- see _transaction_push. Begun BEFORE the
+	  // control is written, or the stamp would carry the retired id.
+	  if (this->_initialized && Memory::transaction.pointer.hash_key == nullptr)
+	    this->begin_transaction();
+
 	  this->_load_control(pointer, control);
 
 	  control.online_state = RowState::NONE;
@@ -1181,12 +1166,6 @@ namespace Zigurat
 	    // startup would and look at the row again.
 	    if (this->_initialized && !Memory::transaction_live(control.transaction_id)) {
 	      if (streams) streams->lock();
-	      // BREAKER-LEDGER (temporary instrumentation)
-	      fprintf(stderr, "BREAKER-FIRED addr=%lld owner=%zu fate=%d on=%d off=%d lk=%d by=%zu tid=%lu\n",
-		      (long long)pointer.address, control.transaction_id,
-		      Memory::transaction_fate(control.transaction_id),
-		      (int)control.online_state, (int)control.offline_state, (int)control.online_lock,
-		      Memory::transaction.id, (unsigned long)pthread_self());
 	      if (this->_watcher) {
 		this->dba_watch("Break Stale Lock: (address: " + std::to_string(pointer.address) + ")");
 	      }
@@ -1452,6 +1431,10 @@ namespace Zigurat
 
   void Memory::_control_insert(BaseTable* object)
   {
+    // A stage needs a transaction -- see _transaction_push.
+    if (this->_initialized && Memory::transaction.pointer.hash_key == nullptr)
+      this->begin_transaction();
+
     if (this->_watcher) {
       this->dba_watch("Control Insert: (address: " + std::to_string(object->pointer.address) + ")");
     }
@@ -1470,6 +1453,10 @@ namespace Zigurat
   
   void Memory::_control_update(BaseTable* old_object, BaseTable* new_object, Streams* streams)
   {
+    // A stage needs a transaction -- see _transaction_push.
+    if (this->_initialized && Memory::transaction.pointer.hash_key == nullptr)
+      this->begin_transaction();
+
     if (this->_watcher) {
       this->dba_watch("Control Update: (address: " + std::to_string(old_object->pointer.address) + ")");
     }
@@ -1503,6 +1490,10 @@ namespace Zigurat
   
   void Memory::_control_delete(BaseTable* object, Streams* streams)
   {
+    // A stage needs a transaction -- see _transaction_push.
+    if (this->_initialized && Memory::transaction.pointer.hash_key == nullptr)
+      this->begin_transaction();
+
     if (this->_watcher) {
       this->dba_watch("Control Delete: (address: " + std::to_string(object->pointer.address) + ")");
     }
@@ -1524,6 +1515,19 @@ namespace Zigurat
   
   void Memory::_transaction_push(const Pointer& pointer)
   {
+    // A STAGE NEEDS A TRANSACTION. The layer above commits between
+    // statements and does not always begin before the next one, so the next
+    // statement's stages arrived under the RETIRED id of the transaction
+    // that had just committed -- work that was alive by every intention but
+    // dead by the registry, and the lazy stale-lock breaker rolled it back
+    // from under the running statement: the machines rows lost their index
+    // entries that way, one ghost per broken stage, and every ghost refused
+    // a name forever. Beginning here is idempotent -- a begin on an open
+    // transaction continues it -- so a stage that arrives with no
+    // transaction open simply opens the next one.
+    if (this->_initialized && Memory::transaction.pointer.hash_key == nullptr)
+      this->begin_transaction();
+
     if (this->_watcher) {
       this->dba_watch("Transaction Push: (address: " + std::to_string(pointer.address) + ")");
     }
@@ -1726,7 +1730,7 @@ namespace Zigurat
 	  this->_free(Memory::transaction.pointer);
 	Memory::transaction.pointer = Pointer();
       }
-      Memory::transaction_retire_why(Memory::transaction.id, 11);
+      Memory::transaction_retire(Memory::transaction.id);
       Memory::transaction.reset();
       return;
     }
@@ -1776,7 +1780,7 @@ namespace Zigurat
     // Retired from the live registry only now, with every lock already
     // cleared above: a waiter that still sees this id on a lock must find it
     // live, or it would break a lock whose commit is mid-flight.
-    Memory::transaction_retire_why(Memory::transaction.id, 12);
+    Memory::transaction_retire(Memory::transaction.id);
 
     // THE TRANSACTION IS OVER, so what belonged to it goes back to the
     // connection's defaults -- the isolation level above all, which is how a
@@ -1834,7 +1838,7 @@ namespace Zigurat
 
     // A rolled back transaction is as over as a committed one -- and retired
     // the same way, after its locks are gone.
-    Memory::transaction_retire_why(Memory::transaction.id, 13);
+    Memory::transaction_retire(Memory::transaction.id);
     Memory::transaction.reset();
   }
 

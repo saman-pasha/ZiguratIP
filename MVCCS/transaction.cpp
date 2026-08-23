@@ -111,7 +111,7 @@ namespace Zigurat
     // managed to stamp before things went wrong reads as breakable debris, not
     // as a live owner.
     try {
-      Memory::transaction_retire_why(this->id, 14);
+      Memory::transaction_retire(this->id);
     } catch (...) {
       // Process teardown may have destroyed the registry already.
     }

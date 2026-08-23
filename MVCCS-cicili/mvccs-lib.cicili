@@ -1310,6 +1310,20 @@
       (full_hexmap m (aof (-> tl_txn pointer)))
       (write_transaction m (-> tl_txn id) (cast time_t 0))))
 
+  ;; A STAGE NEEDS A TRANSACTION. The layer above commits between
+  ;; statements and does not always begin before the next one, so the
+  ;; next statement's stages arrived under the RETIRED id of the
+  ;; transaction that had just committed -- alive by every intention,
+  ;; dead by the registry, and the lazy stale-lock breaker rolled such
+  ;; work back from under the running statement. Beginning here is
+  ;; idempotent -- a begin on an open transaction continues it -- so a
+  ;; stage arriving with no transaction open simply opens the next one.
+  (func stage_needs_transaction ((Memory * m)) (out void)
+    (if (and (-> m initialized)
+             (or (== tl_txn nil)
+                 (== ($ (-> tl_txn pointer) hash_key) nil)))
+        (begin_transaction m)))
+
   (func transaction_context_clear ((Transaction * t)) (out void)
     (let ((TxnEntry * e . #'(-> t ctx_head)))
       (while (!= e nil)
@@ -1579,6 +1593,9 @@
                  (== offline_state ROW_INSERTED))
              (if (== online_lock LOCK_NONE)
                  (block
+                   ;; a stamp is a stage too, begun BEFORE the control is
+                   ;; written or it would carry the retired id
+                   (stage_needs_transaction m)
                    (load_control m p (aof control))
                    (set ($ control online_state) ROW_NONE)
                    (set ($ control online_lock) LOCK_SHARED)
@@ -1790,6 +1807,9 @@
                                        (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
                                                (== offline_state ROW_INSERTED))
                                            (block
+                                             ;; a stamp is a stage too -- see
+                                             ;; stage_needs_transaction
+                                             (stage_needs_transaction m)
                                              (load_control m (aof pointer) (aof control))
                                              (if (== online_lock LOCK_NONE)
                                                  (block
@@ -1894,6 +1914,7 @@
   ;; ISUD -- the staged writes
   ;; ==================================================================
   (func control_insert ((Memory * m) (BaseTable * obj)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Insert" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
@@ -1906,6 +1927,7 @@
 
   (func control_update ((Memory * m) (BaseTable * old_obj) (BaseTable * new_obj)
                         (Streams * streams)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Update" ($ (-> old_obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
@@ -1930,6 +1952,7 @@
       (dump_control m (aof (-> new_obj pointer)) (aof control))))
 
   (func control_delete ((Memory * m) (BaseTable * obj) (Streams * streams)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Delete" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
