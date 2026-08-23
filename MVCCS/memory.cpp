@@ -56,6 +56,38 @@ namespace Zigurat
   const uint8_t Memory::MAX_CURSOR_COUNT = 16;
   int Memory::lock_wait_timeout_ms = 10000;
 
+  // ---- the live-transaction registry ---------------------------------------
+  // What it is for is in memory.hpp, above the declaration.
+
+  std::mutex Memory::_live_txn_mutex;
+  std::unordered_set<size_t> Memory::_live_txn_ids;
+
+  // The thread's slot: the one id this thread has begun and not yet ended.
+  // begin_transaction retiring it before registering the fresh id is what
+  // makes an abandoned transaction's debris breakable.
+  static thread_local size_t _thread_live_txn = 0;
+
+  bool Memory::transaction_live(size_t transaction_id)
+  {
+    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
+    return Memory::_live_txn_ids.find(transaction_id) != Memory::_live_txn_ids.end();
+  }
+
+  void Memory::transaction_retire(size_t transaction_id)
+  {
+    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
+    Memory::_live_txn_ids.erase(transaction_id);
+    if (_thread_live_txn == transaction_id) _thread_live_txn = 0;
+  }
+
+  void Memory::_transaction_register(size_t fresh_id)
+  {
+    std::lock_guard<std::mutex> guard(Memory::_live_txn_mutex);
+    if (_thread_live_txn != 0) Memory::_live_txn_ids.erase(_thread_live_txn);
+    Memory::_live_txn_ids.insert(fresh_id);
+    _thread_live_txn = fresh_id;
+  }
+
   bool Memory::HashKeyComparer::operator()(hashkey_ptr src, hashkey_ptr dst) const
   {
     return (std::memcmp(src, dst, HASHKEY_SIZE) < 0);
@@ -1119,6 +1151,23 @@ namespace Zigurat
 	    do_read = false;
 	    break;
 	  } else  {
+	    // A LOCK WHOSE TRANSACTION IS DEAD IS DEBRIS, NOT CONTENTION. A
+	    // crashed client or an abandoned pool slot leaves its staged lock
+	    // on disk with nothing left to commit or roll it back; only a
+	    // restart's recovery would sweep it, and until then every waiter
+	    // burned its whole timeout on a corpse -- the wedged row that
+	    // stranded a machine for run after run. So recovery is executed
+	    // lazily, here, on contact: roll the one pointer back exactly as
+	    // startup would and look at the row again.
+	    if (this->_initialized && !Memory::transaction_live(control.transaction_id)) {
+	      if (streams) streams->lock();
+	      if (this->_watcher) {
+		this->dba_watch("Break Stale Lock: (address: " + std::to_string(pointer.address) + ")");
+	      }
+	      this->_rollback_pointer(pointer, true);
+	      continue;
+	    }
+
 	    // Two sessions can each hold a lock the other is waiting for. Give up
 	    // rather than spin forever: the caller rolls back and retries, which
 	    // is what breaks the cycle.
@@ -1502,7 +1551,7 @@ namespace Zigurat
     this->_dump_control(pointer, control);
   }
 
-  void Memory::_rollback_pointer(const Pointer& pointer)
+  void Memory::_rollback_pointer(const Pointer& pointer, bool as_recovery)
   {
     if (this->_watcher) {
       this->dba_watch("Rollback Pointer: (address: " + std::to_string(pointer.address) + ")");
@@ -1514,7 +1563,10 @@ namespace Zigurat
     // The same ownership rule as _commit_pointer -- a partial rollback
     // 'restoring' a row whose stage now belongs to another transaction
     // erased that transaction's staged delete and resurrected the row.
-    if (this->_initialized && control.transaction_id != Memory::transaction.id)
+    // Recovery stands outside the rule as it always has: as_recovery is
+    // _check_lock breaking a dead transaction's lock, whose whole point is
+    // rolling back a stage that is nobody's.
+    if (!as_recovery && this->_initialized && control.transaction_id != Memory::transaction.id)
       return;
 
     switch (control.online_state) {
@@ -1578,6 +1630,22 @@ namespace Zigurat
     if (beginning) return;
     ReentryGuard guard(beginning);
 
+    // A FRESH ID PER BEGIN, not per thread. The constructor's per-thread id
+    // meant every transaction a pooled connection ever ran shared one id, so
+    // "is the transaction that stamped this lock still running" had no
+    // answer -- the id outlived every one of them. Now an id names exactly
+    // one begin..commit-or-rollback span, which is what the live registry
+    // and the stale-lock breaker in _check_lock key on. The serial makes two
+    // begins distinct even within one clock second; the hashed base keeps
+    // ids from different runs from colliding in a store that outlives them.
+    {
+      static const size_t id_base = Utility::generate_id();
+      static std::atomic<size_t> id_serial{0};
+      Memory::transaction.id = id_base + (++id_serial);
+      if (Memory::transaction.id == 0) Memory::transaction.id = ++id_serial;
+      Memory::_transaction_register(Memory::transaction.id);
+    }
+
     // Allocating the transaction record touches the hexmap and the data file
     // exactly as commit and rollback do, so it needs the same two mutexes.
     // Without them concurrent sessions raced here and lost each other's pages.
@@ -1622,6 +1690,7 @@ namespace Zigurat
 	  this->_free(Memory::transaction.pointer);
 	Memory::transaction.pointer = Pointer();
       }
+      Memory::transaction_retire(Memory::transaction.id);
       Memory::transaction.reset();
       return;
     }
@@ -1667,6 +1736,11 @@ namespace Zigurat
     this->_write_transaction(Memory::transaction.id, (time_t)0);
     this->_sync();
     }
+
+    // Retired from the live registry only now, with every lock already
+    // cleared above: a waiter that still sees this id on a lock must find it
+    // live, or it would break a lock whose commit is mid-flight.
+    Memory::transaction_retire(Memory::transaction.id);
 
     // THE TRANSACTION IS OVER, so what belonged to it goes back to the
     // connection's defaults -- the isolation level above all, which is how a
@@ -1722,7 +1796,9 @@ namespace Zigurat
     this->_sync();
     }
 
-    // A rolled back transaction is as over as a committed one.
+    // A rolled back transaction is as over as a committed one -- and retired
+    // the same way, after its locks are gone.
+    Memory::transaction_retire(Memory::transaction.id);
     Memory::transaction.reset();
   }
 

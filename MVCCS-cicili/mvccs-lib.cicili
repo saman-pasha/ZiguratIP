@@ -292,6 +292,66 @@
 
   (thread-local) (var Transaction * tl_txn . nil)
 
+  ;; ---- the live-transaction registry ------------------------------
+  ;; Which transaction ids are between begin and commit-or-rollback
+  ;; right now, process-wide. A lock whose owner is not in here belongs
+  ;; to a transaction nothing will ever finish -- a crashed client, an
+  ;; abandoned pool slot -- and check_lock breaks it in place instead
+  ;; of waiting on a corpse until a restart's recovery would have swept
+  ;; it. One slot per thread: begin_transaction registers the fresh id
+  ;; and retires the thread's previous one, so a transaction ABANDONED
+  ;; by its thread (a new begin with no commit or rollback between)
+  ;; drops out at that moment and its locks become breakable debris.
+  ;; 512 slots holds one live transaction per thread plus every slot a
+  ;; thread abandoned and has not yet re-begun over -- far above any
+  ;; real thread count here. A full table would leave a live id
+  ;; unregistered and its locks breakable, so the headroom is the point.
+  (var pthread_mutex_t live_txn_access . PTHREAD_MUTEX_INITIALIZER)
+  (var size_t live_txn_ids [512])            ;; zero marks an empty slot
+  (thread-local) (var size_t tl_live_txn . 0)
+  (var size_t txn_id_base . 0)
+  (var size_t txn_id_serial . 0)
+
+  (func transaction_live ((size_t transaction_id)) (out bool)
+    (if (== transaction_id (cast size_t 0)) (return #f))
+    (let ((bool found . #f))
+      (pthread_mutex_lock (aof live_txn_access))
+      (let ((int i . 0))
+        (while (< i 512)
+          (if (== (nth i live_txn_ids) transaction_id)
+              (block (set found #t) (set i 512))
+            (set i (+ i 1)))))
+      (pthread_mutex_unlock (aof live_txn_access))
+      (return found)))
+
+  (func transaction_retire ((size_t transaction_id)) (out void)
+    (pthread_mutex_lock (aof live_txn_access))
+    (let ((int i . 0))
+      (while (< i 512)
+        (if (== (nth i live_txn_ids) transaction_id)
+            (set (nth i live_txn_ids) (cast size_t 0)))
+        (set i (+ i 1))))
+    (if (== tl_live_txn transaction_id) (set tl_live_txn (cast size_t 0)))
+    (pthread_mutex_unlock (aof live_txn_access)))
+
+  (func transaction_register ((size_t fresh_id)) (out void)
+    (pthread_mutex_lock (aof live_txn_access))
+    (let ((int i . 0))
+      ;; the thread's previous transaction, if it never ended, ends here
+      (if (!= tl_live_txn (cast size_t 0))
+          (block
+            (while (< i 512)
+              (if (== (nth i live_txn_ids) tl_live_txn)
+                  (set (nth i live_txn_ids) (cast size_t 0)))
+              (set i (+ i 1)))
+            (set i 0)))
+      (while (< i 512)
+        (if (== (nth i live_txn_ids) (cast size_t 0))
+            (block (set (nth i live_txn_ids) fresh_id) (set i 512))
+          (set i (+ i 1)))))
+    (set tl_live_txn fresh_id)
+    (pthread_mutex_unlock (aof live_txn_access)))
+
   (var IsolationLevel default_isolation_level . READ_COMMITTED)
 
   ;; ==================================================================
@@ -1143,24 +1203,14 @@
 
       (dump_control m p (aof control))))
 
-  (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
-    (dba_watch1 m "Rollback Pointer" (-> p address))
+  ;; the rollback of ONE pointer with no ownership question asked --
+  ;; rollback_pointer guards it for a transaction rolling back its own
+  ;; context, and check_lock calls it bare when breaking a dead
+  ;; transaction's lock, which is recovery's foreign-id work done lazily
+  (func rollback_pointer_apply ((Memory * m) (const Pointer * p)) (out void)
     (let ((Control control))
       (control_clear (aof control))
       (load_control m p (aof control))
-
-      ;; the same ownership rule as commit_pointer, and it is what a claim
-      ;; retry's partial rollback was violating: it 'restored' a row whose
-      ;; stage now belonged to a SAVE that had staged a delete over the
-      ;; claim's shared stamp -- the restore erased the staged delete, the
-      ;; save's commit then found nothing of its own to flip, and the row
-      ;; came back from the dead as a TWIN the twelve workers bounced their
-      ;; saves between forever. Startup recovery stands outside the rule,
-      ;; exactly as at commit_pointer.
-      (if (and (-> m initialized)
-               (and (!= tl_txn nil)
-                    (!= ($ control transaction_id) (-> tl_txn id))))
-          (return))
 
       (set ($ control online_state) ROW_NONE)
       (set ($ control online_lock) LOCK_NONE)
@@ -1182,6 +1232,26 @@
 
       (dump_control m p (aof control))))
 
+  (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (dba_watch1 m "Rollback Pointer" (-> p address))
+    (let ((Control control))
+      (control_clear (aof control))
+      (load_control m p (aof control))
+
+      ;; the same ownership rule as commit_pointer, and it is what a claim
+      ;; retry's partial rollback was violating: it 'restored' a row whose
+      ;; stage now belonged to a SAVE that had staged a delete over the
+      ;; claim's shared stamp -- the restore erased the staged delete, the
+      ;; save's commit then found nothing of its own to flip, and the row
+      ;; came back from the dead as a TWIN the twelve workers bounced their
+      ;; saves between forever. Startup recovery stands outside the rule,
+      ;; exactly as at commit_pointer.
+      (if (and (-> m initialized)
+               (and (!= tl_txn nil)
+                    (!= ($ control transaction_id) (-> tl_txn id))))
+          (return)))
+    (rollback_pointer_apply m p))
+
   ;; data before hexmap, every durability point -- the hexmap is the claim,
   ;; the data the substance
   (func sync_disk ((Memory * m)) (out void)
@@ -1199,7 +1269,23 @@
           (set (-> tl_txn isolation_level) READ_COMMITTED)
           (set (-> tl_txn ctx_head) nil)
           (set (-> tl_txn ctx_tail) nil)))
-    (set (-> tl_txn id) (Utility::generate_id))
+    ;; A FRESH ID PER BEGIN, unique within the process: generate_id
+    ;; hashes the thread and the wall second, so two begins in one
+    ;; second on one thread collided -- and "is the transaction that
+    ;; stamped this lock still running" needs an id to name exactly one
+    ;; begin..commit-or-rollback span. The serial makes every begin
+    ;; distinct; the hashed base keeps ids from different runs from
+    ;; colliding in a store that outlives them.
+    (block
+      (pthread_mutex_lock (aof live_txn_access))
+      (if (== txn_id_base (cast size_t 0))
+          (set txn_id_base (Utility::generate_id)))
+      (set txn_id_serial (+ txn_id_serial 1))
+      (set (-> tl_txn id) (+ txn_id_base txn_id_serial))
+      (if (== (-> tl_txn id) (cast size_t 0))
+          (set (-> tl_txn id) txn_id_serial))
+      (pthread_mutex_unlock (aof live_txn_access)))
+    (transaction_register (-> tl_txn id))
     (transaction_reset tl_txn)
     (dba_watch0 m "Begin Transaction")
 
@@ -1249,6 +1335,7 @@
                     (free_pointer m (aof (-> t pointer))))
                 (set (-> t pointer) (pointer_null))
                 (cast void 0)))
+            (transaction_retire (-> t id))
             (transaction_reset t)
             (return)))
       ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
@@ -1270,6 +1357,10 @@
             ;; only then is the intention retired
             (write_transaction m (-> t id) (cast time_t 0))
             (sync_disk m))))
+      ;; retired from the live registry only now, with every lock
+      ;; already cleared: a waiter still seeing this id on a lock must
+      ;; find it live, or it would break a commit mid-flight
+      (transaction_retire (-> t id))
       (transaction_reset t)))
 
   (func rollback_transaction ((Memory * m)) (out void)
@@ -1287,6 +1378,9 @@
               (free_pointer m (aof (-> t pointer))))
           (set (-> t pointer) (pointer_null))
           (sync_disk m)))
+      ;; a rolled back transaction is as over as a committed one, and
+      ;; retired the same way, after its locks are gone
+      (transaction_retire (-> t id))
       (transaction_reset t)))
 
   ;; the partial rollback the repeatable-read retry uses
@@ -1394,6 +1488,22 @@
                     (set do_read #f)
                     (set looping #f))
                 (block
+                  ;; A LOCK WHOSE TRANSACTION IS DEAD IS DEBRIS, NOT
+                  ;; CONTENTION. A crashed client or an abandoned pool
+                  ;; slot leaves its staged lock on disk with nothing
+                  ;; left to commit or roll it back; only a restart's
+                  ;; recovery would sweep it, and until then every
+                  ;; waiter burned its whole timeout on a corpse. So
+                  ;; recovery is executed lazily, here, on contact:
+                  ;; roll the one pointer back exactly as startup
+                  ;; would and look at the row again.
+                  (if (and (-> m initialized)
+                           (not (transaction_live (-> c transaction_id))))
+                      (block
+                        (if (!= streams nil) ((-> streams lock)))
+                        (dba_watch1 m "Break Stale Lock" (-> p address))
+                        (rollback_pointer_apply m p)
+                        continue))
                   ;; two sessions can each hold what the other wants: give up
                   ;; rather than spin forever
                   (if (and (> lock_wait_timeout_ms 0)

@@ -236,6 +236,25 @@
       (commit_transaction m))
     (return nil))
 
+  ;; stages an update on row 300 and ABANDONS it, exactly as a pooled
+  ;; connection does: a fresh begin with the staged work neither
+  ;; committed nor rolled back, then the thread ends. The ownership
+  ;; guard keeps the new commit from adopting the orphan, so the row's
+  ;; EXCLUSIVE lock stays behind on disk as debris.
+  (func abandon_worker ((void * arg)) (out void *)
+    (let ((Memory * m . #'(cast (Memory *) arg)))
+      (begin_transaction m)
+      (let ((Book old_row) (Book new_row))
+        (if (book_find m 300 (aof old_row))
+            (block
+              (set new_row old_row)
+              (set ($ new_row value) 701)
+              (Book_update m (aof old_row) (aof new_row)))))
+      ;; the abandonment
+      (begin_transaction m)
+      (commit_transaction m))
+    (return nil))
+
   ;; one concurrent session: its own transaction, ten inserts, commit
   (func session_worker ((void * arg)) (out void *)
     (let ((Memory * m . #'(cast (Memory *) arg)))
@@ -319,7 +338,10 @@
         (check "the index hides the deleted row" (book_equal_count (aof mem) 30) 0)
 
         ;; ---- TRUNCATE reclaims exactly the settled dead ---------------
-        (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 1)
+        ;; two of them: row 3's settled delete AND the superseded old
+        ;; version row 2's update left behind -- reclaiming UPDATED
+        ;; versions is the machines-table lesson, see dead_pointers
+        (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 2)
         (check "truncate spares the living" (book_count (aof mem) nil) 2)
         (check "the index survives truncate" (book_equal_count (aof mem) 42) 1)
 
@@ -627,6 +649,44 @@
           (Memo_cursor (aof mem) (cast (void *) (aof sc)) memo_cb)
           (check "text rows come back" ($ sc rows) 2)
           (check "byte for byte" ($ sc bytes) 17))
+
+        ;; ---- a dead transaction's lock breaks on contact --------------
+        ;; abandon_worker leaves row 300 EXCLUSIVE-locked by a transaction
+        ;; nothing will ever finish. Before the breaker this update burned
+        ;; the whole lock_wait_timeout_ms on a corpse and threw; now
+        ;; check_lock finds the owner dead in the live registry, rolls the
+        ;; one pointer back exactly as startup recovery would, and the
+        ;; update lands in milliseconds.
+        (let ((Book b))
+          (set ($ b id) 300)
+          (set ($ b value) 700)
+          (Book_insert (aof mem) (aof b)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((pthread_t ta))
+          (pthread_create (aof ta) nil abandon_worker (cast (void *) (aof mem)))
+          (pthread_join ta nil))
+        (let ((int64_t t0 . #'(mvccs_wall_micros)))
+          (let ((Book old_row) (Book new_row))
+            (check "the debris hides nothing committed"
+                   (? (book_find (aof mem) 300 (aof old_row)) 1 0) 1)
+            (check "and the committed version is what reads"
+                   ($ old_row value) 700)
+            (set new_row old_row)
+            (set ($ new_row value) 702)
+            (Book_update (aof mem) (aof old_row) (aof new_row)))
+          (commit_transaction (aof mem))
+          (begin_transaction (aof mem))
+          (check "the stale lock broke on contact, not by timeout"
+                 (? (< (- (mvccs_wall_micros) t0) 1000000) 1 0) 1))
+        (check "the abandoned stage never landed" (book_equal_count (aof mem) 701) 0)
+        (check "the second writer's update did" (book_equal_count (aof mem) 702) 1)
+        ;; and the row leaves, so every later count stands
+        (let ((Book doomed))
+          (if (book_find (aof mem) 300 (aof doomed))
+              (Book_delete (aof mem) (aof doomed))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
 
         (sync_disk (aof mem))
         (cast void 0)))

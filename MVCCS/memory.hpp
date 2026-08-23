@@ -18,6 +18,7 @@
 #include <map>
 #include <list>
 #include <mutex>
+#include <unordered_set>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -66,6 +67,21 @@ namespace Zigurat
     // milliseconds. Two sessions can each hold a lock the other is waiting for,
     // and without a bound the whole server sits there forever. 0 waits forever.
     static int lock_wait_timeout_ms;
+
+    // ---- the live-transaction registry -------------------------------------
+    //
+    // Which transaction ids are between begin and commit-or-rollback right
+    // now, process-wide. A lock whose owner is not in here belongs to a
+    // transaction nothing will ever finish -- a crashed client, an abandoned
+    // pool slot -- and _check_lock breaks it in place instead of waiting on a
+    // corpse until a restart's recovery would have swept it.
+    //
+    // One slot per thread: begin_transaction registers the fresh id and
+    // retires the thread's previous one, so a transaction ABANDONED by its
+    // thread (a new begin with no commit or rollback between) drops out of
+    // the registry at that moment and its locks become breakable debris.
+    static bool transaction_live(size_t transaction_id);
+    static void transaction_retire(size_t transaction_id);
     
     class HashKeyComparer : public std::binary_function<hashkey_ptr, hashkey_ptr, bool>
     {
@@ -244,7 +260,13 @@ namespace Zigurat
     void _write_transaction(size_t, time_t);
     
     void _commit_pointer(const Pointer&, time_t);
-    void _rollback_pointer(const Pointer&);
+    // as_recovery bypasses the ownership guard: recovery -- at startup or
+    // lazily from _check_lock on a dead transaction's lock -- rolls back
+    // exactly the foreign stages the guard exists to protect.
+    void _rollback_pointer(const Pointer&, bool as_recovery = false);
+    static std::mutex _live_txn_mutex;
+    static std::unordered_set<size_t> _live_txn_ids;
+    static void _transaction_register(size_t fresh_id);
     
     bool _check_lock(RowLock, const Pointer&, Control&, Streams*);
 
