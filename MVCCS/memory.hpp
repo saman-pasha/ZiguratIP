@@ -85,6 +85,9 @@ namespace Zigurat
     // so an open transaction is never orphaned by beginning again.
     static bool transaction_live(size_t transaction_id);
     static void transaction_retire(size_t transaction_id);
+    // FATE-LEDGER (temporary instrumentation)
+    static void transaction_retire_why(size_t transaction_id, int why);
+    static int transaction_fate(size_t transaction_id);
     
     class HashKeyComparer : public std::binary_function<hashkey_ptr, hashkey_ptr, bool>
     {

@@ -19,6 +19,8 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <cstdio>
+#include <pthread.h>
 
 namespace Zigurat
 {
@@ -83,7 +85,7 @@ namespace Zigurat
     void _map(path_t&, BTreeNode&, const _Table&, const _First&, const Long&);
 
     virtual void _unmap_callback(const _Table&, const _First&, const Long&, BTreeKey<_First>&);
-    void _unmap(BTreeNode&, const _Table&, const _First&, const Long&);
+    bool _unmap(BTreeNode&, const _Table&, const _First&, const Long&);
 
     void _free_key_values(BTreeKey<_First>&);
     void _unlink_dead_values(BTreeKey<_First>&);
@@ -728,9 +730,42 @@ namespace Zigurat
 	  if (key == current_key.key) {
 
 	    if (this->_is_unique && !this->_is_multi_level) {
+	      bool taken = false;
 	      this->_cursor_values(current_key, [&] (int64_t, BTreeValue& current_value) -> bool {
-		  throw IndexException("unique key '" + this->_name + "'");
-		});  
+		  taken = true;
+		  return false;
+		});
+	      if (taken) {
+		// UNIQUE-LEDGER (temporary instrumentation): dump the whole
+		// chain raw -- every link, visible or not, with its control --
+		// so the ghost that just refused this insert can be named.
+		fprintf(stderr, "UNIQUE-LEDGER %s key@%lld txn=%zu iso=%d qt=%lld qid=%lld tid=%lu\n",
+			this->_name.c_str(), (long long)current_key.pointer.address,
+			Memory::transaction.id, (int)Memory::transaction.isolation_level(),
+			(long long)Memory::transaction.query_time, (long long)Memory::transaction.query_id,
+			(unsigned long)pthread_self());
+		Long walk_address = current_key.values_address;
+		if (walk_address.is_null().value()) walk_address = (int64_t)-1;
+		int hops = 0;
+		while (walk_address.value() > -1 && hops < 64) {
+		  Pointer vp = this->_memory->_pointer(this->_hash_key, walk_address);
+		  BTreeValue v;
+		  this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(vp), std::ios::beg);
+		  this->_memory->_data_io >> v;
+		  Control vc;
+		  this->_memory->_load_control(vp, vc);
+		  fprintf(stderr, "UNIQUE-LEDGER   val@%lld row=%lld next=%lld on=%d off=%d lk=%d vtxn=%zu cr=%lld mod=%lld\n",
+			  (long long)walk_address.value(),
+			  (long long)(v.value.is_null().value() ? -1 : v.value.value()),
+			  (long long)(v.next_address.is_null().value() ? -1 : v.next_address.value()),
+			  (int)vc.online_state, (int)vc.offline_state, (int)vc.online_lock,
+			  vc.transaction_id, (long long)vc.create_time, (long long)vc.modify_time);
+		  walk_address = v.next_address;
+		  if (walk_address.is_null().value()) walk_address = (int64_t)-1;
+		  hops++;
+		}
+		throw IndexException("unique key '" + this->_name + "'");
+	      }
 	    }
 
 	    if (!this->_is_multi_level)
@@ -819,8 +854,9 @@ namespace Zigurat
   }
 
   template <typename _Table, typename _First>
-  void BTreeIndex<_Table, _First>::_unmap(BTreeNode& node, const _Table& object, const _First& key, const Long& value)
+  bool BTreeIndex<_Table, _First>::_unmap(BTreeNode& node, const _Table& object, const _First& key, const Long& value)
   {
+    bool found = false;
     BTreeKey<_First> left_key;
     this->_cursor_keys(node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
 	if (key < current_key.key) {
@@ -828,10 +864,10 @@ namespace Zigurat
 	  if (node.is_internal) {
 
 	    BTreeNode left_node = this->_btreenode(current_key.left_node_address);
-            this->_unmap(left_node, object, key, value);
+            found = this->_unmap(left_node, object, key, value);
 
 	    return false;
-	  } 
+	  }
 
 	} else if (key == current_key.key) {
 
@@ -841,6 +877,7 @@ namespace Zigurat
 	    // this level has none of its own and the walk below would never run
 	    // -- which left the dependent index holding a deleted row.
 	    this->_unmap_callback(object, key, value, current_key);
+	    found = true;
 
 	  } else {
 
@@ -853,8 +890,45 @@ namespace Zigurat
 
 		this->_unmap_callback(object, key, value, current_key);
 		this->_delete_btreevalue(current_value);
+		found = true;
 		return false;
 	      });
+
+	    // UNMAP-LEDGER (temporary instrumentation): the row is leaving the
+	    // table but its entry was not found under its key -- the birth of
+	    // a ghost. Dump the chain raw so the invisible entry names itself.
+	    if (!found) {
+	      Control rc_;
+	      this->_memory->_load_control(object.pointer, rc_);
+	      fprintf(stderr, "UNMAP-LEDGER %s key@%lld row=%lld rowctl{on=%d off=%d lk=%d txn=%zu cr=%lld mod=%lld} txn=%zu iso=%d qt=%lld qid=%lld tid=%lu\n",
+		      this->_name.c_str(), (long long)current_key.pointer.address,
+		      (long long)value.value(),
+		      (int)rc_.online_state, (int)rc_.offline_state, (int)rc_.online_lock,
+		      rc_.transaction_id, (long long)rc_.create_time, (long long)rc_.modify_time,
+		      Memory::transaction.id, (int)Memory::transaction.isolation_level(),
+		      (long long)Memory::transaction.query_time, (long long)Memory::transaction.query_id,
+		      (unsigned long)pthread_self());
+	      Long walk_address = current_key.values_address;
+	      if (walk_address.is_null().value()) walk_address = (int64_t)-1;
+	      int hops = 0;
+	      while (walk_address.value() > -1 && hops < 64) {
+		Pointer vp = this->_memory->_pointer(this->_hash_key, walk_address);
+		BTreeValue v;
+		this->_memory->_data_io.seekg(this->_memory->_pointer_data_address(vp), std::ios::beg);
+		this->_memory->_data_io >> v;
+		Control vc;
+		this->_memory->_load_control(vp, vc);
+		fprintf(stderr, "UNMAP-LEDGER   val@%lld row=%lld next=%lld on=%d off=%d lk=%d vtxn=%zu cr=%lld mod=%lld\n",
+			(long long)walk_address.value(),
+			(long long)(v.value.is_null().value() ? -1 : v.value.value()),
+			(long long)(v.next_address.is_null().value() ? -1 : v.next_address.value()),
+			(int)vc.online_state, (int)vc.offline_state, (int)vc.online_lock,
+			vc.transaction_id, (long long)vc.create_time, (long long)vc.modify_time);
+		walk_address = v.next_address;
+		if (walk_address.is_null().value()) walk_address = (int64_t)-1;
+		hops++;
+	      }
+	    }
 	  }
 	  return false;
 
@@ -863,14 +937,15 @@ namespace Zigurat
 	  if (node.is_internal && current_key.right_address.value() == -1) {
 
 	    BTreeNode right_node = this->_btreenode(current_key.right_node_address);
-            this->_unmap(right_node, object, key, value);  
+            found = this->_unmap(right_node, object, key, value);
 	  }
-	  
+
 	}
 
 	left_key = current_key;
 	return true;
       });
+    return found;
   }
 
   template <typename _Table, typename _First>
@@ -886,7 +961,13 @@ namespace Zigurat
 
       BTreeNode root_node = this->_btreenode(this->_root_address);
       Long value = object.pointer.address;
-      this->_unmap(root_node, object, object.*this->_column, value);
+      if (!this->_unmap(root_node, object, object.*this->_column, value)) {
+	// Reported inside _unmap with the chain when the key was reached;
+	// this line fires alone when the KEY itself was never met.
+	fprintf(stderr, "UNMAP-LEDGER UNFOUND %s row=%lld txn=%zu tid=%lu\n",
+		this->_name.c_str(), (long long)value.value(),
+		Memory::transaction.id, (unsigned long)pthread_self());
+      }
     }
   }
   
