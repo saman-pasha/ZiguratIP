@@ -528,6 +528,11 @@
     (member FreeEntry * frees)
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
+    (member pthread_rwlock_t streams_rw)
+    ;; where a thread may open its own read-only view of the two files --
+    ;; empty means "no private readers": every guard is exclusive, as before
+    (member char rd_hex_path [512])
+    (member char rd_data_path [512])
     (member pthread_mutex_t page_list_access)
     (member pthread_mutex_t free_list_access)
     ;; the DBA watcher: one line per engine operation goes through this
@@ -542,34 +547,114 @@
   ;; C++ layer earning its keep: a ctor/dtor pair IS the discipline.
   ;; ==================================================================
   (thread-local) (var void * tl_streams_held . nil)
+  ;; nonzero while this thread holds the guard SHARED: its reads go through
+  ;; the thread's own read-only streams, and writers are excluded wholesale
+  (thread-local) (var int tl_read_mode . 0)
+  (thread-local) (var binarystream * tl_rd_hex . nil)
+  (thread-local) (var binarystream * tl_rd_data . nil)
+  ;; the next Streams constructed on this thread would LIKE to be shared;
+  ;; the ctor consumes the flag and grants it only when it is safe to
+  (thread-local) (var int tl_want_shared . 0)
+
+  ;; a shared guard is granted only to a read whose isolation writes
+  ;; nothing: REPEATABLE READ and SERIALIZABLE stamp shared row locks as
+  ;; they scan -- the lesson of the reverted first attempt at this -- so
+  ;; the lock mode follows the level
+  (func reader_eligible ((Memory * m)) (out int)
+    (if (not (-> m initialized)) (return 0))
+    (if (== (nth 0 (-> m rd_hex_path)) (cast char 0)) (return 0))
+    (if (== tl_txn nil) (return 0))
+    (if (or (== (-> tl_txn isolation_level) REPEATABLE_READ)
+            (== (-> tl_txn isolation_level) SERIALIZABLE))
+        (return 0))
+    (return 1))
+
+  (func reader_ensure ((Memory * m)) (out void)
+    (if (!= tl_rd_hex nil) (return))
+    (set tl_rd_hex (cast (binarystream *)
+                         (new* Zigurat::filestream (std::string (-> m rd_hex_path))
+                               std::ios::in)))
+    (set tl_rd_data (cast (binarystream *)
+                          (new* Zigurat::filestream (std::string (-> m rd_data_path))
+                                std::ios::in))))
+
+  ;; which stream a READ goes through: the thread's private one under a
+  ;; shared guard, the canonical one everywhere else -- above all under a
+  ;; write guard, where the canonical stream is the only place this
+  ;; thread's own unflushed bytes can be read back from
+  (func hex_in ((Memory * m)) (out binarystream *)
+    (if (or (== tl_read_mode 0) (!= tl_streams_held nil)) (return (-> m hexmap_io)))
+    (reader_ensure m)
+    (return tl_rd_hex))
+
+  (func data_in ((Memory * m)) (out binarystream *)
+    (if (or (== tl_read_mode 0) (!= tl_streams_held nil)) (return (-> m data_io)))
+    (reader_ensure m)
+    (return tl_rd_data))
 
   (struct Streams
     (member Memory * m)
     (member bool mine_)
     (member bool locked_)
+    (member bool shared_)
 
     (method lock () (out void)
       (if (or (not ($ this mine_)) ($ this locked_)) (return))
-      ;; always hexmap then data -- one order at every site, no deadlock
-      (pthread_mutex_lock (aof (-> ($ this m) hexmap_access)))
-      (pthread_mutex_lock (aof (-> ($ this m) data_access)))
-      (set tl_streams_held (cast (void *) this))
+      (if ($ this shared_)
+          (block
+            (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
+            (set tl_read_mode 1))
+        (block
+          ;; a write guard under a held shared one would deadlock on the
+          ;; rwlock -- surface the bug instead of wedging on it
+          (if (== tl_read_mode 1)
+              (throw* (MemoryException "an exclusive streams guard under a shared one")))
+          (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
+          (set tl_streams_held (cast (void *) this))))
       (set ($ this locked_) #t))
 
     (method unlock () (out void)
       (if (or (not ($ this mine_)) (not ($ this locked_))) (return))
-      ;; withdrawn BEFORE releasing: never claim a hold already given back
-      (set tl_streams_held nil)
-      (set ($ this locked_) #f)
-      (pthread_mutex_unlock (aof (-> ($ this m) data_access)))
-      (pthread_mutex_unlock (aof (-> ($ this m) hexmap_access))))
+      (if ($ this shared_)
+          (block
+            ;; withdrawn BEFORE releasing: never claim a hold already given back
+            (set tl_read_mode 0)
+            (set ($ this locked_) #f)
+            (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw))))
+        (block
+          ;; every write is in the FILE before the guard is released, or a
+          ;; private reader taken the next instant would miss the bytes
+          ;; still sitting in the canonical streams' buffers
+          ((-> (-> ($ this m) hexmap_io) flush))
+          ((-> (-> ($ this m) data_io) flush))
+          (set tl_streams_held nil)
+          (set ($ this locked_) #f)
+          (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw))))))
 
     (ctor ((Memory * mem))
-      (init (m mem) (mine_ (== tl_streams_held nil)) (locked_ #f))
+      (init (m mem) (mine_ #f) (locked_ #f) (shared_ #f))
+      (let ((int want . tl_want_shared))
+        (set tl_want_shared 0)
+        (if (!= tl_streams_held nil)
+            (set ($ this mine_) #f)          ;; nested under a write hold: no-op
+          (if (== tl_read_mode 1)
+              (if (== want 1)
+                  (set ($ this mine_) #f)     ;; nested under a shared hold: no-op
+                (set ($ this mine_) #t))      ;; write wanted under shared: trap in lock()
+            (block                            ;; outermost
+              (set ($ this mine_) #t)
+              (if (and (== want 1) (== 1 (reader_eligible mem)))
+                  (set ($ this shared_) #t))))))
       (($ this lock)))
 
     (dtor ()
       (($ this unlock))))
+
+  ;; called once, by whoever opened the store and knows where its two
+  ;; files live -- this is what turns the shared side ON
+  (func memory_reader_paths ((Memory * m) (const char * hex) (const char * data)) (out void)
+    (snprintf (-> m rd_hex_path) 512 "%s" hex)
+    (snprintf (-> m rd_data_path) 512 "%s" data))
 
   ;; ==================================================================
   ;; Statement -- where a reader's single point in time is fixed. The
@@ -659,17 +744,33 @@
   ;; holder spent most of its time.
   (func load_control ((Memory * m) (const Pointer * p) (Control * c)) (out void)
     (let ((uint8_t flags [4])
-          (uint8_t fields [48]))
-      ((-> (-> m hexmap_io) seekg) (ptr_hexmap p) std::ios::beg)
-      ((-> (-> m hexmap_io) read) (cast (char *) flags) 2)
+          (uint8_t fields [48])
+          (binarystream * hio . #'(hex_in m))
+          (binarystream * dio . #'(data_in m)))
+      ;; a stream a failed read has poisoned answers nothing until it is
+      ;; cleared -- and a thread's PRIVATE stream lives for the thread, so
+      ;; one bad read would turn every later judgment on this thread into
+      ;; garbage. Clear first, verify after.
+      (if (not ((-> hio good))) ((-> hio clear)))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> hio seekg) (ptr_hexmap p) std::ios::beg)
+      ((-> hio read) (cast (char *) flags) 2)
 
       (set (-> c online_state) (cast RowState (bitand (nth 0 flags) 12)))
       (set (-> c online_lock) (cast RowLock (bitand (nth 0 flags) 3)))
       (set (-> c offline_state) (cast RowState (bitand (nth 1 flags) 12)))
       (set (-> c offline_lock) (cast RowLock (bitand (nth 1 flags) 3)))
 
-      ((-> (-> m data_io) seekg) (-> p address) std::ios::beg)
-      ((-> (-> m data_io) read) (cast (char *) fields) 48)
+      ((-> dio seekg) (-> p address) std::ios::beg)
+      ((-> dio read) (cast (char *) fields) 48)
+      (if (or (not ((-> hio good))) (not ((-> dio good))))
+          (block
+            ;; the read did not land: clear the streams and answer the one
+            ;; safe thing -- a control nobody may see (offline NONE)
+            ((-> hio clear))
+            ((-> dio clear))
+            (control_clear c)
+            (return)))
       (memcpy (cast (void *) (aof (-> c online_time))) (cast (void *) (+ fields 0)) 8)
       (memcpy (cast (void *) (aof (-> c transaction_id))) (cast (void *) (+ fields 8)) 8)
       (memcpy (cast (void *) (aof (-> c query_id))) (cast (void *) (+ fields 16)) 8)
@@ -719,13 +820,14 @@
   ;; a Pointer read back from the hexmap chain at ADDRESS -- _pointer
   (func pointer_at ((Memory * m) (const uint8_t * key) (int64_t address)) (out Pointer)
     (let ((uint8_t hex_byte . 0)
-          (int64_t size . 0))
-      ((-> (-> m hexmap_io) seekg) (addr_hexmap_data address) std::ios::beg)
+          (int64_t size . 0)
+          (binarystream * hio . #'(hex_in m)))
+      ((-> hio seekg) (addr_hexmap_data address) std::ios::beg)
       (while #t
-        ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
-        (if (not ((-> (-> m hexmap_io) good)))
+        ((-> hio read_std_ubyte) hex_byte)
+        (if (not ((-> hio good)))
             (block
-              ((-> (-> m hexmap_io) clear))
+              ((-> hio clear))
               (throw* (MemoryException "hexmap ends inside the chunk"))))
         (if (== (bitand hex_byte 64) 64)
             (return (pointer_make key address (+ size (size_remainder hex_byte)))))
@@ -737,23 +839,24 @@
                           (bool * is_data) (RowState * online_state) (RowLock * online_lock))
         (out Pointer)
     (let ((uint8_t hex_byte . 0)
-          (int64_t size . 0))
-      ((-> (-> m hexmap_io) seekg) (addr_hexmap address) std::ios::beg)
-      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+          (int64_t size . 0)
+          (binarystream * hio . #'(hex_in m)))
+      ((-> hio seekg) (addr_hexmap address) std::ios::beg)
+      ((-> hio read_std_ubyte) hex_byte)
       (set (cof online_state) (cast RowState (bitand hex_byte 12)))
       (set (cof online_lock) (cast RowLock (bitand hex_byte 3)))
-      ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 1) std::ios::cur)
+      ((-> hio seekg) (- CONTROL_COUNT 1) std::ios::cur)
       (while #t
-        ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+        ((-> hio read_std_ubyte) hex_byte)
         ;; Reading past the end of the hexmap leaves the stream failed and
         ;; every further read a no-op, so without this the loop spins
         ;; forever on a truncated store rather than reporting the problem.
         ;; The C++ engine throws here in the same words (memory.cpp,
         ;; _pointer_state); the port had dropped the guard, and a wedged
         ;; store took the process with it instead of refusing.
-        (if (not ((-> (-> m hexmap_io) good)))
+        (if (not ((-> hio good)))
             (block
-              ((-> (-> m hexmap_io) clear))
+              ((-> hio clear))
               (let ((char msg [96]))
                 (snprintf msg 96 "hexmap ends inside the chunk at %lld"
                           (cast llong address))
@@ -1040,11 +1143,16 @@
       (set ($ control query_id) 0)
 
       ;; a row that was never committed is flagged deleted rather than freed:
-      ;; rows are never reclaimed except by TRUNCATE
+      ;; rows are never reclaimed except by TRUNCATE. BORN AND DIED AT THE
+      ;; SAME INSTANT, so no snapshot anywhere can see it -- without the
+      ;; birth stamp, a reader whose statement began BEFORE this rollback
+      ;; read "died after my snapshot" on a row that was never alive: the
+      ;; dirty read the upstream suite caught about one run in three.
       (if (== ($ control offline_state) ROW_NONE)
           (block
             (set ($ control offline_state) ROW_DELETED)
-            (set ($ control modify_time) (version_time))))
+            (set ($ control modify_time) (version_time))
+            (set ($ control create_time) ($ control modify_time))))
 
       (dump_control m p (aof control))))
 
@@ -1187,6 +1295,13 @@
   (func alive_at ((const Control * c) (time_t at)) (out bool)
     ;; never committed: nothing here anybody else may see
     (if (== (-> c offline_state) ROW_NONE) (return #f))
+    ;; flagged dead at rollback without ever being born: create_time 0 with
+    ;; a death state is rollback_pointer's never-committed shape from before
+    ;; it stamped the birth too. Nobody may see it at any time.
+    (if (and (== (-> c create_time) (cast time_t 0))
+             (or (== (-> c offline_state) ROW_DELETED)
+                 (== (-> c offline_state) ROW_UPDATED)))
+        (return #f))
     ;; born after this read began
     (if (and (!= (-> c create_time) (cast time_t 0)) (> (-> c create_time) at))
         (return #f))
@@ -1357,7 +1472,11 @@
                         (set settled #t))))
 
                    ((== ($ control offline_state) ROW_DELETED)
-                    (if (> ($ control modify_time) (-> tl_txn init_time))
+                    ;; deleted after my snapshot is visible only if it was
+                    ;; also BORN by then
+                    (if (and (> ($ control modify_time) (-> tl_txn init_time))
+                             (and (!= ($ control create_time) (cast time_t 0))
+                                  (<= ($ control create_time) (-> tl_txn init_time))))
                         (block (set is_visible #t) (set settled #t))
                       (if (> ($ control reference_address) -1)
                           (set (cof p) (pointer_at m (-> p hash_key)
@@ -1388,12 +1507,13 @@
   (func cursor_page_hexmap ((Memory * m) (int64_t page_address) (uint8_t * buf)) (out void)
     (if (> (-> m hbpp) 4096)
         (throw* (MemoryException "page too large for the cursor's hexmap buffer")))
-    ((-> (-> m hexmap_io) seekg) (addr_hexmap page_address) std::ios::beg)
-    ((-> (-> m hexmap_io) read) (cast (char *) buf) (-> m hbpp))
-    (if (not ((-> (-> m hexmap_io) good)))
-        (block
-          ((-> (-> m hexmap_io) clear))
-          (throw* (MemoryException "hexmap ends inside the page")))))
+    (let ((binarystream * hio . #'(hex_in m)))
+      ((-> hio seekg) (addr_hexmap page_address) std::ios::beg)
+      ((-> hio read) (cast (char *) buf) (-> m hbpp))
+      (if (not ((-> hio good)))
+          (block
+            ((-> hio clear))
+            (throw* (MemoryException "hexmap ends inside the page"))))))
 
   (decl) (func cursor_walk ((Memory * m) (const uint8_t * hash_key) (Streams * streams)
                             (void * ctx)
@@ -1415,20 +1535,50 @@
       ;; THE PAGE LIST IS COPIED BEFORE IT IS WALKED -- the lesson the
       ;; original learnt the hard way, kept here: entries snapshotted
       ;; under the lock, walked without it, because the callback is free
-      ;; to allocate pages
-      (let ((int64_t page_total . 0)
-            (const uint8_t * page_keys [512])
-            (int64_t page_addrs [512]))
+      ;; to allocate pages.
+      ;;
+      ;; AND RE-COPIED UNTIL NOTHING NEW APPEARS. The walk lets the
+      ;; streams go around every callback, and in that window a writer
+      ;; can commit a row into a page the snapshot never saw -- fresh
+      ;; from the allocator, or a __FREE__ page rekeyed to this table.
+      ;; A walk that ended on the stale snapshot then answered "no such
+      ;; row" about a row that was committed before it finished, and
+      ;; machine_open, told exactly that, inserted a TWIN of a machine
+      ;; that existed -- the twelve workers then bounced saves and
+      ;; loads between the twins forever. So the walk repeats over
+      ;; whatever pages appeared, until a pass adds none.
+      (let ((int64_t walked_addrs [1024])
+            (int64_t walked_total . 0)
+            (int walk_done . 0)
+            (int rounds . 0))
+       (while (and (== walk_done 0) (< rounds 16))
+        (set rounds (+ rounds 1))
+        (let ((int64_t page_total . 0)
+              (const uint8_t * page_keys [512])
+              (int64_t page_addrs [512]))
         (pthread_mutex_lock (aof (-> m page_list_access)))
         (let ((PageEntry * e . #'(-> m pages)))
           (while (and (!= e nil) (< page_total 512))
             (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
-                (block
-                  (set (nth page_total page_keys) (-> e key))
-                  (set (nth page_total page_addrs) (-> e address))
-                  (set page_total (+ page_total 1))))
+                (let ((int seen . 0) (int64_t w . 0))
+                  (while (< w walked_total)
+                    (if (== (nth w walked_addrs) (-> e address)) (set seen 1))
+                    (set w (+ w 1)))
+                  (if (== seen 0)
+                      (block
+                        (set (nth page_total page_keys) (-> e key))
+                        (set (nth page_total page_addrs) (-> e address))
+                        (set page_total (+ page_total 1))))))
             (set e (-> e next))))
         (pthread_mutex_unlock (aof (-> m page_list_access)))
+
+        (if (== page_total 0) (set walk_done 1))
+        (let ((int64_t pt . 0))
+          (while (and (< pt page_total) (< walked_total 1024))
+            (set (nth walked_total walked_addrs) (nth pt page_addrs))
+            (set walked_total (+ walked_total 1))
+            (set pt (+ pt 1))))
+        (if (>= walked_total 1024) (set walk_done 1))
 
         (let ((int64_t page_n . 0))
           (while (< page_n page_total)
@@ -1548,7 +1698,11 @@
                                                         (set pointer (pointer_at m hash_key ($ control reference_address)))
                                                       (set break_while #t))))
                                                  ((== ($ control offline_state) ROW_DELETED)
-                                                  (if (> ($ control modify_time) (-> tl_txn init_time))
+                                                  ;; deleted after my snapshot is visible only if
+                                                  ;; it was also BORN by then
+                                                  (if (and (> ($ control modify_time) (-> tl_txn init_time))
+                                                           (and (!= ($ control create_time) (cast time_t 0))
+                                                                (<= ($ control create_time) (-> tl_txn init_time))))
                                                       (block (set do_callback #t) (set break_while #t))
                                                     (if (> ($ control reference_address) -1)
                                                         (set pointer (pointer_at m hash_key ($ control reference_address)))
@@ -1574,7 +1728,7 @@
                                           (set page_stale #f)))))))
                         ;; not the last chunk yet
                         (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
-              (set page_n (+ page_n 1)))))))
+              (set page_n (+ page_n 1)))))))))
 
     (set tl_cursor_id (- tl_cursor_id 1)))
 
@@ -1582,9 +1736,13 @@
   ;; guard of its own -- the cursor has handed the streams back by the
   ;; time anything calls this
   (func read_row ((Memory * m) (BaseTable * obj)) (out void)
+    (set tl_want_shared 1)
     (letin* ((streams (Streams m)))
-      ((-> (-> m data_io) seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
-      ((-> obj unpack) (cof (-> m data_io)))))
+      (let ((binarystream * dio . #'(data_in m)))
+        (if (not ((-> dio good))) ((-> dio clear)))
+        ((-> dio seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+        ((-> obj unpack) (cof dio)))
+      (cast void 0)))
 
   ;; ==================================================================
   ;; ISUD -- the staged writes
@@ -1962,6 +2120,15 @@
     (pthread_mutex_init (aof (-> m data_access)) nil)
     (pthread_mutex_init (aof (-> m page_list_access)) nil)
     (pthread_mutex_init (aof (-> m free_list_access)) nil)
+    (set (nth 0 (-> m rd_hex_path)) (cast char 0))
+    (set (nth 0 (-> m rd_data_path)) (cast char 0))
+    ;; writer-preferring where the platform offers it: eight pollers
+    ;; holding the shared side in relay must not starve the one writer
+    (code "{ pthread_rwlockattr_t rwa; pthread_rwlockattr_init(&rwa);")
+    (code "#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP")
+    (code "  pthread_rwlockattr_setkind_np(&rwa, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);")
+    (code "#endif")
+    (code "  pthread_rwlock_init(&m->streams_rw, &rwa); pthread_rwlockattr_destroy(&rwa); }")
 
     ((-> data_io seekg) 0 std::ios::end)
     (set (-> m page_count) (/ ((-> data_io tellg)) page_size))
@@ -3890,6 +4057,8 @@
             (set ($ cc m) m)
             (set ($ cc user) user)
             (set ($ cc cb) cb)
+            ;; shared when the isolation writes nothing; the ctor decides
+            (set tl_want_shared 1)
             (letin* ((streams (Streams m)))
               (cursor_walk m (,kname) (aof streams) (cast (void *) (aof cc)) ,shim)
               (cast void 0))))
