@@ -645,10 +645,33 @@ namespace Zigurat
     this->_free_hexmap(begin, full_count);
 
     if (this->_page_size == full_count * CHUNK_SIZE) {
-      
+
       this->_allocate_page(FREE_HASHKEY, begin * CHUNK_SIZE);
-      this->_page_list.insert({pointer.hash_key, begin * CHUNK_SIZE});
-      
+
+      // REKEYED IN THE LIST, NOT LISTED TWICE. The page is __FREE__ on disk
+      // now, and _allocate_new_page finds returnable pages by looking the
+      // page list up under FREE_HASHKEY -- so the entry has to move. This
+      // used to insert a SECOND entry under the table's key and keep the
+      // old one: the returned page was invisible to the allocator until a
+      // restart rebuilt the list from disk, and every scan of the table
+      // walked the freed page twice under a key it no longer carries.
+      //
+      // The erased entry's key is not freed here: page list keys are heap
+      // copies almost everywhere, but _free_key inserts the static
+      // FREE_HASHKEY itself, and twenty bytes is the wrong price for
+      // guessing which one this was.
+      auto page_iter = this->_page_list.equal_range(pointer.hash_key);
+      for (auto iter = page_iter.first; iter != page_iter.second; iter++) {
+	if (iter->second == begin * CHUNK_SIZE) {
+	  this->_page_list.erase(iter);
+	  break;
+	}
+      }
+
+      auto free_key = new hashkey_t;
+      std::memcpy(free_key, FREE_HASHKEY, HASHKEY_SIZE);
+      this->_page_list.insert({free_key, begin * CHUNK_SIZE});
+
     } else {
       
       Pointer tmp_pointer(pointer.hash_key, begin * CHUNK_SIZE, full_count * CHUNK_SIZE);
@@ -1745,6 +1768,13 @@ namespace Zigurat
 
   void Memory::dba_pointers(binarystream& stream)
   {
+    // Under the pair, like everything else that seeks and reads the shared
+    // streams. This walked them with nothing held -- an admin connection
+    // asking for a page dump while any session wrote raced every seek
+    // against every read, which is the exact interleaving Streams exists
+    // to prevent.
+    Streams streams(this);
+
     int64_t pagefile_start;
     stream.read_std_long(pagefile_start);
 

@@ -7,7 +7,13 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 
 ## What is here
 
-* **`mvccs.cicili`** (~4,600 lines) — the storage engine core **and the
+* **`mvccs-lib.cicili`** — the engine and the three `def…` macros as an
+  **importable library**: one `mvccs-engine` macro a target invokes after
+  its includes, which is how a Cicili library ships (an imported file is
+  evaluated Lisp). `mvccs.cicili` imports it and carries the suite;
+  `schema-test.cicili` imports it beside **the `.cicili` files the Parsi
+  compiler now generates** — see below.
+* **`mvccs.cicili`** — the storage engine core **and the
   B-tree index tier**, written in Cicili's C++ layer, compiled against
   the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
   `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
@@ -173,9 +179,12 @@ creates the catalogue record and hooks the table's
 `map`/`unmap`/`truncate`), and the typed cursor wrappers riding the
 table's own row shim — all seven for a single column; for a composite,
 `_equal` takes one key per column and `_cursor` descends every level,
-with the engine's `*_dep` cursors there for hand-rolled composition. What a template instantiates invisibly, the
-macro emits greppably. One index per table for now — the last attach
-wins the hooks; chaining is where a second index would go. The
+with the engine's `*_dep` cursors there for hand-rolled composition.
+Several indexes share one table by **chaining**: each attach keeps the
+hooks it found and calls them ahead of its own work, registered once
+per process so a re-attach cannot loop the chain — cocolog's
+`machines`, with three indexes, is the test. What a template instantiates invisibly, the
+macro emits greppably. The
 branching factor is a parameter (the original derives it from the key
 type's size), which is what lets a test force splits with a tree of
 branching 3.
@@ -216,7 +225,35 @@ whole engine: `clock_gettime` on a `struct timespec`.
   `pointer_at` / `pointer_at_state`, and streams flow through
   `pack`/`unpack` virtuals instead of `operator<</>>`.
 
-## Found upstream while porting
+## The Parsi compiler generates these objects now
+
+`Compiler/compilerddl.cpp` emits, beside every generated `.hpp`/`.cpp`
+pair, **one `.cicili` per TABLE and SEQUENCE** — a macro file
+(`define-<NAME>`) whose expansion is the `deftable`/`defindex`/
+`defsequence` forms for the same object, columns and index shapes and
+bounds carried over (a `LONG::MAX` bound becomes the literal). The
+files under `generated/` are byte-for-byte what it wrote for cocolog's
+`machines` table and its sequence; `schema-test.cicili` imports them
+untouched and runs eight checks green — three machines through the
+generated table, ids drawn from the generated sequence, the UNIQUE
+NAME index refusing a duplicate, and both objects coming back through
+the catalogue after a restart. A Parsi schema now compiles to either
+engine from one source.
+
+## Found upstream while porting — and now fixed in the C++ too
+
+Every cluster below is **fixed in the original sources** in the same
+commit that added the compiler emission: `_free` rekeys the returned
+page in the list; a dependent's root split no longer writes the
+catalogue through a default Pointer, and `_map_callback` writes the
+root back whenever it changed; `_unmap_key` deletes internal keys by
+leftmost-leaf successor replacement, combines on the live separator
+with the boundary children adopted, and shrinks only the actual root;
+`dba_pointers` runs under the Streams pair. Verified: ZiguratIP's own
+suite 303 cases / 0 failed, and cocolog's ten suites `red: 0` against
+the rebuilt server with every Parsi object recompiled.
+
+The findings, as the port originally recorded them:
 
 `Memory::dba_pointers` (memory.cpp): walks a page through the shared
 `_hexmap_io`/`_data_io` holding neither stream mutex — the same

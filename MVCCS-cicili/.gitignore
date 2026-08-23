@@ -3,3 +3,5 @@ mvccs_test
 *.o
 *.lo
 .libs/
+schema_test
+schema_test.cpp

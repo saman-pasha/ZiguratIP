@@ -65,6 +65,9 @@ namespace Zigurat
     BTreeNode _btreenode(const Long&);
     BTreeKey<_First> _btreekey(const Long&);
 
+    // The in-order successor's home: the leftmost leaf key of a subtree.
+    BTreeKey<_First> _leftmost_key(const Long&);
+
     void _cursor_keys(BTreeNode&, std::function<bool (int16_t, BTreeKey<_First>&)>&&);
     void _cursor_values(const BTreeKey<_First>&, std::function<bool (int64_t, BTreeValue&)>&&);
 
@@ -334,6 +337,16 @@ namespace Zigurat
     return btreekey;
   }
 
+  template <typename _Table, typename _First>
+  BTreeKey<_First> BTreeIndex<_Table, _First>::_leftmost_key(const Long& node_address)
+  {
+    BTreeNode node = this->_btreenode(node_address);
+    BTreeKey<_First> first = this->_btreekey(node.keys_address);
+    if (node.is_internal)
+      return this->_leftmost_key(first.left_node_address);
+    return first;
+  }
+
   // Allocated under the index's own hash key, beside the nodes and keys that
   // were always there, and linked at the head of the key's chain. The head is
   // the cheap end: pushing there is two writes and never walks what is already
@@ -513,7 +526,14 @@ namespace Zigurat
             this->_map_to_internal(none, root, current_key);
 
 	    this->_root_address = root.pointer.address;
-            this->_update_btreeindex();
+
+	    // A DEPENDENT level has no catalogue record: its _pointer is the
+	    // default Pointer, and _update_btreeindex through it wrote a
+	    // control block and record at ADDRESS ZERO, over the first
+	    // page's header. The dependent's new root travels back through
+	    // the parent key instead -- see _map_callback.
+	    if (!this->_is_dependent)
+	      this->_update_btreeindex();
 
 	  } else {
 
@@ -998,10 +1018,17 @@ namespace Zigurat
     
     this->_cursor_keys(right_node, [&] (int16_t, BTreeKey<_First>& current_key) -> bool {
 
-	key.left_node_address = -1;
+	// THE BOUNDARY CHILDREN ARE ADOPTED, NOT ZEROED. When the merged
+	// children are internal, the left child's last key and the right
+	// child's first key each hang a subtree toward the seam, and the
+	// demoted separator is what now sits between them -- zeroing its
+	// child links dropped both subtrees from the index. When the
+	// children are leaves both links are -1 anyway, so the adoption is
+	// the general case and the old zeroing was the leaf-only special.
+	key.left_node_address = left_key.right_node_address;
         key.left_address = left_key.pointer.address;
 	key.right_address = current_key.pointer.address;
-	key.right_node_address = -1;
+	key.right_node_address = current_key.left_node_address;
 	this->_memory->_offline_update(key);
 
 	current_key.left_address = key.pointer.address;
@@ -1025,9 +1052,15 @@ namespace Zigurat
       this->_split_node(ancestors, left_node);
     }
 
-    if (node.degree == Short(Int(0))) {
+    // THE ROOT SHRINKS ONLY WHEN THE EMPTIED PARENT IS THE ROOT. This used
+    // to reassign the root for ANY node reaching degree zero -- a transient
+    // state a cascading merge passes through -- pointing the whole index at
+    // an interior node. And a dependent level has no catalogue record to
+    // update; its root travels back through its parent key.
+    if (node.degree == Short(Int(0)) && this->_root_address.value() == node.pointer.address) {
       this->_root_address = left_node.pointer.address;
-      this->_update_btreeindex();
+      if (!this->_is_dependent)
+	this->_update_btreeindex();
     }
   }
   
@@ -1057,46 +1090,43 @@ namespace Zigurat
 
 	  if (node.is_internal) {
 
-	    BTreeNode right_child_node = this->_btreenode(current_key.right_node_address);
-	    this->_unmap_key(&node, &current_key, right_child_node, object, key);
-	    
-	    BTreeKey<_First> first_child_key = this->_btreekey(right_child_node.keys_address);
-
-	    right_child_node.keys_address = first_child_key.right_address;
-	    right_child_node.degree = right_child_node.degree.value() - 1;
-
-	    if (first_child_key.right_address.value() != -1) {
-	      BTreeKey<_First> second_child_key = this->_btreekey(first_child_key.right_address);
-	      second_child_key.left_address = nullptr;
-	      this->_memory->_offline_update(second_child_key);	      
-	    }
-
-	    first_child_key.left_node_address = current_key.left_node_address;
-	    first_child_key.left_address = current_key.left_address;
-	    first_child_key.right_address = current_key.right_address;
-	    first_child_key.right_node_address = current_key.right_node_address;
-	    this->_memory->_offline_update(first_child_key);
-	    
-	    if (current_index == 0) {
-	      node.keys_address = first_child_key.pointer.address;
-	      this->_memory->_offline_update(node);
-	    } else {
-	      left_key.right_address = first_child_key.pointer.address;
-	      this->_memory->_offline_update(left_key);	    
-	    }
-	    
-	    BTreeKey<_First> right_key = this->_btreekey(current_key.right_address);
-	    right_key.left_address = current_key.left_address;
-	    this->_memory->_offline_update(right_key);
-
+	    // AN INTERNAL KEY LEAVES BY SUCCESSOR REPLACEMENT. What stood
+	    // here lifted the right child's FIRST key in as the replacement
+	    // -- the in-order successor only when that child is a LEAF --
+	    // after a recursive call that walked the right subtree for a key
+	    // that is not in it (a no-op); relinked the right neighbour to
+	    // the OLD key's left neighbour instead of the replacement;
+	    // assigned nullptr into a Long -- a NULL the store cannot read
+	    // back; and ran the underflow combine on the key AFTER
+	    // _offline_delete had freed its record, resurrecting chunks the
+	    // allocator owned into the tree.
+	    //
+	    // Now: this key's own values go back first, the leftmost LEAF
+	    // key of the right subtree lends its payload -- key, values,
+	    // dependents -- to this record while the links stay, the leaf
+	    // copy is stripped so its deletion frees nothing that moved, and
+	    // the successor is deleted out of the right subtree by the
+	    // ordinary recursion, whose own end-of-walk check runs any
+	    // underflow combine against the LIVE separator.
 	    this->_unmap_key_callback(object, key, current_key);
 	    this->_free_key_values(current_key);
-	    this->_memory->_offline_delete(current_key);
-	      
-	    if (right_child_node.degree.value() < this->_min_degree) {
-	      this->_combine_nodes(node, current_key);
-	    }
-	    
+
+	    BTreeKey<_First> successor = this->_leftmost_key(current_key.right_node_address);
+
+	    current_key.key = successor.key;
+	    current_key.values_address = successor.values_address;
+	    current_key.dependents_address = successor.dependents_address;
+	    this->_memory->_offline_update(current_key);
+
+	    successor.values_address = -1;
+	    successor.dependents_address = -1;
+	    this->_memory->_offline_update(successor);
+
+	    BTreeNode right_child_node = this->_btreenode(current_key.right_node_address);
+	    this->_unmap_key(&node, &current_key, right_child_node, object, current_key.key);
+
+	    return false;
+
 	  } else {
 	    if (left_key.pointer.hash_key == nullptr) { // first
 
@@ -1674,7 +1704,12 @@ namespace Zigurat
 
       dependent_index.map(object);
 
-      if (current_key.dependents_address.value() == -1) {
+      // WHENEVER IT CHANGED, not only on creation. A dependent level's root
+      // moves when it splits, and writing it back only from -1 left the
+      // parent pointing at the old root -- the lower half -- so every key
+      // promoted above it silently left the index the moment one
+      // first-column key held more than 2d second-column keys.
+      if (dependent_index.root_address().value() != current_key.dependents_address.value()) {
 	current_key.dependents_address = dependent_index.root_address();
 	this->_memory->_offline_update(current_key);
       }

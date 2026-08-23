@@ -1,0 +1,148 @@
+;;;; The generated-schema test: the two .cicili files under generated/
+;;;; are BYTE-FOR-BYTE what the Parsi compiler wrote beside the C++ pair
+;;;; for cocolog's machines table and its sequence (copied from
+;;;; home/ld/_COCOLOG::MACHINES_.cicili and _COCOLOG::MACHINES_SEQ_.cicili;
+;;;; regenerate with cocolog's `make schema`). If this target compiles and
+;;;; its checks run green, a Parsi schema really does define the same
+;;;; objects against the Cicili MVCCS engine through the def... macros.
+
+(source "schema_test.cpp"
+  (make :cpp #t :compile #t
+        :link ("-lschema_test.o" "-o" "schema_test"
+               "-L/home/user/ZiguratIP/home/lib" "-lCore" "-lStreamIO"
+               "-lpthread"
+               "-Wl,-rpath,/home/user/ZiguratIP/home/lib"))
+
+  (include <cstdio>)
+  (include <cstdint>)
+  (include <cstring>)
+  (include <string>)
+  (include <pthread.h>)
+  (include <unistd.h>)
+  (include <time.h>)
+  (include <ctype.h>)
+  (include "/home/user/ZiguratIP/Core/zexception.hpp")
+  (include "/home/user/ZiguratIP/Core/utility.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/binarystream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/filestream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/bufferstream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/textstream.hpp")
+
+  (import "./mvccs-lib.cicili")
+  (mvccs-engine)
+
+  ;; what the Parsi compiler wrote, untouched
+  (import "./generated/cocolog-machines.cicili")
+  (import "./generated/cocolog-machines-seq.cicili")
+  (define-COCOLOG_MACHINES)
+  (define-COCOLOG_MACHINES_SEQ)
+
+  (var int failures . 0)
+
+  (func check ((const char * what) (int64_t got) (int64_t want)) (out void)
+    (if (== got want)
+        (printf "ok   %-44s %ld\n" what (cast long got))
+      (block
+        (printf "FAIL %-44s got %ld want %ld\n" what (cast long got) (cast long want))
+        (set failures (+ failures 1)))))
+
+  (struct MCountCtx
+    (member int64_t rows)
+    (member int64_t id_sum))
+
+  (func machine_count_cb ((void * u) (COCOLOG_MACHINES * r)) (out bool)
+    (let ((MCountCtx * c . #'(cast (MCountCtx *) u)))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (set (-> c id_sum) (+ (-> c id_sum) (-> r ID)))
+      (return #t)))
+
+  (func machines_by_name ((Memory * m) (int64_t name)) (out int64_t)
+    (let ((MCountCtx c))
+      (set ($ c rows) 0)
+      (set ($ c id_sum) 0)
+      (IDX_COCOLOG_MACHINES_NAME_equal m name (cast (void *) (aof c)) machine_count_cb)
+      (return ($ c rows))))
+
+  (main
+    (remove "/tmp/mvccs-schema-hexmap.bin")
+    (remove "/tmp/mvccs-schema-data.bin")
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-schema-hexmap.bin")
+                                 (bitor std::ios::in (bitor std::ios::out std::ios::trunc))))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-schema-data.bin")
+                               (bitor std::ios::in (bitor std::ios::out std::ios::trunc)))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+
+        ;; the generated objects, attached exactly as their comments say
+        (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
+        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
+        (IDX_COCOLOG_MACHINES_KB_attach (aof mem))
+        (COCOLOG_MACHINES_SEQ_attach (aof mem))
+
+        ;; three machines, their ids drawn from the generated sequence
+        (let ((int64_t i . 0))
+          (while (< i 3)
+            (let ((COCOLOG_MACHINES row))
+              (set ($ row ID) (COCOLOG_MACHINES_SEQ_next))
+              (set ($ row NAME) (+ 1000 i))
+              (set ($ row KB) 7)
+              (set ($ row STATUS) 1)
+              (set ($ row CHUNKS) 0)
+              (set ($ row NOTE) 0)
+              (COCOLOG_MACHINES_insert (aof mem) (aof row)))
+            (set i (+ i 1))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (let ((MCountCtx c))
+          (set ($ c rows) 0)
+          (set ($ c id_sum) 0)
+          (COCOLOG_MACHINES_cursor (aof mem) (cast (void *) (aof c)) machine_count_cb)
+          (check "three machines through the generated table" ($ c rows) 3)
+          ;; the generated sequence starts at 1: ids 1, 2, 3
+          (check "their ids came from the generated sequence" ($ c id_sum) 6))
+
+        (check "the generated name index finds one" (machines_by_name (aof mem) 1001) 1)
+        (check "and misses what was never there" (machines_by_name (aof mem) 9999) 0)
+
+        ;; NAME is UNIQUE in the schema; the generated index enforces it
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((COCOLOG_MACHINES dup))
+                   (set ($ dup ID) (COCOLOG_MACHINES_SEQ_next))
+                   (set ($ dup NAME) 1001)
+                   (set ($ dup KB) 7)
+                   (set ($ dup STATUS) 1)
+                   (set ($ dup CHUNKS) 0)
+                   (set ($ dup NOTE) 0)
+                   (COCOLOG_MACHINES_insert (aof mem) (aof dup))))
+               (catch ((const IndexException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "the schema's UNIQUE NAME is enforced" refused 1))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (check "the sequence kept its draw" (COCOLOG_MACHINES_SEQ_current) 5)
+        (sync_disk (aof mem))
+        (cast void 0)))
+
+    ;; and the generated objects come back through the catalogue
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-schema-hexmap.bin")
+                                 (bitor std::ios::in std::ios::out)))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-schema-data.bin")
+                               (bitor std::ios::in std::ios::out))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
+        (COCOLOG_MACHINES_SEQ_attach (aof mem))
+        (check "the generated index survives a restart" (machines_by_name (aof mem) 1002) 1)
+        (check "so does the generated sequence" (COCOLOG_MACHINES_SEQ_current) 5)
+        (cast void 0)))
+
+    (if (== failures 0)
+        (printf "\nschema-test: all green\n")
+      (printf "\nschema-test: %d FAILED\n" failures))
+    (return failures)))
