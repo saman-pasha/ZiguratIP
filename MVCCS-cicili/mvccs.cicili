@@ -1768,7 +1768,14 @@
     (member int64_t min_degree)
     (member int64_t max_degree)
     (member int64_t root_address)
-    (member Pointer record_pointer))
+    (member Pointer record_pointer)
+    ;; the composite tier: how many columns this level covers (1 = the
+    ;; level that holds value chains), whether this is a stack-built
+    ;; dependent (no catalogue record to write through), and the hash
+    ;; key every dependent level of this index shares
+    (member int64_t levels)
+    (member int64_t is_dependent)
+    (member const uint8_t * dep_hash_key))
 
   ;; ---- node / key readers (_btreenode / _btreekey) ------------------
   (func bt_node_read ((BTreeIndex * idx) (int64_t address) (BTNode * node)) (out void)
@@ -1782,6 +1789,27 @@
       (set (-> key pointer) (pointer_at m (-> idx hash_key) address))
       ((-> (-> m data_io) seekg) (ptr_data (aof (-> key pointer))) std::ios::beg)
       ((-> key unpack) (cof (-> m data_io)))))
+
+  ;; a dependent level, built on the stack per descent exactly as the
+  ;; original builds its dependent_index: same store, same tuning, the
+  ;; shared dependent hash key, one column fewer, and no catalogue
+  (func bt_dependent ((BTreeIndex * idx) (int64_t root)) (out BTreeIndex)
+    (let ((BTreeIndex dep))
+      (set ($ dep m) (-> idx m))
+      (set ($ dep name) (-> idx name))
+      (set ($ dep hash_key) (-> idx dep_hash_key))
+      (set ($ dep dep_hash_key) (-> idx dep_hash_key))
+      (set ($ dep table_key) (-> idx table_key))
+      (set ($ dep catalogue_id) 0)
+      (set ($ dep is_unique) (-> idx is_unique))
+      (set ($ dep branching_factor) (-> idx branching_factor))
+      (set ($ dep min_degree) (-> idx min_degree))
+      (set ($ dep max_degree) (-> idx max_degree))
+      (set ($ dep levels) (- (-> idx levels) 1))
+      (set ($ dep is_dependent) 1)
+      (set ($ dep root_address) root)
+      (set ($ dep record_pointer) (pointer_null))
+      (return dep)))
 
   ;; ---- the catalogue (_insert/_select/_update_btreeindex) -----------
   (func bt_insert_record ((BTreeIndex * idx)) (out void)
@@ -1899,7 +1927,8 @@
   (decl) (func bt_map_to_internal ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
                                    (BTNode * node) (BTKey * new_key)) (out void))
   (decl) (func bt_map_rec ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
-                           (BTNode * node) (int64_t k) (int64_t value)) (out void))
+                           (BTNode * node) (int64_t k) (int64_t value)
+                           (BTKey * out_key)) (out void))
 
   (struct BTUniqCtx (member int found))
   (func bt_uniq_cb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
@@ -1948,7 +1977,11 @@
                   (offline_update m (cast (BaseTable *) (aof cur)))
 
                   (if (== depth 0)
-                      ;; splitting the root: grow a new one above it
+                      ;; splitting the root: grow a new one above it.
+                      ;; A DEPENDENT level has no catalogue record: its new
+                      ;; root travels back through the parent key instead
+                      ;; (the original wrote through a default Pointer here
+                      ;; -- address zero -- and never told the parent).
                       (let ((BTNode root)
                             (BTNode * none [1]))
                         (bt_node_clear (aof root))
@@ -1956,7 +1989,8 @@
                         (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof root)))
                         (bt_map_to_internal idx none 0 (aof root) (aof cur))
                         (set (-> idx root_address) ($ ($ root pointer) address))
-                        (bt_update_record idx))
+                        (if (== (-> idx is_dependent) 0)
+                            (bt_update_record idx)))
                     ;; the promoted key goes to the immediate parent, and
                     ;; the parent's own ancestors travel with it
                     (bt_map_to_internal idx ancestors (- depth 1)
@@ -2039,7 +2073,8 @@
   ;; _map: descend to the leaf, insert the key or add a value to the one
   ;; already there, split what overflowed on the way back up
   (func bt_map_rec ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
-                    (BTNode * node) (int64_t k) (int64_t value)) (out void)
+                    (BTNode * node) (int64_t k) (int64_t value)
+                    (BTKey * out_key)) (out void)
     (let ((Memory * m . #'(-> idx m)))
       (if (== (-> node keys_address) -1)
           (block
@@ -2047,10 +2082,14 @@
               (bt_key_clear (aof new_key))
               (set ($ new_key key) k)
               (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
-              (bt_insert_value idx (aof new_key) value)
+              ;; a value chain only where this level holds the rows -- an
+              ;; outer level's keys carry a dependent tree instead
+              (if (== (-> idx levels) 1)
+                  (bt_insert_value idx (aof new_key) value))
               (set (-> node degree) 1)
               (set (-> node keys_address) ($ ($ new_key pointer) address))
-              (offline_update m (cast (BaseTable *) node)))
+              (offline_update m (cast (BaseTable *) node))
+              (if (!= out_key nil) (set (cof out_key) new_key)))
             (return)))
 
       (let ((BTKey left_key)
@@ -2069,7 +2108,7 @@
                      (let ((BTNode left_node))
                        (bt_node_read idx ($ cur left_node_address) (aof left_node))
                        (set (nth depth ancestors) node)
-                       (bt_map_rec idx ancestors (+ depth 1) (aof left_node) k value))
+                       (bt_map_rec idx ancestors (+ depth 1) (aof left_node) k value out_key))
                      (set stop 1))
                  (block
                    (let ((BTKey new_key))
@@ -2079,7 +2118,8 @@
                          (set ($ new_key left_address) ($ ($ left_key pointer) address)))
                      (set ($ new_key right_address) ($ ($ cur pointer) address))
                      (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
-                     (bt_insert_value idx (aof new_key) value)
+                     (if (== (-> idx levels) 1)
+                         (bt_insert_value idx (aof new_key) value))
                      (set (-> node degree) (+ (-> node degree) 1))
                      (if (== index 0)
                          (set (-> node keys_address) ($ ($ new_key pointer) address)))
@@ -2089,18 +2129,23 @@
                            (set ($ left_key right_address) ($ ($ new_key pointer) address))
                            (offline_update m (cast (BaseTable *) (aof left_key)))))
                      (set ($ cur left_address) ($ ($ new_key pointer) address))
-                     (offline_update m (cast (BaseTable *) (aof cur))))
+                     (offline_update m (cast (BaseTable *) (aof cur)))
+                     (if (!= out_key nil) (set (cof out_key) new_key)))
                    (set stop 1))))
 
               ((== k ($ cur key))
                (block
-                 (if (!= (-> idx is_unique) 0)
+                 ;; uniqueness is the whole tuple's: only the level holding
+                 ;; the value chains can refuse
+                 (if (and (!= (-> idx is_unique) 0) (== (-> idx levels) 1))
                      (let ((BTUniqCtx uc))
                        (set ($ uc found) 0)
                        (bt_walk_values idx (aof cur) (cast (void *) (aof uc)) bt_uniq_cb)
                        (if (== ($ uc found) 1)
                            (throw* (IndexException "unique key")))))
-                 (bt_insert_value idx (aof cur) value)
+                 (if (== (-> idx levels) 1)
+                     (bt_insert_value idx (aof cur) value))
+                 (if (!= out_key nil) (set (cof out_key) cur))
                  (set stop 1)))
 
               (#t
@@ -2110,7 +2155,7 @@
                      (let ((BTNode right_node))
                        (bt_node_read idx ($ cur right_node_address) (aof right_node))
                        (set (nth depth ancestors) node)
-                       (bt_map_rec idx ancestors (+ depth 1) (aof right_node) k value))
+                       (bt_map_rec idx ancestors (+ depth 1) (aof right_node) k value out_key))
                      (set stop 1))
                  (if (and (== (-> node is_internal) 0)
                           (== index (- (-> node degree) 1)))
@@ -2120,11 +2165,13 @@
                          (set ($ new_key key) k)
                          (set ($ new_key left_address) ($ ($ cur pointer) address))
                          (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
-                         (bt_insert_value idx (aof new_key) value)
+                         (if (== (-> idx levels) 1)
+                             (bt_insert_value idx (aof new_key) value))
                          (set (-> node degree) (+ (-> node degree) 1))
                          (offline_update m (cast (BaseTable *) node))
                          (set ($ cur right_address) ($ ($ new_key pointer) address))
-                         (offline_update m (cast (BaseTable *) (aof cur))))
+                         (offline_update m (cast (BaseTable *) (aof cur)))
+                         (if (!= out_key nil) (set (cof out_key) new_key)))
                        (set stop 1))))))
 
             (set left_key cur)
@@ -2144,11 +2191,53 @@
                 (bt_node_clear (aof root))
                 (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof root)))
                 (set (-> idx root_address) ($ ($ root pointer) address)))
-              (bt_update_record idx)))
+              (if (== (-> idx is_dependent) 0)
+                  (bt_update_record idx))))
         (let ((BTNode root_node)
               (BTNode * ancestors [64]))
           (bt_node_read idx (-> idx root_address) (aof root_node))
-          (bt_map_rec idx ancestors 0 (aof root_node) k value))
+          (bt_map_rec idx ancestors 0 (aof root_node) k value nil))
+        (cast void 0))))
+
+  ;; the composite map: each level maps its column's key WITHOUT a value
+  ;; chain and descends into the key's dependent tree; only the innermost
+  ;; level holds the rows. The dependent's root travels back through the
+  ;; parent key WHENEVER it changed -- creation or a root split. (The
+  ;; original wrote it back on creation only, and a dependent root split
+  ;; also updated a catalogue record the dependent does not have, through
+  ;; a default Pointer at address zero. Both are corrected here.)
+  (decl) (func bt_map_multi ((BTreeIndex * idx) (int64_t * ks) (int64_t value)) (out void))
+  (func bt_map_multi ((BTreeIndex * idx) (int64_t * ks) (int64_t value)) (out void)
+    (if (== (-> idx levels) 1)
+        (block
+          (bt_map idx (nth 0 ks) value)
+          (return)))
+    (let ((Memory * m . #'(-> idx m)))
+      (letin* ((streams (Streams m)))
+        (if (== (-> idx root_address) -1)
+            (block
+              (let ((BTNode root))
+                (bt_node_clear (aof root))
+                (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof root)))
+                (set (-> idx root_address) ($ ($ root pointer) address)))
+              (if (== (-> idx is_dependent) 0)
+                  (bt_update_record idx))))
+        (let ((BTNode root_node)
+              (BTNode * ancestors [64])
+              (BTKey keyrec))
+          (bt_key_clear (aof keyrec))
+          (bt_node_read idx (-> idx root_address) (aof root_node))
+          (bt_map_rec idx ancestors 0 (aof root_node) (nth 0 ks) value (aof keyrec))
+          (let ((int64_t old_dep . #'($ keyrec dependents_address)))
+            (let ((BTreeIndex dep . #'(bt_dependent idx old_dep)))
+              (bt_map_multi (aof dep) (aof (nth 1 ks)) value)
+              (if (!= ($ dep root_address) old_dep)
+                  ;; re-read before writing back: a split at this level may
+                  ;; have relinked the record since keyrec was copied
+                  (let ((BTKey fresh))
+                    (bt_key_read idx ($ ($ keyrec pointer) address) (aof fresh))
+                    (set ($ fresh dependents_address) ($ dep root_address))
+                    (offline_update m (cast (BaseTable *) (aof fresh))))))))
         (cast void 0))))
 
   ;; ---- unmap: one row's entry, never the key's whole chain ----------
@@ -2200,6 +2289,58 @@
           (let ((BTNode root_node))
             (bt_node_read idx (-> idx root_address) (aof root_node))
             (bt_unmap_rec idx (aof root_node) k value)))
+      (cast void 0)))
+
+  ;; locate one key's record by equal-descent -- the read-only half of
+  ;; the map descent, for the composite unmap
+  (decl) (func bt_find_key ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                            (BTKey * out)) (out bool))
+  (func bt_find_key ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                     (BTKey * out)) (out bool)
+    (let ((BTNode node)
+          (bool found . #f))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address))
+            (int stop . 0))
+        (while (and (> tmp -1) (== stop 0))
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+            (cond
+              ((< k ($ cur key))
+               (block
+                 (if (!= ($ node is_internal) 0)
+                     (set found (bt_find_key idx ($ cur left_node_address) k out)))
+                 (set stop 1)))
+              ((== k ($ cur key))
+               (block
+                 (set (cof out) cur)
+                 (set found #t)
+                 (set stop 1)))
+              (#t
+               (if (and (!= ($ node is_internal) 0) (== ($ cur right_address) -1))
+                   (block
+                     (set found (bt_find_key idx ($ cur right_node_address) k out))
+                     (set stop 1))))))))
+      (return found)))
+
+  ;; the composite unmap: descend the levels to the innermost tree and
+  ;; mark the one row's value there -- keys at every level stay, exactly
+  ;; as a single-level key stays with an empty chain
+  (decl) (func bt_unmap_multi ((BTreeIndex * idx) (int64_t * ks) (int64_t value)) (out void))
+  (func bt_unmap_multi ((BTreeIndex * idx) (int64_t * ks) (int64_t value)) (out void)
+    (if (== (-> idx levels) 1)
+        (block
+          (bt_unmap idx (nth 0 ks) value)
+          (return)))
+    (letin* ((streams (Streams (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (let ((BTKey keyrec))
+            (bt_key_clear (aof keyrec))
+            (if (bt_find_key idx (-> idx root_address) (nth 0 ks) (aof keyrec))
+                (if (> ($ keyrec dependents_address) -1)
+                    (let ((BTreeIndex dep . #'(bt_dependent idx ($ keyrec dependents_address))))
+                      (bt_unmap_multi (aof dep) (aof (nth 1 ks)) value))))))
       (cast void 0)))
 
   ;; ---- the in-order key walk every cursor is built on ----------------
@@ -2265,29 +2406,79 @@
       (bt_walk_values idx key (cast (void *) (aof rc)) bt_output_vcb)
       (return (== ($ rc cont) 1))))
 
-  (func bt_output_kcb ((void * c) (BTKey * key)) (out bool)
-    (let ((BTRowsCtx * rc . #'(cast (BTRowsCtx *) c)))
-      (return (bt_cursor_output (-> rc idx) key (-> rc user) (-> rc rcb)))))
+  ;; what a qualifying key yields depends on the level: rows where this
+  ;; level holds the value chains, the DEPENDENT INDEX where it does not
+  ;; -- the caller's dep callback receives it under the streams, exactly
+  ;; as the original hands its stack-built dependent_index over
+  (struct BTEmit
+    (member BTreeIndex * idx)
+    (member void * user)
+    (member func rcb ((void * c) (Pointer * p)) (out bool))
+    (member func dcb ((void * c) (BTreeIndex * dep)) (out bool))
+    (member int cont))
+
+  (func bt_no_rows ((void * c) (Pointer * p)) (out bool)
+    (cast void c) (cast void p) (return #t))
+  (func bt_no_deps ((void * c) (BTreeIndex * d)) (out bool)
+    (cast void c) (cast void d) (return #t))
+
+  (func bt_emit_key ((BTEmit * em) (BTKey * key)) (out bool)
+    (let ((BTreeIndex * idx . #'(-> em idx))
+          (bool cont . #t))
+      (if (> (-> idx levels) 1)
+          (block
+            ;; a key with no dependents yet is skipped, as the original does
+            (if (> (-> key dependents_address) -1)
+                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
+                  (set cont ((-> em dcb) (-> em user) (aof dep))))))
+        (set cont (bt_cursor_output idx key (-> em user) (-> em rcb))))
+      (set (-> em cont) (? cont 1 0))
+      (return cont)))
+
+  (func bt_emit_kcb ((void * c) (BTKey * key)) (out bool)
+    (return (bt_emit_key (cast (BTEmit *) c) key)))
 
   ;; ---- the seven cursors ---------------------------------------------
   (func bt_cursor ((BTreeIndex * idx) (void * user)
-                   (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (let ((BTRowsCtx rc))
-            (set ($ rc idx) idx)
-            (set ($ rc user) user)
-            (set ($ rc rcb) rcb)
-            (set ($ rc cont) 1)
-            (bt_walk_keys_rec idx (-> idx root_address) (cast (void *) (aof rc)) bt_output_kcb)))
-      (cast void 0)))
+                   (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_walk_keys_rec idx (-> idx root_address)
+                                     (cast (void *) (aof em)) bt_emit_kcb)
+                   (cast void 0)))
+        (cast void 0))
+      (return (== ($ em cont) 1))))
+
+  ;; the full walk handing DEPENDENT INDEXES to the callback -- the
+  ;; composite counterpart of bt_cursor, as the variadic class shapes it
+  (func bt_cursor_dep ((BTreeIndex * idx) (void * user)
+                       (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) bt_no_rows)
+      (set ($ em dcb) dcb)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_walk_keys_rec idx (-> idx root_address)
+                                     (cast (void *) (aof em)) bt_emit_kcb)
+                   (cast void 0)))
+        (cast void 0))
+      (return (== ($ em cont) 1))))
 
   (decl) (func bt_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
-                             (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
-         (out bool))
+                             (BTEmit * em)) (out bool))
   (func bt_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
-                      (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+                      (BTEmit * em)) (out bool)
     (let ((BTNode node)
           (bool do_continue . #t))
       (bt_node_read idx node_address (aof node))
@@ -2303,35 +2494,57 @@
                  ;; everything from here on is larger: the child between
                  ;; the previous key and this one, or nowhere
                  (if (!= ($ node is_internal) 0)
-                     (set do_continue (bt_equal_rec idx ($ cur left_node_address) k user rcb)))
+                     (set do_continue (bt_equal_rec idx ($ cur left_node_address) k em)))
                  (set stop 1)))
               ((== k ($ cur key))
                (block
-                 (set do_continue (bt_cursor_output idx (aof cur) user rcb))
+                 (set do_continue (bt_emit_key em (aof cur)))
                  (set stop 1)))
               (#t
                ;; only past the last key does the rightmost child count
                (if (and (!= ($ node is_internal) 0) (== ($ cur right_address) -1))
                    (block
-                     (set do_continue (bt_equal_rec idx ($ cur right_node_address) k user rcb))
+                     (set do_continue (bt_equal_rec idx ($ cur right_node_address) k em))
                      (set stop 1))))))))
       (return do_continue)))
 
   (func bt_cursor_equal ((BTreeIndex * idx) (int64_t k) (void * user)
-                         (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_equal_rec idx (-> idx root_address) k user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+                         (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_equal_rec idx (-> idx root_address) k (aof em))
+                   (cast void 0)))
+        (cast void 0))
+      (return (== ($ em cont) 1))))
+
+  (func bt_cursor_equal_dep ((BTreeIndex * idx) (int64_t k) (void * user)
+                             (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) bt_no_rows)
+      (set ($ em dcb) dcb)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_equal_rec idx (-> idx root_address) k (aof em))
+                   (cast void 0)))
+        (cast void 0))
+      (return (== ($ em cont) 1))))
 
   ;; a full walk with one key held back
   (decl) (func bt_not_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
-                                 (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
-         (out bool))
+                                 (BTEmit * em)) (out bool))
   (func bt_not_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
-                          (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+                          (BTEmit * em)) (out bool)
     (let ((BTNode node))
       (bt_node_read idx node_address (aof node))
       (let ((int64_t tmp . #'($ node keys_address))
@@ -2341,32 +2554,37 @@
             (bt_key_read idx tmp (aof cur))
             (set tmp ($ cur right_address))
             (if (and (!= ($ node is_internal) 0) (== index 0))
-                (if (not (bt_not_equal_rec idx ($ cur left_node_address) k user rcb))
+                (if (not (bt_not_equal_rec idx ($ cur left_node_address) k em))
                     (return #f)))
             (if (!= k ($ cur key))
-                (if (not (bt_cursor_output idx (aof cur) user rcb))
+                (if (not (bt_emit_key em (aof cur)))
                     (return #f)))
             (if (!= ($ node is_internal) 0)
-                (if (not (bt_not_equal_rec idx ($ cur right_node_address) k user rcb))
+                (if (not (bt_not_equal_rec idx ($ cur right_node_address) k em))
                     (return #f))))
           (set index (+ index 1)))))
     (return #t))
 
   (func bt_cursor_not_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_not_equal_rec idx (-> idx root_address) k user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_not_equal_rec idx (-> idx root_address) k (aof em))
+                   (cast void 0)))
+        (cast void 0))))
 
   ;; in order from the smallest key, stopped at the bound
   (decl) (func bt_less_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
-                            (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
-         (out bool))
+                            (BTEmit * em)) (out bool))
   (func bt_less_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
-                     (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+                     (BTEmit * em)) (out bool)
     (let ((BTNode node))
       (bt_node_read idx node_address (aof node))
       (let ((int64_t tmp . #'($ node keys_address))
@@ -2376,48 +2594,59 @@
             (bt_key_read idx tmp (aof cur))
             (set tmp ($ cur right_address))
             (if (and (!= ($ node is_internal) 0) (== index 0))
-                (if (not (bt_less_rec idx ($ cur left_node_address) k or_equal user rcb))
+                (if (not (bt_less_rec idx ($ cur left_node_address) k or_equal em))
                     (return #f)))
             ;; at or above the bound: the straddling child is already walked
             (if (== or_equal 0)
                 (if (not (< ($ cur key) k)) (return #t))
               (if (< k ($ cur key)) (return #t)))
-            (if (not (bt_cursor_output idx (aof cur) user rcb))
+            (if (not (bt_emit_key em (aof cur)))
                 (return #f))
             ;; keys are distinct in the tree: once the bound itself has
             ;; been emitted there is nothing above it left to match
             (if (and (!= or_equal 0) (== k ($ cur key))) (return #t))
             (if (!= ($ node is_internal) 0)
-                (if (not (bt_less_rec idx ($ cur right_node_address) k or_equal user rcb))
+                (if (not (bt_less_rec idx ($ cur right_node_address) k or_equal em))
                     (return #f))))
           (set index (+ index 1)))))
     (return #t))
 
   (func bt_cursor_less_than ((BTreeIndex * idx) (int64_t k) (void * user)
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_less_rec idx (-> idx root_address) k 0 user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_less_rec idx (-> idx root_address) k 0 (aof em))
+                   (cast void 0)))
+        (cast void 0))))
 
   (func bt_cursor_less_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_less_rec idx (-> idx root_address) k 1 user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_less_rec idx (-> idx root_address) k 1 (aof em))
+                   (cast void 0)))
+        (cast void 0))))
 
   ;; skip forward to the bound, then walk in order to the end; only the
   ;; first qualifying key needs its left child descended
   (decl) (func bt_greater_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
-                               (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
-         (out bool))
+                               (BTEmit * em)) (out bool))
   (func bt_greater_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
-                        (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+                        (BTEmit * em)) (out bool)
     (let ((BTNode node)
           (int started . 0))
       (bt_node_read idx node_address (aof node))
@@ -2440,39 +2669,106 @@
                         (if (and (!= ($ node is_internal) 0)
                                  (== ($ cur right_address) -1))
                             (return (bt_greater_rec idx ($ cur right_node_address)
-                                                    k or_equal user rcb)))
+                                                    k or_equal em)))
                         continue))
                   (set started 1)
                   (if (!= ($ node is_internal) 0)
                       (if (not (bt_greater_rec idx ($ cur left_node_address)
-                                               k or_equal user rcb))
+                                               k or_equal em))
                           (return #f)))))
 
-            (if (not (bt_cursor_output idx (aof cur) user rcb))
+            (if (not (bt_emit_key em (aof cur)))
                 (return #f))
             (if (!= ($ node is_internal) 0)
                 (if (not (bt_greater_rec idx ($ cur right_node_address)
-                                         k or_equal user rcb))
+                                         k or_equal em))
                     (return #f)))))))
     (return #t))
 
   (func bt_cursor_greater_than ((BTreeIndex * idx) (int64_t k) (void * user)
                                 (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_greater_rec idx (-> idx root_address) k 0 user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_greater_rec idx (-> idx root_address) k 0 (aof em))
+                   (cast void 0)))
+        (cast void 0))))
 
   (func bt_cursor_greater_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                                       (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
-    (letin* ((streams (Streams (-> idx m)))
-             (statement (Statement (-> idx m))))
-      (if (> (-> idx root_address) -1)
-          (block (bt_greater_rec idx (-> idx root_address) k 1 user rcb)
-                 (cast void 0)))
-      (cast void 0)))
+    (let ((BTEmit em))
+      (set ($ em idx) idx)
+      (set ($ em user) user)
+      (set ($ em rcb) rcb)
+      (set ($ em dcb) bt_no_deps)
+      (set ($ em cont) 1)
+      (letin* ((streams (Streams (-> idx m)))
+               (statement (Statement (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_greater_rec idx (-> idx root_address) k 1 (aof em))
+                   (cast void 0)))
+        (cast void 0))))
+
+  ;; ---- the composite walks over the whole level stack ----------------
+
+  ;; every row under a composite index, levels descended automatically
+  (struct BTDeepCtx
+    (member void * user)
+    (member func rcb ((void * c) (Pointer * p)) (out bool))
+    (member int cont))
+
+  (decl) (func bt_cursor_rows_deep ((BTreeIndex * idx) (void * user)
+                                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool))
+
+  (func bt_deep_dcb ((void * c) (BTreeIndex * dep)) (out bool)
+    (let ((BTDeepCtx * dc . #'(cast (BTDeepCtx *) c)))
+      (set (-> dc cont) (? (bt_cursor_rows_deep dep (-> dc user) (-> dc rcb)) 1 0))
+      (return (== (-> dc cont) 1))))
+
+  (func bt_cursor_rows_deep ((BTreeIndex * idx) (void * user)
+                             (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (if (== (-> idx levels) 1)
+        (return (bt_cursor idx user rcb)))
+    (let ((BTDeepCtx dc))
+      (set ($ dc user) user)
+      (set ($ dc rcb) rcb)
+      (set ($ dc cont) 1)
+      (bt_cursor_dep idx (cast (void *) (aof dc)) bt_deep_dcb)
+      (return (== ($ dc cont) 1))))
+
+  ;; equality on the whole tuple: equal at each level, rows at the last
+  (struct BTEqChainCtx
+    (member int64_t * ks)
+    (member void * user)
+    (member func rcb ((void * c) (Pointer * p)) (out bool))
+    (member int cont))
+
+  (decl) (func bt_cursor_equal_multi ((BTreeIndex * idx) (int64_t * ks) (void * user)
+                                      (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool))
+
+  (func bt_eqchain_dcb ((void * c) (BTreeIndex * dep)) (out bool)
+    (let ((BTEqChainCtx * ec . #'(cast (BTEqChainCtx *) c)))
+      (set (-> ec cont)
+           (? (bt_cursor_equal_multi dep (aof (nth 1 (-> ec ks))) (-> ec user) (-> ec rcb)) 1 0))
+      (return (== (-> ec cont) 1))))
+
+  (func bt_cursor_equal_multi ((BTreeIndex * idx) (int64_t * ks) (void * user)
+                               (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (if (== (-> idx levels) 1)
+        (return (bt_cursor_equal idx (nth 0 ks) user rcb)))
+    (let ((BTEqChainCtx ec))
+      (set ($ ec ks) ks)
+      (set ($ ec user) user)
+      (set ($ ec rcb) rcb)
+      (set ($ ec cont) 1)
+      (bt_cursor_equal_dep idx (nth 0 ks) (cast (void *) (aof ec)) bt_eqchain_dcb)
+      (return (== ($ ec cont) 1))))
 
   ;; ---- truncate: unlink the settled dead values, then reclaim --------
   (func bt_unlink_dead_values ((BTreeIndex * idx) (BTKey * key)) (out void)
@@ -2507,20 +2803,37 @@
               (set previous v)
               (set has_previous 1)))))))
 
+  ;; down through the dependents: an outer level's keys hold no values
+  ;; of their own, so the chains to unlink live at the innermost level
+  (decl) (func bt_unlink_dead ((BTreeIndex * idx)) (out void))
+
   (func bt_unlink_kcb ((void * c) (BTKey * key)) (out bool)
     (let ((BTreeIndex * idx . #'(cast (BTreeIndex *) c)))
-      (bt_unlink_dead_values idx key)
+      (if (> (-> idx levels) 1)
+          (block
+            (if (> (-> key dependents_address) -1)
+                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
+                  (bt_unlink_dead (aof dep)))))
+        (bt_unlink_dead_values idx key))
       (return #t)))
 
+  (func bt_unlink_dead ((BTreeIndex * idx)) (out void)
+    (if (> (-> idx root_address) -1)
+        (block (bt_walk_keys_rec idx (-> idx root_address)
+                                 (cast (void *) idx) bt_unlink_kcb)
+               (cast void 0))))
+
+  ;; two hash keys to sweep for a composite, not one: every dependent
+  ;; level shares dep_hash_key, which is not the top level's own
   (func bt_truncate ((BTreeIndex * idx) (Memory * m)) (out size_t)
     (block
       (letin* ((streams (Streams (-> idx m))))
-        (if (> (-> idx root_address) -1)
-            (block (bt_walk_keys_rec idx (-> idx root_address)
-                                     (cast (void *) idx) bt_unlink_kcb)
-                   (cast void 0)))
+        (bt_unlink_dead idx)
         (cast void 0)))
-    (return (truncate_key m (-> idx hash_key))))
+    (let ((size_t freed . #'(truncate_key m (-> idx hash_key))))
+      (if (> (-> idx levels) 1)
+          (set freed (+ freed (truncate_key m (-> idx dep_hash_key)))))
+      (return freed)))
 
   ;; ==================================================================
   ;; deftable -- Cicili metaprogramming where C++ used templates.
@@ -2667,9 +2980,14 @@
   (DEFMACRO defindex (idxname table column unique branching)
     (LET* ((iname    (SYMBOL-NAME idxname))
            (tname    (SYMBOL-NAME table))
+           (cols     (IF (LISTP column) column (LIST column)))
+           (nlev     (LENGTH cols))
            (harr     (INTERN (CONCATENATE 'STRING iname "_HASHKEY")))
            (hready   (INTERN (CONCATENATE 'STRING iname "_hashkey_ready")))
            (keyfn    (INTERN (CONCATENATE 'STRING iname "_key")))
+           (depharr  (INTERN (CONCATENATE 'STRING iname "_DEP_HASHKEY")))
+           (dephready (INTERN (CONCATENATE 'STRING iname "_dep_hashkey_ready")))
+           (depkeyfn (INTERN (CONCATENATE 'STRING iname "_dep_key")))
            (attach   (INTERN (CONCATENATE 'STRING iname "_attach")))
            (domap    (INTERN (CONCATENATE 'STRING iname "_do_map")))
            (dounmap  (INTERN (CONCATENATE 'STRING iname "_do_unmap")))
@@ -2686,21 +3004,31 @@
            (hooksvar (INTERN (CONCATENATE 'STRING tname "_hooks")))
            (ctxname  (INTERN (CONCATENATE 'STRING tname "_CursorCtx")))
            (shim     (INTERN (CONCATENATE 'STRING tname "_cursor_shim")))
-           (bytes (LET ((h 2166136261) (out NIL))
-                    (LOOP FOR ch ACROSS iname
-                          DO (SETF h (LOGAND (* (LOGXOR h (CHAR-CODE ch)) 16777619)
-                                             #xFFFFFFFF)))
-                    (LOOP FOR i FROM 0 BELOW 20
-                          DO (SETF h (LOGAND (+ (* h 1103515245) (+ 12345 i))
-                                             #xFFFFFFFF))
-                             (PUSH (LOGAND (ASH h -16) #xFF) out))
-                    (NREVERSE out)))
+           ;; a 20-byte digest of a name, derived in Lisp at expansion time.
+           ;; DIVERGENCE: the real engine uses SHA-1; equality and stability
+           ;; are all the engine ever asks of it.
+           (digest (LAMBDA (nm)
+                     (LET ((h 2166136261) (out NIL))
+                       (LOOP FOR ch ACROSS nm
+                             DO (SETF h (LOGAND (* (LOGXOR h (CHAR-CODE ch)) 16777619)
+                                                #xFFFFFFFF)))
+                       (LOOP FOR i FROM 0 BELOW 20
+                             DO (SETF h (LOGAND (+ (* h 1103515245) (+ 12345 i))
+                                                #xFFFFFFFF))
+                                (PUSH (LOGAND (ASH h -16) #xFF) out))
+                       (NREVERSE out))))
+           (bytes    (FUNCALL digest iname))
+           ;; every dependent level of one index shares this second key --
+           ;; the counterpart of the original's memcpy from the hash name
+           (depbytes (FUNCALL digest (CONCATENATE 'STRING iname "~dep")))
            ;; the catalogue id: the digest's first eight bytes folded to a
            ;; positive int64 -- what the original kept as a hex hash_name
            (catid (LET ((v 0))
                     (LOOP FOR i FROM 0 BELOW 8
                           DO (SETF v (+ (* v 256) (NTH i bytes))))
-                    (LOGAND v #x7FFFFFFFFFFFFFFF))))
+                    (LOGAND v #x7FFFFFFFFFFFFFFF)))
+           (kparams (LOOP FOR i FROM 0 BELOW nlev
+                          COLLECT (INTERN (FORMAT NIL "k~A" i)))))
       `($$$
         (var uint8_t ,harr [20])
         (var int ,hready)
@@ -2712,17 +3040,43 @@
                 (set ,hready 1)))
           (return (cast (uint8_t *) ,harr)))
 
+        ,@(IF (> nlev 1)
+              `((var uint8_t ,depharr [20])
+                (var int ,dephready)
+                (func ,depkeyfn () (out const uint8_t *)
+                  (if (== ,dephready 0)
+                      (block
+                        ,@(LOOP FOR b IN depbytes FOR i FROM 0
+                                COLLECT `(set (nth ,i ,depharr) ,b))
+                        (set ,dephready 1)))
+                  (return (cast (uint8_t *) ,depharr))))
+              '())
+
         (var BTreeIndex ,idxname)
 
-        (func ,domap ((void * mm) (void * rr)) (out void)
-          (cast void mm)
-          (let ((,table * r . #'(cast (,table *) rr)))
-            (bt_map (aof ,idxname) (-> r ,column) ($ (-> r pointer) address))))
-
-        (func ,dounmap ((void * mm) (void * rr)) (out void)
-          (cast void mm)
-          (let ((,table * r . #'(cast (,table *) rr)))
-            (bt_unmap (aof ,idxname) (-> r ,column) ($ (-> r pointer) address))))
+        ,@(IF (= nlev 1)
+              `((func ,domap ((void * mm) (void * rr)) (out void)
+                  (cast void mm)
+                  (let ((,table * r . #'(cast (,table *) rr)))
+                    (bt_map (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address))))
+                (func ,dounmap ((void * mm) (void * rr)) (out void)
+                  (cast void mm)
+                  (let ((,table * r . #'(cast (,table *) rr)))
+                    (bt_unmap (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address)))))
+              `((func ,domap ((void * mm) (void * rr)) (out void)
+                  (cast void mm)
+                  (let ((,table * r . #'(cast (,table *) rr))
+                        (int64_t ks [8]))
+                    ,@(LOOP FOR c IN cols FOR i FROM 0
+                            COLLECT `(set (nth ,i ks) (-> r ,c)))
+                    (bt_map_multi (aof ,idxname) ks ($ (-> r pointer) address))))
+                (func ,dounmap ((void * mm) (void * rr)) (out void)
+                  (cast void mm)
+                  (let ((,table * r . #'(cast (,table *) rr))
+                        (int64_t ks [8]))
+                    ,@(LOOP FOR c IN cols FOR i FROM 0
+                            COLLECT `(set (nth ,i ks) (-> r ,c)))
+                    (bt_unmap_multi (aof ,idxname) ks ($ (-> r pointer) address))))))
 
         (func ,dotrunc ((void * mm)) (out void)
           (bt_truncate (aof ,idxname) (cast (Memory *) mm))
@@ -2740,66 +3094,78 @@
           (set ($ ,idxname max_degree) ,(* (- branching 1) 2))
           (set ($ ,idxname root_address) -1)
           (set ($ ,idxname record_pointer) (pointer_null))
+          (set ($ ,idxname levels) ,nlev)
+          (set ($ ,idxname is_dependent) 0)
+          ,(IF (> nlev 1)
+               `(set ($ ,idxname dep_hash_key) (intern_key (,depkeyfn)))
+               `(set ($ ,idxname dep_hash_key) nil))
           (bt_select_record (aof ,idxname))
           (set ($ ,hooksvar on_map) ,domap)
           (set ($ ,hooksvar on_unmap) ,dounmap)
           (set ($ ,hooksvar on_truncate) ,dotrunc))
 
+        ;; the full row walk descends every level by itself
         (func ,icur ((Memory * m) (void * user)
                      (func cb ((void * u) (,table * r)) (out bool))) (out void)
           (let ((,ctxname cc))
             (set ($ cc m) m)
             (set ($ cc user) user)
             (set ($ cc cb) cb)
-            (bt_cursor (aof ,idxname) (cast (void *) (aof cc)) ,shim)))
+            (bt_cursor_rows_deep (aof ,idxname) (cast (void *) (aof cc)) ,shim)))
 
-        (func ,ieq ((Memory * m) (int64_t k) (void * user)
+        ;; equality over the whole tuple: one key parameter per column
+        (func ,ieq ((Memory * m)
+                    ,@(LOOP FOR kp IN kparams COLLECT `(int64_t ,kp))
+                    (void * user)
                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
+          (let ((,ctxname cc)
+                (int64_t ks [8]))
             (set ($ cc m) m)
             (set ($ cc user) user)
             (set ($ cc cb) cb)
-            (bt_cursor_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+            ,@(LOOP FOR kp IN kparams FOR i FROM 0
+                    COLLECT `(set (nth ,i ks) ,kp))
+            (bt_cursor_equal_multi (aof ,idxname) ks (cast (void *) (aof cc)) ,shim)))
 
-        (func ,ineq ((Memory * m) (int64_t k) (void * user)
-                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
-            (set ($ cc m) m)
-            (set ($ cc user) user)
-            (set ($ cc cb) cb)
-            (bt_cursor_not_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-
-        (func ,ilt ((Memory * m) (int64_t k) (void * user)
-                    (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
-            (set ($ cc m) m)
-            (set ($ cc user) user)
-            (set ($ cc cb) cb)
-            (bt_cursor_less_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-
-        (func ,ilte ((Memory * m) (int64_t k) (void * user)
-                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
-            (set ($ cc m) m)
-            (set ($ cc user) user)
-            (set ($ cc cb) cb)
-            (bt_cursor_less_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-
-        (func ,igt ((Memory * m) (int64_t k) (void * user)
-                    (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
-            (set ($ cc m) m)
-            (set ($ cc user) user)
-            (set ($ cc cb) cb)
-            (bt_cursor_greater_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-
-        (func ,igte ((Memory * m) (int64_t k) (void * user)
-                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
-          (let ((,ctxname cc))
-            (set ($ cc m) m)
-            (set ($ cc user) user)
-            (set ($ cc cb) cb)
-            (bt_cursor_greater_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+        ;; the range family stays single-column: on a composite index the
+        ;; engine's *_dep cursors hand the dependent levels to the caller
+        ,@(IF (= nlev 1)
+              `((func ,ineq ((Memory * m) (int64_t k) (void * user)
+                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_not_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+                (func ,ilt ((Memory * m) (int64_t k) (void * user)
+                            (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_less_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+                (func ,ilte ((Memory * m) (int64_t k) (void * user)
+                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_less_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+                (func ,igt ((Memory * m) (int64_t k) (void * user)
+                            (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_greater_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+                (func ,igte ((Memory * m) (int64_t k) (void * user)
+                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_greater_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim))))
+              '())
 
         (func ,itrunc ((Memory * m)) (out size_t)
           (return (bt_truncate (aof ,idxname) m))))))
@@ -2813,6 +3179,12 @@
 
   (deftable Tag "smoke::Tag" k)
   (defindex IDX_TAG_K Tag k 1 3)
+
+  (deftable Loan "smoke::Loan" member_id book_id)
+  (defindex IDX_LOAN_MB Loan (member_id book_id) 0 3)
+
+  (deftable Pair "smoke::Pair" a b)
+  (defindex IDX_PAIR_AB Pair (a b) 1 3)
 
   (var int failures . 0)
 
@@ -2918,6 +3290,51 @@
       (IDX_TAG_K_not_equal m k (cast (void *) (aof c)) tag_ord_cb)
       (return ($ c rows))))
 
+  ;; counters over the composite indexes
+  (struct NRowsCtx
+    (member int64_t rows))
+
+  (func loan_n_cb ((void * u) (Loan * r)) (out bool)
+    (cast void r)
+    (let ((NRowsCtx * c . #'(cast (NRowsCtx *) u)))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (return #t)))
+
+  (func pair_n_cb ((void * u) (Pair * r)) (out bool)
+    (cast void r)
+    (let ((NRowsCtx * c . #'(cast (NRowsCtx *) u)))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (return #t)))
+
+  (func loan_equal_count ((Memory * m) (int64_t a) (int64_t b)) (out int64_t)
+    (let ((NRowsCtx c))
+      (set ($ c rows) 0)
+      (IDX_LOAN_MB_equal m a b (cast (void *) (aof c)) loan_n_cb)
+      (return ($ c rows))))
+
+  (func loan_all_count ((Memory * m)) (out int64_t)
+    (let ((NRowsCtx c))
+      (set ($ c rows) 0)
+      (IDX_LOAN_MB_cursor m (cast (void *) (aof c)) loan_n_cb)
+      (return ($ c rows))))
+
+  (func pair_equal_count ((Memory * m) (int64_t a) (int64_t b)) (out int64_t)
+    (let ((NRowsCtx c))
+      (set ($ c rows) 0)
+      (IDX_PAIR_AB_equal m a b (cast (void *) (aof c)) pair_n_cb)
+      (return ($ c rows))))
+
+  ;; pick one row out of a composite lookup, to delete it
+  (struct LoanPickCtx
+    (member Loan row)
+    (member int found))
+
+  (func loan_pick_cb ((void * u) (Loan * r)) (out bool)
+    (let ((LoanPickCtx * c . #'(cast (LoanPickCtx *) u)))
+      (set (-> c row) (cof r))
+      (set (-> c found) 1)
+      (return #f)))
+
   ;; a session that updates one row and commits, for the SNAPSHOT test
   (func update_worker ((void * arg)) (out void *)
     (let ((Memory * m . #'(cast (Memory *) arg)))
@@ -2961,6 +3378,8 @@
         ;; the indexes: attached once, before anything writes
         (IDX_BOOK_VALUE_attach (aof mem))
         (IDX_TAG_K_attach (aof mem))
+        (IDX_LOAN_MB_attach (aof mem))
+        (IDX_PAIR_AB_attach (aof mem))
 
         ;; ---- insert three, commit, read back --------------------------
         (let ((int64_t i . 1))
@@ -3107,6 +3526,72 @@
         (check "greater_than twenty-seven" (tag_gt_count (aof mem) 27) 2)
         (check "not_equal five" (tag_neq_count (aof mem) 5) 29)
 
+        ;; ---- composite: a five-by-six grid through two levels ---------
+        ;; five top keys split the top root (max degree 4); six dependent
+        ;; keys under each split THEIR roots -- the write-back the
+        ;; original loses (its dependent root splits update a catalogue
+        ;; record the dependent does not have, and the parent key is only
+        ;; told at creation)
+        (let ((int64_t i . 0))
+          (while (< i 5)
+            (let ((int64_t j . 0))
+              (while (< j 6)
+                (let ((Loan l))
+                  (set ($ l member_id) i)
+                  (set ($ l book_id) j)
+                  (Loan_insert (aof mem) (aof l)))
+                (set j (+ j 1))))
+            (set i (+ i 1))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (check "composite equal finds its cell" (loan_equal_count (aof mem) 3 4) 1)
+        (check "composite cursor sees the grid" (loan_all_count (aof mem)) 30)
+
+        ;; a second row in one cell: the non-unique tuple buckets
+        (let ((Loan l))
+          (set ($ l member_id) 3)
+          (set ($ l book_id) 4)
+          (Loan_insert (aof mem) (aof l)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the cell buckets its pair" (loan_equal_count (aof mem) 3 4) 2)
+
+        ;; delete one of the pair: the other stays found
+        (let ((LoanPickCtx pick))
+          (set ($ pick found) 0)
+          (IDX_LOAN_MB_equal (aof mem) 3 4 (cast (void *) (aof pick)) loan_pick_cb)
+          (if (== ($ pick found) 1)
+              (Loan_delete (aof mem) (aof ($ pick row)))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "one of the pair deleted" (loan_equal_count (aof mem) 3 4) 1)
+        (check "the grid is whole again" (loan_all_count (aof mem)) 30)
+
+        ;; ---- composite uniqueness is the whole tuple's ----------------
+        (let ((Pair p))
+          (set ($ p a) 1) (set ($ p b) 1)
+          (Pair_insert (aof mem) (aof p)))
+        (let ((Pair p))
+          (set ($ p a) 1) (set ($ p b) 2)
+          (Pair_insert (aof mem) (aof p)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((Pair dup))
+                   (set ($ dup a) 1) (set ($ dup b) 2)
+                   (Pair_insert (aof mem) (aof dup))))
+               (catch ((const IndexException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "a duplicate tuple refused" refused 1))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "a shared first column is no duplicate" (pair_equal_count (aof mem) 1 1) 1)
+        (check "the refused tuple left one behind" (pair_equal_count (aof mem) 1 2) 1)
+
         (sync_disk (aof mem))
         (cast void 0)))
 
@@ -3124,7 +3609,11 @@
         ;; roots come back, nothing re-inserts
         (IDX_BOOK_VALUE_attach (aof mem))
         (IDX_TAG_K_attach (aof mem))
+        (IDX_LOAN_MB_attach (aof mem))
+        (IDX_PAIR_AB_attach (aof mem))
         (check "the index survives it too" (book_equal_count (aof mem) 500) 1)
+        (check "the composite survives it too" (loan_equal_count (aof mem) 3 4) 1)
+        (check "the whole grid survives it too" (loan_all_count (aof mem)) 30)
         (let ((TagOrdCtx oc))
           (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
           (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)

@@ -7,7 +7,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 
 ## What is here
 
-* **`mvccs.cicili`** (~3,140 lines) — the storage engine core **and the
+* **`mvccs.cicili`** (~3,630 lines) — the storage engine core **and the
   B-tree index tier**, written in Cicili's C++ layer, compiled against
   the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
   `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
@@ -15,7 +15,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 * **`build.sh`** — `CICILI=$HOME/cicili sh build.sh`; the binary prints
   a check line per behaviour and exits with the failure count.
 
-Thirty-eight checks, all green, five runs in a row: insert/commit/read-back,
+Forty-eight checks, all green, five runs in a row: insert/commit/read-back,
 update versioning (the old version retired and the new adopted at one
 commit instant), rollback undoing a staged delete, TRUNCATE reclaiming
 exactly the settled dead row and sparing the superseded one, allocation
@@ -30,8 +30,12 @@ rolled back delete **reappears in the index on its own**, by the value
 chain's visibility), thirty shuffled keys split their way through a
 branching-3 tree and walk back out in order, a unique index refuses a
 duplicate with a real `IndexException`, ranges over the split tree
-answer exactly, and both trees come back through the catalogue after a
-restart.
+answer exactly, and every tree comes back through the catalogue after a
+restart — including a **two-column composite index** over a five-by-six
+grid: tuple lookups, one cell holding a bucketed pair, deletion of one
+of the pair, whole-tuple uniqueness (a shared first column is no
+duplicate), and the grid intact after reopening, which is the proof of
+the dependent-root fix below.
 
 ## What was rewritten, and what was not
 
@@ -58,10 +62,25 @@ the original's `__INDICES__` hash key, and all seven cursors (`full`,
 original's descent rules and the streams handed back around every
 callback.
 
-**Not rewritten:** the variadic multi-level composite index
-(`BTreeIndex<Table, First, Rest...>`), `unmap_key`/`_combine_nodes`
-(true key deletion — present upstream, documented there as reached by
-nothing), `BaseSequence`, `Globals`, and the DBA plumbing (watcher,
+Third pass: **the multi-level composite index** — the original's
+variadic `BTreeIndex<Table, First, Rest...>` type recursion becomes
+runtime *levels*: every key here is an int64, so a dependent level is
+a stack-built `BTreeIndex` value (`bt_dependent`) sharing one interned
+dependent hash key, exactly the role of the original's stack
+`dependent_index`. Outer levels hold no value chains; each key's
+`dependents_address` roots the next level's tree; `bt_map_multi` and
+`bt_unmap_multi` walk the levels; uniqueness is judged where the value
+chains live, so it is the whole tuple's; `bt_truncate` sweeps both
+hash keys; and the cursors are generalised through one emit point
+(`BTEmit`): a qualifying key yields rows at the innermost level and
+the **dependent index** everywhere else — `bt_cursor_dep`,
+`bt_cursor_equal_dep` for composition, `bt_cursor_rows_deep` and
+`bt_cursor_equal_multi` for the common whole-tree and whole-tuple
+questions.
+
+**Not rewritten:** `unmap_key`/`_combine_nodes` (true key deletion —
+present upstream, documented there as reached by nothing),
+`BaseSequence`, `Globals`, and the DBA plumbing (watcher,
 `dba_pagefiles`, `dba_pointers`).
 
 ## The experiment's answer
@@ -88,12 +107,16 @@ expansion time**, typed `Book_insert` / `Book_update` / `Book_delete` /
 an index attaches through. `defindex` is its counterpart:
 
     (defindex IDX_BOOK_VALUE Book value 0 3)
+    (defindex IDX_LOAN_MB Loan (member_id book_id) 0 3)
 
 expands the index instance, its expansion-time hash key and catalogue
-id, an `_attach` function the program calls once after `memory_open`
-(it finds or creates the catalogue record and hooks the table's
-`map`/`unmap`/`truncate`), and the seven typed cursor wrappers riding
-the table's own row shim. What a template instantiates invisibly, the
+id (a composite also gets the shared dependent-level key), an `_attach`
+function the program calls once after `memory_open` (it finds or
+creates the catalogue record and hooks the table's
+`map`/`unmap`/`truncate`), and the typed cursor wrappers riding the
+table's own row shim — all seven for a single column; for a composite,
+`_equal` takes one key per column and `_cursor` descends every level,
+with the engine's `*_dep` cursors there for hand-rolled composition. What a template instantiates invisibly, the
 macro emits greppably. One index per table for now — the last attach
 wins the hooks; chaining is where a second index would go. The
 branching factor is a parameter (the original derives it from the key
@@ -137,6 +160,20 @@ whole engine: `clock_gettime` on a `struct timespec`.
   `pack`/`unpack` virtuals instead of `operator<</>>`.
 
 ## Found upstream while porting
+
+`BTreeIndex` dependent root splits (btreeindex.hpp): when a *dependent*
+level's root splits, `_split_node` calls `_update_btreeindex()`
+unconditionally — but a dependent index has no catalogue record, and
+its `_pointer` is a default `Pointer`, so the update writes a control
+block and record at **address 0**, over the first page's header area.
+And the split's new root is never stored into the parent key:
+`_map_callback` writes `dependents_address` back only when it was `-1`
+(creation), so after a dependent root split the parent still points at
+the old root — the lower half — and every key promoted above it leaves
+the index. Both trigger as soon as one first-column key holds more
+than `2d` second-column keys. The rewrite guards the catalogue write on
+`is_dependent` and writes the root back **whenever it changed**; the
+restart-survives-the-grid check is the regression test.
 
 `Memory::_free` (memory.cpp): when a freed run covers a whole page, the
 page is rewritten under `__FREE__` on disk, but the in-memory page list
