@@ -7,7 +7,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 
 ## What is here
 
-* **`mvccs.cicili`** (~4,150 lines) — the storage engine core **and the
+* **`mvccs.cicili`** (~4,600 lines) — the storage engine core **and the
   B-tree index tier**, written in Cicili's C++ layer, compiled against
   the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
   `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
@@ -15,7 +15,7 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 * **`build.sh`** — `CICILI=$HOME/cicili sh build.sh`; the binary prints
   a check line per behaviour and exits with the failure count.
 
-Seventy-one checks, all green, five runs in a row: insert/commit/read-back,
+Ninety-three checks, all green, five runs in a row: insert/commit/read-back,
 update versioning (the old version retired and the new adopted at one
 commit instant), rollback undoing a staged delete, TRUNCATE reclaiming
 exactly the settled dead row and sparing the superseded one, allocation
@@ -44,7 +44,17 @@ the ten lowest keys leave a thirty-key tree through leftmost-leaf
 unlinks, underflow merges and root shrinks; twenty remain in order;
 the deletions are durable across another reopen, where two mid-tree
 separators then go through successor replacement against reloaded
-pages).
+pages). The fifth pass closes the inventory: **Globals** (the mode
+switches; the connection defaults flowing into the next transaction —
+isolation level and autocommit both; a bound client stream coming
+back and an unbound one refusing loudly; the whole permission-path
+model — a schema grant covers its tables, case never decides, an
+object grant covers itself and what is under it but never its schema,
+`*` covers everything, a cleared peer is a plain connection again, and
+a denial names its subject; the runtime-instance canary) and the
+**DBA plumbing** (`dba_pagefiles` and `dba_pointers` describing the
+raw store, and the watcher hearing one line per engine operation
+through an attached stream).
 
 ## What was rewritten, and what was not
 
@@ -106,9 +116,29 @@ keys, underflow merging through the parent's separator
 The composite form is refused loudly — upstream's own is unfinished
 (the outer key goes wholesale, taking other tuples with it).
 
-**Not rewritten:** `Globals`, the DBA plumbing (watcher,
-`dba_pagefiles`, `dba_pointers`), and composite `unmap_key`
-semantics.
+Fifth pass: **Globals and the DBA plumbing** — the last units.
+Globals' class of statics becomes file-scope state behind `globals_`
+accessors: the process switches, the connection defaults (read by
+`transaction_reset`, so a new default reaches the next transaction),
+the stream and store singletons, and the thread-local peer identity
+with the original's permission-path matching ported word for word —
+upper-cased trimmed levels split on `::`, empties dropped so a stray
+separator cannot widen a grant, a grant covering what it names and
+everything under it, `*` covering all, and `require_permission`
+throwing 7800 with the subject named. `globals_client_stream` refuses
+with 7802 rather than letting a null vtable call surface three frames
+later, and the `extern "C"` runtime-instance canary is emitted through
+Cicili's own `extern-c` clause. The DBA tier adds the watcher to
+`Memory` — attach owns the stream, the first failed write detaches it,
+and one guarded line per engine operation is sprinkled at the
+original's sites — plus `dba_pagefiles` (page list under its lock) and
+`dba_pointers` (the chunk-by-chunk page dump, run under the Streams
+pair — the original reads the shared streams there with nothing held,
+one more seek-and-read race).
+
+**Not rewritten:** composite `unmap_key` semantics (upstream would
+need to define them first) and Globals' `Parser`/`Compiler` slots —
+there are no such components beside this engine.
 
 ## The experiment's answer
 
@@ -187,6 +217,12 @@ whole engine: `clock_gettime` on a `struct timespec`.
   `pack`/`unpack` virtuals instead of `operator<</>>`.
 
 ## Found upstream while porting
+
+`Memory::dba_pointers` (memory.cpp): walks a page through the shared
+`_hexmap_io`/`_data_io` holding neither stream mutex — the same
+seek-and-read race the `Streams` pair exists to prevent, reachable
+from any admin connection while sessions write. The rewrite runs the
+walk under the pair.
 
 `BTreeIndex::_unmap_key` / `_combine_nodes` (btreeindex.hpp): shipped
 but called by nothing, and unfinished in ways a port would inherit:

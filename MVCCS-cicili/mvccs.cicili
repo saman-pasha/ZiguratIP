@@ -33,6 +33,9 @@
   (include "/home/user/ZiguratIP/Core/utility.hpp")
   (include "/home/user/ZiguratIP/StreamIO/binarystream.hpp")
   (include "/home/user/ZiguratIP/StreamIO/filestream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/bufferstream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/textstream.hpp")
+  (include <ctype.h>)
 
   ;; ------------------------------------------------------------------
   ;; Declaration bindings: emit nothing, buy member resolution on the
@@ -58,6 +61,9 @@
         (method read_std_time ((time_t & v)) (out void))
         (method write_std_time ((time_t && v)) (out void))
         (method fill_n ((size_t count) (char c)) (out void))
+        (method write_std_string ((std::string && s)) (out void))
+        (method write_std_bool ((bool && v)) (out void))
+        (method length () (out int64_t))
         (method flush () (out void))
         (method good () (out bool))
         (method clear () (out void))
@@ -292,12 +298,177 @@
     (member int64_t query_id)
     (member time_t query_time)
     (member IsolationLevel isolation_level)
+    (member int64_t auto_commit)
     (member TxnEntry * ctx_head)
     (member TxnEntry * ctx_tail))
 
   (thread-local) (var Transaction * tl_txn . nil)
 
   (var IsolationLevel default_isolation_level . READ_COMMITTED)
+
+  ;; ==================================================================
+  ;; Globals -- globals.hpp/.cpp, the process and the connection. The
+  ;; class of statics becomes file-scope state behind globals_ accessors;
+  ;; Parser and Compiler stay behind (no such components here). The
+  ;; permission model is the original's, word for word: a permission is
+  ;; a path, it covers what it names and everything under it, "*" covers
+  ;; everything, matching ignores case, and an empty level is dropped so
+  ;; a stray separator cannot widen a grant.
+  ;; ==================================================================
+  (var int g_reset_mode)
+  (var int g_trace_mode)
+  ;; whether what a certificate grants is enforced at all -- one switch,
+  ;; because half enforced would be worse than either
+  (var int g_permissions_mode)
+  (var int g_default_autocommit)
+
+  (func globals_reset_mode () (out int) (return g_reset_mode))
+  (func globals_set_reset_mode ((int v)) (out void) (set g_reset_mode v))
+  (func globals_trace_mode () (out int) (return g_trace_mode))
+  (func globals_set_trace_mode ((int v)) (out void) (set g_trace_mode v))
+  (func globals_permissions_mode () (out int) (return g_permissions_mode))
+  (func globals_set_permissions_mode ((int v)) (out void) (set g_permissions_mode v))
+  (func globals_default_autocommit_mode () (out int) (return g_default_autocommit))
+  (func globals_set_default_autocommit_mode ((int v)) (out void) (set g_default_autocommit v))
+  (func globals_default_isolation_level () (out IsolationLevel) (return default_isolation_level))
+  (func globals_set_default_isolation_level ((IsolationLevel lvl)) (out void)
+    (set default_isolation_level lvl))
+
+  ;; who is on the other end of this thread's connection, and what the
+  ;; certificate that opened it says they may reach -- a connection
+  ;; carries its own authority, nothing is stored anywhere else
+  (thread-local) (var int tl_identified)
+  (thread-local) (var char tl_peer_subject [128])
+  (thread-local) (var char tl_peer_perms [2048])     ;; 16 grants, stride 128
+  (thread-local) (var int tl_peer_perm_count)
+
+  (thread-local) (var binarystream * tl_client_stream)
+  (thread-local) (var Zigurat::textstream * tl_echo_stream)
+
+  (func globals_identified () (out int) (return tl_identified))
+  (func globals_peer_subject () (out const char *)
+    (return (cast (char *) tl_peer_subject)))
+
+  (func globals_set_peer ((const char * subject)) (out void)
+    (set tl_identified 1)
+    (strncpy tl_peer_subject subject 127)
+    (set (nth 127 tl_peer_subject) 0)
+    (set tl_peer_perm_count 0))
+
+  (func globals_add_peer_permission ((const char * granted)) (out void)
+    (if (< tl_peer_perm_count 16)
+        (block
+          (strncpy (aof (nth (* tl_peer_perm_count 128) tl_peer_perms)) granted 127)
+          (set (nth (+ (* tl_peer_perm_count 128) 127) tl_peer_perms) 0)
+          (set tl_peer_perm_count (+ tl_peer_perm_count 1)))))
+
+  (func globals_clear_peer () (out void)
+    (set tl_identified 0)
+    (set (nth 0 tl_peer_subject) 0)
+    (set tl_peer_perm_count 0))
+
+  ;; "DEMO::AUTHORS" -> {"DEMO", "AUTHORS"}, upper cased, empties dropped.
+  ;; Levels land in OUT at stride 64; the count comes back.
+  (func path_split ((const char * qualified) (char * out_levels) (int max_levels)) (out int)
+    (let ((int n . #'(cast int (strlen qualified)))
+          (int i . 0)
+          (int count . 0)
+          (char level [64])
+          (int li . 0))
+      (while (<= i n)
+        (let ((int is_sep . 0))
+          (if (== i n)
+              (set is_sep 1)
+            (if (and (== (cast int (nth i qualified)) 58)
+                     (and (< (+ i 1) n) (== (cast int (nth (+ i 1) qualified)) 58)))
+                (set is_sep 1)))
+          (if (== is_sep 1)
+              (block
+                ;; trailing spaces off, and an empty level dropped
+                (while (and (> li 0) (== (cast int (nth (- li 1) level)) 32))
+                  (set li (- li 1)))
+                (if (and (> li 0) (< count max_levels))
+                    (block
+                      (set (nth li level) (cast char 0))
+                      (strcpy (aof (nth (* count 64) out_levels)) level)
+                      (set count (+ count 1))))
+                (set li 0)
+                (if (== i n) break)
+                (set i (+ i 2)))
+            (block
+              (let ((int c . #'(bitand (cast int (nth i qualified)) 255)))
+                ;; leading spaces never start a level
+                (if (not (and (== li 0) (== c 32)))
+                    (if (< li 63)
+                        (block
+                          (set (nth li level) (cast char (toupper c)))
+                          (set li (+ li 1))))))
+              (set i (+ i 1))))))
+      (return count)))
+
+  (func globals_permits ((const char * qualified_name)) (out int)
+    ;; turned off, a certificate says who its holder is and nothing more
+    (if (== g_permissions_mode 0) (return 1))
+    ;; a plain connection has nobody to ask about
+    (if (== tl_identified 0) (return 1))
+
+    (let ((char object [512])
+          (int object_n . #'(path_split qualified_name object 8)))
+      (if (== object_n 0) (return 0))
+
+      (let ((int pn . 0))
+        (while (< pn tl_peer_perm_count)
+          (let ((char granted [512])
+                (int granted_n . #'(path_split (aof (nth (* pn 128) tl_peer_perms)) granted 8)))
+            (if (> granted_n 0)
+                (block
+                  (if (and (== granted_n 1)
+                           (== 0 (strcmp (aof (nth 0 granted)) "*")))
+                      (return 1))
+                  ;; a permission covers what it names and everything under it
+                  (if (<= granted_n object_n)
+                      (let ((int covers . 1)
+                            (int i . 0))
+                        (while (< i granted_n)
+                          (if (!= 0 (strcmp (aof (nth (* i 64) granted))
+                                            (aof (nth (* i 64) object))))
+                              (block (set covers 0) break))
+                          (set i (+ i 1)))
+                        (if (== covers 1) (return 1)))))))
+          (set pn (+ pn 1))))
+      (return 0)))
+
+  ;; the same question, asked where the answer has to be no
+  (func globals_require_permission ((const char * qualified_name)) (out void)
+    (if (!= (globals_permits qualified_name) 0) (return))
+    (let ((char msg [256]))
+      (snprintf msg 256 "'%s' has no permission for '%s'" tl_peer_subject qualified_name)
+      (throw* (Zigurat::ZiguratException 7800 (std::string msg)))))
+
+  ;; a null client stream is not a forgotten null check: it is a call
+  ;; through a vtable at address zero several frames later. Refuse here.
+  (func globals_client_stream () (out binarystream *)
+    (if (== tl_client_stream nil)
+        (throw* (Zigurat::ZiguratException 7802 (std::string "no connection is bound to this thread"))))
+    (return tl_client_stream))
+  (func globals_set_client_stream ((binarystream * stream)) (out void)
+    (set tl_client_stream stream))
+  (func globals_echo_stream () (out Zigurat::textstream *)
+    (return tl_echo_stream))
+  (func globals_set_echo_stream ((Zigurat::textstream * stream)) (out void)
+    (set tl_echo_stream stream))
+
+  ;; one byte, at a different address in every copy of this library a
+  ;; process has loaded -- the canary that catches a rebuilt object
+  ;; mapped in beside the one the server already holds
+  (var char g_runtime_instance)
+  (func globals_runtime_instance () (out const void *)
+    (return (cast (void *) (aof g_runtime_instance))))
+  ;; and the C-linkage spelling the servers dlsym for
+  (extern-c
+    (func mvccs_runtime_instance () (out const void *)
+      (return (globals_runtime_instance))))
+
 
   ;; the SERIALIZABLE semaphore of one -- Transaction::_serialize_* done
   ;; with pthreads. Counter and wait under one mutex; the slot is taken
@@ -344,6 +515,8 @@
     (set (-> t init_time) (version_time))
     (set (-> t query_time) (cast time_t 0))
     (set (-> t query_id) 0)
+    ;; the connection's settings, not the last transaction's
+    (set (-> t auto_commit) (cast int64_t g_default_autocommit))
     (set_isolation_level t default_isolation_level))
 
   (func txn () (out Transaction *)
@@ -368,7 +541,10 @@
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
     (member pthread_mutex_t page_list_access)
-    (member pthread_mutex_t free_list_access))
+    (member pthread_mutex_t free_list_access)
+    ;; the DBA watcher: one line per engine operation goes through this
+    ;; stream while it is attached; detached on the first write failure
+    (member binarystream * watcher))
 
   ;; ==================================================================
   ;; Streams -- THE guard. One pair of shared streams for the whole
@@ -432,6 +608,39 @@
           (block
             (set (-> tl_txn query_id) 0)
             (set (-> tl_txn query_time) (cast time_t 0))))))
+
+  ;; ==================================================================
+  ;; The watcher -- dba_watch and its formatting helpers. Nothing
+  ;; generated checks the watcher first; these do, so a sprinkled call
+  ;; costs one pointer test when nobody is watching.
+  ;; ==================================================================
+  (func dba_watch ((Memory * m) (const char * text)) (out void)
+    (if (== (-> m watcher) nil) (return))
+    (try (block
+           ((-> (-> m watcher) write_std_size)
+            (cast size_t (? (!= tl_txn nil) (-> tl_txn id) 0)))
+           ((-> (-> m watcher) write_std_string) (std::string text)))
+         ;; the watcher is best effort: the first failed write detaches it
+         (catch ()
+           (set (-> m watcher) nil))))
+
+  (func dba_watch0 ((Memory * m) (const char * op)) (out void)
+    (if (== (-> m watcher) nil) (return))
+    (let ((char msg [192]))
+      (snprintf msg 192 "%s: ()" op)
+      (dba_watch m msg)))
+
+  (func dba_watch1 ((Memory * m) (const char * op) (int64_t a)) (out void)
+    (if (== (-> m watcher) nil) (return))
+    (let ((char msg [192]))
+      (snprintf msg 192 "%s: (%ld)" op (cast long a))
+      (dba_watch m msg)))
+
+  (func dba_watch2 ((Memory * m) (const char * op) (int64_t a) (int64_t b)) (out void)
+    (if (== (-> m watcher) nil) (return))
+    (let ((char msg [192]))
+      (snprintf msg 192 "%s: (%ld, %ld)" op (cast long a) (cast long b))
+      (dba_watch m msg)))
 
   ;; ==================================================================
   ;; Control block I/O -- _dump_control / _load_control
@@ -709,6 +918,7 @@
         (set e (-> e next)))))
 
   (func free_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (dba_watch2 m "Free" (-> p address) (-> p size))
     (let ((int64_t from . #'(ptr_hexmap p))
           (int64_t count . #'(ptr_actual_count p))
           (int64_t full_count . 0)
@@ -760,7 +970,7 @@
   ;; Transaction plumbing
   ;; ==================================================================
   (func transaction_push ((Memory * m) (const Pointer * p)) (out void)
-    (cast void m)
+    (dba_watch1 m "Transaction Push" (-> p address))
     (let ((Transaction * t . #'(txn))
           (TxnEntry * e . #'(new* TxnEntry)))
       ;; same clock as query_time: rollback_transaction_to compares the two
@@ -780,6 +990,7 @@
       ((-> (-> m data_io) write_std_time) (cast time_t commit_time))))
 
   (func commit_pointer ((Memory * m) (const Pointer * p) (time_t commit_time)) (out void)
+    (dba_watch1 m "Commit Pointer" (-> p address))
     (let ((Control control))
       (control_clear (aof control))
       (load_control m p (aof control))
@@ -804,6 +1015,7 @@
       (dump_control m p (aof control))))
 
   (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (dba_watch1 m "Rollback Pointer" (-> p address))
     (let ((Control control))
       (control_clear (aof control))
       (load_control m p (aof control))
@@ -842,6 +1054,7 @@
           (set (-> tl_txn ctx_tail) nil)))
     (set (-> tl_txn id) (Utility::generate_id))
     (transaction_reset tl_txn)
+    (dba_watch0 m "Begin Transaction")
 
     (letin* ((streams (Streams m)))
       (set (-> tl_txn pointer)
@@ -864,6 +1077,7 @@
     (set (-> t ctx_tail) nil))
 
   (func commit_transaction ((Memory * m)) (out void)
+    (dba_watch0 m "Commit Transaction")
     (let ((Transaction * t . #'(txn)))
       ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
       ;; not hold the streams while it does
@@ -887,6 +1101,7 @@
       (transaction_reset t)))
 
   (func rollback_transaction ((Memory * m)) (out void)
+    (dba_watch0 m "Rollback Transaction")
     (let ((Transaction * t . #'(txn)))
       (block
         (letin* ((streams (Streams m)))
@@ -904,6 +1119,7 @@
 
   ;; the partial rollback the repeatable-read retry uses
   (func rollback_transaction_to ((Memory * m) (time_t at)) (out void)
+    (dba_watch0 m "Rollback Transaction to")
     (letin* ((streams (Streams m)))
       (let ((Transaction * t . #'(txn))
             (TxnEntry * e . #'(-> t ctx_tail)))
@@ -971,6 +1187,7 @@
   ;; the writer's wait -- bounded, streams handed back while sleeping
   (func check_lock ((Memory * m) (int lock_mask) (const Pointer * p)
                     (Control * c) (Streams * streams)) (out bool)
+    (dba_watch1 m "Check Lock" (-> p address))
     (let ((bool do_read . #t)
           (int waited_ms . 0)
           (bool looping . #t))
@@ -1131,6 +1348,7 @@
                      (void * ctx)
                      (func callback ((void * c) (Pointer * p)) (out bool)))
         (out void)
+    (dba_watch0 m "Cursor")
     (set tl_cursor_id (+ tl_cursor_id 1))
     (if (>= tl_cursor_id MAX_CURSOR_COUNT)
         (throw* (MemoryException "maximum cursor count")))
@@ -1308,6 +1526,7 @@
   ;; ISUD -- the staged writes
   ;; ==================================================================
   (func control_insert ((Memory * m) (BaseTable * obj)) (out void)
+    (dba_watch1 m "Control Insert" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (set ($ control online_state) ROW_INSERTED)
@@ -1319,6 +1538,7 @@
 
   (func control_update ((Memory * m) (BaseTable * old_obj) (BaseTable * new_obj)
                         (Streams * streams)) (out void)
+    (dba_watch1 m "Control Update" ($ (-> old_obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (if (not (check_lock m (cast int LOCK_EXCLUSIVE) (aof (-> old_obj pointer))
@@ -1342,6 +1562,7 @@
       (dump_control m (aof (-> new_obj pointer)) (aof control))))
 
   (func control_delete ((Memory * m) (BaseTable * obj) (Streams * streams)) (out void)
+    (dba_watch1 m "Control Delete" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (if (not (check_lock m (cast int LOCK_EXCLUSIVE) (aof (-> obj pointer))
@@ -1360,6 +1581,7 @@
     ;; this one and does nothing -- the whole reason Streams exists
     (letin* ((streams (Streams m)))
       (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
+      (dba_watch1 m "Online Insert" ($ (-> obj pointer) address))
       (transaction_push m (aof (-> obj pointer)))
       (control_insert m obj)
       (full_hexmap m (aof (-> obj pointer)))
@@ -1375,6 +1597,7 @@
     ((-> new_obj prepare))
     (letin* ((streams (Streams m)))
       (set (-> new_obj pointer) (allocate m hash_key ((-> new_obj pack_size))))
+      (dba_watch2 m "Online Update" ($ (-> old_obj pointer) address) ($ (-> new_obj pointer) address))
       (transaction_push m (aof (-> old_obj pointer)))
       (transaction_push m (aof (-> new_obj pointer)))
       (control_update m old_obj new_obj (aof streams))
@@ -1388,6 +1611,7 @@
       (cast void 0)))
 
   (func online_delete ((Memory * m) (BaseTable * obj)) (out void)
+    (dba_watch1 m "Online Delete" ($ (-> obj pointer) address))
     (letin* ((streams (Streams m)))
       (transaction_push m (aof (-> obj pointer)))
       (control_delete m obj (aof streams))
@@ -1400,6 +1624,7 @@
   ;; and sequences use for their own records
   (func offline_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
     (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
+    (dba_watch1 m "Offline Insert" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (set ($ control offline_state) ROW_INSERTED)
@@ -1412,6 +1637,7 @@
     ((-> (-> m data_io) flush)))
 
   (func offline_update ((Memory * m) (BaseTable * obj)) (out void)
+    (dba_watch1 m "Offline Update" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (load_control m (aof (-> obj pointer)) (aof control))
@@ -1496,6 +1722,7 @@
       (return head)))
 
   (func truncate_key ((Memory * m) (const uint8_t * hash_key)) (out size_t)
+    (dba_watch0 m "Truncate")
     (letin* ((streams (Streams m)))
       ;; collected in full before anything is freed: free_pointer rewrites
       ;; the hexmap and moves entries the walk stands on
@@ -1635,6 +1862,7 @@
     (set (-> m initialized) #f)
     (set (-> m pages) nil)
     (set (-> m frees) nil)
+    (set (-> m watcher) nil)
     (pthread_mutex_init (aof (-> m hexmap_access)) nil)
     (pthread_mutex_init (aof (-> m data_access)) nil)
     (pthread_mutex_init (aof (-> m page_list_access)) nil)
@@ -2181,6 +2409,7 @@
           (bt_split_node idx ancestors depth node))))
 
   (func bt_map ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
+    (dba_watch2 (-> idx m) "BTreeIndex map" k value)
     (let ((Memory * m . #'(-> idx m)))
       ;; reached from online_insert, which is already holding these; the
       ;; guard nests and does nothing. Reached bare, it locks for real.
@@ -2284,6 +2513,7 @@
                    (set stop 1)))))))))
 
   (func bt_unmap ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
+    (dba_watch2 (-> idx m) "BTreeIndex unmap" k value)
     (letin* ((streams (Streams (-> idx m))))
       (if (!= (-> idx root_address) -1)
           (let ((BTNode root_node))
@@ -2557,6 +2787,7 @@
   (func bt_unmap_key ((BTreeIndex * idx) (int64_t k)) (out void)
     ;; the composite semantics upstream are unfinished (the outer key
     ;; goes wholesale, taking other tuples with it); refuse loudly
+    (dba_watch1 (-> idx m) "BTreeIndex unmap_key" k)
     (if (> (-> idx levels) 1)
         (throw* (IndexException "unmap_key is single-level only")))
     (letin* ((streams (Streams (-> idx m))))
@@ -3057,6 +3288,129 @@
       (if (> (-> idx levels) 1)
           (set freed (+ freed (truncate_key m (-> idx dep_hash_key)))))
       (return freed)))
+
+  ;; ==================================================================
+  ;; The singleton registry -- the rest of Globals: the store's two
+  ;; streams and the Memory itself, set once at startup and read by
+  ;; everything the server wires together.
+  ;; ==================================================================
+  (var binarystream * g_memory_hexmap_stream)
+  (var binarystream * g_memory_data_stream)
+  (var Memory * g_memory)
+
+  (func globals_memory_hexmap_stream () (out binarystream *) (return g_memory_hexmap_stream))
+  (func globals_set_memory_hexmap_stream ((binarystream * stream)) (out void)
+    (set g_memory_hexmap_stream stream))
+  (func globals_memory_data_stream () (out binarystream *) (return g_memory_data_stream))
+  (func globals_set_memory_data_stream ((binarystream * stream)) (out void)
+    (set g_memory_data_stream stream))
+  (func globals_memory () (out Memory *) (return g_memory))
+  (func globals_set_memory ((Memory * m)) (out void) (set g_memory m))
+
+  ;; ==================================================================
+  ;; The DBA reports -- dba_pagefiles and dba_pointers, the Memory
+  ;; Viewer's raw dumps, and the watcher's attach/detach. The pointers
+  ;; walk runs under the Streams pair; the original reads the shared
+  ;; streams there with nothing held, which is one more seek/read race.
+  ;; ==================================================================
+  (func dba_attach_watcher ((Memory * m) (binarystream * watcher)) (out void)
+    (if (!= (-> m watcher) nil)
+        (delete* (-> m watcher)))
+    (set (-> m watcher) watcher))
+
+  (func dba_detach_watcher ((Memory * m)) (out void)
+    (if (!= (-> m watcher) nil)
+        (delete* (-> m watcher)))
+    (set (-> m watcher) nil))
+
+  (func dba_pagefiles ((Memory * m) (binarystream * stream)) (out void)
+    (pthread_mutex_lock (aof (-> m page_list_access)))
+    (let ((size_t total . 0)
+          (PageEntry * e . #'(-> m pages)))
+      (while (!= e nil)
+        (set total (+ total 1))
+        (set e (-> e next)))
+      ((-> stream write_std_size) (cast size_t total))
+      (set e (-> m pages))
+      (while (!= e nil)
+        ((-> stream write_std_string) (Utility::octet_as_hex (-> e key) (cast size_t HASHKEY_SIZE)))
+        ((-> stream write_std_long) (cast int64_t (-> e address)))
+        (set e (-> e next))))
+    (pthread_mutex_unlock (aof (-> m page_list_access))))
+
+  (func dba_pointers ((Memory * m) (binarystream * stream)) (out void)
+    (letin* ((streams (Streams m)))
+      (let ((int64_t pagefile_start . 0))
+        ((-> stream read_std_long) pagefile_start)
+        (if (or (< pagefile_start 0)
+                (> pagefile_start (* (-> m page_count) (-> m page_size))))
+            (block
+              ((-> stream write_std_bool) #f)
+              (return)))
+
+        ((-> stream write_std_bool) #t)
+        ((-> stream write_std_ubyte) (cast uint8_t 2))
+        ((-> stream write_std_long) (cast int64_t pagefile_start))
+        ((-> stream write_std_long) (cast int64_t PAGEFILE_CONTROL_SIZE))
+        ((-> stream write_std_long) (cast int64_t PAGEFILE_CONTROL_SIZE))
+
+        (let ((int64_t begin_address . #'(+ pagefile_start PAGEFILE_CONTROL_SIZE))
+              (int64_t end_address . #'(+ pagefile_start (-> m page_size)))
+              (Control control)
+              (uint8_t hex_byte . 0))
+          (control_clear (aof control))
+          (while (< begin_address end_address)
+            ((-> (-> m data_io) seekg) begin_address std::ios::beg)
+            ((-> (-> m data_io) read_std_time) ($ control online_time))
+            ((-> (-> m data_io) read_std_size) ($ control transaction_id))
+            ((-> (-> m data_io) read_std_long) ($ control query_id))
+            ((-> (-> m data_io) read_std_long) ($ control reference_address))
+            ((-> (-> m data_io) read_std_time) ($ control modify_time))
+            ((-> (-> m data_io) read_std_time) ($ control create_time))
+
+            ((-> (-> m hexmap_io) seekg) (addr_hexmap begin_address) std::ios::beg)
+            ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+            (set ($ control online_state) (cast RowState (bitand hex_byte 12)))
+            (set ($ control online_lock) (cast RowLock (bitand hex_byte 3)))
+            ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+            (set ($ control offline_state) (cast RowState (bitand hex_byte 12)))
+            (set ($ control offline_lock) (cast RowLock (bitand hex_byte 3)))
+            ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 2) std::ios::cur)
+
+            (let ((int64_t size . 0)
+                  (int64_t actual_size . CONTROL_SIZE)
+                  (int at_end . 0)
+                  (int is_data . 0))
+              (while (== at_end 0)
+                ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                (if (== (bitand hex_byte 64) 64)
+                    (block
+                      (set at_end 1)
+                      (set is_data (? (== (bitand hex_byte 128) 128) 1 0))
+                      ((-> stream write_std_bool) #t)
+                      ((-> stream write_std_ubyte) (cast uint8_t is_data))
+                      ((-> stream write_std_long) (cast int64_t begin_address))
+                      ((-> stream write_std_long) (cast int64_t (+ size (bitand hex_byte 31))))
+                      ((-> stream write_std_long) (cast int64_t (+ actual_size CHUNK_SIZE)))
+                      (if (== is_data 1)
+                          (block
+                            ((-> stream write_std_ubyte) (cast uint8_t ($ control online_state)))
+                            ((-> stream write_std_ubyte) (cast uint8_t ($ control online_lock)))
+                            ((-> stream write_std_ubyte) (cast uint8_t ($ control offline_state)))
+                            ((-> stream write_std_ubyte) (cast uint8_t ($ control offline_lock)))
+                            ((-> stream write_std_time) (cast time_t ($ control online_time)))
+                            ((-> stream write_std_size) (cast size_t ($ control transaction_id)))
+                            ((-> stream write_std_long) (cast int64_t ($ control query_id)))
+                            ((-> stream write_std_long) (cast int64_t ($ control reference_address)))
+                            ((-> stream write_std_time) (cast time_t ($ control modify_time)))
+                            ((-> stream write_std_time) (cast time_t ($ control create_time)))))
+                      (set actual_size (+ actual_size CHUNK_SIZE)))
+                  (block
+                    (set size (+ size CHUNK_SIZE))
+                    (set actual_size (+ actual_size CHUNK_SIZE)))))
+              (set begin_address (+ begin_address actual_size))))))
+      ((-> stream write_std_bool) #f)
+      (cast void 0)))
 
   ;; ==================================================================
   ;; Sequences -- basesequence.hpp. One row per sequence under its own
@@ -4074,6 +4428,94 @@
                  (cast void e)
                  (set refused 1)))
           (check "maximum exceeds refused" refused 1))
+
+        ;; ---- Globals: switches, the registry, who may reach what ------
+        (globals_set_trace_mode 1)
+        (check "a switch flips on" (cast int64_t (globals_trace_mode)) 1)
+        (globals_set_trace_mode 0)
+        (check "and off" (cast int64_t (globals_trace_mode)) 0)
+        (check "the canary answers"
+               (? (!= (globals_runtime_instance) nil) 1 0) 1)
+
+        ;; an unbound client stream refuses instead of dying later
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((binarystream * cs . #'(globals_client_stream)))
+                   (cast void cs)))
+               (catch ((const ZiguratException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "no connection refused loudly" refused 1))
+        (globals_set_client_stream (cast (binarystream *) (aof data)))
+        (check "a bound stream comes back"
+               (? (== (globals_client_stream) (cast (binarystream *) (aof data))) 1 0) 1)
+        (globals_set_client_stream nil)
+
+        ;; the permission paths, exactly the original's model
+        (check "permissions off admits all" (cast int64_t (globals_permits "ANY::THING")) 1)
+        (globals_set_permissions_mode 1)
+        (check "unidentified admits all" (cast int64_t (globals_permits "ANY::THING")) 1)
+        (globals_set_peer "tester")
+        (globals_add_peer_permission "demo")
+        (globals_add_peer_permission "App::Books")
+        (check "a schema grant covers its tables" (cast int64_t (globals_permits "DEMO::AUTHORS")) 1)
+        (check "case never decides" (cast int64_t (globals_permits "demo::authors")) 1)
+        (check "an object grant covers itself" (cast int64_t (globals_permits "app::books")) 1)
+        (check "and what is under it" (cast int64_t (globals_permits "APP::BOOKS::TITLE")) 1)
+        (check "but never its schema" (cast int64_t (globals_permits "APP")) 0)
+        (check "and nothing else" (cast int64_t (globals_permits "OTHER")) 0)
+        (let ((int64_t refused . 0))
+          (try (globals_require_permission "OTHER::THING")
+               (catch ((const ZiguratException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "denial names its subject" refused 1))
+        (globals_add_peer_permission "*")
+        (check "star covers everything" (cast int64_t (globals_permits "anything::at::all")) 1)
+        (globals_clear_peer)
+        (check "a cleared peer is a plain connection" (cast int64_t (globals_permits "OTHER")) 1)
+        (globals_set_permissions_mode 0)
+
+        ;; the connection defaults flow into the next transaction
+        (globals_set_default_isolation_level SNAPSHOT)
+        (globals_set_default_autocommit_mode 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the default level reaches the transaction"
+               (cast int64_t (cast int (-> tl_txn isolation_level))) 3)
+        (check "so does autocommit" (-> tl_txn auto_commit) 1)
+        (globals_set_default_isolation_level READ_COMMITTED)
+        (globals_set_default_autocommit_mode 0)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        ;; the registry holds what it is given
+        (globals_set_memory (aof mem))
+        (check "the registry answers with the store"
+               (? (== (globals_memory) (aof mem)) 1 0) 1)
+
+        ;; ---- the DBA reports and the watcher --------------------------
+        (let ((binarystream * report . #'(cast (binarystream *) (new* Zigurat::bufferstream))))
+          (dba_pagefiles (aof mem) report)
+          (check "pagefiles describes the store"
+                 (? (> ((-> report length)) 0) 1 0) 1)
+          (delete* report))
+        (let ((binarystream * report . #'(cast (binarystream *) (new* Zigurat::bufferstream))))
+          ((-> report write_std_long) (cast int64_t 0))
+          (dba_pointers (aof mem) report)
+          (check "pointers walks page zero"
+                 (? (> ((-> report length)) 8) 1 0) 1)
+          (delete* report))
+        (let ((binarystream * ear . #'(cast (binarystream *) (new* Zigurat::bufferstream))))
+          (dba_attach_watcher (aof mem) ear)
+          (let ((Pair pr))
+            (set ($ pr a) 5) (set ($ pr b) 5)
+            (Pair_insert (aof mem) (aof pr)))
+          (commit_transaction (aof mem))
+          (begin_transaction (aof mem))
+          (check "the watcher heard the engine work"
+                 (? (> ((-> ear length)) 0) 1 0) 1)
+          (dba_detach_watcher (aof mem)))
 
         (sync_disk (aof mem))
         (cast void 0)))
