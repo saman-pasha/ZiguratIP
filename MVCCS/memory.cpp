@@ -974,7 +974,9 @@ namespace Zigurat
 	    break;
 
 	  case RowState::DELETED:
-	    if (control.modify_time > Memory::transaction.init_time) {
+	    if (control.modify_time > Memory::transaction.init_time
+		&& control.create_time != (time_t)0
+		&& control.create_time <= Memory::transaction.init_time) {
 	      is_visible = true;
 	      settled = true;
 	    } else if (control.reference_address > -1) {
@@ -1048,6 +1050,13 @@ namespace Zigurat
   {
     // Never committed: there is nothing at this address anybody else may see.
     if (control.offline_state == RowState::NONE) return false;
+
+    // Flagged dead at rollback without ever being born: create_time 0 with a
+    // death state is _rollback_pointer's never-committed shape from before it
+    // stamped the birth too. Nobody may see it at any time.
+    if (control.create_time == (time_t)0
+	&& (control.offline_state == RowState::DELETED || control.offline_state == RowState::UPDATED))
+      return false;
 
     // Born after this read began. A committed row with no create_time at all is
     // one an older build wrote, and the honest reading of that is "long ago".
@@ -1320,7 +1329,9 @@ namespace Zigurat
 		      break;
 
 		    case RowState::DELETED:
-		      if (control.modify_time > Memory::transaction.init_time) {
+		      if (control.modify_time > Memory::transaction.init_time
+			  && control.create_time != (time_t)0
+			  && control.create_time <= Memory::transaction.init_time) {
 			do_callback = true;
 			break_while = true;
 		      } else if (control.reference_address > -1) {
@@ -1510,6 +1521,12 @@ namespace Zigurat
       if (control.offline_state == RowState::NONE) {
 	control.offline_state = RowState::DELETED;
 	control.modify_time = Memory::version_time();
+	// Born and died at the same instant, so no snapshot anywhere can see
+	// it. Without the birth stamp, a reader whose statement began BEFORE
+	// this rollback read "died after my snapshot" on a row that was never
+	// alive -- the dirty read readers_do_not_queue_behind_staged_writes
+	// caught about one run in three.
+	control.create_time = control.modify_time;
       }
 
       this->_dump_control(pointer, control);
