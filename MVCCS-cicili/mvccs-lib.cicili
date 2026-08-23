@@ -651,27 +651,31 @@
       ((-> (-> m data_io) write_std_time) (cast time_t (-> c modify_time)))
       ((-> (-> m data_io) write_std_time) (cast time_t (-> c create_time)))))
 
+  ;; Two block reads instead of nine field reads: the stream's read_std_*
+  ;; are host-order raw reads, so the 48-byte control area decodes with
+  ;; memcpy. What this buys is measured, not cosmetic -- a cursor at
+  ;; READ_COMMITTED judges every row, dead ones included, through this
+  ;; function, and under twelve threads it was where the one stream guard's
+  ;; holder spent most of its time.
   (func load_control ((Memory * m) (const Pointer * p) (Control * c)) (out void)
-    (let ((uint8_t online_hexmap . 0)
-          (uint8_t offline_hexmap . 0)
-          (uint8_t skip . 0))
+    (let ((uint8_t flags [4])
+          (uint8_t fields [48]))
       ((-> (-> m hexmap_io) seekg) (ptr_hexmap p) std::ios::beg)
-      ((-> (-> m hexmap_io) read_std_ubyte) online_hexmap)
-      ((-> (-> m hexmap_io) read_std_ubyte) offline_hexmap)
-      ((-> (-> m hexmap_io) read_std_ubyte) skip)
+      ((-> (-> m hexmap_io) read) (cast (char *) flags) 2)
 
-      (set (-> c online_state) (cast RowState (bitand online_hexmap 12)))
-      (set (-> c online_lock) (cast RowLock (bitand online_hexmap 3)))
-      (set (-> c offline_state) (cast RowState (bitand offline_hexmap 12)))
-      (set (-> c offline_lock) (cast RowLock (bitand offline_hexmap 3)))
+      (set (-> c online_state) (cast RowState (bitand (nth 0 flags) 12)))
+      (set (-> c online_lock) (cast RowLock (bitand (nth 0 flags) 3)))
+      (set (-> c offline_state) (cast RowState (bitand (nth 1 flags) 12)))
+      (set (-> c offline_lock) (cast RowLock (bitand (nth 1 flags) 3)))
 
       ((-> (-> m data_io) seekg) (-> p address) std::ios::beg)
-      ((-> (-> m data_io) read_std_time) (-> c online_time))
-      ((-> (-> m data_io) read_std_size) (-> c transaction_id))
-      ((-> (-> m data_io) read_std_long) (-> c query_id))
-      ((-> (-> m data_io) read_std_long) (-> c reference_address))
-      ((-> (-> m data_io) read_std_time) (-> c modify_time))
-      ((-> (-> m data_io) read_std_time) (-> c create_time))))
+      ((-> (-> m data_io) read) (cast (char *) fields) 48)
+      (memcpy (cast (void *) (aof (-> c online_time))) (cast (void *) (+ fields 0)) 8)
+      (memcpy (cast (void *) (aof (-> c transaction_id))) (cast (void *) (+ fields 8)) 8)
+      (memcpy (cast (void *) (aof (-> c query_id))) (cast (void *) (+ fields 16)) 8)
+      (memcpy (cast (void *) (aof (-> c reference_address))) (cast (void *) (+ fields 24)) 8)
+      (memcpy (cast (void *) (aof (-> c modify_time))) (cast (void *) (+ fields 32)) 8)
+      (memcpy (cast (void *) (aof (-> c create_time))) (cast (void *) (+ fields 40)) 8)))
 
   ;; ==================================================================
   ;; Hexmap runs
@@ -1373,6 +1377,24 @@
   ;; ==================================================================
   (thread-local) (var uint8_t tl_cursor_id . 0)
 
+  ;; One seek and one read bring a page's whole hexmap slice into BUF, and
+  ;; the walk parses it from memory. What this replaces was the walk's cost:
+  ;; an absolute seek and byte-at-a-time reads PER RECORD through a buffered
+  ;; stream whose buffer every seek throws away -- twelve polling workers
+  ;; measured 21 of their 34 seconds inside the kernel re-reading the same
+  ;; page's bytes under the one stream guard. The buffer is re-read wherever
+  ;; the walk let go of the streams (the callback, a lock wait), because in
+  ;; that window another thread may have written ahead of the scan.
+  (func cursor_page_hexmap ((Memory * m) (int64_t page_address) (uint8_t * buf)) (out void)
+    (if (> (-> m hbpp) 4096)
+        (throw* (MemoryException "page too large for the cursor's hexmap buffer")))
+    ((-> (-> m hexmap_io) seekg) (addr_hexmap page_address) std::ios::beg)
+    ((-> (-> m hexmap_io) read) (cast (char *) buf) (-> m hbpp))
+    (if (not ((-> (-> m hexmap_io) good)))
+        (block
+          ((-> (-> m hexmap_io) clear))
+          (throw* (MemoryException "hexmap ends inside the page")))))
+
   (decl) (func cursor_walk ((Memory * m) (const uint8_t * hash_key) (Streams * streams)
                             (void * ctx)
                             (func callback ((void * c) (Pointer * p)) (out bool)))
@@ -1412,7 +1434,10 @@
           (while (< page_n page_total)
             (let ((const uint8_t * page_hashkey . #'(nth page_n page_keys))
                   (int64_t page_address . #'(nth page_n page_addrs))
-                  (int64_t i . PAGEFILE_CONTROL_COUNT))
+                  (int64_t i . PAGEFILE_CONTROL_COUNT)
+                  (uint8_t hexbuf [4096])
+                  (bool page_stale . #f))
+              (cursor_page_hexmap m page_address hexbuf)
 
               (while (< i (-> m hbpp))
                 (let ((int64_t hexmap_address . #'(+ (addr_hexmap page_address) i))
@@ -1425,19 +1450,17 @@
                   (control_clear (aof control))
                   (set pointer_address (* hexmap_address CHUNK_SIZE))
 
-                  ((-> (-> m hexmap_io) seekg) hexmap_address std::ios::beg)
-                  ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                  (set hex_byte (nth i hexbuf))
                   (set online_state (cast RowState (bitand hex_byte 12)))
                   (set online_lock (cast RowLock (bitand hex_byte 3)))
-                  ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                  (set hex_byte (nth (+ i 1) hexbuf))
                   (set offline_state (cast RowState (bitand hex_byte 12)))
-                  ((-> (-> m hexmap_io) seekg) (- CONTROL_COUNT 2) std::ios::cur)
 
                   (set i (+ i CONTROL_COUNT))
                   (let ((int64_t pointer_size . 0)
                         (bool at_end . #f))
                     (while (and (not at_end) (< i (-> m hbpp)))
-                      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                      (set hex_byte (nth i hexbuf))
                       (set i (+ i 1))
 
                       (if (and (!= hex_byte CONTROL_STANDALONE_CHUNK)
@@ -1483,6 +1506,8 @@
                                                    (transaction_push m (aof pointer))
                                                    (set do_callback #t))
                                                (block
+                                                 ;; check_lock lets the streams go while it waits
+                                                 (set page_stale #t)
                                                  (set do_callback
                                                       (check_lock m (bitor (cast int LOCK_EXCLUSIVE) (cast int LOCK_SHARED))
                                                                   (aof pointer) (aof control) streams))
@@ -1541,7 +1566,12 @@
                                           (if (!= streams nil) ((-> streams unlock)))
                                           (if (not (callback ctx (aof pointer)))
                                               (set i (-> m hbpp)))
-                                          (if (!= streams nil) ((-> streams lock)))))))))
+                                          (if (!= streams nil) ((-> streams lock)))
+                                          (set page_stale #t)))
+                                    (if (and page_stale (< i (-> m hbpp)))
+                                        (block
+                                          (cursor_page_hexmap m page_address hexbuf)
+                                          (set page_stale #f)))))))
                         ;; not the last chunk yet
                         (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
               (set page_n (+ page_n 1)))))))
@@ -1743,8 +1773,19 @@
                                    (== (bitand hex_byte 128) 128))
                               (block
                                 (set pointer_size (+ pointer_size (size_remainder hex_byte)))
-                                ;; settled: delete committed, nobody mid-flight
-                                (if (and (== offline_state ROW_DELETED)
+                                ;; settled: dead and nobody mid-flight. UPDATED
+                                ;; counts as dead here because only a SUPERSEDED
+                                ;; version ever carries it -- commit_pointer
+                                ;; stamps the new version INSERTED, the old one
+                                ;; UPDATED -- and the machines table proved what
+                                ;; skipping them costs: a row claimed and
+                                ;; released a thousand times left a thousand
+                                ;; UPDATED versions no truncate would touch,
+                                ;; 22 pages carrying 4 live rows. Reclaiming
+                                ;; them spends the same point-in-time reads the
+                                ;; DELETED reclaim already spends.
+                                (if (and (or (== offline_state ROW_DELETED)
+                                             (== offline_state ROW_UPDATED))
                                          (and (== online_state ROW_NONE)
                                               (== online_lock LOCK_NONE)))
                                     (let ((DeadList * d . #'(new* DeadList)))
@@ -1838,6 +1879,15 @@
                 (RowLock online_lock . LOCK_NONE)
                 (Control control))
             (control_clear (aof control))
+            ;; A CONTENT TEAR IS SALVAGED, NOT REFUSED. A kill can catch the
+            ;; hexmap mid-write, leaving a page whose bytes claim a record
+            ;; that runs past the end -- the walk used to throw there and
+            ;; the whole store was refused forever. What was mid-write never
+            ;; reached its commit sync, so by shadow paging's own rule it
+            ;; never happened: the records parsed BEFORE the tear are kept,
+            ;; and the rest of the page is refreed for the allocator.
+            (try
+              (block
             (while (< begin_address end_address)
               (let ((Pointer pointer . #'(pointer_at_state m (-> e key) begin_address
                                             (aof is_data) (aof online_state) (aof online_lock))))
@@ -1865,7 +1915,18 @@
                       (block
                         (free_list_insert m (-> e key) begin_address (* run CHUNK_SIZE))
                         ;; AND KEEP WALKING: free space is not always the tail
-                        (set begin_address (+ begin_address (* run CHUNK_SIZE))))))))))
+                        (set begin_address (+ begin_address (* run CHUNK_SIZE)))))))))
+                (cast void 0))
+              (catch ((const ZiguratException & ex))
+                (cast void ex)
+                (if (< begin_address end_address)
+                    (let ((int64_t remaining . #'(/ (- end_address begin_address) CHUNK_SIZE)))
+                      ((-> (-> m hexmap_io) clear))
+                      ((-> (-> m data_io) clear))
+                      (free_hexmap m (addr_hexmap begin_address) remaining)
+                      ((-> (-> m hexmap_io) flush))
+                      (free_list_insert m (-> e key) begin_address
+                                        (* remaining CHUNK_SIZE)))))))
           (set e (-> e next))))
 
       ;; the spent transaction records go back to the allocator
@@ -1905,6 +1966,38 @@
     ((-> data_io seekg) 0 std::ios::end)
     (set (-> m page_count) (/ ((-> data_io tellg)) page_size))
     ((-> data_io clear))
+
+    ;; A process killed mid-append leaves a torn tail: data pages the hexmap
+    ;; never covered, or a ragged last page shorter than page_size. Nothing
+    ;; in them was ever committed -- a commit syncs both files, so what a
+    ;; kill caught in flight is by shadow paging's own rule work that never
+    ;; happened -- and the walk below used to hit the missing hexmap bytes
+    ;; and refuse the whole store with "hexmap ends inside the chunk",
+    ;; permanently. The tail is reforged instead: the ragged page padded to
+    ;; the boundary, and every page past the hexmap's coverage rewritten as
+    ;; a __FREE__ page for the allocator to hand out again.
+    (let ((int64_t datalen . 0) (int64_t hexlen . 0))
+      ((-> data_io seekg) 0 std::ios::end)
+      (set datalen ((-> data_io tellg)))
+      ((-> data_io clear))
+      (let ((int64_t ragged . #'(% datalen page_size)))
+        (if (> ragged 0)
+            (block
+              ((-> data_io seekp) 0 std::ios::end)
+              ((-> data_io fill_n) (cast size_t (- page_size ragged)) (cast char 0))
+              ((-> data_io flush))
+              (set (-> m page_count) (+ (-> m page_count) 1)))))
+      ((-> hexmap_io seekg) 0 std::ios::end)
+      (set hexlen ((-> hexmap_io tellg)))
+      ((-> hexmap_io clear))
+      (let ((int64_t covered . #'(/ hexlen (-> m hbpp))))
+        (if (< covered (-> m page_count))
+            (let ((int64_t p . covered))
+              (while (< p (-> m page_count))
+                (allocate_page m FREE_HASHKEY (* p page_size))
+                (set p (+ p 1)))
+              ((-> hexmap_io flush))
+              ((-> data_io flush))))))
 
     (memory_initialize m)
     (begin_transaction m))
@@ -3277,7 +3370,8 @@
           (load_control m (aof pointer) (aof control))
           ;; settled, as _dead_pointers means it: the chain is closed over
           ;; the dead link BEFORE its space can be asked for
-          (if (and (== ($ control offline_state) ROW_DELETED)
+          (if (and (or (== ($ control offline_state) ROW_DELETED)
+                       (== ($ control offline_state) ROW_UPDATED))
                    (and (== ($ control online_state) ROW_NONE)
                         (== ($ control online_lock) LOCK_NONE)))
               (if (== has_previous 1)
@@ -3322,6 +3416,59 @@
       (if (> (-> idx levels) 1)
           (set freed (+ freed (truncate_key m (-> idx dep_hash_key)))))
       (return freed)))
+
+  ;; ---- rebuild: drop the whole index, then map the live rows again --
+  ;; What bt_truncate cannot reach is the point: it unlinks DEAD VALUE
+  ;; records, but the keys, the nodes and the once-dead values' key rows
+  ;; stay -- "keys at every level stay" is the unmap contract -- so an
+  ;; index over a churning table grows by every id it has ever seen, and
+  ;; a walk pays for all of them forever. Four such indexes held 72 of a
+  ;; vacuumed store's 168 pages with twelve rows alive. A truncate is the
+  ;; one moment the table is at its smallest, so instead of sweeping the
+  ;; index it is REBUILT there: every page under its keys goes back to
+  ;; the allocator wholesale, and the survivors -- read through the
+  ;; table's own cursor -- are mapped into a fresh tree.
+  (func drop_key_pages ((Memory * m) (const uint8_t * key)) (out void)
+    (pthread_mutex_lock (aof (-> m page_list_access)))
+    (pthread_mutex_lock (aof (-> m free_list_access)))
+    ;; the key's free entries first: their space is about to sit inside
+    ;; __FREE__ pages and must not be handed out under the old key
+    (let ((FreeEntry * prev . nil)
+          (FreeEntry * e . #'(-> m frees)))
+      (while (!= e nil)
+        (if (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)))
+            (let ((FreeEntry * dead . e))
+              (set e (-> e next))
+              (if (== prev nil) (set (-> m frees) e) (set (-> prev next) e))
+              (delete* dead))
+          (block
+            (set prev e)
+            (set e (-> e next))))))
+    (let ((PageEntry * e . #'(-> m pages)))
+      (while (!= e nil)
+        (if (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)))
+            (block
+              (allocate_page m FREE_HASHKEY (-> e address))
+              (set (-> e key) (intern_key FREE_HASHKEY))))
+        (set e (-> e next))))
+    (pthread_mutex_unlock (aof (-> m free_list_access)))
+    (pthread_mutex_unlock (aof (-> m page_list_access))))
+
+  (func bt_drop_storage ((BTreeIndex * idx) (Memory * m)) (out void)
+    (block
+      (letin* ((streams (Streams m)))
+        (drop_key_pages m (-> idx hash_key))
+        (if (> (-> idx levels) 1)
+            (drop_key_pages m (-> idx dep_hash_key)))
+        ((-> (-> m hexmap_io) flush))
+        ((-> (-> m data_io) flush))
+        (cast void 0)))
+    (set (-> idx root_address) -1)
+    ;; the reset root has to outlive the process, or the next attach
+    ;; would follow the catalogue into pages that are __FREE__ now
+    (if (and (== (-> idx is_dependent) 0)
+             (!= ($ (-> idx record_pointer) hash_key) nil))
+        (bt_update_record idx)))
 
   ;; ==================================================================
   ;; The singleton registry -- the rest of Globals: the store's two
@@ -3814,6 +3961,8 @@
            (domap    (INTERN (CONCATENATE 'STRING iname "_do_map")))
            (dounmap  (INTERN (CONCATENATE 'STRING iname "_do_unmap")))
            (dotrunc  (INTERN (CONCATENATE 'STRING iname "_do_truncate")))
+           (rebuildcb (INTERN (CONCATENATE 'STRING iname "_rebuild_row")))
+           (tcur     (INTERN (CONCATENATE 'STRING tname "_cursor")))
            (icur     (INTERN (CONCATENATE 'STRING iname "_cursor")))
            (ieq      (INTERN (CONCATENATE 'STRING iname "_equal")))
            (ineq     (INTERN (CONCATENATE 'STRING iname "_not_equal")))
@@ -3913,11 +4062,30 @@
                             COLLECT `(set (nth ,i ks) (-> r ,c)))
                     (bt_unmap_multi (aof ,idxname) ks ($ (-> r pointer) address))))))
 
+        ;; the rebuild's row hand: THIS index only -- domap chains the
+        ;; other indexes' hooks, and each of them rebuilds itself
+        ,@(IF (= nlev 1)
+              `((func ,rebuildcb ((void * u) (,table * r)) (out bool)
+                  (cast void u)
+                  (bt_map (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address))
+                  (return #t)))
+              `((func ,rebuildcb ((void * u) (,table * r)) (out bool)
+                  (cast void u)
+                  (let ((int64_t ks [8]))
+                    ,@(LOOP FOR c IN cols FOR i FROM 0
+                            COLLECT `(set (nth ,i ks) (-> r ,c)))
+                    (bt_map_multi (aof ,idxname) ks ($ (-> r pointer) address)))
+                  (return #t))))
+
+        ;; a truncate is the one moment the table is at its smallest, so
+        ;; the index is not swept there but REBUILT -- storage dropped
+        ;; wholesale, survivors mapped into a fresh tree. See
+        ;; bt_drop_storage for what sweeping could never reclaim.
         (func ,dotrunc ((void * mm)) (out void)
           (if (!= ($ ,prevvar on_truncate) nil)
               (($ ,prevvar on_truncate) mm))
-          (bt_truncate (aof ,idxname) (cast (Memory *) mm))
-          (cast void 0))
+          (bt_drop_storage (aof ,idxname) (cast (Memory *) mm))
+          (,tcur (cast (Memory *) mm) nil ,rebuildcb))
 
         (func ,attach ((Memory * m)) (out void)
           (set ($ ,idxname m) m)

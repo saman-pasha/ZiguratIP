@@ -741,9 +741,13 @@ namespace Zigurat
 
 	      pointer_size += _size_remainder(hex_byte);
 
-	      // Settled means the delete is committed and nobody is mid-flight on
+	      // Settled means the death is committed and nobody is mid-flight on
 	      // the row. A row a live transaction still holds is left where it is.
-	      if (offline_state == RowState::DELETED
+	      // UPDATED counts as dead here because only a SUPERSEDED version
+	      // ever carries it -- _commit_pointer stamps the new version
+	      // INSERTED and the old one UPDATED -- and skipping them left a
+	      // much-updated row's every old version behind forever.
+	      if ((offline_state == RowState::DELETED || offline_state == RowState::UPDATED)
 		  && online_state == RowState::NONE
 		  && online_lock == RowLock::NONE) {
 		dead.push_back(Pointer(page_hashkey, pointer_address, pointer_size));
