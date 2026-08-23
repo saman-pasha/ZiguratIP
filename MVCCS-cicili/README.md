@@ -7,15 +7,15 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
 
 ## What is here
 
-* **`mvccs.cicili`** (~1,950 lines) — the storage engine core, written in
-  Cicili's C++ layer, compiled against the **real** `StreamIO` and `Core`
-  libraries (`Zigurat::binarystream`, `Zigurat::filestream`,
-  `ZiguratException`, `Utility`). One source target emits `mvccs.cpp`
-  (~2,100 lines of C++), compiles it with g++ and links `mvccs_test`.
+* **`mvccs.cicili`** (~3,140 lines) — the storage engine core **and the
+  B-tree index tier**, written in Cicili's C++ layer, compiled against
+  the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
+  `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
+  target emits `mvccs.cpp`, compiles it with g++ and links `mvccs_test`.
 * **`build.sh`** — `CICILI=$HOME/cicili sh build.sh`; the binary prints
   a check line per behaviour and exits with the failure count.
 
-Eighteen checks, all green, five runs in a row: insert/commit/read-back,
+Thirty-eight checks, all green, five runs in a row: insert/commit/read-back,
 update versioning (the old version retired and the new adopted at one
 commit instant), rollback undoing a staged delete, TRUNCATE reclaiming
 exactly the settled dead row and sparing the superseded one, allocation
@@ -24,7 +24,14 @@ pthread sessions racing 20 inserts through the shared streams,
 REPEATABLE READ taking and releasing shared row locks, the SERIALIZABLE
 gate admitting and releasing, **SNAPSHOT holding its point in time while
 another session commits an update under it**, and a fresh `Memory` over
-the same two files recovering the store through the startup walk.
+the same two files recovering the store through the startup walk — and
+the index tier: lookups tracking updates, deletes and rollbacks (a
+rolled back delete **reappears in the index on its own**, by the value
+chain's visibility), thirty shuffled keys split their way through a
+branching-3 tree and walk back out in order, a unique index refuses a
+duplicate with a real `IndexException`, ranges over the split tree
+answer exactly, and both trees come back through the catalogue after a
+restart.
 
 ## What was rewritten, and what was not
 
@@ -40,11 +47,22 @@ all five isolation levels including SNAPSHOT's version-chain walk; the
 full page-scan cursor with the repeatable-read retry; ISUD online and
 offline; `_dead_pointers` and TRUNCATE.
 
-**Not rewritten:** the B-tree index family (`btreeindex.hpp`, 1,888
-lines — the `map`/`unmap`/split/combine machinery and the six
-comparison cursors), `BaseSequence`, `Globals`, and the DBA plumbing
-(watcher, `dba_pagefiles`, `dba_pointers`). The index tier is the
-natural next step and `deftable` is where it would grow a `defindex`.
+Also rewritten, second pass: **the B-tree index tier** — nodes, keys
+and values as rows under the index's hash key, the value chains with
+per-link visibility (newest first, the next address read before the
+callback), `map` with node splits up the ancestor path and root
+growth, `unmap` marking one row's value and never the key's chain,
+dead-value unlinking ahead of TRUNCATE, the catalogue records under
+the original's `__INDICES__` hash key, and all seven cursors (`full`,
+`equal`, `not_equal`, the two `less`, the two `greater`) with the
+original's descent rules and the streams handed back around every
+callback.
+
+**Not rewritten:** the variadic multi-level composite index
+(`BTreeIndex<Table, First, Rest...>`), `unmap_key`/`_combine_nodes`
+(true key deletion — present upstream, documented there as reached by
+nothing), `BaseSequence`, `Globals`, and the DBA plumbing (watcher,
+`dba_pagefiles`, `dba_pointers`).
 
 ## The experiment's answer
 
@@ -65,9 +83,22 @@ Here `deftable`:
 
 expands at read time into the `BaseTable` subclass with `pack`/`unpack`/
 `pack_size` written out, the 20-byte hash key computed **in Lisp at
-expansion time**, and typed `Book_insert` / `Book_update` /
-`Book_delete` / `Book_cursor` / `Book_truncate` wrappers. What a
-template instantiates invisibly, the macro emits greppably.
+expansion time**, typed `Book_insert` / `Book_update` / `Book_delete` /
+`Book_cursor` / `Book_truncate` wrappers, and a hooks record — the seam
+an index attaches through. `defindex` is its counterpart:
+
+    (defindex IDX_BOOK_VALUE Book value 0 3)
+
+expands the index instance, its expansion-time hash key and catalogue
+id, an `_attach` function the program calls once after `memory_open`
+(it finds or creates the catalogue record and hooks the table's
+`map`/`unmap`/`truncate`), and the seven typed cursor wrappers riding
+the table's own row shim. What a template instantiates invisibly, the
+macro emits greppably. One index per table for now — the last attach
+wins the hooks; chaining is where a second index would go. The
+branching factor is a parameter (the original derives it from the key
+type's size), which is what lets a test force splits with a tree of
+branching 3.
 
 **The plumbing went C, deliberately.** Cicili lambdas are lifted and
 cannot capture, so `std::function` callbacks became context structs +
@@ -91,6 +122,14 @@ whole engine: `clock_gettime` on a `struct timespec`.
 * Transactions are explicit (`begin_transaction` per session thread)
   rather than riding a `thread_local` constructor — `__thread` cannot
   run one.
+* The catalogue is found by scanning the `__INDICES__` rows — the
+  original's self-hosting catalogue index (`BTreeRecord` +
+  `IDX_ZIGURAT_BTREERECORD_HASH_NAME`, with its careful bootstrap and
+  offline-written index entries) is not reproduced; its record shape
+  replaces the `String hash_name` with the int64 catalogue id.
+* An index attaches explicitly (`IDX_..._attach` after `memory_open`)
+  instead of in a static initialiser — the original's own comments
+  record what static-initialiser lookups cost it under `dlopen`.
 * The cursor snapshots the page list into a bounded array (512 pages
   per key per scan) instead of a heap copy.
 * No overloading in Cicili, so `_pointer`'s four overloads are
@@ -109,29 +148,37 @@ the allocator until restart, and the duplicate entry makes the same
 page scanned twice under its old key. The rewrite rekeys the entry in
 place; the original is unfixed as of `eed884f`.
 
-## What the transpiler could not say (findings for cicili)
+## What the transpiler could not say — and what got fixed
 
-Hit while writing this, worked around in place, listed for the record:
+Hit while writing this, worked around in place. Three turned out to be
+genuine transpiler bugs and are **fixed in cicili** (commit `803766b`,
+each with a regression test in cicili's own suite):
 
-1. A qualified base class cannot appear in a ctor's `init`
-   (`(init (Zigurat::ZiguratException 9390 …))` → "wrong init entry");
+* Top-level `var` (and `typedef`) inside a `module` under `:cpp` was
+  name-mangled while references were not — every other construct asked
+  `module-mangles<`; these asked `*module-path*`.
+* A dotted `var` init inside a macro expansion (`(var int ,x . 0)`
+  through `$$$`) died in the body dispatcher's `CL:LENGTH` before the
+  var specifier — which handles the dotted tail — ever saw it.
+* A `(code "…")` escape could not carry a double quote: the reader
+  keeps backslashes (right for string literals, emitted back between
+  quotes) and the escape's bare emission never took them off.
+
+Still the dialect, worked with rather than around:
+
+1. A qualified base class cannot appear in a ctor's `init`;
    `using namespace` + the bare name works.
-2. Top-level `var` inside a `module` under `:cpp` is name-mangled while
-   references to it are not — so the engine lives at file scope.
-3. A dotted `var` init inside a macro expansion (`(var int ,x . 0)`
-   through `$$$`) breaks the reader path that handles the same form in
-   plain source. Zero-initialized namespace-scope vars sidestep it.
-4. `letin*` compiles to a GNU statement expression, so a block whose
+2. `letin*` compiles to a GNU statement expression, so a block whose
    last statement returns a non-copyable (`stream->flush()` returning
    `basic_ostream&`) fails to compile; end such blocks with
    `(cast void 0)`.
-5. Member access needs bound storage: `(-> (txn) id)` and member access
+3. Member access needs bound storage: `(-> (txn) id)` and member access
    through a cast expression are refused; bind first.
-6. `(out …)` types are flat (`(out const uint8_t *)`), parameter
+4. `(out …)` types are flat (`(out const uint8_t *)`), parameter
    descriptors are flat, but `cast` wants parenthesized pointer types
    without `const`.
-7. A `(code "…")` escape re-escapes embedded quotes on emission, so a
-   string literal cannot ride through one.
+5. `**` is one token in a type descriptor: `(BTNode ** ancestors)`,
+   never `* *`.
 
 None of these blocked the port; every one had an in-language answer.
 

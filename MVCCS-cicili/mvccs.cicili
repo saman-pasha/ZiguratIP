@@ -1648,6 +1648,880 @@
     (begin_transaction m))
 
 
+
+  ;; ==================================================================
+  ;; The B-tree tier -- btreenode/key/value/record + btreeindex.hpp,
+  ;; re-expressed. Nodes, keys and values are BaseTable rows under the
+  ;; INDEX's hash key, written offline (the tree's shape is metadata);
+  ;; a key's values are a chain, each link a TRANSACTIONAL row -- which
+  ;; is how a rolled back delete reappears in the index on its own.
+  ;; The catalogue is one record per index under __INDICES__.
+  ;; ==================================================================
+
+  ;; indexexception.hpp, code 1063
+  (struct IndexException (inherits ZiguratException)
+    (ctor ((const char * msg))
+      (init (ZiguratException 1063 (std::string msg)))))
+
+  ;; __INDICES__ -- byte for byte the original's hash key
+  (var uint8_t INDICES_HASHKEY [20]
+       . '{ 65 19 64 97 216 179 156 200 72 43 78 23 75 227 190 109 106 79 44 180 })
+
+  (struct BTNode (inherits BaseTable)
+    (member int64_t degree)
+    (member int64_t is_internal)
+    (member int64_t keys_address)
+    (override) (method pack_size () (out int64_t) (return 24))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this degree)))
+      (($ io write_std_long) (cast int64_t ($ this is_internal)))
+      (($ io write_std_long) (cast int64_t ($ this keys_address))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this degree))
+      (($ io read_std_long) ($ this is_internal))
+      (($ io read_std_long) ($ this keys_address))))
+
+  (func bt_node_clear ((BTNode * n)) (out void)
+    (set (-> n degree) 0)
+    (set (-> n is_internal) 0)
+    (set (-> n keys_address) -1)
+    (set (-> n pointer) (pointer_null)))
+
+  (struct BTKey (inherits BaseTable)
+    (member int64_t left_node_address)
+    (member int64_t left_address)
+    (member int64_t right_address)
+    (member int64_t right_node_address)
+    (member int64_t dependents_address)
+    (member int64_t values_address)
+    (member int64_t key)
+    (override) (method pack_size () (out int64_t) (return 56))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this left_node_address)))
+      (($ io write_std_long) (cast int64_t ($ this left_address)))
+      (($ io write_std_long) (cast int64_t ($ this right_address)))
+      (($ io write_std_long) (cast int64_t ($ this right_node_address)))
+      (($ io write_std_long) (cast int64_t ($ this dependents_address)))
+      (($ io write_std_long) (cast int64_t ($ this values_address)))
+      (($ io write_std_long) (cast int64_t ($ this key))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this left_node_address))
+      (($ io read_std_long) ($ this left_address))
+      (($ io read_std_long) ($ this right_address))
+      (($ io read_std_long) ($ this right_node_address))
+      (($ io read_std_long) ($ this dependents_address))
+      (($ io read_std_long) ($ this values_address))
+      (($ io read_std_long) ($ this key))))
+
+  (func bt_key_clear ((BTKey * k)) (out void)
+    (set (-> k left_node_address) -1)
+    (set (-> k left_address) -1)
+    (set (-> k right_address) -1)
+    (set (-> k right_node_address) -1)
+    (set (-> k dependents_address) -1)
+    (set (-> k values_address) -1)
+    (set (-> k key) 0)
+    (set (-> k pointer) (pointer_null)))
+
+  (struct BTValue (inherits BaseTable)
+    (member int64_t value)
+    (member int64_t next_address)
+    (override) (method pack_size () (out int64_t) (return 16))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this value)))
+      (($ io write_std_long) (cast int64_t ($ this next_address))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this value))
+      (($ io read_std_long) ($ this next_address))))
+
+  ;; the catalogue record: btreerecord.hpp with the String hash_name
+  ;; replaced by an int64 id derived from the index name at expansion
+  ;; time (the catalogue is found by scan, not by the self-hosting index)
+  (struct BTRecord (inherits BaseTable)
+    (member int64_t catalogue_id)
+    (member int64_t is_unique)
+    (member int64_t branching_factor)
+    (member int64_t root_address)
+    (override) (method pack_size () (out int64_t) (return 32))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this catalogue_id)))
+      (($ io write_std_long) (cast int64_t ($ this is_unique)))
+      (($ io write_std_long) (cast int64_t ($ this branching_factor)))
+      (($ io write_std_long) (cast int64_t ($ this root_address))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this catalogue_id))
+      (($ io read_std_long) ($ this is_unique))
+      (($ io read_std_long) ($ this branching_factor))
+      (($ io read_std_long) ($ this root_address))))
+
+  ;; the index itself -- BTreeIndex<Table, First> minus the templates:
+  ;; the key type is int64 and the table is reached through table_key +
+  ;; the deftable shim, both handed over by defindex at attach time
+  (struct BTreeIndex
+    (member Memory * m)
+    (member const char * name)
+    (member const uint8_t * hash_key)
+    (member const uint8_t * table_key)
+    (member int64_t catalogue_id)
+    (member int64_t is_unique)
+    (member int64_t branching_factor)
+    (member int64_t min_degree)
+    (member int64_t max_degree)
+    (member int64_t root_address)
+    (member Pointer record_pointer))
+
+  ;; ---- node / key readers (_btreenode / _btreekey) ------------------
+  (func bt_node_read ((BTreeIndex * idx) (int64_t address) (BTNode * node)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      (set (-> node pointer) (pointer_at m (-> idx hash_key) address))
+      ((-> (-> m data_io) seekg) (ptr_data (aof (-> node pointer))) std::ios::beg)
+      ((-> node unpack) (cof (-> m data_io)))))
+
+  (func bt_key_read ((BTreeIndex * idx) (int64_t address) (BTKey * key)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      (set (-> key pointer) (pointer_at m (-> idx hash_key) address))
+      ((-> (-> m data_io) seekg) (ptr_data (aof (-> key pointer))) std::ios::beg)
+      ((-> key unpack) (cof (-> m data_io)))))
+
+  ;; ---- the catalogue (_insert/_select/_update_btreeindex) -----------
+  (func bt_insert_record ((BTreeIndex * idx)) (out void)
+    (let ((BTRecord rec))
+      (set ($ rec catalogue_id) (-> idx catalogue_id))
+      (set ($ rec is_unique) (-> idx is_unique))
+      (set ($ rec branching_factor) (-> idx branching_factor))
+      (set ($ rec root_address) (-> idx root_address))
+      (offline_insert (-> idx m) INDICES_HASHKEY (cast (BaseTable *) (aof rec)))
+      (set (-> idx record_pointer) ($ rec pointer))))
+
+  (struct BTSelCtx
+    (member BTreeIndex * idx)
+    (member int found))
+
+  (func bt_select_cb ((void * c) (Pointer * p)) (out bool)
+    (let ((BTSelCtx * sc . #'(cast (BTSelCtx *) c)))
+      (let ((BTreeIndex * idx . #'(-> sc idx))
+            (BTRecord rec))
+        (set ($ rec pointer) (cof p))
+        (read_row (-> idx m) (cast (BaseTable *) (aof rec)))
+        (if (== ($ rec catalogue_id) (-> idx catalogue_id))
+            (block
+              (set (-> idx root_address) ($ rec root_address))
+              (set (-> idx record_pointer) (cof p))
+              (set (-> sc found) 1)
+              (return #f)))
+        (return #t))))
+
+  (func bt_select_record ((BTreeIndex * idx)) (out void)
+    (let ((BTSelCtx sc))
+      (set ($ sc idx) idx)
+      (set ($ sc found) 0)
+      (letin* ((streams (Streams (-> idx m))))
+        (cursor_walk (-> idx m) INDICES_HASHKEY (aof streams)
+                     (cast (void *) (aof sc)) bt_select_cb)
+        (cast void 0))
+      ;; not recording a hit left the original catalogue re-inserting
+      ;; its own row on every restart; same rule here
+      (if (== ($ sc found) 0)
+          (bt_insert_record idx))))
+
+  (func bt_update_record ((BTreeIndex * idx)) (out void)
+    (let ((BTRecord rec))
+      (set ($ rec pointer) (-> idx record_pointer))
+      (set ($ rec catalogue_id) (-> idx catalogue_id))
+      (set ($ rec is_unique) (-> idx is_unique))
+      (set ($ rec branching_factor) (-> idx branching_factor))
+      (set ($ rec root_address) (-> idx root_address))
+      (offline_update (-> idx m) (cast (BaseTable *) (aof rec)))))
+
+  ;; ---- value chains (_insert_btreevalue / _delete_btreevalue) -------
+  ;; Linked at the head -- the cheap end -- and the key written back
+  ;; here, because every caller has just written the key anyway.
+  (func bt_insert_value ((BTreeIndex * idx) (BTKey * key) (int64_t value)) (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (BTValue v))
+      (set ($ v value) value)
+      (set ($ v next_address) (-> key values_address))
+      (set ($ v pointer) (allocate m (-> idx hash_key) 16))
+
+      ;; transactional, unlike the nodes and keys: the entry must roll
+      ;; back with the row it indexes
+      (transaction_push m (aof ($ v pointer)))
+      (control_insert m (cast (BaseTable *) (aof v)))
+
+      (full_hexmap m (aof ($ v pointer)))
+      ((-> (-> m data_io) seekp) (ptr_data (aof ($ v pointer))) std::ios::beg)
+      (($ v pack) (cof (-> m data_io)))
+
+      (set (-> key values_address) ($ ($ v pointer) address))
+      (offline_update m (cast (BaseTable *) key))))
+
+  (func bt_delete_value ((BTreeIndex * idx) (BTValue * v)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      (transaction_push m (aof (-> v pointer)))
+      (control_delete m (cast (BaseTable *) v) (cast (Streams *) tl_streams_held))
+      ((-> (-> m hexmap_io) flush))
+      ((-> (-> m data_io) flush))))
+
+  ;; ---- one key's values, newest first (_cursor_values) --------------
+  ;; Each link is asked Memory's visibility question directly; under
+  ;; SNAPSHOT the answer can be an older version, so the value is read
+  ;; again from wherever the pointer moved to.
+  (func bt_walk_values ((BTreeIndex * idx) (BTKey * key) (void * ctx)
+                        (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
+        (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (int64_t counter . -1)
+          (int64_t tmp . #'(-> key values_address)))
+      (while (> tmp -1)
+        (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
+              (BTValue v))
+          ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
+          (($ v unpack) (cof (-> m data_io)))
+          ;; advanced before the callback, so a callback that deletes the
+          ;; value it was handed does not lose the rest of the chain
+          (set tmp ($ v next_address))
+
+          (let ((Pointer vp . pointer))
+            (if (visible m (aof vp) (cast (Streams *) tl_streams_held))
+                (block
+                  (if (!= ($ vp address) ($ pointer address))
+                      (block
+                        ((-> (-> m data_io) seekg) (ptr_data (aof vp)) std::ios::beg)
+                        (($ v unpack) (cof (-> m data_io)))))
+                  (set ($ v pointer) vp)
+                  (set counter (+ counter 1))
+                  (if (not (vcb ctx counter (aof v)))
+                      (return)))))))))
+
+  ;; ---- map (insert) --------------------------------------------------
+  (decl) (func bt_split_node ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                              (BTNode * node)) (out void))
+  (decl) (func bt_map_to_internal ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                                   (BTNode * node) (BTKey * new_key)) (out void))
+  (decl) (func bt_map_rec ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                           (BTNode * node) (int64_t k) (int64_t value)) (out void))
+
+  (struct BTUniqCtx (member int found))
+  (func bt_uniq_cb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
+    (cast void counter)
+    (cast void v)
+    (let ((BTUniqCtx * uc . #'(cast (BTUniqCtx *) c)))
+      (set (-> uc found) 1)
+      (return #f)))
+
+  ;; _split_node: the lower half keeps the node, the upper half moves to
+  ;; a fresh node of the SAME kind, and the median key is promoted into
+  ;; the parent -- or into a brand new root when there is none.
+  (func bt_split_node ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                       (BTNode * node)) (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (BTNode new_node)
+          (BTKey left_key)
+          (int have_left . 0))
+      (bt_node_clear (aof new_node))
+      ;; the upper half is the same kind of node as the half it came from
+      (set ($ new_node is_internal) (-> node is_internal))
+      (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_node)))
+
+      (let ((int64_t tmp . #'(-> node keys_address))
+            (int64_t index . 0)
+            (int stop . 0))
+        (while (and (> tmp -1) (== stop 0))
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+
+            (if (== index (-> idx min_degree))
+                ;; the median: promote it
+                (block
+                  (if (== have_left 1)
+                      (block
+                        (set ($ left_key right_address) -1)
+                        (offline_update m (cast (BaseTable *) (aof left_key)))))
+                  (set (-> node degree) (-> idx min_degree))
+                  (offline_update m (cast (BaseTable *) node))
+
+                  (set ($ cur left_node_address) ($ (-> node pointer) address))
+                  (set ($ cur left_address) -1)
+                  (set ($ cur right_address) -1)
+                  (set ($ cur right_node_address) ($ ($ new_node pointer) address))
+                  (offline_update m (cast (BaseTable *) (aof cur)))
+
+                  (if (== depth 0)
+                      ;; splitting the root: grow a new one above it
+                      (let ((BTNode root)
+                            (BTNode * none [1]))
+                        (bt_node_clear (aof root))
+                        (set ($ root is_internal) 1)
+                        (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof root)))
+                        (bt_map_to_internal idx none 0 (aof root) (aof cur))
+                        (set (-> idx root_address) ($ ($ root pointer) address))
+                        (bt_update_record idx))
+                    ;; the promoted key goes to the immediate parent, and
+                    ;; the parent's own ancestors travel with it
+                    (bt_map_to_internal idx ancestors (- depth 1)
+                                        (nth (- depth 1) ancestors) (aof cur))))
+              (if (> index (-> idx min_degree))
+                  ;; the first key of the upper half
+                  (block
+                    (set ($ cur left_address) -1)
+                    (set ($ new_node degree) (-> idx min_degree))
+                    (set ($ new_node keys_address) ($ ($ cur pointer) address))
+                    (offline_update m (cast (BaseTable *) (aof new_node)))
+                    (offline_update m (cast (BaseTable *) (aof cur)))
+                    (set stop 1))))
+
+            (set left_key cur)
+            (set have_left 1)
+            (set index (+ index 1)))))))
+
+  ;; _map_to_internal: insert an already-written key into an internal
+  ;; node's key list, keeping consecutive keys sharing a child
+  (func bt_map_to_internal ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                            (BTNode * node) (BTKey * new_key)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      (if (== (-> node keys_address) -1)
+          (block
+            (set (-> node degree) 1)
+            (set (-> node keys_address) ($ (-> new_key pointer) address))
+            (offline_update m (cast (BaseTable *) node))
+            (return)))
+
+      (let ((BTKey left_key)
+            (int have_left . 0)
+            (int64_t tmp . #'(-> node keys_address))
+            (int64_t index . 0)
+            (int stop . 0))
+        (while (and (> tmp -1) (== stop 0))
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+
+            (if (< (-> new_key key) ($ cur key))
+                (block
+                  (if (== index 0)
+                      (block
+                        (set (-> new_key right_address) ($ ($ cur pointer) address))
+                        (offline_update m (cast (BaseTable *) new_key))
+                        (set (-> node degree) (+ (-> node degree) 1))
+                        (set (-> node keys_address) ($ (-> new_key pointer) address))
+                        (offline_update m (cast (BaseTable *) node)))
+                    (block
+                      (set (-> new_key left_address) ($ ($ left_key pointer) address))
+                      (set (-> new_key right_address) ($ ($ cur pointer) address))
+                      (offline_update m (cast (BaseTable *) new_key))
+                      (set (-> node degree) (+ (-> node degree) 1))
+                      (offline_update m (cast (BaseTable *) node))
+                      (set ($ left_key right_address) ($ (-> new_key pointer) address))
+                      (offline_update m (cast (BaseTable *) (aof left_key)))))
+                  (set ($ cur left_address) ($ (-> new_key pointer) address))
+                  (set ($ cur left_node_address) (-> new_key right_node_address))
+                  (offline_update m (cast (BaseTable *) (aof cur)))
+                  (set stop 1))
+              (if (== index (- (-> node degree) 1))
+                  ;; past the last key: append
+                  (block
+                    (set (-> new_key left_address) ($ ($ cur pointer) address))
+                    (offline_update m (cast (BaseTable *) new_key))
+                    (set (-> node degree) (+ (-> node degree) 1))
+                    (offline_update m (cast (BaseTable *) node))
+                    (set ($ cur right_address) ($ (-> new_key pointer) address))
+                    (offline_update m (cast (BaseTable *) (aof cur)))
+                    (set stop 1))))
+
+            (set left_key cur)
+            (set have_left 1)
+            (set index (+ index 1)))))
+
+      (if (> (-> node degree) (-> idx max_degree))
+          (bt_split_node idx ancestors depth node))))
+
+  ;; _map: descend to the leaf, insert the key or add a value to the one
+  ;; already there, split what overflowed on the way back up
+  (func bt_map_rec ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
+                    (BTNode * node) (int64_t k) (int64_t value)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      (if (== (-> node keys_address) -1)
+          (block
+            (let ((BTKey new_key))
+              (bt_key_clear (aof new_key))
+              (set ($ new_key key) k)
+              (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
+              (bt_insert_value idx (aof new_key) value)
+              (set (-> node degree) 1)
+              (set (-> node keys_address) ($ ($ new_key pointer) address))
+              (offline_update m (cast (BaseTable *) node)))
+            (return)))
+
+      (let ((BTKey left_key)
+            (int64_t tmp . #'(-> node keys_address))
+            (int64_t index . 0)
+            (int stop . 0))
+        (while (and (> tmp -1) (== stop 0))
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+
+            (cond
+              ((< k ($ cur key))
+               (if (!= (-> node is_internal) 0)
+                   (block
+                     (let ((BTNode left_node))
+                       (bt_node_read idx ($ cur left_node_address) (aof left_node))
+                       (set (nth depth ancestors) node)
+                       (bt_map_rec idx ancestors (+ depth 1) (aof left_node) k value))
+                     (set stop 1))
+                 (block
+                   (let ((BTKey new_key))
+                     (bt_key_clear (aof new_key))
+                     (set ($ new_key key) k)
+                     (if (> index 0)
+                         (set ($ new_key left_address) ($ ($ left_key pointer) address)))
+                     (set ($ new_key right_address) ($ ($ cur pointer) address))
+                     (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
+                     (bt_insert_value idx (aof new_key) value)
+                     (set (-> node degree) (+ (-> node degree) 1))
+                     (if (== index 0)
+                         (set (-> node keys_address) ($ ($ new_key pointer) address)))
+                     (offline_update m (cast (BaseTable *) node))
+                     (if (> index 0)
+                         (block
+                           (set ($ left_key right_address) ($ ($ new_key pointer) address))
+                           (offline_update m (cast (BaseTable *) (aof left_key)))))
+                     (set ($ cur left_address) ($ ($ new_key pointer) address))
+                     (offline_update m (cast (BaseTable *) (aof cur))))
+                   (set stop 1))))
+
+              ((== k ($ cur key))
+               (block
+                 (if (!= (-> idx is_unique) 0)
+                     (let ((BTUniqCtx uc))
+                       (set ($ uc found) 0)
+                       (bt_walk_values idx (aof cur) (cast (void *) (aof uc)) bt_uniq_cb)
+                       (if (== ($ uc found) 1)
+                           (throw* (IndexException "unique key")))))
+                 (bt_insert_value idx (aof cur) value)
+                 (set stop 1)))
+
+              (#t
+               (if (and (!= (-> node is_internal) 0)
+                        (== index (- (-> node degree) 1)))
+                   (block
+                     (let ((BTNode right_node))
+                       (bt_node_read idx ($ cur right_node_address) (aof right_node))
+                       (set (nth depth ancestors) node)
+                       (bt_map_rec idx ancestors (+ depth 1) (aof right_node) k value))
+                     (set stop 1))
+                 (if (and (== (-> node is_internal) 0)
+                          (== index (- (-> node degree) 1)))
+                     (block
+                       (let ((BTKey new_key))
+                         (bt_key_clear (aof new_key))
+                         (set ($ new_key key) k)
+                         (set ($ new_key left_address) ($ ($ cur pointer) address))
+                         (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
+                         (bt_insert_value idx (aof new_key) value)
+                         (set (-> node degree) (+ (-> node degree) 1))
+                         (offline_update m (cast (BaseTable *) node))
+                         (set ($ cur right_address) ($ ($ new_key pointer) address))
+                         (offline_update m (cast (BaseTable *) (aof cur))))
+                       (set stop 1))))))
+
+            (set left_key cur)
+            (set index (+ index 1)))))
+
+      (if (> (-> node degree) (-> idx max_degree))
+          (bt_split_node idx ancestors depth node))))
+
+  (func bt_map ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
+    (let ((Memory * m . #'(-> idx m)))
+      ;; reached from online_insert, which is already holding these; the
+      ;; guard nests and does nothing. Reached bare, it locks for real.
+      (letin* ((streams (Streams m)))
+        (if (== (-> idx root_address) -1)
+            (block
+              (let ((BTNode root))
+                (bt_node_clear (aof root))
+                (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof root)))
+                (set (-> idx root_address) ($ ($ root pointer) address)))
+              (bt_update_record idx)))
+        (let ((BTNode root_node)
+              (BTNode * ancestors [64]))
+          (bt_node_read idx (-> idx root_address) (aof root_node))
+          (bt_map_rec idx ancestors 0 (aof root_node) k value))
+        (cast void 0))))
+
+  ;; ---- unmap: one row's entry, never the key's whole chain ----------
+  (struct BTUnmapCtx (member int64_t value) (member BTreeIndex * idx))
+  (func bt_unmap_vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
+    (cast void counter)
+    (let ((BTUnmapCtx * uc . #'(cast (BTUnmapCtx *) c)))
+      (if (== (-> v value) (-> uc value))
+          (block
+            (bt_delete_value (-> uc idx) v)
+            (return #f)))
+      (return #t)))
+
+  (decl) (func bt_unmap_rec ((BTreeIndex * idx) (BTNode * node) (int64_t k) (int64_t value)) (out void))
+  (func bt_unmap_rec ((BTreeIndex * idx) (BTNode * node) (int64_t k) (int64_t value)) (out void)
+    (let ((int64_t tmp . #'(-> node keys_address))
+          (int stop . 0))
+      (while (and (> tmp -1) (== stop 0))
+        (let ((BTKey cur))
+          (bt_key_read idx tmp (aof cur))
+          (set tmp ($ cur right_address))
+          (cond
+            ((< k ($ cur key))
+             (if (!= (-> node is_internal) 0)
+                 (block
+                   (let ((BTNode left_node))
+                     (bt_node_read idx ($ cur left_node_address) (aof left_node))
+                     (bt_unmap_rec idx (aof left_node) k value))
+                   (set stop 1))))
+            ((== k ($ cur key))
+             (block
+               (let ((BTUnmapCtx uc))
+                 (set ($ uc value) value)
+                 (set ($ uc idx) idx)
+                 (bt_walk_values idx (aof cur) (cast (void *) (aof uc)) bt_unmap_vcb))
+               (set stop 1)))
+            (#t
+             (if (and (!= (-> node is_internal) 0)
+                      (== ($ cur right_address) -1))
+                 (block
+                   (let ((BTNode right_node))
+                     (bt_node_read idx ($ cur right_node_address) (aof right_node))
+                     (bt_unmap_rec idx (aof right_node) k value))
+                   (set stop 1)))))))))
+
+  (func bt_unmap ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
+    (letin* ((streams (Streams (-> idx m))))
+      (if (!= (-> idx root_address) -1)
+          (let ((BTNode root_node))
+            (bt_node_read idx (-> idx root_address) (aof root_node))
+            (bt_unmap_rec idx (aof root_node) k value)))
+      (cast void 0)))
+
+  ;; ---- the in-order key walk every cursor is built on ----------------
+  ;;
+  ;;     c0   k0   c1   k1   c2   k2   c3
+  ;;
+  ;; c0 is k0.left_node_address and c(i+1) is k(i).right_node_address;
+  ;; consecutive keys share a child, so the walk descends the left child
+  ;; of the FIRST key only and then alternates key, right child.
+  (decl) (func bt_walk_keys_rec ((BTreeIndex * idx) (int64_t node_address) (void * ctx)
+                                 (func kcb ((void * c) (BTKey * key)) (out bool))) (out bool))
+  (func bt_walk_keys_rec ((BTreeIndex * idx) (int64_t node_address) (void * ctx)
+                          (func kcb ((void * c) (BTKey * key)) (out bool))) (out bool)
+    (let ((BTNode node))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address))
+            (int64_t index . 0))
+        (while (> tmp -1)
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+            (if (and (!= ($ node is_internal) 0) (== index 0))
+                (if (not (bt_walk_keys_rec idx ($ cur left_node_address) ctx kcb))
+                    (return #f)))
+            (if (not (kcb ctx (aof cur)))
+                (return #f))
+            (if (!= ($ node is_internal) 0)
+                (if (not (bt_walk_keys_rec idx ($ cur right_node_address) ctx kcb))
+                    (return #f))))
+          (set index (+ index 1)))))
+    (return #t))
+
+  ;; ---- _cursor_output: a key's rows to the caller --------------------
+  ;; The value record answered the visibility question already -- it is
+  ;; the row's transactional twin -- so the row itself is read plainly,
+  ;; and THE STREAMS GO BACK around the caller's callback.
+  (struct BTRowsCtx
+    (member BTreeIndex * idx)
+    (member void * user)
+    (member func rcb ((void * c) (Pointer * p)) (out bool))
+    (member int cont))
+
+  (func bt_output_vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
+    (cast void counter)
+    (let ((BTRowsCtx * rc . #'(cast (BTRowsCtx *) c)))
+      (let ((Memory * m . #'(-> (-> rc idx) m)))
+        (let ((Pointer row_ptr . #'(pointer_at m (-> (-> rc idx) table_key) (-> v value)))
+              (Streams * held . #'(cast (Streams *) tl_streams_held)))
+          (if (!= held nil) ((-> held unlock)))
+          (set (-> rc cont) (? ((-> rc rcb) (-> rc user) (aof row_ptr)) 1 0))
+          (if (!= held nil) ((-> held lock)))
+          (return (== (-> rc cont) 1))))))
+
+  (func bt_cursor_output ((BTreeIndex * idx) (BTKey * key) (void * user)
+                          (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTRowsCtx rc))
+      (set ($ rc idx) idx)
+      (set ($ rc user) user)
+      (set ($ rc rcb) rcb)
+      ;; true unless the callback stops: an unmapped row leaves its key
+      ;; behind with an empty bucket, and that is not a reason to end
+      (set ($ rc cont) 1)
+      (bt_walk_values idx key (cast (void *) (aof rc)) bt_output_vcb)
+      (return (== ($ rc cont) 1))))
+
+  (func bt_output_kcb ((void * c) (BTKey * key)) (out bool)
+    (let ((BTRowsCtx * rc . #'(cast (BTRowsCtx *) c)))
+      (return (bt_cursor_output (-> rc idx) key (-> rc user) (-> rc rcb)))))
+
+  ;; ---- the seven cursors ---------------------------------------------
+  (func bt_cursor ((BTreeIndex * idx) (void * user)
+                   (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (let ((BTRowsCtx rc))
+            (set ($ rc idx) idx)
+            (set ($ rc user) user)
+            (set ($ rc rcb) rcb)
+            (set ($ rc cont) 1)
+            (bt_walk_keys_rec idx (-> idx root_address) (cast (void *) (aof rc)) bt_output_kcb)))
+      (cast void 0)))
+
+  (decl) (func bt_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                             (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
+         (out bool))
+  (func bt_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                      (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTNode node)
+          (bool do_continue . #t))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address))
+            (int stop . 0))
+        (while (and (> tmp -1) (== stop 0))
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+            (cond
+              ((< k ($ cur key))
+               (block
+                 ;; everything from here on is larger: the child between
+                 ;; the previous key and this one, or nowhere
+                 (if (!= ($ node is_internal) 0)
+                     (set do_continue (bt_equal_rec idx ($ cur left_node_address) k user rcb)))
+                 (set stop 1)))
+              ((== k ($ cur key))
+               (block
+                 (set do_continue (bt_cursor_output idx (aof cur) user rcb))
+                 (set stop 1)))
+              (#t
+               ;; only past the last key does the rightmost child count
+               (if (and (!= ($ node is_internal) 0) (== ($ cur right_address) -1))
+                   (block
+                     (set do_continue (bt_equal_rec idx ($ cur right_node_address) k user rcb))
+                     (set stop 1))))))))
+      (return do_continue)))
+
+  (func bt_cursor_equal ((BTreeIndex * idx) (int64_t k) (void * user)
+                         (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_equal_rec idx (-> idx root_address) k user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  ;; a full walk with one key held back
+  (decl) (func bt_not_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                                 (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
+         (out bool))
+  (func bt_not_equal_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k)
+                          (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTNode node))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address))
+            (int64_t index . 0))
+        (while (> tmp -1)
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+            (if (and (!= ($ node is_internal) 0) (== index 0))
+                (if (not (bt_not_equal_rec idx ($ cur left_node_address) k user rcb))
+                    (return #f)))
+            (if (!= k ($ cur key))
+                (if (not (bt_cursor_output idx (aof cur) user rcb))
+                    (return #f)))
+            (if (!= ($ node is_internal) 0)
+                (if (not (bt_not_equal_rec idx ($ cur right_node_address) k user rcb))
+                    (return #f))))
+          (set index (+ index 1)))))
+    (return #t))
+
+  (func bt_cursor_not_equal ((BTreeIndex * idx) (int64_t k) (void * user)
+                             (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_not_equal_rec idx (-> idx root_address) k user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  ;; in order from the smallest key, stopped at the bound
+  (decl) (func bt_less_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
+                            (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
+         (out bool))
+  (func bt_less_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
+                     (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTNode node))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address))
+            (int64_t index . 0))
+        (while (> tmp -1)
+          (let ((BTKey cur))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+            (if (and (!= ($ node is_internal) 0) (== index 0))
+                (if (not (bt_less_rec idx ($ cur left_node_address) k or_equal user rcb))
+                    (return #f)))
+            ;; at or above the bound: the straddling child is already walked
+            (if (== or_equal 0)
+                (if (not (< ($ cur key) k)) (return #t))
+              (if (< k ($ cur key)) (return #t)))
+            (if (not (bt_cursor_output idx (aof cur) user rcb))
+                (return #f))
+            ;; keys are distinct in the tree: once the bound itself has
+            ;; been emitted there is nothing above it left to match
+            (if (and (!= or_equal 0) (== k ($ cur key))) (return #t))
+            (if (!= ($ node is_internal) 0)
+                (if (not (bt_less_rec idx ($ cur right_node_address) k or_equal user rcb))
+                    (return #f))))
+          (set index (+ index 1)))))
+    (return #t))
+
+  (func bt_cursor_less_than ((BTreeIndex * idx) (int64_t k) (void * user)
+                             (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_less_rec idx (-> idx root_address) k 0 user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  (func bt_cursor_less_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
+                                   (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_less_rec idx (-> idx root_address) k 1 user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  ;; skip forward to the bound, then walk in order to the end; only the
+  ;; first qualifying key needs its left child descended
+  (decl) (func bt_greater_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
+                               (void * user) (func rcb ((void * c) (Pointer * p)) (out bool)))
+         (out bool))
+  (func bt_greater_rec ((BTreeIndex * idx) (int64_t node_address) (int64_t k) (int or_equal)
+                        (void * user) (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    (let ((BTNode node)
+          (int started . 0))
+      (bt_node_read idx node_address (aof node))
+      (let ((int64_t tmp . #'($ node keys_address)))
+        (while (> tmp -1)
+          (let ((BTKey cur)
+                (int below . 0))
+            (bt_key_read idx tmp (aof cur))
+            (set tmp ($ cur right_address))
+
+            (if (== started 0)
+                (block
+                  (if (== or_equal 0)
+                      (set below (? (not (< k ($ cur key))) 1 0))
+                    (set below (? (< ($ cur key) k) 1 0)))
+                  (if (== below 1)
+                      ;; still at or below the bound: the rightmost child
+                      ;; is the only one left once the keys run out
+                      (block
+                        (if (and (!= ($ node is_internal) 0)
+                                 (== ($ cur right_address) -1))
+                            (return (bt_greater_rec idx ($ cur right_node_address)
+                                                    k or_equal user rcb)))
+                        continue))
+                  (set started 1)
+                  (if (!= ($ node is_internal) 0)
+                      (if (not (bt_greater_rec idx ($ cur left_node_address)
+                                               k or_equal user rcb))
+                          (return #f)))))
+
+            (if (not (bt_cursor_output idx (aof cur) user rcb))
+                (return #f))
+            (if (!= ($ node is_internal) 0)
+                (if (not (bt_greater_rec idx ($ cur right_node_address)
+                                         k or_equal user rcb))
+                    (return #f)))))))
+    (return #t))
+
+  (func bt_cursor_greater_than ((BTreeIndex * idx) (int64_t k) (void * user)
+                                (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_greater_rec idx (-> idx root_address) k 0 user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  (func bt_cursor_greater_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
+                                      (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    (letin* ((streams (Streams (-> idx m)))
+             (statement (Statement (-> idx m))))
+      (if (> (-> idx root_address) -1)
+          (block (bt_greater_rec idx (-> idx root_address) k 1 user rcb)
+                 (cast void 0)))
+      (cast void 0)))
+
+  ;; ---- truncate: unlink the settled dead values, then reclaim --------
+  (func bt_unlink_dead_values ((BTreeIndex * idx) (BTKey * key)) (out void)
+    (let ((Memory * m . #'(-> idx m))
+          (BTValue previous)
+          (int has_previous . 0)
+          (int64_t tmp . #'(-> key values_address)))
+      (while (> tmp -1)
+        (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
+              (BTValue v)
+              (Control control))
+          (control_clear (aof control))
+          ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
+          (($ v unpack) (cof (-> m data_io)))
+          (set ($ v pointer) pointer)
+          (set tmp ($ v next_address))
+
+          (load_control m (aof pointer) (aof control))
+          ;; settled, as _dead_pointers means it: the chain is closed over
+          ;; the dead link BEFORE its space can be asked for
+          (if (and (== ($ control offline_state) ROW_DELETED)
+                   (and (== ($ control online_state) ROW_NONE)
+                        (== ($ control online_lock) LOCK_NONE)))
+              (if (== has_previous 1)
+                  (block
+                    (set ($ previous next_address) ($ v next_address))
+                    (offline_update m (cast (BaseTable *) (aof previous))))
+                (block
+                  (set (-> key values_address) ($ v next_address))
+                  (offline_update m (cast (BaseTable *) key))))
+            (block
+              (set previous v)
+              (set has_previous 1)))))))
+
+  (func bt_unlink_kcb ((void * c) (BTKey * key)) (out bool)
+    (let ((BTreeIndex * idx . #'(cast (BTreeIndex *) c)))
+      (bt_unlink_dead_values idx key)
+      (return #t)))
+
+  (func bt_truncate ((BTreeIndex * idx) (Memory * m)) (out size_t)
+    (block
+      (letin* ((streams (Streams (-> idx m))))
+        (if (> (-> idx root_address) -1)
+            (block (bt_walk_keys_rec idx (-> idx root_address)
+                                     (cast (void *) idx) bt_unlink_kcb)
+                   (cast void 0)))
+        (cast void 0)))
+    (return (truncate_key m (-> idx hash_key))))
+
   ;; ==================================================================
   ;; deftable -- Cicili metaprogramming where C++ used templates.
   ;;
@@ -1670,6 +2544,8 @@
            (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
            (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
            (ctxname (INTERN (CONCATENATE 'STRING sname "_CursorCtx")))
+           (hooksname (INTERN (CONCATENATE 'STRING sname "_Hooks")))
+           (hooksvar (INTERN (CONCATENATE 'STRING sname "_hooks")))
            (shim    (INTERN (CONCATENATE 'STRING sname "_cursor_shim")))
            (icur    (INTERN (CONCATENATE 'STRING sname "_cursor")))
            (iins    (INTERN (CONCATENATE 'STRING sname "_insert")))
@@ -1689,6 +2565,15 @@
                              (PUSH (LOGAND (ASH h -16) #xFF) out))
                     (NREVERSE out))))
       `($$$
+        ;; the seam an index attaches through: what the C++ engine wired
+        ;; with per-class statics and generated map() bodies, a table
+        ;; here exposes as one hooks record an index fills in at attach
+        (struct ,hooksname
+          (member func on_map ((void * mm) (void * rr)) (out void))
+          (member func on_unmap ((void * mm) (void * rr)) (out void))
+          (member func on_truncate ((void * mm)) (out void)))
+        (var ,hooksname ,hooksvar)
+
         (struct ,name (inherits BaseTable)
           ,@(LOOP FOR c IN columns COLLECT `(member int64_t ,c))
           (override)
@@ -1701,7 +2586,15 @@
           (override)
           (method unpack ((binarystream & io)) (out void)
             ,@(LOOP FOR c IN columns
-                    COLLECT `(($ io read_std_long) ($ this ,c)))))
+                    COLLECT `(($ io read_std_long) ($ this ,c))))
+          (override)
+          (method map ((void * mm)) (out void)
+            (if (!= ($ ,hooksvar on_map) nil)
+                (($ ,hooksvar on_map) mm (cast (void *) this))))
+          (override)
+          (method unmap ((void * mm)) (out void)
+            (if (!= ($ ,hooksvar on_unmap) nil)
+                (($ ,hooksvar on_unmap) mm (cast (void *) this)))))
 
         ;; no dotted inits here: a macro-produced dotted var breaks the
         ;; reader path, and namespace-scope C++ zero-initializes both anyway
@@ -1748,13 +2641,178 @@
           (online_delete m (cast (BaseTable *) row)))
 
         (func ,itrunc ((Memory * m)) (out size_t)
-          (return (truncate_key m (,kname)))))))
+          ;; the rows first, then the indexes over them, as the original
+          ;; truncate<T> orders it
+          (let ((size_t rows . #'(truncate_key m (,kname))))
+            (if (!= ($ ,hooksvar on_truncate) nil)
+                (($ ,hooksvar on_truncate) (cast (void *) m)))
+            (return rows))))))
+
+  ;; ==================================================================
+  ;; defindex -- the index tier's counterpart to deftable. Where the C++
+  ;; engine instantiated BTreeIndex<Table, Column> with the hash key
+  ;; SHA-1'd at runtime and the instance wired in a static initialiser,
+  ;; this macro expands the index instance, its 20-byte hash key and
+  ;; catalogue id (both computed at expansion time), an attach function
+  ;; the program calls once per process after memory_open, and the typed
+  ;; cursor wrappers over the table's own shim.
+  ;;
+  ;;   (defindex IDX_BOOK_VALUE Book value 0 65)
+  ;;                            table col unique branching
+  ;;
+  ;; Attaching hooks the index into the table's map/unmap/truncate seam.
+  ;; One index per table (the last attach wins the hooks) -- chaining is
+  ;; where a second index would go.
+  ;; ==================================================================
+  (DEFMACRO defindex (idxname table column unique branching)
+    (LET* ((iname    (SYMBOL-NAME idxname))
+           (tname    (SYMBOL-NAME table))
+           (harr     (INTERN (CONCATENATE 'STRING iname "_HASHKEY")))
+           (hready   (INTERN (CONCATENATE 'STRING iname "_hashkey_ready")))
+           (keyfn    (INTERN (CONCATENATE 'STRING iname "_key")))
+           (attach   (INTERN (CONCATENATE 'STRING iname "_attach")))
+           (domap    (INTERN (CONCATENATE 'STRING iname "_do_map")))
+           (dounmap  (INTERN (CONCATENATE 'STRING iname "_do_unmap")))
+           (dotrunc  (INTERN (CONCATENATE 'STRING iname "_do_truncate")))
+           (icur     (INTERN (CONCATENATE 'STRING iname "_cursor")))
+           (ieq      (INTERN (CONCATENATE 'STRING iname "_equal")))
+           (ineq     (INTERN (CONCATENATE 'STRING iname "_not_equal")))
+           (ilt      (INTERN (CONCATENATE 'STRING iname "_less_than")))
+           (ilte     (INTERN (CONCATENATE 'STRING iname "_less_than_equal")))
+           (igt      (INTERN (CONCATENATE 'STRING iname "_greater_than")))
+           (igte     (INTERN (CONCATENATE 'STRING iname "_greater_than_equal")))
+           (itrunc   (INTERN (CONCATENATE 'STRING iname "_truncate")))
+           (tablekeyfn (INTERN (CONCATENATE 'STRING tname "_key")))
+           (hooksvar (INTERN (CONCATENATE 'STRING tname "_hooks")))
+           (ctxname  (INTERN (CONCATENATE 'STRING tname "_CursorCtx")))
+           (shim     (INTERN (CONCATENATE 'STRING tname "_cursor_shim")))
+           (bytes (LET ((h 2166136261) (out NIL))
+                    (LOOP FOR ch ACROSS iname
+                          DO (SETF h (LOGAND (* (LOGXOR h (CHAR-CODE ch)) 16777619)
+                                             #xFFFFFFFF)))
+                    (LOOP FOR i FROM 0 BELOW 20
+                          DO (SETF h (LOGAND (+ (* h 1103515245) (+ 12345 i))
+                                             #xFFFFFFFF))
+                             (PUSH (LOGAND (ASH h -16) #xFF) out))
+                    (NREVERSE out)))
+           ;; the catalogue id: the digest's first eight bytes folded to a
+           ;; positive int64 -- what the original kept as a hex hash_name
+           (catid (LET ((v 0))
+                    (LOOP FOR i FROM 0 BELOW 8
+                          DO (SETF v (+ (* v 256) (NTH i bytes))))
+                    (LOGAND v #x7FFFFFFFFFFFFFFF))))
+      `($$$
+        (var uint8_t ,harr [20])
+        (var int ,hready)
+        (func ,keyfn () (out const uint8_t *)
+          (if (== ,hready 0)
+              (block
+                ,@(LOOP FOR b IN bytes FOR i FROM 0
+                        COLLECT `(set (nth ,i ,harr) ,b))
+                (set ,hready 1)))
+          (return (cast (uint8_t *) ,harr)))
+
+        (var BTreeIndex ,idxname)
+
+        (func ,domap ((void * mm) (void * rr)) (out void)
+          (cast void mm)
+          (let ((,table * r . #'(cast (,table *) rr)))
+            (bt_map (aof ,idxname) (-> r ,column) ($ (-> r pointer) address))))
+
+        (func ,dounmap ((void * mm) (void * rr)) (out void)
+          (cast void mm)
+          (let ((,table * r . #'(cast (,table *) rr)))
+            (bt_unmap (aof ,idxname) (-> r ,column) ($ (-> r pointer) address))))
+
+        (func ,dotrunc ((void * mm)) (out void)
+          (bt_truncate (aof ,idxname) (cast (Memory *) mm))
+          (cast void 0))
+
+        (func ,attach ((Memory * m)) (out void)
+          (set ($ ,idxname m) m)
+          (set ($ ,idxname name) ,iname)
+          (set ($ ,idxname hash_key) (intern_key (,keyfn)))
+          (set ($ ,idxname table_key) (,tablekeyfn))
+          (set ($ ,idxname catalogue_id) ,catid)
+          (set ($ ,idxname is_unique) ,unique)
+          (set ($ ,idxname branching_factor) ,branching)
+          (set ($ ,idxname min_degree) ,(- branching 1))
+          (set ($ ,idxname max_degree) ,(* (- branching 1) 2))
+          (set ($ ,idxname root_address) -1)
+          (set ($ ,idxname record_pointer) (pointer_null))
+          (bt_select_record (aof ,idxname))
+          (set ($ ,hooksvar on_map) ,domap)
+          (set ($ ,hooksvar on_unmap) ,dounmap)
+          (set ($ ,hooksvar on_truncate) ,dotrunc))
+
+        (func ,icur ((Memory * m) (void * user)
+                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor (aof ,idxname) (cast (void *) (aof cc)) ,shim)))
+
+        (func ,ieq ((Memory * m) (int64_t k) (void * user)
+                    (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,ineq ((Memory * m) (int64_t k) (void * user)
+                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_not_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,ilt ((Memory * m) (int64_t k) (void * user)
+                    (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_less_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,ilte ((Memory * m) (int64_t k) (void * user)
+                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_less_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,igt ((Memory * m) (int64_t k) (void * user)
+                    (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_greater_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,igte ((Memory * m) (int64_t k) (void * user)
+                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
+          (let ((,ctxname cc))
+            (set ($ cc m) m)
+            (set ($ cc user) user)
+            (set ($ cc cb) cb)
+            (bt_cursor_greater_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
+
+        (func ,itrunc ((Memory * m)) (out size_t)
+          (return (bt_truncate (aof ,idxname) m))))))
 
   ;; ==================================================================
   ;; The smoke tests. A Book table, one store, the ACID walk-through,
   ;; a restart, and a two-session race.
   ;; ==================================================================
   (deftable Book "smoke::Book" id value)
+  (defindex IDX_BOOK_VALUE Book value 0 3)
+
+  (deftable Tag "smoke::Tag" k)
+  (defindex IDX_TAG_K Tag k 1 3)
 
   (var int failures . 0)
 
@@ -1807,6 +2865,59 @@
       (if ($ c found) (set (cof out_row) ($ c row)))
       (return ($ c found))))
 
+  ;; count matches through the index cursors
+  (func book_equal_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((CountCtx c))
+      (set ($ c rows) 0)
+      (set ($ c value_sum) 0)
+      (IDX_BOOK_VALUE_equal m k (cast (void *) (aof c)) count_cb)
+      (return ($ c rows))))
+
+  (func book_gt_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((CountCtx c))
+      (set ($ c rows) 0)
+      (set ($ c value_sum) 0)
+      (IDX_BOOK_VALUE_greater_than m k (cast (void *) (aof c)) count_cb)
+      (return ($ c rows))))
+
+  ;; ordered-walk verifier for the Tag tree
+  (struct TagOrdCtx
+    (member int64_t rows)
+    (member int64_t last)
+    (member int ascending))
+
+  (func tag_ord_cb ((void * u) (Tag * r)) (out bool)
+    (let ((TagOrdCtx * c . #'(cast (TagOrdCtx *) u)))
+      (if (and (> (-> c rows) 0) (<= (-> r k) (-> c last)))
+          (set (-> c ascending) 0))
+      (set (-> c last) (-> r k))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (return #t)))
+
+  (func tag_equal_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((TagOrdCtx c))
+      (set ($ c rows) 0) (set ($ c last) 0) (set ($ c ascending) 1)
+      (IDX_TAG_K_equal m k (cast (void *) (aof c)) tag_ord_cb)
+      (return ($ c rows))))
+
+  (func tag_lte_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((TagOrdCtx c))
+      (set ($ c rows) 0) (set ($ c last) 0) (set ($ c ascending) 1)
+      (IDX_TAG_K_less_than_equal m k (cast (void *) (aof c)) tag_ord_cb)
+      (return ($ c rows))))
+
+  (func tag_gt_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((TagOrdCtx c))
+      (set ($ c rows) 0) (set ($ c last) 0) (set ($ c ascending) 1)
+      (IDX_TAG_K_greater_than m k (cast (void *) (aof c)) tag_ord_cb)
+      (return ($ c rows))))
+
+  (func tag_neq_count ((Memory * m) (int64_t k)) (out int64_t)
+    (let ((TagOrdCtx c))
+      (set ($ c rows) 0) (set ($ c last) 0) (set ($ c ascending) 1)
+      (IDX_TAG_K_not_equal m k (cast (void *) (aof c)) tag_ord_cb)
+      (return ($ c rows))))
+
   ;; a session that updates one row and commits, for the SNAPSHOT test
   (func update_worker ((void * arg)) (out void *)
     (let ((Memory * m . #'(cast (Memory *) arg)))
@@ -1847,6 +2958,10 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
 
+        ;; the indexes: attached once, before anything writes
+        (IDX_BOOK_VALUE_attach (aof mem))
+        (IDX_TAG_K_attach (aof mem))
+
         ;; ---- insert three, commit, read back --------------------------
         (let ((int64_t i . 1))
           (while (<= i 3)
@@ -1875,6 +2990,8 @@
         (let ((int64_t sum . 0))
           (check "update kept the row count" (book_count (aof mem) (aof sum)) 3)
           (check "the new version shows" sum 82))
+        (check "the index finds the new version" (book_equal_count (aof mem) 42) 1)
+        (check "the index dropped the old version" (book_equal_count (aof mem) 20) 0)
 
         ;; ---- a rolled back delete never happened ----------------------
         (let ((Book doomed))
@@ -1883,6 +3000,7 @@
         (rollback_transaction (aof mem))
         (begin_transaction (aof mem))
         (check "rollback undid the delete" (book_count (aof mem) nil) 3)
+        (check "a rolled back delete reappears in the index" (book_equal_count (aof mem) 30) 1)
 
         ;; ---- the same delete, committed, is real ----------------------
         (let ((Book doomed))
@@ -1891,10 +3009,12 @@
         (commit_transaction (aof mem))
         (begin_transaction (aof mem))
         (check "committed delete holds" (book_count (aof mem) nil) 2)
+        (check "the index hides the deleted row" (book_equal_count (aof mem) 30) 0)
 
         ;; ---- TRUNCATE reclaims exactly the settled dead ---------------
         (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 1)
         (check "truncate spares the living" (book_count (aof mem) nil) 2)
+        (check "the index survives truncate" (book_equal_count (aof mem) 42) 1)
 
         ;; ---- an allocation past a page is refused ---------------------
         (let ((int64_t refused . 0))
@@ -1913,6 +3033,8 @@
           (pthread_join t1 nil)
           (pthread_join t2 nil))
         (check "two sessions landed their rows" (book_count (aof mem) nil) 22)
+        (check "the index carries the sessions' rows" (book_equal_count (aof mem) 1) 20)
+        (check "a range query finds the pair above nine" (book_gt_count (aof mem) 9) 2)
 
         ;; ---- REPEATABLE READ takes and releases its shared locks ------
         (set_isolation_level tl_txn REPEATABLE_READ)
@@ -1944,6 +3066,46 @@
         (let ((int64_t sum . 0))
           (check "a fresh read sees the update" (book_count (aof mem) (aof sum)) 22)
           (check "the updated value" sum 571))
+        (check "the index moved with the update" (book_equal_count (aof mem) 500) 1)
+
+        ;; ---- thirty distinct keys through a branching-3 tree ----------
+        ;; inserted in a shuffled order (i*7 mod 30), so the tree splits
+        ;; its way up from a root of max degree 4
+        (let ((int64_t i . 0))
+          (while (< i 30)
+            (let ((Tag t))
+              (set ($ t k) (% (* i 7) 30))
+              (Tag_insert (aof mem) (aof t)))
+            (set i (+ i 1))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+
+        (let ((TagOrdCtx oc))
+          (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
+          (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
+          (check "thirty keys through the splits" ($ oc rows) 30)
+          (check "and the walk comes back in order" (cast int64_t ($ oc ascending)) 1))
+        (check "a key below the median" (tag_equal_count (aof mem) 4) 1)
+        (check "a key above the median" (tag_equal_count (aof mem) 27) 1)
+
+        ;; ---- the unique index refuses a duplicate ---------------------
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((Tag dup))
+                   (set ($ dup k) 7)
+                   (Tag_insert (aof mem) (aof dup))))
+               (catch ((const IndexException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "the unique index refuses a duplicate" refused 1))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the refusal left exactly one behind" (tag_equal_count (aof mem) 7) 1)
+
+        ;; ---- ranges over the split tree -------------------------------
+        (check "less_than_equal ten" (tag_lte_count (aof mem) 10) 11)
+        (check "greater_than twenty-seven" (tag_gt_count (aof mem) 27) 2)
+        (check "not_equal five" (tag_neq_count (aof mem) 5) 29)
 
         (sync_disk (aof mem))
         (cast void 0)))
@@ -1957,6 +3119,17 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
         (check "the store survives a restart" (book_count (aof mem) nil) 22)
+
+        ;; attach finds the catalogue records written last time -- the
+        ;; roots come back, nothing re-inserts
+        (IDX_BOOK_VALUE_attach (aof mem))
+        (IDX_TAG_K_attach (aof mem))
+        (check "the index survives it too" (book_equal_count (aof mem) 500) 1)
+        (let ((TagOrdCtx oc))
+          (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
+          (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)
+          (check "the tree survives it too" ($ oc rows) 30)
+          (check "and still walks in order" (cast int64_t ($ oc ascending)) 1))
         (cast void 0)))
 
     (if (== failures 0)
