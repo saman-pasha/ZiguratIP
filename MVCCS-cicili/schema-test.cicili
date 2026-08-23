@@ -1,10 +1,15 @@
-;;;; The generated-schema test: the two .cicili files under generated/
-;;;; are BYTE-FOR-BYTE what the Parsi compiler wrote beside the C++ pair
-;;;; for cocolog's machines table and its sequence (copied from
+;;;; The generated-schema test: the .cicili files under generated/ are
+;;;; BYTE-FOR-BYTE what the Parsi compiler wrote beside the C++ pair for
+;;;; cocolog's machines table and its sequence (copied from
 ;;;; home/ld/_COCOLOG::MACHINES_.cicili and _COCOLOG::MACHINES_SEQ_.cicili;
 ;;;; regenerate with cocolog's `make schema`). If this target compiles and
 ;;;; its checks run green, a Parsi schema really does define the same
 ;;;; objects against the Cicili MVCCS engine through the def... macros.
+;;;;
+;;;; STRING/TEXT Parsi columns ride as (TEXT col) -- std::string members
+;;;; packed as 2-byte length + bytes. Their indexes ship commented out
+;;;; (the Cicili B-tree keys int64 only), so name lookups here go through
+;;;; a table scan, which is also what the embedded cocolog backend does.
 
 (source "schema_test.cpp"
   (make :cpp #t :compile #t
@@ -56,11 +61,42 @@
       (set (-> c id_sum) (+ (-> c id_sum) (-> r ID)))
       (return #t)))
 
-  (func machines_by_name ((Memory * m) (int64_t name)) (out int64_t)
+  ;; name lookup by scan: what stands in for the commented-out
+  ;; string-keyed IDX_COCOLOG_MACHINES_NAME
+  (struct MNameCtx
+    (member const char * target)
+    (member int64_t hits)
+    (member int64_t id))
+
+  (func machine_name_cb ((void * u) (COCOLOG_MACHINES * r)) (out bool)
+    (let ((MNameCtx * c . #'(cast (MNameCtx *) u)))
+      (if (== 0 (strcmp (($ (-> r NAME) c_str)) (-> c target)))
+          (block
+            (set (-> c hits) (+ (-> c hits) 1))
+            (set (-> c id) (-> r ID))))
+      (return #t)))
+
+  (func machines_by_name ((Memory * m) (const char * name)) (out int64_t)
+    (let ((MNameCtx c))
+      (set ($ c target) name)
+      (set ($ c hits) 0)
+      (set ($ c id) 0)
+      (COCOLOG_MACHINES_cursor m (cast (void *) (aof c)) machine_name_cb)
+      (return ($ c hits))))
+
+  (func machine_id_by_name ((Memory * m) (const char * name)) (out int64_t)
+    (let ((MNameCtx c))
+      (set ($ c target) name)
+      (set ($ c hits) 0)
+      (set ($ c id) 0)
+      (COCOLOG_MACHINES_cursor m (cast (void *) (aof c)) machine_name_cb)
+      (return ($ c id))))
+
+  (func id_equal_count ((Memory * m) (int64_t id)) (out int64_t)
     (let ((MCountCtx c))
       (set ($ c rows) 0)
       (set ($ c id_sum) 0)
-      (IDX_COCOLOG_MACHINES_NAME_equal m name (cast (void *) (aof c)) machine_count_cb)
+      (IDX_COCOLOG_MACHINES_ID_equal m id (cast (void *) (aof c)) machine_count_cb)
       (return ($ c rows))))
 
   (main
@@ -74,22 +110,25 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
 
-        ;; the generated objects, attached exactly as their comments say
+        ;; the generated objects, attached exactly as their comments say:
+        ;; the ID index and the sequence (the string-keyed indexes ship
+        ;; commented out, so there is nothing else to attach)
         (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
-        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
-        (IDX_COCOLOG_MACHINES_KB_attach (aof mem))
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
 
-        ;; three machines, their ids drawn from the generated sequence
+        ;; three machines, their ids drawn from the generated sequence,
+        ;; their names/kb/status through the generated TEXT columns
         (let ((int64_t i . 0))
           (while (< i 3)
-            (let ((COCOLOG_MACHINES row))
+            (let ((COCOLOG_MACHINES row)
+                  (char nm [16]))
+              (sprintf nm "m-%ld" (cast long i))
               (set ($ row ID) (COCOLOG_MACHINES_SEQ_next))
-              (set ($ row NAME) (+ 1000 i))
-              (set ($ row KB) 7)
-              (set ($ row STATUS) 1)
+              (set ($ row NAME) (std::string nm))
+              (set ($ row KB) (std::string "user"))
+              (set ($ row STATUS) (std::string "idle"))
               (set ($ row CHUNKS) 0)
-              (set ($ row NOTE) 0)
+              (set ($ row NOTE) (std::string ""))
               (COCOLOG_MACHINES_insert (aof mem) (aof row)))
             (set i (+ i 1))))
         (commit_transaction (aof mem))
@@ -103,28 +142,31 @@
           ;; the generated sequence starts at 1: ids 1, 2, 3
           (check "their ids came from the generated sequence" ($ c id_sum) 6))
 
-        (check "the generated name index finds one" (machines_by_name (aof mem) 1001) 1)
-        (check "and misses what was never there" (machines_by_name (aof mem) 9999) 0)
+        (check "a TEXT name scan finds one" (machines_by_name (aof mem) "m-1") 1)
+        (check "and misses what was never there" (machines_by_name (aof mem) "m-9") 0)
+        (check "the scan pairs name with its id" (machine_id_by_name (aof mem) "m-2") 3)
+        (check "the generated ID index finds one" (id_equal_count (aof mem) 2) 1)
+        (check "and misses what was never drawn" (id_equal_count (aof mem) 99) 0)
 
-        ;; NAME is UNIQUE in the schema; the generated index enforces it
+        ;; ID is the schema's PRIMARY key; the generated index enforces it
         (let ((int64_t refused . 0))
           (try (block
                  (let ((COCOLOG_MACHINES dup))
-                   (set ($ dup ID) (COCOLOG_MACHINES_SEQ_next))
-                   (set ($ dup NAME) 1001)
-                   (set ($ dup KB) 7)
-                   (set ($ dup STATUS) 1)
+                   (set ($ dup ID) 2)
+                   (set ($ dup NAME) (std::string "again"))
+                   (set ($ dup KB) (std::string "user"))
+                   (set ($ dup STATUS) (std::string "idle"))
                    (set ($ dup CHUNKS) 0)
-                   (set ($ dup NOTE) 0)
+                   (set ($ dup NOTE) (std::string ""))
                    (COCOLOG_MACHINES_insert (aof mem) (aof dup))))
                (catch ((const IndexException & e))
                  (cast void e)
                  (set refused 1)))
-          (check "the schema's UNIQUE NAME is enforced" refused 1))
+          (check "the schema's PRIMARY ID is enforced" refused 1))
         (rollback_transaction (aof mem))
         (begin_transaction (aof mem))
 
-        (check "the sequence kept its draw" (COCOLOG_MACHINES_SEQ_current) 5)
+        (check "the sequence kept its draw" (COCOLOG_MACHINES_SEQ_current) 4)
         (sync_disk (aof mem))
         (cast void 0)))
 
@@ -136,10 +178,11 @@
       (let ((Memory mem))
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
-        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
+        (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
-        (check "the generated index survives a restart" (machines_by_name (aof mem) 1002) 1)
-        (check "so does the generated sequence" (COCOLOG_MACHINES_SEQ_current) 5)
+        (check "TEXT columns survive a restart" (machines_by_name (aof mem) "m-1") 1)
+        (check "the generated index survives too" (id_equal_count (aof mem) 3) 1)
+        (check "so does the generated sequence" (COCOLOG_MACHINES_SEQ_current) 4)
         (cast void 0)))
 
     (if (== failures 0)

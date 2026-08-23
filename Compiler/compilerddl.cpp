@@ -564,14 +564,28 @@ namespace Zigurat
       // is a name of its own, so no string rides beside it
       cicili << "    (deftable " << type_name << "";
       for (const Expression& expr : ast.args) {
-	if (expr.token.value == "COLUMN")
-	  cicili << " " << expr.args[0].token.value;
+	if (expr.token.value == "COLUMN") {
+	  const std::string col_type = this->_type_name(expr.args[1]);
+	  // STRING/TEXT columns ride as std::string members; everything else
+	  // is the engine's int64 column
+	  if (col_type == "STRING" || col_type == "TEXT")
+	    cicili << " (TEXT " << expr.args[0].token.value << ")";
+	  else
+	    cicili << " " << expr.args[0].token.value;
+	}
       }
       cicili << ")" << std::endl;
 
       // branching 65 is the Long-key factor the C++ engine derives from the
       // key type's width; the Cicili engine takes it as a parameter
       for (const index_desc_t& index : indexes) {
+	// the Cicili engine's B-tree keys are int64 only: an index over a
+	// STRING/TEXT column ships commented out, as a record of the C++
+	// pair's shape -- scans stand in for it
+	bool string_keyed = false;
+	for (const std::string& key_type : std::get<1>(index))
+	  if (key_type == "STRING" || key_type == "TEXT") string_keyed = true;
+	if (string_keyed) cicili << "    ;; string-keyed, no Cicili B-tree:";
 	cicili << "    (defindex " << std::get<3>(index) << " " << type_name << " ";
 	const std::vector<std::string>& columns = std::get<0>(index);
 	if (columns.size() == 1) {

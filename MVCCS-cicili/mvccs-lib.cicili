@@ -32,6 +32,8 @@
         (method write_std_time ((time_t && v)) (out void))
         (method fill_n ((size_t count) (char c)) (out void))
         (method write_std_string ((std::string && s)) (out void))
+        (method write_std_text ((std::string && s)) (out void))
+        (method read_std_text ((std::string & s)) (out void))
         (method write_std_bool ((bool && v)) (out void))
         (method length () (out int64_t))
         (method flush () (out void))
@@ -3568,6 +3570,20 @@
            (columns (IF (STRINGP (FIRST args)) (REST args) args))
            (sname   (FUNCALL qfold qname))
            (name    (INTERN sname))
+           ;; a column is a symbol -- an int64 -- or (TEXT sym): a
+           ;; variable-length string, stored as binarystream's std_text
+           ;; (a 16-bit length and the bytes), which is what lets a row
+           ;; carry clause text and 4000-byte machine chunks. pack_size
+           ;; is a virtual, so a row's size is its own business.
+           (colspecs (MAPCAR (LAMBDA (c)
+                               (IF (LISTP c)
+                                   (CONS (SECOND c) 'TEXT)
+                                   (CONS c 'INT)))
+                             columns))
+           (intcols  (LOOP FOR c IN colspecs
+                           WHEN (EQ (CDR c) 'INT) COLLECT (CAR c)))
+           (textcols (LOOP FOR c IN colspecs
+                           WHEN (EQ (CDR c) 'TEXT) COLLECT (CAR c)))
            (harr    (INTERN (CONCATENATE 'STRING sname "_HASHKEY")))
            (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
            (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
@@ -3603,18 +3619,28 @@
         (var ,hooksname ,hooksvar)
 
         (struct ,name (inherits BaseTable)
-          ,@(LOOP FOR c IN columns COLLECT `(member int64_t ,c))
+          ,@(LOOP FOR c IN colspecs
+                  COLLECT (IF (EQ (CDR c) 'TEXT)
+                              `(member std::string ,(CAR c))
+                              `(member int64_t ,(CAR c))))
           (override)
           (method pack_size () (out int64_t)
-            (return ,(* 8 (LENGTH columns))))
+            (return ,(LET ((acc (* 8 (LENGTH intcols))))
+                       (LOOP FOR c IN textcols
+                             DO (SETF acc `(+ ,acc (+ 2 (cast int64_t (($ ($ this ,c) size)))))))
+                       acc)))
           (override)
           (method pack ((binarystream & io)) (out void)
-            ,@(LOOP FOR c IN columns
-                    COLLECT `(($ io write_std_long) (cast int64_t ($ this ,c)))))
+            ,@(LOOP FOR c IN colspecs
+                    COLLECT (IF (EQ (CDR c) 'TEXT)
+                                `(($ io write_std_text) (std::string ($ this ,(CAR c))))
+                                `(($ io write_std_long) (cast int64_t ($ this ,(CAR c)))))))
           (override)
           (method unpack ((binarystream & io)) (out void)
-            ,@(LOOP FOR c IN columns
-                    COLLECT `(($ io read_std_long) ($ this ,c))))
+            ,@(LOOP FOR c IN colspecs
+                    COLLECT (IF (EQ (CDR c) 'TEXT)
+                                `(($ io read_std_text) ($ this ,(CAR c)))
+                                `(($ io read_std_long) ($ this ,(CAR c))))))
           (override)
           (method map ((void * mm)) (out void)
             (if (!= ($ ,hooksvar on_map) nil)

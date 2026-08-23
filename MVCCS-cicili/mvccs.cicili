@@ -58,6 +58,8 @@
 
   (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
 
+  (deftable Memo "smoke::Memo" id (TEXT body))
+
   (var int failures . 0)
 
   (func check ((const char * what) (int64_t got) (int64_t want)) (out void)
@@ -206,6 +208,20 @@
       (set (-> c row) (cof r))
       (set (-> c found) 1)
       (return #f)))
+
+  ;; text-column scan: counts rows, sums body lengths, checks content
+  (struct MemoScan
+    (member int64_t rows)
+    (member int64_t bytes))
+
+  (func memo_cb ((void * u) (Memo * r)) (out bool)
+    (let ((MemoScan * c . #'(cast (MemoScan *) u)))
+      (set (-> c rows) (+ (-> c rows) 1))
+      (set (-> c bytes) (+ (-> c bytes) (cast int64_t (($ (-> r body) size)))))
+      (if (== (-> r id) 1)
+          (if (!= 0 (strcmp (($ (-> r body) c_str)) "parent(tom, bob)."))
+              (set (-> c rows) -1000)))
+      (return #t)))
 
   ;; a session that updates one row and commits, for the SNAPSHOT test
   (func update_worker ((void * arg)) (out void *)
@@ -593,6 +609,24 @@
           (check "the watcher heard the engine work"
                  (? (> ((-> ear length)) 0) 1 0) 1)
           (dba_detach_watcher (aof mem)))
+
+        ;; ---- a TEXT column: variable rows, read back exactly ----------
+        (let ((Memo w))
+          (set ($ w id) 1)
+          (set ($ w body) (std::string "parent(tom, bob)."))
+          (Memo_insert (aof mem) (aof w)))
+        (let ((Memo w))
+          (set ($ w id) 2)
+          (set ($ w body) (std::string ""))
+          (Memo_insert (aof mem) (aof w)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((MemoScan sc))
+          (set ($ sc rows) 0)
+          (set ($ sc bytes) 0)
+          (Memo_cursor (aof mem) (cast (void *) (aof sc)) memo_cb)
+          (check "text rows come back" ($ sc rows) 2)
+          (check "byte for byte" ($ sc bytes) 17))
 
         (sync_disk (aof mem))
         (cast void 0)))
