@@ -4,6 +4,7 @@
 
 
 #include <cstdint>
+#include <type_traits>
 #include "typeobject.hpp"
 
 namespace Zigurat
@@ -30,6 +31,12 @@ namespace Zigurat
     Long(const Long&);
     Long(int&&);
     Long(const int&);
+    // The mirror of ULong's integral template: int64_t is `long' on
+    // LP64 Linux and `long long' on macOS, so the other platform's
+    // spelling has no exact constructor without this.
+    template <typename T,
+              typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    Long(T v) : Long(static_cast<int64_t>(v)) {}
     Long(Int&&);
     Long(const Int&);
 
