@@ -1157,3 +1157,63 @@ ZTEST(BTree, a_torn_value_chain_ends_instead_of_spinning)
   // come back instead of spinning under the exclusive guard.
   ZCHECK_NOTHROW(Item::truncate_indexes());
 }
+
+// --- the eleventh-run split ------------------------------------------------
+//
+// The groups choreography makes ~twelve fresh machine ids per run, each a new
+// key in an index whose old keys stay behind as empty buckets, and on the
+// eleventh run the count crosses the root's 128-key split threshold. On the
+// wire that split left a key whose KEY FIELD read NULL, and every later map
+// threw `NULL value'. This is that store's life in miniature: batches of
+// twelve distinct keys, the rows deleted and reclaimed between batches so the
+// old keys sit with empty buckets, driven far enough that the root splits --
+// then one more batch, which on the broken engine was the one that threw.
+ZTEST(BTree, splits_survive_batches_of_churned_keys)
+{
+  Fixture fixture("btree-churnsplit");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  Memory* m = fixture.memory();
+  int64_t next_id = 1;
+
+  for (int batch = 0; batch < 14; batch++) {
+    std::vector<Item> rows;
+    m->begin_transaction();
+    for (int i = 0; i < 12; i++) {
+      Item row(next_id++, "churn", batch * 100 + i, (int16_t)(next_id % BUCKET_MODULUS));
+      m->online_insert(row);
+      rows.push_back(row);
+    }
+    m->commit_transaction();
+
+    // The batch's rows die, their keys stay as empty buckets -- exactly the
+    // groups store between two runs.
+    m->begin_transaction();
+    for (Item& row : rows) m->online_delete(row);
+    m->commit_transaction();
+
+    m->begin_transaction();
+    Item::truncate_indexes();
+    m->truncate<Item>();
+    m->commit_transaction();
+    m->begin_transaction();
+  }
+
+  // Every id ever inserted is a key; every bucket is empty. The index must
+  // still answer -- walking it is what threw on the wire.
+  int64_t seen = 0;
+  Item::IDX_ID->cursor([&seen] (Item&) -> bool { seen++; return true; });
+  ZCHECK_EQ(seen, (int64_t)0);
+
+  // And one more batch maps cleanly through the split trees.
+  m->begin_transaction();
+  for (int i = 0; i < 12; i++) {
+    Item row(next_id++, "churn", 9900 + i, (int16_t)(next_id % BUCKET_MODULUS));
+    m->online_insert(row);
+  }
+  m->commit_transaction();
+
+  int64_t live = 0;
+  Item::IDX_ID->cursor([&live] (Item&) -> bool { live++; return true; });
+  ZCHECK_EQ(live, (int64_t)12);
+}

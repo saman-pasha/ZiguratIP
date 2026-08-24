@@ -454,23 +454,40 @@ namespace Zigurat
   template <typename T>
   void Memory::_offline_insert(hashkey_ptr hash_key, T& object)
   {
+
     if (this->_watcher) {
       this->dba_watch("Offline Insert: (" + T::name + ")");
     }
     
     object.pointer = this->_allocate(hash_key, object.pack_size());
 
+    // THE DATA LANDS BEFORE THE ALLOCATION IS MARKED. The old order flushed
+    // the hexmap marking first, so a process that died between the two
+    // flushes left an ALLOCATED record whose bytes were never written --
+    // zeros, which for a BTreeNode decode as keys_address 0: a link into the
+    // store's origin, measured twice as the torn link that wedged (then
+    // refused) the vacuum. The payload and the control block both live in
+    // the data file (the control at the record's address, the payload after
+    // it), so they are written together and land under ONE flush before the
+    // hexmap marking goes durable: a death before the marking leaves bytes
+    // nothing points at and space the allocator hands out again, a death
+    // after it leaves a complete record.
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
+    this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
+    this->_data_io << object;
+
     Control control;
     control.offline_state = RowState::INSERTED;
     control.create_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
-    this->_full_hexmap(object.pointer);
-    this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
-    this->_data_io << object;
-
-    this->_hexmap_io.flush();
     this->_data_io.flush();
+
+    this->_full_hexmap(object.pointer);
+    this->_hexmap_io.flush();
   }
   
   template <typename T>
@@ -489,6 +506,7 @@ namespace Zigurat
   template <typename T>
   void Memory::_offline_update(T& object)
   {
+
     if (this->_watcher) {
       this->dba_watch("Offline Update: (" + T::name + ", " + std::to_string(object.pointer.address) + ")");
     }
@@ -498,6 +516,10 @@ namespace Zigurat
     control.modify_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
     this->_data_io << object;
 
@@ -519,6 +541,10 @@ namespace Zigurat
     control.modify_time = Memory::version_time();
     this->_dump_control(new_object.pointer, control);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);
     this->_data_io << new_object;
 
@@ -555,6 +581,10 @@ namespace Zigurat
     this->_control_insert(&object);
     
     this->_full_hexmap(object.pointer);
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
     this->_data_io << object;
 
@@ -581,6 +611,10 @@ namespace Zigurat
     this->_control_update(&old_object, &new_object, &streams);
 
     this->_full_hexmap(new_object.pointer);
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);
     this->_data_io << new_object;
 

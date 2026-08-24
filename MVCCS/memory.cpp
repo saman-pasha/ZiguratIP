@@ -386,7 +386,26 @@ namespace Zigurat
       
       while (begin_address < end_address) {
 
-	Pointer pointer = this->_pointer(iter->first, begin_address, is_data, online_state, online_lock);
+	// FREE OR RECORD IS DECIDED FROM THE FIRST HEXMAP BYTE, before any
+	// parsing. _pointer seeks CONTROL_COUNT bytes in and measures what
+	// follows, which is right for a record and reads straight through a
+	// SHORT free run into the record behind it -- the comment below knew
+	// this, but the is_data answer gating the two branches came out of
+	// that same read-through: a one-chunk free run parsed as a 64-byte
+	// "record", the walk went one phase out of step, read data codes as
+	// control bytes, and rolled back live rows it mistook for uncommitted
+	// -- measured as a live index node zeroed at every eleventh run's
+	// restart. A record's first chunk is a control chunk and always
+	// carries the high bit; a free chunk never does. One byte decides.
+	uint8_t head_byte = 0;
+	this->_hexmap_io.seekg(this->_pointer_hexmap_address(begin_address), std::ios::beg);
+	this->_hexmap_io.read_std_ubyte(head_byte);
+	if (!this->_hexmap_io.good()) { this->_hexmap_io.clear(); break; }
+	is_data = (head_byte & (uint8_t)128) == 128;
+
+	Pointer pointer;
+	if (is_data)
+	  pointer = this->_pointer(iter->first, begin_address, is_data, online_state, online_lock);
 
 	if (is_data) {
 	  if (online_lock != RowLock::NONE) {
@@ -476,12 +495,20 @@ namespace Zigurat
     uint8_t online_hexmap = CONTROL_CHUNK + (uint8_t)control.online_state + (uint8_t)control.online_lock;
     uint8_t offline_hexmap = CONTROL_CHUNK + (uint8_t)control.offline_state + (uint8_t)control.offline_lock;
     
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(this->_pointer_hexmap_address(pointer), std::ios::beg);
 
     this->_hexmap_io.write_std_ubyte(online_hexmap);
     this->_hexmap_io.write_std_ubyte(offline_hexmap);
     this->_hexmap_io.write_std_ubyte(CONTROL_STANDALONE_CHUNK);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(pointer.address, std::ios::beg);
 
     this->_data_io.write_std_time(control.online_time);  
@@ -529,6 +556,10 @@ namespace Zigurat
 
   void Memory::_full_hexmap(int64_t address, int64_t count)
   {
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(address, std::ios::beg);
     this->_hexmap_io.fill_n(count - 1, DATA_CHUNK);
     this->_hexmap_io.write_std_ubyte(DATA_STANDALONE_CHUNK);
@@ -539,6 +570,10 @@ namespace Zigurat
     int64_t address = this->_pointer_hexmap_data_address(pointer);
     int64_t count = this->_pointer_data_count(pointer);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(address, std::ios::beg);
     this->_hexmap_io.fill_n(count - 1, DATA_CHUNK);
     this->_hexmap_io.write_std_ubyte(DATA_STANDALONE_CHUNK + (pointer.size % CHUNK_SIZE));
@@ -580,6 +615,10 @@ namespace Zigurat
 
   void Memory::_free_hexmap(int64_t address, int64_t count)
   {
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(address, std::ios::beg);
     this->_hexmap_io.fill_n(count - 1, FREE_CHUNK);
     this->_hexmap_io.write_std_ubyte(FREE_STANDALONE_CHUNK);
@@ -590,6 +629,10 @@ namespace Zigurat
     this->_full_hexmap(this->_pointer_hexmap_address(address), PAGEFILE_CONTROL_COUNT);
     this->_free_hexmap(this->_pointer_hexmap_address(address) + PAGEFILE_CONTROL_COUNT, this->_hbpp - PAGEFILE_CONTROL_COUNT);
     
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(address, std::ios::beg);
     this->_data_io.write((const char*)hash_key, HASHKEY_SIZE);
 
@@ -611,6 +654,10 @@ namespace Zigurat
       return address;
     }
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(0, std::ios::end);
     int64_t start = this->_data_io.tellp();
 
@@ -760,6 +807,10 @@ namespace Zigurat
     std::lock_guard<std::mutex> page_list_lock(this->_page_list_access);
     std::lock_guard<std::mutex> free_list_lock(this->_free_list_access);
     
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(from, std::ios::beg);
     int64_t prev_count = this->_free_prev_count();
 
@@ -778,6 +829,10 @@ namespace Zigurat
       }
     }
     
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_hexmap_io.good()) this->_hexmap_io.clear();
     this->_hexmap_io.seekp(from + count, std::ios::beg);
     int64_t next_count = this->_free_next_count();
 
@@ -1824,6 +1879,10 @@ namespace Zigurat
     *transaction_id_ptr = transaction_id;
     *commit_time_ptr = commit_time;
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(Memory::transaction.pointer), std::ios::beg);
     this->_data_io.write(buffer, length);
   }

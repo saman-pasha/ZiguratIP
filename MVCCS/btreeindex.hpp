@@ -431,16 +431,23 @@ namespace Zigurat
     // the _pointer guard, a spin).
     Long tmp_address = node.keys_address;
     if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    // An all-zero node is what a torn _offline_insert used to leave (the
+    // hexmap marking landed, the bytes did not): degree 0 with keys_address
+    // 0, a shape no real node ever writes -- an empty node's head is -1.
+    // Address 0 can be a real record, so this is judged by the pair, not
+    // the zero alone.
+    if (tmp_address.value() == 0 && node.degree.value() == 0) tmp_address = (int64_t)-1;
     std::unordered_set<int64_t> walked;
     int16_t counter = 0;
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s keys unresolvable=%lld head=%lld\n", this->_name.c_str(), (long long)tmp_address.value(), (long long)node.keys_address.value()); break; }
-      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s keys revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       BTreeKey<_First> key;
       key.pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
       this->_memory->_offline_select(key);
+
 
       tmp_address = key.right_address;
       if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
@@ -476,8 +483,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s values unresolvable=%lld head=%lld\n", this->_name.c_str(), (long long)tmp_address.value(), (long long)key.values_address.value()); break; }
-      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s values revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -939,8 +946,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s free unresolvable=%lld \n", this->_name.c_str(), (long long)tmp_address.value()); break; }
-      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s free revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -982,8 +989,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s unlink unresolvable=%lld \n", this->_name.c_str(), (long long)tmp_address.value()); break; }
-      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s unlink revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -1286,7 +1293,6 @@ namespace Zigurat
 	// for one torn entry made every SELECT on the bucket an error.
 	if (current_value.value.is_null().value() ||
 	    !this->_memory->_chain_resolves(current_value.value.value())) {
-	  fprintf(stderr, "TORN-LEDGER %s output row=%lld\n", this->_name.c_str(), current_value.value.is_null().value() ? -1LL : (long long)current_value.value.value());
 	  return true;
 	}
 

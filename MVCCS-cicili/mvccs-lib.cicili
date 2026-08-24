@@ -785,11 +785,19 @@
                                        (+ (cast int (-> c online_state)) (cast int (-> c online_lock))))))
           (uint8_t offline_hexmap . #'(cast uint8_t (+ CONTROL_CHUNK
                                         (+ (cast int (-> c offline_state)) (cast int (-> c offline_lock)))))))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) (ptr_hexmap p) std::ios::beg)
       ((-> (-> m hexmap_io) write_std_ubyte) online_hexmap)
       ((-> (-> m hexmap_io) write_std_ubyte) offline_hexmap)
       ((-> (-> m hexmap_io) write_std_ubyte) CONTROL_STANDALONE_CHUNK)
 
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (-> p address) std::ios::beg)
       ((-> (-> m data_io) write_std_time) (cast time_t (-> c online_time)))
       ((-> (-> m data_io) write_std_size) (cast size_t (-> c transaction_id)))
@@ -844,6 +852,10 @@
   ;; Hexmap runs
   ;; ==================================================================
   (func full_hexmap_at ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m hexmap_io) good)))
+        ((-> (-> m hexmap_io) clear)))
     ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
     ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
     ((-> (-> m hexmap_io) write_std_ubyte) DATA_STANDALONE_CHUNK))
@@ -851,12 +863,20 @@
   (func full_hexmap ((Memory * m) (const Pointer * p)) (out void)
     (let ((int64_t hex_address . #'(ptr_hexmap_data p))
           (int64_t count . #'(ptr_data_count p)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
       ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
       ((-> (-> m hexmap_io) write_std_ubyte)
        (cast uint8_t (+ DATA_STANDALONE_CHUNK (% (-> p size) CHUNK_SIZE))))))
 
   (func free_hexmap ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m hexmap_io) good)))
+        ((-> (-> m hexmap_io) clear)))
     ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
     ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char FREE_CHUNK))
     ((-> (-> m hexmap_io) write_std_ubyte) FREE_STANDALONE_CHUNK))
@@ -981,6 +1001,10 @@
     (full_hexmap_at m (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
     (free_hexmap m (+ (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
                  (- (-> m hbpp) PAGEFILE_CONTROL_COUNT))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) address std::ios::beg)
     ((-> (-> m data_io) write) (cast (char *) key) HASHKEY_SIZE)
     ((-> (-> m data_io) fill_n) (cast size_t (- (-> m page_size) HASHKEY_SIZE)) (cast char 0)))
@@ -998,6 +1022,10 @@
               (set (-> e key) (intern_key key))
               (return (-> e address))))
         (set e (-> e next))))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) 0 std::ios::end)
     (let ((int64_t start . #'((-> (-> m data_io) tellp))))
       (allocate_page m key start)
@@ -1125,6 +1153,10 @@
       (pthread_mutex_lock (aof (-> m page_list_access)))
       (pthread_mutex_lock (aof (-> m free_list_access)))
 
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) from std::ios::beg)
       ((-> (-> m hexmap_io) seekg) from std::ios::beg)
       (let ((int64_t prev_count . #'(free_prev_count m)))
@@ -1189,6 +1221,10 @@
 
   (func write_transaction ((Memory * m) (size_t transaction_id) (time_t commit_time)) (out void)
     (let ((Transaction * t . #'(txn)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> t pointer))) std::ios::beg)
       ((-> (-> m data_io) write_std_size) (cast size_t transaction_id))
       ((-> (-> m data_io) write_std_time) (cast time_t commit_time))))
@@ -2008,6 +2044,10 @@
       (transaction_push m (aof (-> obj pointer)))
       (control_insert m obj)
       (full_hexmap m (aof (-> obj pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
       ((-> obj pack) (cof (-> m data_io)))
       ((-> obj map) (cast (void *) m))
@@ -2025,6 +2065,10 @@
       (transaction_push m (aof (-> new_obj pointer)))
       (control_update m old_obj new_obj (aof streams))
       (full_hexmap m (aof (-> new_obj pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> new_obj pointer))) std::ios::beg)
       ((-> new_obj pack) (cof (-> m data_io)))
       ((-> old_obj unmap) (cast (void *) m))
@@ -2048,16 +2092,28 @@
   (func offline_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
     (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
     (dba_watch1 m "Offline Insert" ($ (-> obj pointer) address))
+    ;; THE DATA LANDS BEFORE THE ALLOCATION IS MARKED. The old order flushed
+    ;; the hexmap marking first, so a process that died between the two
+    ;; flushes left an ALLOCATED record whose bytes were never written --
+    ;; zeros, which for a node decode as a keys head of 0: the torn link
+    ;; the C++ twin measured twice. The payload and the control block both
+    ;; live in the data file, so they land together under ONE flush before
+    ;; the hexmap marking goes durable: a death before the marking leaves
+    ;; bytes nothing points at, a death after it a complete record.
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
+    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+    ((-> obj pack) (cof (-> m data_io)))
     (let ((Control control))
       (control_clear (aof control))
       (set ($ control offline_state) ROW_INSERTED)
       (set ($ control create_time) (version_time))
       (dump_control m (aof (-> obj pointer)) (aof control)))
+    ((-> (-> m data_io) flush))
     (full_hexmap m (aof (-> obj pointer)))
-    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
-    ((-> obj pack) (cof (-> m data_io)))
-    ((-> (-> m hexmap_io) flush))
-    ((-> (-> m data_io) flush)))
+    ((-> (-> m hexmap_io) flush)))
 
   (func offline_update ((Memory * m) (BaseTable * obj)) (out void)
     (dba_watch1 m "Offline Update" ($ (-> obj pointer) address))
@@ -2066,6 +2122,10 @@
       (load_control m (aof (-> obj pointer)) (aof control))
       (set ($ control modify_time) (version_time))
       (dump_control m (aof (-> obj pointer)) (aof control)))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
     ((-> obj pack) (cof (-> m data_io)))
     ((-> (-> m hexmap_io) flush))
@@ -2248,8 +2308,27 @@
             (try
               (block
             (while (< begin_address end_address)
-              (let ((Pointer pointer . #'(pointer_at_state m (-> e key) begin_address
-                                            (aof is_data) (aof online_state) (aof online_lock))))
+              ;; FREE OR RECORD IS DECIDED FROM THE FIRST HEXMAP BYTE, before
+              ;; any parsing. pointer_at_state seeks CONTROL_COUNT bytes in
+              ;; and measures what follows -- right for a record, and a read
+              ;; straight through a SHORT free run into the record behind it.
+              ;; The C++ twin measured that as the walk going one phase out
+              ;; of step and rolling back live rows. A record's first chunk
+              ;; is a control chunk and always carries the high bit; a free
+              ;; chunk never does. One byte decides.
+              (let ((uint8_t head_byte . 0)
+                    (binarystream * hio . #'(hex_in m)))
+                ((-> hio seekg) (addr_hexmap begin_address) std::ios::beg)
+                ((-> hio read_std_ubyte) head_byte)
+                (if (not ((-> hio good)))
+                    (block
+                      ((-> hio clear))
+                      break))
+                (set is_data (== (bitand head_byte 128) 128)))
+              (let ((Pointer pointer . #'(pointer_null)))
+                (if is_data
+                    (set pointer (pointer_at_state m (-> e key) begin_address
+                                    (aof is_data) (aof online_state) (aof online_lock))))
                 (if is_data
                     (block
                       (if (!= online_lock LOCK_NONE)
@@ -2600,6 +2679,10 @@
       (control_insert m (cast (BaseTable *) (aof v)))
 
       (full_hexmap m (aof ($ v pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof ($ v pointer))) std::ios::beg)
       (($ v pack) (cof (-> m data_io)))
 
@@ -3335,6 +3418,10 @@
             (int64_t brent_mark . -2)
             (int64_t brent_steps . 0)
             (int64_t brent_limit . 2))
+        ;; an all-zero node is a torn offline insert's shape: degree 0 with
+        ;; a keys head of 0, which no real node writes -- an empty head is -1
+        (if (and (== tmp 0) (== ($ node degree) 0))
+            (set tmp -1))
         (while (> tmp -1)
           (if (not (chain_resolves (-> idx m) tmp)) break)
           (if (== tmp brent_mark) break)
