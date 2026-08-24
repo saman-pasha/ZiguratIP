@@ -974,6 +974,16 @@ namespace Zigurat
 	throw MemoryException("hexmap ends inside the chunk at " + std::to_string(address));
       }
 
+      // Every chunk of a record is a DATA chunk -- the high bit is set on all
+      // of them, standalone or not. A byte without it is free space, and free
+      // space is where a torn chain link points: without this the walk reads
+      // the hexmap one free byte at a time to its end (a FREE_STANDALONE byte
+      // even "ends" it with a bogus pointer), which measured as the vacuum
+      // spinning forever at address 0 with the whole server queued behind its
+      // exclusive guard.
+      if ( (hex_byte & (uint8_t)128) != 128)
+	throw MemoryException("the chunk at " + std::to_string(address) + " is not an allocated record -- a torn link");
+
       if ( (hex_byte & (uint8_t)64) == 64) { // last chunk is standalone
 	return Pointer(hash_key, address, size + _size_remainder(hex_byte));
       }
@@ -984,6 +994,28 @@ namespace Zigurat
   Pointer Memory::_pointer(hashkey_ptr hash_key, const Long& address)
   {
     return this->_pointer(hash_key, address.value());
+  }
+
+  // Whether ADDRESS names an allocated record: its first hexmap byte carries
+  // the DATA bit. A chain walk asks this before following a link, because a
+  // torn chain edit -- one the process died inside of -- reads as whatever
+  // bytes landed: NULL ended chains before (see the walks in btreeindex.hpp),
+  // and a ZERO arrives here, a "valid" address that in practice points at
+  // free space. One such link sent the vacuum's walk spinning at address 0
+  // with the server queued behind its exclusive guard until it was killed.
+  bool Memory::_chain_resolves(int64_t address)
+  {
+    if (address < 0) return false;
+
+    binarystream& hin = this->_hex_in();
+    if (!hin.good()) hin.clear();
+    hin.seekg(this->_pointer_hexmap_data_address(address), std::ios::beg);
+
+    uint8_t hex_byte = 0;
+    hin.read_std_ubyte(hex_byte);
+    if (!hin.good()) { hin.clear(); return false; }
+
+    return (hex_byte & (uint8_t)128) == 128;
   }
 
   Pointer Memory::_pointer(hashkey_ptr hash_key, int64_t address, bool& is_data)

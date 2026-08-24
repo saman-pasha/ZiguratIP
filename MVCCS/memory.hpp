@@ -387,6 +387,11 @@ namespace Zigurat
     int64_t _pointer_hexmap_data_address(int64_t);
     int64_t _pointer_data_address(int64_t);
 
+    // Whether ADDRESS names an allocated record, asked by a chain walk before
+    // it follows a link there -- a torn chain edit can leave a link pointing
+    // at free space, and _pointer on such an address is an error, not an answer.
+    bool _chain_resolves(int64_t);
+
     int64_t _pointer_data_count(const Pointer&);
     int64_t _pointer_actual_count(const Pointer&);
     int64_t _pointer_round_size(const Pointer&);

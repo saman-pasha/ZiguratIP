@@ -891,10 +891,36 @@
             (block
               ((-> hio clear))
               (throw* (MemoryException "hexmap ends inside the chunk"))))
+        ;; Every chunk of a record is a DATA chunk: the high bit is set on
+        ;; all of them, standalone or not. A byte without it is free space,
+        ;; which is where a torn chain link points -- walked naively that is
+        ;; the hexmap read one free byte at a time to its end, and the C++
+        ;; twin measured exactly that as a vacuum spinning forever.
+        (if (!= (bitand hex_byte 128) 128)
+            (throw* (MemoryException "the chunk is not an allocated record -- a torn link")))
         (if (== (bitand hex_byte 64) 64)
             (return (pointer_make key address (+ size (size_remainder hex_byte)))))
         (set size (+ size CHUNK_SIZE)))
       (return (pointer_null))))
+
+  ;; Whether ADDRESS names an allocated record: its first hexmap byte carries
+  ;; the DATA bit. A chain walk asks this before following a link, because a
+  ;; torn chain edit -- one the process died inside of -- can land as a ZERO,
+  ;; a "valid" address that in practice points at free space. One such link
+  ;; sent the C++ vacuum's walk spinning at address 0 with the whole server
+  ;; queued behind its exclusive guard; the walks in both engines now end a
+  ;; chain at an unresolvable link exactly as they end it at -1.
+  (func chain_resolves ((Memory * m) (int64_t address)) (out bool)
+    (if (< address 0) (return #f))
+    (let ((uint8_t hex_byte . 0)
+          (binarystream * hio . #'(hex_in m)))
+      ((-> hio seekg) (addr_hexmap_data address) std::ios::beg)
+      ((-> hio read_std_ubyte) hex_byte)
+      (if (not ((-> hio good)))
+          (block
+            ((-> hio clear))
+            (return #f)))
+      (return (== (bitand hex_byte 128) 128))))
 
   ;; the startup variant that also answers is-data and the online flags
   (func pointer_at_state ((Memory * m) (const uint8_t * key) (int64_t address)
@@ -2596,8 +2622,25 @@
         (out void)
     (let ((Memory * m . #'(-> idx m))
           (int64_t counter . -1)
-          (int64_t tmp . #'(-> key values_address)))
+          (int64_t tmp . #'(-> key values_address))
+          ;; Brent's cycle check, in three integers: remember a mark, double
+          ;; the distance each time it is moved, and a link that comes back
+          ;; to the mark is a chain pointing into itself -- a torn edit's
+          ;; other shape, which chain_resolves cannot see because every
+          ;; record in the loop is genuinely allocated.
+          (int64_t brent_mark . -2)
+          (int64_t brent_steps . 0)
+          (int64_t brent_limit . 2))
       (while (> tmp -1)
+        ;; an unresolvable or revisited link ends the chain exactly as -1 does
+        (if (not (chain_resolves m tmp)) break)
+        (if (== tmp brent_mark) break)
+        (set brent_steps (+ brent_steps 1))
+        (if (== brent_steps brent_limit)
+            (block
+              (set brent_mark tmp)
+              (set brent_steps 0)
+              (set brent_limit (* brent_limit 2))))
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v))
           ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
@@ -3058,6 +3101,11 @@
     (let ((Memory * m . #'(-> idx m))
           (int64_t tmp . #'(-> key values_address)))
       (while (> tmp -1)
+        ;; An unresolvable link ends the chain exactly as -1 does. This is
+        ;; also what makes the walk safe against a chain that points back
+        ;; into itself: freeing marks the chunks FREE, so a link that comes
+        ;; around again stops resolving before it can be freed twice.
+        (if (not (chain_resolves m tmp)) break)
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v))
           ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
@@ -3698,8 +3746,22 @@
     (let ((Memory * m . #'(-> idx m))
           (BTValue previous)
           (int has_previous . 0)
-          (int64_t tmp . #'(-> key values_address)))
+          (int64_t tmp . #'(-> key values_address))
+          ;; the same Brent's cycle check as the values walk: this is the
+          ;; walk the C++ vacuum was measured spinning in
+          (int64_t brent_mark . -2)
+          (int64_t brent_steps . 0)
+          (int64_t brent_limit . 2))
       (while (> tmp -1)
+        ;; an unresolvable or revisited link ends the chain exactly as -1 does
+        (if (not (chain_resolves m tmp)) break)
+        (if (== tmp brent_mark) break)
+        (set brent_steps (+ brent_steps 1))
+        (if (== brent_steps brent_limit)
+            (block
+              (set brent_mark tmp)
+              (set brent_steps 0)
+              (set brent_limit (* brent_limit 2))))
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v)
               (Control control))
