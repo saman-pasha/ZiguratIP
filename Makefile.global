@@ -109,6 +109,16 @@ else ifeq ($(OS),Darwin)
 	# unresolved symbols at link time; Mach-O does not unless asked to.
 	ifeq ($(TYPE),Library)
 		LDFLAGS := $(LDFLAGS) -Wl,-undefined,dynamic_lookup
+		# Mach-O stamps a library's install name -- by default its -o path,
+		# here the relative ../home/lib/libX.so -- into every binary linked
+		# against it, and dyld then resolves that string against the
+		# process's working directory, never the rpath. An @rpath install
+		# name defers instead to the rpath of whatever loaded it: the
+		# home/bin executables carry theirs below, and outside consumers
+		# (cocolog) bake the absolute home/lib at their own link.
+		LDFLAGS := $(LDFLAGS) -Wl,-install_name,@rpath/lib$(PROJECT).so
+	else
+		LDFLAGS := $(LDFLAGS) -Wl,-rpath,@executable_path/../lib
 	endif
 endif
 
