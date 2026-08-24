@@ -4,6 +4,7 @@
 
 
 #include <cstdint>
+#include <type_traits>
 #include "typeobject.hpp"
 
 namespace Zigurat
@@ -31,6 +32,16 @@ namespace Zigurat
     ULong(const int&);
     ULong(unsigned int&&);
     ULong(const unsigned int&);
+    // Every remaining plain integral, exactly. uint64_t is `unsigned
+    // long' on LP64 Linux and `unsigned long long' on macOS, so a
+    // size_t, a 0ul literal or a strlen() matches no fixed-type
+    // constructor on one platform or the other and drowns ambiguously
+    // among equal-rank conversions instead. A constrained template is
+    // an exact match wherever it is needed, and loses to the
+    // non-template constructors everywhere it is not.
+    template <typename T,
+              typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    ULong(T v) : ULong(static_cast<uint64_t>(v)) {}
     ULong(Int&&);
     ULong(const Int&);
     ULong(UInt&&);
