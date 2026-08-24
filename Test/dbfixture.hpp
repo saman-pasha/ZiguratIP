@@ -88,6 +88,11 @@ namespace Zigurat
 
       if (hexmap.good() && data.good()) {
 	memory = new Memory(hexmap, data, 8192);
+	// Parallel reads on, as the server runs it: eligible cursors take the
+	// streams guard shared and read through per-thread streams, so the
+	// whole suite exercises the shared side and not just the exclusive
+	// shape it grew up on.
+	memory->reader_paths(hexmap_path, data_path);
 	Globals::set_memory_hexmap_stream(&hexmap);
 	Globals::set_memory_data_stream(&data);
 	Globals::set_memory(memory);

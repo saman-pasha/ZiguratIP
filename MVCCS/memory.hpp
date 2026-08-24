@@ -19,6 +19,8 @@
 #include <list>
 #include <mutex>
 #include <unordered_set>
+#include <pthread.h>
+#include <atomic>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -177,13 +179,19 @@ namespace Zigurat
     class Streams
     {
     private:
-      lock_t _hexmap;
-      lock_t _data;
-      bool   _mine;
+      Memory* _memory;
+      bool    _mine;
+      bool    _locked;
+      // Held SHARED: this guard took the read side of the lock, and every
+      // read this thread makes while it stands goes through the thread's own
+      // private streams -- see _hex_in and _data_in.
+      bool    _shared;
 
-      // The guard holding the streams on this thread, or null. Published on
-      // lock and withdrawn on unlock, so it never claims a hold that has
-      // already been handed back.
+      // The guard holding the streams EXCLUSIVELY on this thread, or null.
+      // Published on lock and withdrawn on unlock, so it never claims a hold
+      // that has already been handed back. A shared hold is tracked in
+      // _tl_read_mode instead, because a shared guard owns no exclusivity to
+      // pass down.
       static thread_local Streams* _held;
 
     public:
@@ -206,7 +214,51 @@ namespace Zigurat
       static Streams* held();
     };
 
+    // ---- the shared read side ----------------------------------------------
+    //
+    // Handing the engine the two store file paths is what turns it on: a
+    // cursor whose isolation writes nothing (READ UNCOMMITTED, READ
+    // COMMITTED, SNAPSHOT) then takes the streams guard SHARED and reads
+    // through the thread's own private streams, concurrently with every
+    // other such reader. REPEATABLE READ and SERIALIZABLE cursors -- which
+    // stamp shared row locks as they scan -- and every writer take it
+    // exclusive, exactly as before: the lock mode follows the level. Ported
+    // from the Cicili engine, where it ran the twelve-worker choreography
+    // three times faster; empty paths mean every guard is exclusive, the
+    // shape this engine always had.
+    void reader_paths(const std::string& hexmap_path, const std::string& data_path);
+
   private:
+    pthread_rwlock_t _streams_rw;
+    std::string _rd_hex_path;
+    std::string _rd_data_path;
+
+    // Nonzero while this thread holds the guard SHARED.
+    static thread_local int _tl_read_mode;
+    // The thread's private read-only streams, opened lazily from the reader
+    // paths and kept for the thread's life -- WITH the store they belong to:
+    // the epoch stamps which reader_paths() call opened them, so a thread
+    // whose streams were opened on an earlier store (the test suite hops
+    // between stores; the server never does) reopens on the current one
+    // instead of reading a file that is gone.
+    static std::atomic<uint64_t> _reader_epoch;
+    uint64_t _reader_stamp = 0;
+    static thread_local uint64_t _tl_rd_epoch;
+    static thread_local binarystream* _tl_rd_hex;
+    static thread_local binarystream* _tl_rd_data;
+    // The next Streams constructed on this thread would LIKE to be shared;
+    // the constructor consumes the flag and grants it only when it is safe.
+    static thread_local int _tl_want_shared;
+
+    bool _reader_eligible();
+    void _reader_ensure();
+    // Which stream a READ goes through: the thread's private one under a
+    // shared guard, the canonical one everywhere else -- above all under a
+    // write guard, where the canonical stream is the only place this
+    // thread's own unflushed bytes can be read back from.
+    binarystream& _hex_in();
+    binarystream& _data_in();
+
     binarystream& _hexmap_io;
     binarystream& _data_io;
     binarystream* _watcher = nullptr;
@@ -218,8 +270,6 @@ namespace Zigurat
     std::multimap<hashkey_ptr, int64_t, HashKeyComparer> _page_list;
     std::multimap<hashkey_ptr, Pointer, HashKeyComparer> _free_list;
 
-    std::mutex _hexmap_access;
-    std::mutex _data_access;
 
     std::mutex _page_list_access;
     std::mutex _free_list_access;
@@ -573,7 +623,9 @@ namespace Zigurat
     if (this->_watcher) {
       this->dba_watch("Cursor: (" + T::name + ")");
     }
-    
+
+    // Shared when the isolation writes nothing; the constructor decides.
+    Memory::_tl_want_shared = 1;
     Streams streams(this);
 
     // _cursor hands the streams back before it calls this, so reading the row
@@ -585,8 +637,10 @@ namespace Zigurat
 
 	streams.lock();
 
-	this->_data_io.seekg(this->_pointer_data_address(object.pointer), std::ios::beg);
-	this->_data_io >> object;
+	binarystream& din = this->_data_in();
+	if (!din.good()) din.clear();
+	din.seekg(this->_pointer_data_address(object.pointer), std::ios::beg);
+	din >> object;
 
 	streams.unlock();
 

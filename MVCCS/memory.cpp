@@ -2,6 +2,7 @@
 #include <vector>
 #include "memory.hpp"
 #include "memoryexception.hpp"
+#include "filestream.hpp"
 #include <cmath>
 #include <thread>
 #include <chrono>
@@ -100,15 +101,93 @@ namespace Zigurat
 
   thread_local Memory::Streams* Memory::Streams::_held = nullptr;
 
+  // ---- the shared read side ------------------------------------------------
+  // What it is for is in memory.hpp, above reader_paths. Ported from the
+  // Cicili engine; the shapes and the reasons are its, line for line.
+
+  thread_local int Memory::_tl_read_mode = 0;
+  std::atomic<uint64_t> Memory::_reader_epoch(0);
+  thread_local uint64_t Memory::_tl_rd_epoch = 0;
+  thread_local binarystream* Memory::_tl_rd_hex = nullptr;
+  thread_local binarystream* Memory::_tl_rd_data = nullptr;
+  thread_local int Memory::_tl_want_shared = 0;
+
+  void Memory::reader_paths(const std::string& hexmap_path, const std::string& data_path)
+  {
+    this->_rd_hex_path = hexmap_path;
+    this->_rd_data_path = data_path;
+    this->_reader_stamp = ++Memory::_reader_epoch;
+  }
+
+  // A shared guard is granted only to a read whose isolation writes nothing:
+  // REPEATABLE READ and SERIALIZABLE stamp shared row locks as they scan --
+  // the lesson of the reverted first attempt at this -- so the lock mode
+  // follows the level.
+  bool Memory::_reader_eligible()
+  {
+    if (!this->_initialized) return false;
+    if (this->_rd_hex_path.empty()) return false;
+    const IsolationLevel level = Memory::transaction.isolation_level();
+    if (level == IsolationLevel::REPEATABLE_READ || level == IsolationLevel::SERIALIZABLE)
+      return false;
+    return true;
+  }
+
+  void Memory::_reader_ensure()
+  {
+    if (Memory::_tl_rd_hex != nullptr && Memory::_tl_rd_epoch == this->_reader_stamp)
+      return;
+    delete Memory::_tl_rd_hex;
+    delete Memory::_tl_rd_data;
+    Memory::_tl_rd_hex = new Zigurat::filestream(this->_rd_hex_path, std::ios::in);
+    Memory::_tl_rd_data = new Zigurat::filestream(this->_rd_data_path, std::ios::in);
+    Memory::_tl_rd_epoch = this->_reader_stamp;
+  }
+
+  binarystream& Memory::_hex_in()
+  {
+    if (Memory::_tl_read_mode == 0 || Memory::Streams::held() != nullptr)
+      return this->_hexmap_io;
+    this->_reader_ensure();
+    return *Memory::_tl_rd_hex;
+  }
+
+  binarystream& Memory::_data_in()
+  {
+    if (Memory::_tl_read_mode == 0 || Memory::Streams::held() != nullptr)
+      return this->_data_io;
+    this->_reader_ensure();
+    return *Memory::_tl_rd_data;
+  }
+
   // Built deferred and then locked through lock(), so that publishing happens
   // in exactly one place. A guard on a thread that is already holding them owns
   // nothing at all: it never locks, never unlocks, and never publishes, so the
-  // real holder's state is left alone.
+  // real holder's state is left alone. The constructor consumes the
+  // want-shared flag and grants it only to the outermost guard of an eligible
+  // reader; a write guard wanted under a shared hold is trapped in lock()
+  // rather than deadlocking on the rwlock.
   Memory::Streams::Streams(Memory* memory)
-    : _hexmap(memory->_hexmap_access, std::defer_lock),
-      _data(memory->_data_access, std::defer_lock),
-      _mine(_held == nullptr)
+    : _memory(memory),
+      _mine(false),
+      _locked(false),
+      _shared(false)
   {
+    const int want = Memory::_tl_want_shared;
+    Memory::_tl_want_shared = 0;
+
+    if (_held != nullptr) {
+      this->_mine = false;                    // nested under a write hold: no-op
+    } else if (Memory::_tl_read_mode == 1) {
+      this->_mine = (want != 1);              // nested under a shared hold: no-op
+                                              // -- unless a WRITE is wanted,
+                                              // which lock() surfaces as a bug
+    } else {
+      this->_mine = true;                     // outermost
+      if (want == 1 && memory->_reader_eligible())
+	this->_shared = true;
+    }
+
     this->lock();
   }
 
@@ -124,26 +203,41 @@ namespace Zigurat
 
   void Memory::Streams::lock()
   {
-    if (!this->_mine || this->_hexmap.owns_lock()) return;
+    if (!this->_mine || this->_locked) return;
 
-    // Always hexmap then data. Every site in the engine takes them in this
-    // order, which is why two mutexes never deadlock against each other.
-    this->_hexmap.lock();
-    this->_data.lock();
-    _held = this;
+    if (this->_shared) {
+      pthread_rwlock_rdlock(&this->_memory->_streams_rw);
+      Memory::_tl_read_mode = 1;
+    } else {
+      // A write guard under a held shared one would deadlock on the rwlock --
+      // surface the bug instead of wedging on it.
+      if (Memory::_tl_read_mode == 1)
+	throw MemoryException("an exclusive streams guard under a shared one");
+      pthread_rwlock_wrlock(&this->_memory->_streams_rw);
+      _held = this;
+    }
+    this->_locked = true;
   }
 
   void Memory::Streams::unlock()
   {
-    if (!this->_mine || !this->_hexmap.owns_lock()) return;
+    if (!this->_mine || !this->_locked) return;
 
-    // WITHDRAWN BEFORE RELEASING, not after. Between the two the streams are
-    // still held but no longer claimed, which is harmless; the other order
-    // would leave a window where this thread claims a hold it has given up,
-    // and anything nesting in that window would run unguarded.
-    _held = nullptr;
-    this->_data.unlock();
-    this->_hexmap.unlock();
+    if (this->_shared) {
+      // WITHDRAWN BEFORE RELEASING: never claim a hold already given back.
+      Memory::_tl_read_mode = 0;
+      this->_locked = false;
+      pthread_rwlock_unlock(&this->_memory->_streams_rw);
+    } else {
+      // Every write is in the FILE before the guard is released, or a private
+      // reader taken the next instant would miss the bytes still sitting in
+      // the canonical streams' buffers.
+      this->_memory->_hexmap_io.flush();
+      this->_memory->_data_io.flush();
+      _held = nullptr;
+      this->_locked = false;
+      pthread_rwlock_unlock(&this->_memory->_streams_rw);
+    }
   }
 
   Memory::Streams* Memory::Streams::held()
@@ -217,6 +311,19 @@ namespace Zigurat
   Memory::Memory(binarystream& hexmap_io, binarystream& data_io, int64_t page_size)
     : _hexmap_io(hexmap_io), _data_io(data_io), _page_size(page_size), _hbpp(page_size / CHUNK_SIZE)
   {
+    // Writer-preferring, or a steady stream of readers starves every writer:
+    // with the default policy a commit could wait behind readers indefinitely
+    // while new readers kept joining ahead of it.
+    {
+      pthread_rwlockattr_t rwa;
+      pthread_rwlockattr_init(&rwa);
+#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+      pthread_rwlockattr_setkind_np(&rwa, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+      pthread_rwlock_init(&this->_streams_rw, &rwa);
+      pthread_rwlockattr_destroy(&rwa);
+    }
+
     this->_data_io.seekg(0, std::ios::end);
     this->_page_count = std::floor((double)this->_data_io.tellg() / this->_page_size);
     this->_data_io.clear();
@@ -390,25 +497,34 @@ namespace Zigurat
     uint8_t online_hexmap = 0;
     uint8_t offline_hexmap = 0;
 
-    this->_hexmap_io.seekg(this->_pointer_hexmap_address(pointer), std::ios::beg);
+    // Through the read accessors, because a shared-guard reader judges rows
+    // through this function too -- and a stream a failed read has poisoned
+    // answers nothing until it is cleared, which for a thread's PRIVATE
+    // stream would turn every later judgment on that thread into garbage.
+    binarystream& hin = this->_hex_in();
+    binarystream& din = this->_data_in();
+    if (!hin.good()) hin.clear();
+    if (!din.good()) din.clear();
 
-    this->_hexmap_io.read_std_ubyte(online_hexmap);
-    this->_hexmap_io.read_std_ubyte(offline_hexmap);
-    this->_hexmap_io.read_std_ubyte();
-    
+    hin.seekg(this->_pointer_hexmap_address(pointer), std::ios::beg);
+
+    hin.read_std_ubyte(online_hexmap);
+    hin.read_std_ubyte(offline_hexmap);
+    hin.read_std_ubyte();
+
     control.online_state = (RowState)(online_hexmap & (uint8_t)12);
     control.online_lock = (RowLock)(online_hexmap & (uint8_t)3);
     control.offline_state = (RowState)(offline_hexmap & (uint8_t)12);
     control.offline_lock = (RowLock)(offline_hexmap & (uint8_t)3);
-    
-    this->_data_io.seekg(pointer.address, std::ios::beg);
 
-    this->_data_io.read_std_time(control.online_time);
-    this->_data_io.read_std_size(control.transaction_id);
-    this->_data_io.read_std_long(control.query_id);
-    this->_data_io.read_std_long(control.reference_address);
-    this->_data_io.read_std_time(control.modify_time);
-    this->_data_io.read_std_time(control.create_time);
+    din.seekg(pointer.address, std::ios::beg);
+
+    din.read_std_time(control.online_time);
+    din.read_std_size(control.transaction_id);
+    din.read_std_long(control.query_id);
+    din.read_std_long(control.reference_address);
+    din.read_std_time(control.modify_time);
+    din.read_std_time(control.create_time);
   }
 
   void Memory::_full_hexmap(int64_t address, int64_t count)
@@ -840,16 +956,21 @@ namespace Zigurat
     uint8_t hex_byte = 0;
     int64_t size = 0;
 
-    this->_hexmap_io.seekg(this->_pointer_hexmap_data_address(address), std::ios::beg);
+    // Through the read accessor: index lookups resolve pointers through this
+    // while a shared-guard cursor may be doing the same on another thread.
+    binarystream& hin = this->_hex_in();
+    if (!hin.good()) hin.clear();
+
+    hin.seekg(this->_pointer_hexmap_data_address(address), std::ios::beg);
 
     do {
-      this->_hexmap_io.read_std_ubyte(hex_byte);
+      hin.read_std_ubyte(hex_byte);
 
       // Reading past the end of the hexmap leaves the stream in a failed state
       // and every further read a no-op, so without this the loop spins forever
       // on a truncated or empty store rather than reporting the problem.
-      if (!this->_hexmap_io.good()) {
-	this->_hexmap_io.clear();
+      if (!hin.good()) {
+	hin.clear();
 	throw MemoryException("hexmap ends inside the chunk at " + std::to_string(address));
       }
 
@@ -924,13 +1045,16 @@ namespace Zigurat
   {
     uint8_t hex_byte = 0;
 
-    this->_hexmap_io.seekg(this->_pointer_hexmap_address(pointer.address), std::ios::beg);
+    binarystream& hin = this->_hex_in();
+    if (!hin.good()) hin.clear();
 
-    this->_hexmap_io.read_std_ubyte(hex_byte);
+    hin.seekg(this->_pointer_hexmap_address(pointer.address), std::ios::beg);
+
+    hin.read_std_ubyte(hex_byte);
     RowState online_state = (RowState)(hex_byte & (uint8_t)12);
     RowLock  online_lock  = (RowLock)(hex_byte & (uint8_t)3);
 
-    this->_hexmap_io.read_std_ubyte(hex_byte);
+    hin.read_std_ubyte(hex_byte);
     RowState offline_state = (RowState)(hex_byte & (uint8_t)12);
 
     Control control;
@@ -1253,13 +1377,35 @@ namespace Zigurat
     // so holding it for the length of the scan would deadlock against the first
     // callback that allocates a page. A page allocated after this copy is not
     // scanned, which is what a statement's fixed view means anyway.
+    // AND RE-COPIED UNTIL A PASS ADDS NOTHING. The callback below runs with
+    // the streams handed back, so a writer is free to commit rows into a page
+    // this table did not have when the copy above was taken -- and a shared
+    // guard widens that window to the whole scan. So the walk repeats over
+    // whatever pages are NEW since the last pass, until a pass finds none:
+    // the fixed point. Bounded, because a runaway committer must not be able
+    // to hold a scan open forever. Ported from the Cicili engine with the
+    // walk-length ager that taught it.
+    std::vector<int64_t> walked;
+    bool walk_done = false;
+    int rounds = 0;
+
+    while (!walk_done && rounds < 16) {
+      rounds++;
+
     std::vector<std::pair<hashkey_ptr, int64_t> > pages;
     {
       std::lock_guard<std::mutex> page_list_lock(this->_page_list_access);
       auto pair_iter = this->_page_list.equal_range(hash_key);
-      for (auto iter = pair_iter.first; iter != pair_iter.second; iter++)
-	pages.push_back(std::make_pair(iter->first, iter->second));
+      for (auto iter = pair_iter.first; iter != pair_iter.second; iter++) {
+	bool seen = false;
+	for (size_t w = 0; w < walked.size(); w++)
+	  if (walked[w] == iter->second) { seen = true; break; }
+	if (!seen)
+	  pages.push_back(std::make_pair(iter->first, iter->second));
+      }
     }
+
+    if (pages.empty()) { walk_done = true; break; }
 
     for (size_t page_n = 0; page_n < pages.size(); page_n++) {
 
@@ -1267,26 +1413,31 @@ namespace Zigurat
       int64_t page_address = pages[page_n].second;
       int64_t i = PAGEFILE_CONTROL_COUNT;
 
+      walked.push_back(page_address);
+
+      binarystream& hin = this->_hex_in();
+      if (!hin.good()) hin.clear();
+
       while (i < this->_hbpp) {
 
 	hexmap_address = this->_pointer_hexmap_address(page_address) + i;
 	pointer_address = hexmap_address * CHUNK_SIZE;
 
-	this->_hexmap_io.seekg(hexmap_address, std::ios::beg);
-	
-	this->_hexmap_io.read_std_ubyte(hex_byte);
+	hin.seekg(hexmap_address, std::ios::beg);
+
+	hin.read_std_ubyte(hex_byte);
 	online_state = (RowState)(hex_byte & (uint8_t)12);
 	online_lock = (RowLock)(hex_byte & (uint8_t)3);
 
-	this->_hexmap_io.read_std_ubyte(hex_byte);
+	hin.read_std_ubyte(hex_byte);
 	offline_state = (RowState)(hex_byte & (uint8_t)12);
 
-	this->_hexmap_io.seekg(CONTROL_COUNT - 2, std::ios::cur);
+	hin.seekg(CONTROL_COUNT - 2, std::ios::cur);
 
 	i += CONTROL_COUNT;
 	for (int64_t pointer_size = 0 ; i < this->_hbpp; pointer_size += CHUNK_SIZE) {
 
-	  this->_hexmap_io.read_std_ubyte(hex_byte);
+	  hin.read_std_ubyte(hex_byte);
 	  i++;
 	  
 	  if ( hex_byte != CONTROL_STANDALONE_CHUNK && (hex_byte & (uint8_t)64) == 64 ) { // last chunk is standalone
@@ -1425,6 +1576,7 @@ namespace Zigurat
 	} // for
       } // while
     }// for pages
+    }// while !walk_done -- the fixed point
 
     --cursor_id;
   }
