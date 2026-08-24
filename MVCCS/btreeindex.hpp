@@ -19,6 +19,8 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <unordered_set>
+#include <cstdio>
 
 namespace Zigurat
 {
@@ -420,15 +422,35 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_cursor_keys(BTreeNode& node, std::function<bool (int16_t, BTreeKey<_First>&)>&& callback)
   {
+    // The key chain gets the same torn-link rules as the value chains below:
+    // NULL, an address that does not resolve to an allocated record, and an
+    // address already walked all end the chain exactly as -1 does. A key
+    // chain is edited in place exactly as a value chain is, so it can tear
+    // exactly the same way -- and this walk is under every cursor and every
+    // truncate, where a torn link used to surface as a refusal (or, before
+    // the _pointer guard, a spin).
     Long tmp_address = node.keys_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    // An all-zero node is what a torn _offline_insert used to leave (the
+    // hexmap marking landed, the bytes did not): degree 0 with keys_address
+    // 0, a shape no real node ever writes -- an empty node's head is -1.
+    // Address 0 can be a real record, so this is judged by the pair, not
+    // the zero alone.
+    if (tmp_address.value() == 0 && node.degree.value() == 0) tmp_address = (int64_t)-1;
+    std::unordered_set<int64_t> walked;
     int16_t counter = 0;
     while (tmp_address.value() > -1) {
+
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       BTreeKey<_First> key;
       key.pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
       this->_memory->_offline_select(key);
 
+
       tmp_address = key.right_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       if ( !callback(counter, key) )
 	break;
@@ -451,9 +473,18 @@ namespace Zigurat
   void BTreeIndex<_Table, _First>::_cursor_values(const BTreeKey<_First>& key, std::function<bool (int64_t, BTreeValue&)>&& callback)
   {
     int64_t counter = -1;
+    // The same torn-link rules as the truncate walks below: NULL, an address
+    // that does not resolve to an allocated record, and an address already
+    // walked all end the chain exactly as -1 does. This walk is every index
+    // SELECT, so a torn link here was a reader spinning, not just a vacuum.
     Long tmp_address = key.values_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    std::unordered_set<int64_t> walked;
 
     while (tmp_address.value() > -1) {
+
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -462,6 +493,7 @@ namespace Zigurat
       this->_memory->_data_io >> value;
 
       tmp_address = value.next_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       // Asked after the record is read and the chain has been advanced, because
       // under SNAPSHOT the answer is an older version of it: the pointer moves,
@@ -899,9 +931,23 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_free_key_values(BTreeKey<_First>& key)
   {
+    // A NULL address in a value chain is a link that never finished landing --
+    // a stage abandoned mid-write, reachable once the lazy lock breaker
+    // settles such debris. Nothing lies beyond it: it ends the chain exactly
+    // as -1 does, rather than refusing the whole walk with `NULL value'. A
+    // torn link can also land as a ZERO -- a "valid" address pointing at free
+    // space -- or point back into the chain, and either walked naively is an
+    // infinite loop; an unresolvable or revisited address ends the chain the
+    // same way. Stopping at a revisit also keeps this walk from freeing a
+    // record twice.
     Long tmp_address = key.values_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    std::unordered_set<int64_t> walked;
 
     while (tmp_address.value() > -1) {
+
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -910,6 +956,7 @@ namespace Zigurat
       this->_memory->_data_io >> value;
 
       tmp_address = value.next_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       this->_memory->_free(pointer);
     }
@@ -927,9 +974,23 @@ namespace Zigurat
   {
     bool has_previous = false;
     BTreeValue previous;
+    // The same NULL-ends-the-chain rule as _free_key_values, and it was
+    // measured here first: one torn link in a machines-state chain made every
+    // `cocolog vacuum' refuse with `NULL value' until the store was thrown
+    // away, because the one walk that visits EVERY entry is this one. The
+    // ZERO shape was measured here too: a machines-id chain carried a torn
+    // link of 0, address 0's chunk was FREE, and this walk spun on it for
+    // minutes holding the streams guard exclusive -- the whole server queued
+    // behind one vacuum until it was killed. An unresolvable or revisited
+    // address now ends the chain exactly as NULL and -1 do.
     Long tmp_address = key.values_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    std::unordered_set<int64_t> walked;
 
     while (tmp_address.value() > -1) {
+
+      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
+      if (!walked.insert(tmp_address.value()).second) break;
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -939,6 +1000,7 @@ namespace Zigurat
       value.pointer = pointer;
 
       tmp_address = value.next_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       Control control;
       this->_memory->_load_control(pointer, control);
@@ -1224,6 +1286,15 @@ namespace Zigurat
     // key whose rows had been deleted.
     bool do_continue = true;
     this->_cursor_values(key, [&] (int64_t, BTreeValue& current_value) -> bool {
+
+	// A value that names a row which no longer resolves to an allocated
+	// record is debris of a torn edit: skip it and keep walking, the same
+	// tolerance the chain links themselves get. Refusing the whole cursor
+	// for one torn entry made every SELECT on the bucket an error.
+	if (current_value.value.is_null().value() ||
+	    !this->_memory->_chain_resolves(current_value.value.value())) {
+	  return true;
+	}
 
 	_Table object(this->_memory->_pointer(_Table::hash_key, current_value.value));
 

@@ -98,6 +98,20 @@ void load_memory(const Configuration &conf)
 				 *Globals::memory_data_stream(),
 				 memory_page_size));
 
+  // Parallel reads are THE DEFAULT: read-only cursors take the streams guard
+  // shared and read through per-thread streams instead of queueing on the one
+  // canonical pair. ZIGURATIP_PARALLEL_READS=0 keeps the exclusive guard, so
+  // one env var separates the two modes in any future bisect.
+  {
+    const char* par_reads = std::getenv("ZIGURATIP_PARALLEL_READS");
+    if (par_reads == nullptr || std::strcmp(par_reads, "0") != 0) {
+      Globals::memory()->reader_paths(hexmap_path, data_path);
+      std::cout << "Parallel reads: on" << std::endl;
+    } else {
+      std::cout << "Parallel reads: off (ZIGURATIP_PARALLEL_READS=0)" << std::endl;
+    }
+  }
+
   BTreeRecord::IDX_ZIGURAT_BTREERECORD_HASH_NAME = new BTreeIndex<BTreeRecord, String>
     (Globals::memory(), "IDX_ZIGURAT_BTREERECORD_HASH_NAME", true, BTreeRecord::hash_name);
 

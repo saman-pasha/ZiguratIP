@@ -292,6 +292,68 @@
 
   (thread-local) (var Transaction * tl_txn . nil)
 
+  ;; ---- the live-transaction registry ------------------------------
+  ;; Which transaction ids are between begin and commit-or-rollback
+  ;; right now, process-wide. A lock whose owner is not in here belongs
+  ;; to a transaction nothing will ever finish, and check_lock breaks
+  ;; it in place instead of waiting on a corpse until a restart's
+  ;; recovery would have swept it. What makes an id dead: commit and
+  ;; rollback retire it after every lock is cleared, and a process that
+  ;; dies takes its registry with it, so after the restart's recovery
+  ;; anything it left stamped reads as breakable. A begin on a thread
+  ;; whose transaction is still open CONTINUES it -- the id and its
+  ;; registration stand, see begin_transaction -- so an open
+  ;; transaction is never orphaned by beginning again.
+  ;; 512 slots holds one live transaction per thread plus every slot a
+  ;; thread abandoned and has not yet re-begun over -- far above any
+  ;; real thread count here. A full table would leave a live id
+  ;; unregistered and its locks breakable, so the headroom is the point.
+  (var pthread_mutex_t live_txn_access . PTHREAD_MUTEX_INITIALIZER)
+  (var size_t live_txn_ids [512])            ;; zero marks an empty slot
+  (thread-local) (var size_t tl_live_txn . 0)
+  (var size_t txn_id_base . 0)
+  (var size_t txn_id_serial . 0)
+
+  (func transaction_live ((size_t transaction_id)) (out bool)
+    (if (== transaction_id (cast size_t 0)) (return #f))
+    (let ((bool found . #f))
+      (pthread_mutex_lock (aof live_txn_access))
+      (let ((int i . 0))
+        (while (< i 512)
+          (if (== (nth i live_txn_ids) transaction_id)
+              (block (set found #t) (set i 512))
+            (set i (+ i 1)))))
+      (pthread_mutex_unlock (aof live_txn_access))
+      (return found)))
+
+  (func transaction_retire ((size_t transaction_id)) (out void)
+    (pthread_mutex_lock (aof live_txn_access))
+    (let ((int i . 0))
+      (while (< i 512)
+        (if (== (nth i live_txn_ids) transaction_id)
+            (set (nth i live_txn_ids) (cast size_t 0)))
+        (set i (+ i 1))))
+    (if (== tl_live_txn transaction_id) (set tl_live_txn (cast size_t 0)))
+    (pthread_mutex_unlock (aof live_txn_access)))
+
+  (func transaction_register ((size_t fresh_id)) (out void)
+    (pthread_mutex_lock (aof live_txn_access))
+    (let ((int i . 0))
+      ;; the thread's previous transaction, if it never ended, ends here
+      (if (!= tl_live_txn (cast size_t 0))
+          (block
+            (while (< i 512)
+              (if (== (nth i live_txn_ids) tl_live_txn)
+                  (set (nth i live_txn_ids) (cast size_t 0)))
+              (set i (+ i 1)))
+            (set i 0)))
+      (while (< i 512)
+        (if (== (nth i live_txn_ids) (cast size_t 0))
+            (block (set (nth i live_txn_ids) fresh_id) (set i 512))
+          (set i (+ i 1)))))
+    (set tl_live_txn fresh_id)
+    (pthread_mutex_unlock (aof live_txn_access)))
+
   (var IsolationLevel default_isolation_level . READ_COMMITTED)
 
   ;; ==================================================================
@@ -723,11 +785,19 @@
                                        (+ (cast int (-> c online_state)) (cast int (-> c online_lock))))))
           (uint8_t offline_hexmap . #'(cast uint8_t (+ CONTROL_CHUNK
                                         (+ (cast int (-> c offline_state)) (cast int (-> c offline_lock)))))))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) (ptr_hexmap p) std::ios::beg)
       ((-> (-> m hexmap_io) write_std_ubyte) online_hexmap)
       ((-> (-> m hexmap_io) write_std_ubyte) offline_hexmap)
       ((-> (-> m hexmap_io) write_std_ubyte) CONTROL_STANDALONE_CHUNK)
 
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (-> p address) std::ios::beg)
       ((-> (-> m data_io) write_std_time) (cast time_t (-> c online_time)))
       ((-> (-> m data_io) write_std_size) (cast size_t (-> c transaction_id)))
@@ -782,6 +852,10 @@
   ;; Hexmap runs
   ;; ==================================================================
   (func full_hexmap_at ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m hexmap_io) good)))
+        ((-> (-> m hexmap_io) clear)))
     ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
     ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
     ((-> (-> m hexmap_io) write_std_ubyte) DATA_STANDALONE_CHUNK))
@@ -789,12 +863,20 @@
   (func full_hexmap ((Memory * m) (const Pointer * p)) (out void)
     (let ((int64_t hex_address . #'(ptr_hexmap_data p))
           (int64_t count . #'(ptr_data_count p)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
       ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char DATA_CHUNK))
       ((-> (-> m hexmap_io) write_std_ubyte)
        (cast uint8_t (+ DATA_STANDALONE_CHUNK (% (-> p size) CHUNK_SIZE))))))
 
   (func free_hexmap ((Memory * m) (int64_t hex_address) (int64_t count)) (out void)
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m hexmap_io) good)))
+        ((-> (-> m hexmap_io) clear)))
     ((-> (-> m hexmap_io) seekp) hex_address std::ios::beg)
     ((-> (-> m hexmap_io) fill_n) (cast size_t (- count 1)) (cast char FREE_CHUNK))
     ((-> (-> m hexmap_io) write_std_ubyte) FREE_STANDALONE_CHUNK))
@@ -829,10 +911,36 @@
             (block
               ((-> hio clear))
               (throw* (MemoryException "hexmap ends inside the chunk"))))
+        ;; Every chunk of a record is a DATA chunk: the high bit is set on
+        ;; all of them, standalone or not. A byte without it is free space,
+        ;; which is where a torn chain link points -- walked naively that is
+        ;; the hexmap read one free byte at a time to its end, and the C++
+        ;; twin measured exactly that as a vacuum spinning forever.
+        (if (!= (bitand hex_byte 128) 128)
+            (throw* (MemoryException "the chunk is not an allocated record -- a torn link")))
         (if (== (bitand hex_byte 64) 64)
             (return (pointer_make key address (+ size (size_remainder hex_byte)))))
         (set size (+ size CHUNK_SIZE)))
       (return (pointer_null))))
+
+  ;; Whether ADDRESS names an allocated record: its first hexmap byte carries
+  ;; the DATA bit. A chain walk asks this before following a link, because a
+  ;; torn chain edit -- one the process died inside of -- can land as a ZERO,
+  ;; a "valid" address that in practice points at free space. One such link
+  ;; sent the C++ vacuum's walk spinning at address 0 with the whole server
+  ;; queued behind its exclusive guard; the walks in both engines now end a
+  ;; chain at an unresolvable link exactly as they end it at -1.
+  (func chain_resolves ((Memory * m) (int64_t address)) (out bool)
+    (if (< address 0) (return #f))
+    (let ((uint8_t hex_byte . 0)
+          (binarystream * hio . #'(hex_in m)))
+      ((-> hio seekg) (addr_hexmap_data address) std::ios::beg)
+      ((-> hio read_std_ubyte) hex_byte)
+      (if (not ((-> hio good)))
+          (block
+            ((-> hio clear))
+            (return #f)))
+      (return (== (bitand hex_byte 128) 128))))
 
   ;; the startup variant that also answers is-data and the online flags
   (func pointer_at_state ((Memory * m) (const uint8_t * key) (int64_t address)
@@ -893,6 +1001,10 @@
     (full_hexmap_at m (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
     (free_hexmap m (+ (addr_hexmap address) PAGEFILE_CONTROL_COUNT)
                  (- (-> m hbpp) PAGEFILE_CONTROL_COUNT))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) address std::ios::beg)
     ((-> (-> m data_io) write) (cast (char *) key) HASHKEY_SIZE)
     ((-> (-> m data_io) fill_n) (cast size_t (- (-> m page_size) HASHKEY_SIZE)) (cast char 0)))
@@ -910,6 +1022,10 @@
               (set (-> e key) (intern_key key))
               (return (-> e address))))
         (set e (-> e next))))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) 0 std::ios::end)
     (let ((int64_t start . #'((-> (-> m data_io) tellp))))
       (allocate_page m key start)
@@ -1037,6 +1153,10 @@
       (pthread_mutex_lock (aof (-> m page_list_access)))
       (pthread_mutex_lock (aof (-> m free_list_access)))
 
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m hexmap_io) good)))
+          ((-> (-> m hexmap_io) clear)))
       ((-> (-> m hexmap_io) seekp) from std::ios::beg)
       ((-> (-> m hexmap_io) seekg) from std::ios::beg)
       (let ((int64_t prev_count . #'(free_prev_count m)))
@@ -1101,6 +1221,10 @@
 
   (func write_transaction ((Memory * m) (size_t transaction_id) (time_t commit_time)) (out void)
     (let ((Transaction * t . #'(txn)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> t pointer))) std::ios::beg)
       ((-> (-> m data_io) write_std_size) (cast size_t transaction_id))
       ((-> (-> m data_io) write_std_time) (cast time_t commit_time))))
@@ -1143,24 +1267,14 @@
 
       (dump_control m p (aof control))))
 
-  (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
-    (dba_watch1 m "Rollback Pointer" (-> p address))
+  ;; the rollback of ONE pointer with no ownership question asked --
+  ;; rollback_pointer guards it for a transaction rolling back its own
+  ;; context, and check_lock calls it bare when breaking a dead
+  ;; transaction's lock, which is recovery's foreign-id work done lazily
+  (func rollback_pointer_apply ((Memory * m) (const Pointer * p)) (out void)
     (let ((Control control))
       (control_clear (aof control))
       (load_control m p (aof control))
-
-      ;; the same ownership rule as commit_pointer, and it is what a claim
-      ;; retry's partial rollback was violating: it 'restored' a row whose
-      ;; stage now belonged to a SAVE that had staged a delete over the
-      ;; claim's shared stamp -- the restore erased the staged delete, the
-      ;; save's commit then found nothing of its own to flip, and the row
-      ;; came back from the dead as a TWIN the twelve workers bounced their
-      ;; saves between forever. Startup recovery stands outside the rule,
-      ;; exactly as at commit_pointer.
-      (if (and (-> m initialized)
-               (and (!= tl_txn nil)
-                    (!= ($ control transaction_id) (-> tl_txn id))))
-          (return))
 
       (set ($ control online_state) ROW_NONE)
       (set ($ control online_lock) LOCK_NONE)
@@ -1182,6 +1296,26 @@
 
       (dump_control m p (aof control))))
 
+  (func rollback_pointer ((Memory * m) (const Pointer * p)) (out void)
+    (dba_watch1 m "Rollback Pointer" (-> p address))
+    (let ((Control control))
+      (control_clear (aof control))
+      (load_control m p (aof control))
+
+      ;; the same ownership rule as commit_pointer, and it is what a claim
+      ;; retry's partial rollback was violating: it 'restored' a row whose
+      ;; stage now belonged to a SAVE that had staged a delete over the
+      ;; claim's shared stamp -- the restore erased the staged delete, the
+      ;; save's commit then found nothing of its own to flip, and the row
+      ;; came back from the dead as a TWIN the twelve workers bounced their
+      ;; saves between forever. Startup recovery stands outside the rule,
+      ;; exactly as at commit_pointer.
+      (if (and (-> m initialized)
+               (and (!= tl_txn nil)
+                    (!= ($ control transaction_id) (-> tl_txn id))))
+          (return)))
+    (rollback_pointer_apply m p))
+
   ;; data before hexmap, every durability point -- the hexmap is the claim,
   ;; the data the substance
   (func sync_disk ((Memory * m)) (out void)
@@ -1199,7 +1333,31 @@
           (set (-> tl_txn isolation_level) READ_COMMITTED)
           (set (-> tl_txn ctx_head) nil)
           (set (-> tl_txn ctx_tail) nil)))
-    (set (-> tl_txn id) (Utility::generate_id))
+    ;; A FRESH ID PER FRESH BEGIN, not per begin: a begin on a thread
+    ;; whose transaction is STILL OPEN continues that transaction -- the
+    ;; server begins once per request while a turn's transaction spans
+    ;; many -- so the id and its registration stand there; commit and
+    ;; rollback null the record pointer, which is the test. Handing such
+    ;; a begin a fresh id orphaned every stage the turn had already made
+    ;; (the commit's ownership guard skipped them all). Before this the
+    ;; id came from generate_id, hashed from the thread and the wall
+    ;; second: two FRESH begins in one second collided, and a nested
+    ;; begin kept its id only by that same second-resolution accident.
+    ;; The serial makes every fresh begin distinct; the hashed base
+    ;; keeps ids from different runs from colliding in a store that
+    ;; outlives them.
+    (if (== ($ (-> tl_txn pointer) hash_key) nil)
+        (block
+          (block
+            (pthread_mutex_lock (aof live_txn_access))
+            (if (== txn_id_base (cast size_t 0))
+                (set txn_id_base (Utility::generate_id)))
+            (set txn_id_serial (+ txn_id_serial 1))
+            (set (-> tl_txn id) (+ txn_id_base txn_id_serial))
+            (if (== (-> tl_txn id) (cast size_t 0))
+                (set (-> tl_txn id) txn_id_serial))
+            (pthread_mutex_unlock (aof live_txn_access)))
+          (transaction_register (-> tl_txn id))))
     (transaction_reset tl_txn)
     (dba_watch0 m "Begin Transaction")
 
@@ -1213,6 +1371,20 @@
         (dump_control m (aof (-> tl_txn pointer)) (aof control)))
       (full_hexmap m (aof (-> tl_txn pointer)))
       (write_transaction m (-> tl_txn id) (cast time_t 0))))
+
+  ;; A STAGE NEEDS A TRANSACTION. The layer above commits between
+  ;; statements and does not always begin before the next one, so the
+  ;; next statement's stages arrived under the RETIRED id of the
+  ;; transaction that had just committed -- alive by every intention,
+  ;; dead by the registry, and the lazy stale-lock breaker rolled such
+  ;; work back from under the running statement. Beginning here is
+  ;; idempotent -- a begin on an open transaction continues it -- so a
+  ;; stage arriving with no transaction open simply opens the next one.
+  (func stage_needs_transaction ((Memory * m)) (out void)
+    (if (and (-> m initialized)
+             (or (== tl_txn nil)
+                 (== ($ (-> tl_txn pointer) hash_key) nil)))
+        (begin_transaction m)))
 
   (func transaction_context_clear ((Transaction * t)) (out void)
     (let ((TxnEntry * e . #'(-> t ctx_head)))
@@ -1249,6 +1421,7 @@
                     (free_pointer m (aof (-> t pointer))))
                 (set (-> t pointer) (pointer_null))
                 (cast void 0)))
+            (transaction_retire (-> t id))
             (transaction_reset t)
             (return)))
       ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
@@ -1270,6 +1443,16 @@
             ;; only then is the intention retired
             (write_transaction m (-> t id) (cast time_t 0))
             (sync_disk m))))
+      ;; THE RECORD POINTER IS SPENT WITH THE TRANSACTION -- only the
+      ;; read-only path nulled it, so after a writing commit the next
+      ;; begin CONTINUED a committed-out transaction: its stages carried
+      ;; a retired id and the lazy breaker ate live work. The record
+      ;; chunk itself stays for the startup sweep, exactly as before.
+      (set (-> t pointer) (pointer_null))
+      ;; retired from the live registry only now, with every lock
+      ;; already cleared: a waiter still seeing this id on a lock must
+      ;; find it live, or it would break a commit mid-flight
+      (transaction_retire (-> t id))
       (transaction_reset t)))
 
   (func rollback_transaction ((Memory * m)) (out void)
@@ -1287,6 +1470,9 @@
               (free_pointer m (aof (-> t pointer))))
           (set (-> t pointer) (pointer_null))
           (sync_disk m)))
+      ;; a rolled back transaction is as over as a committed one, and
+      ;; retired the same way, after its locks are gone
+      (transaction_retire (-> t id))
       (transaction_reset t)))
 
   ;; the partial rollback the repeatable-read retry uses
@@ -1394,6 +1580,22 @@
                     (set do_read #f)
                     (set looping #f))
                 (block
+                  ;; A LOCK WHOSE TRANSACTION IS DEAD IS DEBRIS, NOT
+                  ;; CONTENTION. A crashed client or an abandoned pool
+                  ;; slot leaves its staged lock on disk with nothing
+                  ;; left to commit or roll it back; only a restart's
+                  ;; recovery would sweep it, and until then every
+                  ;; waiter burned its whole timeout on a corpse. So
+                  ;; recovery is executed lazily, here, on contact:
+                  ;; roll the one pointer back exactly as startup
+                  ;; would and look at the row again.
+                  (if (and (-> m initialized)
+                           (not (transaction_live (-> c transaction_id))))
+                      (block
+                        (if (!= streams nil) ((-> streams lock)))
+                        (dba_watch1 m "Break Stale Lock" (-> p address))
+                        (rollback_pointer_apply m p)
+                        continue))
                   ;; two sessions can each hold what the other wants: give up
                   ;; rather than spin forever
                   (if (and (> lock_wait_timeout_ms 0)
@@ -1459,6 +1661,9 @@
                  (== offline_state ROW_INSERTED))
              (if (== online_lock LOCK_NONE)
                  (block
+                   ;; a stamp is a stage too, begun BEFORE the control is
+                   ;; written or it would carry the retired id
+                   (stage_needs_transaction m)
                    (load_control m p (aof control))
                    (set ($ control online_state) ROW_NONE)
                    (set ($ control online_lock) LOCK_SHARED)
@@ -1670,6 +1875,9 @@
                                        (if (or (and (== offline_state ROW_NONE) (!= online_state ROW_NONE))
                                                (== offline_state ROW_INSERTED))
                                            (block
+                                             ;; a stamp is a stage too -- see
+                                             ;; stage_needs_transaction
+                                             (stage_needs_transaction m)
                                              (load_control m (aof pointer) (aof control))
                                              (if (== online_lock LOCK_NONE)
                                                  (block
@@ -1774,6 +1982,7 @@
   ;; ISUD -- the staged writes
   ;; ==================================================================
   (func control_insert ((Memory * m) (BaseTable * obj)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Insert" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
@@ -1786,6 +1995,7 @@
 
   (func control_update ((Memory * m) (BaseTable * old_obj) (BaseTable * new_obj)
                         (Streams * streams)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Update" ($ (-> old_obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
@@ -1810,6 +2020,7 @@
       (dump_control m (aof (-> new_obj pointer)) (aof control))))
 
   (func control_delete ((Memory * m) (BaseTable * obj) (Streams * streams)) (out void)
+    (stage_needs_transaction m)
     (dba_watch1 m "Control Delete" ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
@@ -1833,6 +2044,10 @@
       (transaction_push m (aof (-> obj pointer)))
       (control_insert m obj)
       (full_hexmap m (aof (-> obj pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
       ((-> obj pack) (cof (-> m data_io)))
       ((-> obj map) (cast (void *) m))
@@ -1850,6 +2065,10 @@
       (transaction_push m (aof (-> new_obj pointer)))
       (control_update m old_obj new_obj (aof streams))
       (full_hexmap m (aof (-> new_obj pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> new_obj pointer))) std::ios::beg)
       ((-> new_obj pack) (cof (-> m data_io)))
       ((-> old_obj unmap) (cast (void *) m))
@@ -1873,16 +2092,28 @@
   (func offline_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
     (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
     (dba_watch1 m "Offline Insert" ($ (-> obj pointer) address))
+    ;; THE DATA LANDS BEFORE THE ALLOCATION IS MARKED. The old order flushed
+    ;; the hexmap marking first, so a process that died between the two
+    ;; flushes left an ALLOCATED record whose bytes were never written --
+    ;; zeros, which for a node decode as a keys head of 0: the torn link
+    ;; the C++ twin measured twice. The payload and the control block both
+    ;; live in the data file, so they land together under ONE flush before
+    ;; the hexmap marking goes durable: a death before the marking leaves
+    ;; bytes nothing points at, a death after it a complete record.
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
+    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+    ((-> obj pack) (cof (-> m data_io)))
     (let ((Control control))
       (control_clear (aof control))
       (set ($ control offline_state) ROW_INSERTED)
       (set ($ control create_time) (version_time))
       (dump_control m (aof (-> obj pointer)) (aof control)))
+    ((-> (-> m data_io) flush))
     (full_hexmap m (aof (-> obj pointer)))
-    ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
-    ((-> obj pack) (cof (-> m data_io)))
-    ((-> (-> m hexmap_io) flush))
-    ((-> (-> m data_io) flush)))
+    ((-> (-> m hexmap_io) flush)))
 
   (func offline_update ((Memory * m) (BaseTable * obj)) (out void)
     (dba_watch1 m "Offline Update" ($ (-> obj pointer) address))
@@ -1891,6 +2122,10 @@
       (load_control m (aof (-> obj pointer)) (aof control))
       (set ($ control modify_time) (version_time))
       (dump_control m (aof (-> obj pointer)) (aof control)))
+    ;; a failed read poisons the stream and every write after it no-ops --
+    ;; writes clear first, exactly as the read accessors do
+    (if (not ((-> (-> m data_io) good)))
+        ((-> (-> m data_io) clear)))
     ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
     ((-> obj pack) (cof (-> m data_io)))
     ((-> (-> m hexmap_io) flush))
@@ -2073,8 +2308,27 @@
             (try
               (block
             (while (< begin_address end_address)
-              (let ((Pointer pointer . #'(pointer_at_state m (-> e key) begin_address
-                                            (aof is_data) (aof online_state) (aof online_lock))))
+              ;; FREE OR RECORD IS DECIDED FROM THE FIRST HEXMAP BYTE, before
+              ;; any parsing. pointer_at_state seeks CONTROL_COUNT bytes in
+              ;; and measures what follows -- right for a record, and a read
+              ;; straight through a SHORT free run into the record behind it.
+              ;; The C++ twin measured that as the walk going one phase out
+              ;; of step and rolling back live rows. A record's first chunk
+              ;; is a control chunk and always carries the high bit; a free
+              ;; chunk never does. One byte decides.
+              (let ((uint8_t head_byte . 0)
+                    (binarystream * hio . #'(hex_in m)))
+                ((-> hio seekg) (addr_hexmap begin_address) std::ios::beg)
+                ((-> hio read_std_ubyte) head_byte)
+                (if (not ((-> hio good)))
+                    (block
+                      ((-> hio clear))
+                      break))
+                (set is_data (== (bitand head_byte 128) 128)))
+              (let ((Pointer pointer . #'(pointer_null)))
+                (if is_data
+                    (set pointer (pointer_at_state m (-> e key) begin_address
+                                    (aof is_data) (aof online_state) (aof online_lock))))
                 (if is_data
                     (block
                       (if (!= online_lock LOCK_NONE)
@@ -2425,6 +2679,10 @@
       (control_insert m (cast (BaseTable *) (aof v)))
 
       (full_hexmap m (aof ($ v pointer)))
+      ;; a failed read poisons the stream and every write after it no-ops --
+      ;; writes clear first, exactly as the read accessors do
+      (if (not ((-> (-> m data_io) good)))
+          ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof ($ v pointer))) std::ios::beg)
       (($ v pack) (cof (-> m data_io)))
 
@@ -2447,8 +2705,25 @@
         (out void)
     (let ((Memory * m . #'(-> idx m))
           (int64_t counter . -1)
-          (int64_t tmp . #'(-> key values_address)))
+          (int64_t tmp . #'(-> key values_address))
+          ;; Brent's cycle check, in three integers: remember a mark, double
+          ;; the distance each time it is moved, and a link that comes back
+          ;; to the mark is a chain pointing into itself -- a torn edit's
+          ;; other shape, which chain_resolves cannot see because every
+          ;; record in the loop is genuinely allocated.
+          (int64_t brent_mark . -2)
+          (int64_t brent_steps . 0)
+          (int64_t brent_limit . 2))
       (while (> tmp -1)
+        ;; an unresolvable or revisited link ends the chain exactly as -1 does
+        (if (not (chain_resolves m tmp)) break)
+        (if (== tmp brent_mark) break)
+        (set brent_steps (+ brent_steps 1))
+        (if (== brent_steps brent_limit)
+            (block
+              (set brent_mark tmp)
+              (set brent_steps 0)
+              (set brent_limit (* brent_limit 2))))
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v))
           ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
@@ -2909,6 +3184,11 @@
     (let ((Memory * m . #'(-> idx m))
           (int64_t tmp . #'(-> key values_address)))
       (while (> tmp -1)
+        ;; An unresolvable link ends the chain exactly as -1 does. This is
+        ;; also what makes the walk safe against a chain that points back
+        ;; into itself: freeing marks the chunks FREE, so a link that comes
+        ;; around again stops resolving before it can be freed twice.
+        (if (not (chain_resolves m tmp)) break)
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v))
           ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
@@ -3131,8 +3411,26 @@
     (let ((BTNode node))
       (bt_node_read idx node_address (aof node))
       (let ((int64_t tmp . #'($ node keys_address))
-            (int64_t index . 0))
+            (int64_t index . 0)
+            ;; the key chain is edited in place exactly as a value chain is,
+            ;; so it tears the same way: the same resolve check and Brent's
+            ;; cycle check as bt_walk_values, ending the chain at a torn link
+            (int64_t brent_mark . -2)
+            (int64_t brent_steps . 0)
+            (int64_t brent_limit . 2))
+        ;; an all-zero node is a torn offline insert's shape: degree 0 with
+        ;; a keys head of 0, which no real node writes -- an empty head is -1
+        (if (and (== tmp 0) (== ($ node degree) 0))
+            (set tmp -1))
         (while (> tmp -1)
+          (if (not (chain_resolves (-> idx m) tmp)) break)
+          (if (== tmp brent_mark) break)
+          (set brent_steps (+ brent_steps 1))
+          (if (== brent_steps brent_limit)
+              (block
+                (set brent_mark tmp)
+                (set brent_steps 0)
+                (set brent_limit (* brent_limit 2))))
           (let ((BTKey cur))
             (bt_key_read idx tmp (aof cur))
             (set tmp ($ cur right_address))
@@ -3161,6 +3459,10 @@
     (cast void counter)
     (let ((BTRowsCtx * rc . #'(cast (BTRowsCtx *) c)))
       (let ((Memory * m . #'(-> (-> rc idx) m)))
+        ;; a value naming a row that no longer resolves is debris of a torn
+        ;; edit: skip it and keep walking, as the chain links themselves do
+        (if (not (chain_resolves m (-> v value)))
+            (return #t))
         (let ((Pointer row_ptr . #'(pointer_at m (-> (-> rc idx) table_key) (-> v value)))
               (Streams * held . #'(cast (Streams *) tl_streams_held)))
           (if (!= held nil) ((-> held unlock)))
@@ -3549,8 +3851,22 @@
     (let ((Memory * m . #'(-> idx m))
           (BTValue previous)
           (int has_previous . 0)
-          (int64_t tmp . #'(-> key values_address)))
+          (int64_t tmp . #'(-> key values_address))
+          ;; the same Brent's cycle check as the values walk: this is the
+          ;; walk the C++ vacuum was measured spinning in
+          (int64_t brent_mark . -2)
+          (int64_t brent_steps . 0)
+          (int64_t brent_limit . 2))
       (while (> tmp -1)
+        ;; an unresolvable or revisited link ends the chain exactly as -1 does
+        (if (not (chain_resolves m tmp)) break)
+        (if (== tmp brent_mark) break)
+        (set brent_steps (+ brent_steps 1))
+        (if (== brent_steps brent_limit)
+            (block
+              (set brent_mark tmp)
+              (set brent_steps 0)
+              (set brent_limit (* brent_limit 2))))
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v)
               (Control control))

@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -1054,4 +1056,164 @@ ZTEST(Memory, every_page_the_store_lists_can_be_read_back)
     }
   }
   ZCHECK_EQ((uint64_t)described, (uint64_t)total_pages(pages));
+}
+
+// --- torn value chains ------------------------------------------------------
+//
+// A chain edit the process dies inside of can leave a link pointing anywhere.
+// NULL and -1 already end a chain; a decoded ZERO is a "valid" address that in
+// practice points at free space, and a torn link can also point back into its
+// own chain. Walked naively, either shape is an infinite loop -- measured on
+// the wire server as one vacuum spinning at address 0 with every other
+// connection queued behind its exclusive streams guard. This case forges both
+// shapes into a real chain through the store's own stream and asks the walks
+// to END instead: an unresolvable or revisited link is the end of the chain.
+ZTEST(BTree, a_torn_value_chain_ends_instead_of_spinning)
+{
+  Fixture fixture("btree-torn");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  // Three rows in one non-unique bucket, so the key's value chain is
+  // V3 -> V2 -> V1 -> -1 (newest first).
+  Item r1(1, "torn", 10, 1), r2(2, "torn", 20, 2), r3(3, "torn", 30, 3);
+  fixture.memory()->begin_transaction();
+  fixture.memory()->online_insert(r1);
+  fixture.memory()->online_insert(r2);
+  fixture.memory()->online_insert(r3);
+  fixture.memory()->commit_transaction();
+  fixture.memory()->begin_transaction();
+
+  // Find each BTreeValue record in the data file by decoding candidate
+  // windows: a Long VALUE holding the row's address, then a Long NEXT holding
+  // the expected link -- both must match, so a row address that happens to
+  // appear inside some other record's bytes cannot. A record's bytes start at
+  // its address plus the control block, so the CHAIN address a link holds is
+  // the window offset minus that.
+  const int64_t control_size = 48;
+  std::string bytes;
+  {
+    std::ifstream in(fixture.store.data_path.c_str(), std::ios::binary);
+    std::ostringstream sink;
+    sink << in.rdbuf();
+    bytes = sink.str();
+  }
+  auto find_values = [&bytes] (int64_t row, int64_t next) -> std::vector<int64_t> {
+    std::vector<int64_t> hits;
+    for (size_t o = 0; o + 18 <= bytes.size(); o++) {
+      if (bytes[o] != bytes[o + 9]) continue;   // both Longs, both non-null
+      int64_t v = 0, n = 0;
+      std::memcpy(&v, bytes.data() + o + 1, 8);
+      std::memcpy(&n, bytes.data() + o + 10, 8);
+      if (v == row && n == next) hits.push_back((int64_t)o);
+    }
+    return hits;
+  };
+
+  // Every index put row 1 into a fresh chain, so (r1, -1) matches one record
+  // PER INDEX. The category chain is the one row 2's record links to -- pick
+  // the candidate that something names, which also proves the address math.
+  int64_t off1 = -1, off2 = -1;
+  for (int64_t candidate : find_values(r1.pointer.address, -1)) {
+    const std::vector<int64_t> links = find_values(r2.pointer.address, candidate - control_size);
+    if (links.size() == 1) { off1 = candidate; off2 = links[0]; break; }
+  }
+  ZCHECK(off1 != -1);
+  ZCHECK(off2 != -1);
+  const int64_t a2 = off2 - control_size;
+  const std::vector<int64_t> tails = find_values(r3.pointer.address, a2);
+  ZCHECK_EQ((int64_t)tails.size(), (int64_t)1);
+  if (tails.size() != 1) return;
+  const int64_t off3 = tails[0];
+
+  auto patch_next = [&fixture] (int64_t record_offset, int64_t next) {
+    fixture.store.data.seekp(record_offset + 10, std::ios::beg);
+    fixture.store.data.write_std_long(next);
+    fixture.store.data.flush();
+  };
+  auto count_bucket = [] () -> int64_t {
+    int64_t counted = 0;
+    Item::IDX_CATEGORY->cursor_equal(String("torn"), [&counted] (Item&) -> bool {
+	counted++;
+	return true;
+      });
+    return counted;
+  };
+
+  ZCHECK_EQ(count_bucket(), (int64_t)3);   // intact, as inserted
+
+  // Shape one: the chain points back into itself. V3's next becomes V3, and
+  // the walk must end at the revisit -- one row answered, not a spin.
+  patch_next(off3, off3 - control_size);
+  ZCHECK_EQ(count_bucket(), (int64_t)1);
+
+  // Shape two: a link that does not resolve to an allocated record. V3 healed,
+  // V1's terminator replaced with an address far past the store's end -- all
+  // three rows answer and the walk ends where the chain stops resolving.
+  patch_next(off3, a2);
+  patch_next(off1, ((int64_t)1) << 40);
+  ZCHECK_EQ(count_bucket(), (int64_t)3);
+
+  // The walk the wedge was measured in: reclaim over the torn chain must
+  // come back instead of spinning under the exclusive guard.
+  ZCHECK_NOTHROW(Item::truncate_indexes());
+}
+
+// --- the eleventh-run split ------------------------------------------------
+//
+// The groups choreography makes ~twelve fresh machine ids per run, each a new
+// key in an index whose old keys stay behind as empty buckets, and on the
+// eleventh run the count crosses the root's 128-key split threshold. On the
+// wire that split left a key whose KEY FIELD read NULL, and every later map
+// threw `NULL value'. This is that store's life in miniature: batches of
+// twelve distinct keys, the rows deleted and reclaimed between batches so the
+// old keys sit with empty buckets, driven far enough that the root splits --
+// then one more batch, which on the broken engine was the one that threw.
+ZTEST(BTree, splits_survive_batches_of_churned_keys)
+{
+  Fixture fixture("btree-churnsplit");
+  if (!fixture.ready()) { ZCHECK(false); return; }
+
+  Memory* m = fixture.memory();
+  int64_t next_id = 1;
+
+  for (int batch = 0; batch < 14; batch++) {
+    std::vector<Item> rows;
+    m->begin_transaction();
+    for (int i = 0; i < 12; i++) {
+      Item row(next_id++, "churn", batch * 100 + i, (int16_t)(next_id % BUCKET_MODULUS));
+      m->online_insert(row);
+      rows.push_back(row);
+    }
+    m->commit_transaction();
+
+    // The batch's rows die, their keys stay as empty buckets -- exactly the
+    // groups store between two runs.
+    m->begin_transaction();
+    for (Item& row : rows) m->online_delete(row);
+    m->commit_transaction();
+
+    m->begin_transaction();
+    Item::truncate_indexes();
+    m->truncate<Item>();
+    m->commit_transaction();
+    m->begin_transaction();
+  }
+
+  // Every id ever inserted is a key; every bucket is empty. The index must
+  // still answer -- walking it is what threw on the wire.
+  int64_t seen = 0;
+  Item::IDX_ID->cursor([&seen] (Item&) -> bool { seen++; return true; });
+  ZCHECK_EQ(seen, (int64_t)0);
+
+  // And one more batch maps cleanly through the split trees.
+  m->begin_transaction();
+  for (int i = 0; i < 12; i++) {
+    Item row(next_id++, "churn", 9900 + i, (int16_t)(next_id % BUCKET_MODULUS));
+    m->online_insert(row);
+  }
+  m->commit_transaction();
+
+  int64_t live = 0;
+  Item::IDX_ID->cursor([&live] (Item&) -> bool { live++; return true; });
+  ZCHECK_EQ(live, (int64_t)12);
 }

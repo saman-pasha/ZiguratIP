@@ -106,6 +106,16 @@ namespace Zigurat
       // The store is already gone or unusable; nothing left to roll back to.
     }
 
+    // The rollback above retires the id from the live registry; when there was
+    // no store to roll back against, retire it here so a lock this transaction
+    // managed to stamp before things went wrong reads as breakable debris, not
+    // as a live owner.
+    try {
+      Memory::transaction_retire(this->id);
+    } catch (...) {
+      // Process teardown may have destroyed the registry already.
+    }
+
     if (this->_isolation_level == IsolationLevel::SERIALIZABLE) {
       try {
 	std::unique_lock<std::mutex> serialize_lock(Transaction::_serialize_mutex);

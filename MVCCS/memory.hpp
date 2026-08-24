@@ -18,6 +18,9 @@
 #include <map>
 #include <list>
 #include <mutex>
+#include <unordered_set>
+#include <pthread.h>
+#include <atomic>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -66,6 +69,24 @@ namespace Zigurat
     // milliseconds. Two sessions can each hold a lock the other is waiting for,
     // and without a bound the whole server sits there forever. 0 waits forever.
     static int lock_wait_timeout_ms;
+
+    // ---- the live-transaction registry -------------------------------------
+    //
+    // Which transaction ids are between begin and commit-or-rollback right
+    // now, process-wide. A lock whose owner is not in here belongs to a
+    // transaction nothing will ever finish, and _check_lock breaks it in
+    // place instead of waiting on a corpse until a restart's recovery would
+    // have swept it.
+    //
+    // What makes an id dead: commit and rollback retire it after every lock
+    // is cleared; a thread that dies retires it in ~Transaction after the
+    // best-effort rollback; and a process that dies takes its registry with
+    // it, so after the restart's recovery anything it left stamped reads as
+    // breakable. A begin on a thread whose transaction is still open
+    // CONTINUES it -- id and registration stand, see begin_transaction --
+    // so an open transaction is never orphaned by beginning again.
+    static bool transaction_live(size_t transaction_id);
+    static void transaction_retire(size_t transaction_id);
     
     class HashKeyComparer : public std::binary_function<hashkey_ptr, hashkey_ptr, bool>
     {
@@ -158,13 +179,19 @@ namespace Zigurat
     class Streams
     {
     private:
-      lock_t _hexmap;
-      lock_t _data;
-      bool   _mine;
+      Memory* _memory;
+      bool    _mine;
+      bool    _locked;
+      // Held SHARED: this guard took the read side of the lock, and every
+      // read this thread makes while it stands goes through the thread's own
+      // private streams -- see _hex_in and _data_in.
+      bool    _shared;
 
-      // The guard holding the streams on this thread, or null. Published on
-      // lock and withdrawn on unlock, so it never claims a hold that has
-      // already been handed back.
+      // The guard holding the streams EXCLUSIVELY on this thread, or null.
+      // Published on lock and withdrawn on unlock, so it never claims a hold
+      // that has already been handed back. A shared hold is tracked in
+      // _tl_read_mode instead, because a shared guard owns no exclusivity to
+      // pass down.
       static thread_local Streams* _held;
 
     public:
@@ -187,7 +214,51 @@ namespace Zigurat
       static Streams* held();
     };
 
+    // ---- the shared read side ----------------------------------------------
+    //
+    // Handing the engine the two store file paths is what turns it on: a
+    // cursor whose isolation writes nothing (READ UNCOMMITTED, READ
+    // COMMITTED, SNAPSHOT) then takes the streams guard SHARED and reads
+    // through the thread's own private streams, concurrently with every
+    // other such reader. REPEATABLE READ and SERIALIZABLE cursors -- which
+    // stamp shared row locks as they scan -- and every writer take it
+    // exclusive, exactly as before: the lock mode follows the level. Ported
+    // from the Cicili engine, where it ran the twelve-worker choreography
+    // three times faster; empty paths mean every guard is exclusive, the
+    // shape this engine always had.
+    void reader_paths(const std::string& hexmap_path, const std::string& data_path);
+
   private:
+    pthread_rwlock_t _streams_rw;
+    std::string _rd_hex_path;
+    std::string _rd_data_path;
+
+    // Nonzero while this thread holds the guard SHARED.
+    static thread_local int _tl_read_mode;
+    // The thread's private read-only streams, opened lazily from the reader
+    // paths and kept for the thread's life -- WITH the store they belong to:
+    // the epoch stamps which reader_paths() call opened them, so a thread
+    // whose streams were opened on an earlier store (the test suite hops
+    // between stores; the server never does) reopens on the current one
+    // instead of reading a file that is gone.
+    static std::atomic<uint64_t> _reader_epoch;
+    uint64_t _reader_stamp = 0;
+    static thread_local uint64_t _tl_rd_epoch;
+    static thread_local binarystream* _tl_rd_hex;
+    static thread_local binarystream* _tl_rd_data;
+    // The next Streams constructed on this thread would LIKE to be shared;
+    // the constructor consumes the flag and grants it only when it is safe.
+    static thread_local int _tl_want_shared;
+
+    bool _reader_eligible();
+    void _reader_ensure();
+    // Which stream a READ goes through: the thread's private one under a
+    // shared guard, the canonical one everywhere else -- above all under a
+    // write guard, where the canonical stream is the only place this
+    // thread's own unflushed bytes can be read back from.
+    binarystream& _hex_in();
+    binarystream& _data_in();
+
     binarystream& _hexmap_io;
     binarystream& _data_io;
     binarystream* _watcher = nullptr;
@@ -199,8 +270,6 @@ namespace Zigurat
     std::multimap<hashkey_ptr, int64_t, HashKeyComparer> _page_list;
     std::multimap<hashkey_ptr, Pointer, HashKeyComparer> _free_list;
 
-    std::mutex _hexmap_access;
-    std::mutex _data_access;
 
     std::mutex _page_list_access;
     std::mutex _free_list_access;
@@ -244,7 +313,13 @@ namespace Zigurat
     void _write_transaction(size_t, time_t);
     
     void _commit_pointer(const Pointer&, time_t);
-    void _rollback_pointer(const Pointer&);
+    // as_recovery bypasses the ownership guard: recovery -- at startup or
+    // lazily from _check_lock on a dead transaction's lock -- rolls back
+    // exactly the foreign stages the guard exists to protect.
+    void _rollback_pointer(const Pointer&, bool as_recovery = false);
+    static std::mutex _live_txn_mutex;
+    static std::unordered_set<size_t> _live_txn_ids;
+    static void _transaction_register(size_t fresh_id);
     
     bool _check_lock(RowLock, const Pointer&, Control&, Streams*);
 
@@ -312,6 +387,11 @@ namespace Zigurat
     int64_t _pointer_hexmap_data_address(int64_t);
     int64_t _pointer_data_address(int64_t);
 
+    // Whether ADDRESS names an allocated record, asked by a chain walk before
+    // it follows a link there -- a torn chain edit can leave a link pointing
+    // at free space, and _pointer on such an address is an error, not an answer.
+    bool _chain_resolves(int64_t);
+
     int64_t _pointer_data_count(const Pointer&);
     int64_t _pointer_actual_count(const Pointer&);
     int64_t _pointer_round_size(const Pointer&);
@@ -374,23 +454,40 @@ namespace Zigurat
   template <typename T>
   void Memory::_offline_insert(hashkey_ptr hash_key, T& object)
   {
+
     if (this->_watcher) {
       this->dba_watch("Offline Insert: (" + T::name + ")");
     }
     
     object.pointer = this->_allocate(hash_key, object.pack_size());
 
+    // THE DATA LANDS BEFORE THE ALLOCATION IS MARKED. The old order flushed
+    // the hexmap marking first, so a process that died between the two
+    // flushes left an ALLOCATED record whose bytes were never written --
+    // zeros, which for a BTreeNode decode as keys_address 0: a link into the
+    // store's origin, measured twice as the torn link that wedged (then
+    // refused) the vacuum. The payload and the control block both live in
+    // the data file (the control at the record's address, the payload after
+    // it), so they are written together and land under ONE flush before the
+    // hexmap marking goes durable: a death before the marking leaves bytes
+    // nothing points at and space the allocator hands out again, a death
+    // after it leaves a complete record.
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
+    this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
+    this->_data_io << object;
+
     Control control;
     control.offline_state = RowState::INSERTED;
     control.create_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
-    this->_full_hexmap(object.pointer);
-    this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
-    this->_data_io << object;
-
-    this->_hexmap_io.flush();
     this->_data_io.flush();
+
+    this->_full_hexmap(object.pointer);
+    this->_hexmap_io.flush();
   }
   
   template <typename T>
@@ -409,6 +506,7 @@ namespace Zigurat
   template <typename T>
   void Memory::_offline_update(T& object)
   {
+
     if (this->_watcher) {
       this->dba_watch("Offline Update: (" + T::name + ", " + std::to_string(object.pointer.address) + ")");
     }
@@ -418,6 +516,10 @@ namespace Zigurat
     control.modify_time = Memory::version_time();
     this->_dump_control(object.pointer, control);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
     this->_data_io << object;
 
@@ -439,6 +541,10 @@ namespace Zigurat
     control.modify_time = Memory::version_time();
     this->_dump_control(new_object.pointer, control);
 
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);
     this->_data_io << new_object;
 
@@ -475,6 +581,10 @@ namespace Zigurat
     this->_control_insert(&object);
     
     this->_full_hexmap(object.pointer);
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(object.pointer), std::ios::beg);
     this->_data_io << object;
 
@@ -501,6 +611,10 @@ namespace Zigurat
     this->_control_update(&old_object, &new_object, &streams);
 
     this->_full_hexmap(new_object.pointer);
+    // A failed read leaves the stream poisoned and every write after it a
+    // silent no-op -- which is how a record can end up allocated and never
+    // written. Writes clear first, exactly as the read accessors do.
+    if (!this->_data_io.good()) this->_data_io.clear();
     this->_data_io.seekp(this->_pointer_data_address(new_object.pointer), std::ios::beg);
     this->_data_io << new_object;
 
@@ -548,7 +662,9 @@ namespace Zigurat
     if (this->_watcher) {
       this->dba_watch("Cursor: (" + T::name + ")");
     }
-    
+
+    // Shared when the isolation writes nothing; the constructor decides.
+    Memory::_tl_want_shared = 1;
     Streams streams(this);
 
     // _cursor hands the streams back before it calls this, so reading the row
@@ -560,8 +676,10 @@ namespace Zigurat
 
 	streams.lock();
 
-	this->_data_io.seekg(this->_pointer_data_address(object.pointer), std::ios::beg);
-	this->_data_io >> object;
+	binarystream& din = this->_data_in();
+	if (!din.good()) din.clear();
+	din.seekg(this->_pointer_data_address(object.pointer), std::ios::beg);
+	din >> object;
 
 	streams.unlock();
 

@@ -1058,3 +1058,106 @@ ZTEST(Isolation, a_serializable_wait_gives_up_rather_than_hanging)
   // It came back at all, and it came back saying no rather than saying yes.
   ZCHECK_EQ(refused.load(), 1);
 }
+
+
+// --- a dead transaction's lock ----------------------------------------------
+
+// A crashed client or an abandoned pool slot leaves its staged lock on disk
+// with no transaction left to commit or roll it back. Before the breaker,
+// every writer that met that row burned the whole lock wait timeout and threw,
+// run after run, until a restart's recovery swept the store -- a suspended
+// machine stranded that way stayed stranded across runs. Now _check_lock asks
+// the live-transaction registry whether the lock's owner is still running, and
+// a dead owner's pointer is rolled back in place, exactly as startup recovery
+// would have -- so the second writer here must get through in milliseconds,
+// not after a ten second refusal.
+ZTEST(Contention, a_dead_transactions_lock_breaks_on_contact)
+{
+  Store store("cont-stale-lock");
+  if (!store.ready()) { ZCHECK(false); return; }
+
+  const int original = Memory::lock_wait_timeout_ms;
+  Memory::lock_wait_timeout_ms = 10000;
+
+  Trouble trouble;
+
+  session(store.memory);
+  Account seed(1, "alive", 10);
+  store.memory->online_insert(seed);
+  store.memory->commit_transaction();
+
+  // The abandonment: stage an update -- the row is now EXCLUSIVE-locked on
+  // disk -- and then have the registry lose the owner, exactly as it does
+  // when the owning thread or process dies without commit or rollback (a
+  // nested begin is NOT that: it continues the open transaction). The thread
+  // then parks, holding its stage on disk, so the debris is real while the
+  // second writer meets it; releasing it afterwards runs the best-effort
+  // rollback a dying thread would run, which the ownership guard makes
+  // harmless against the already-broken row.
+  std::atomic<bool> staged(false);
+  std::atomic<bool> release(false);
+  std::thread abandoner([&] () {
+      try {
+	session(store.memory);
+	Account current;
+	if (!find_by_id(store.memory, 1, current)) { trouble.note("abandoner: seed row missing"); return; }
+	Account doomed(1, "doomed", 11);
+	store.memory->online_update(current, doomed);
+
+	Memory::transaction_retire(Memory::transaction.id);
+	staged = true;
+	while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	store.memory->rollback_transaction();
+      } catch (ZiguratException& e) {
+	trouble.note("abandoner: " + e.message());
+	staged = true;
+      }
+    });
+  for (int waited = 0; waited < 5000 && !staged.load(); waited += 5)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  // A second writer meets the debris. On the old code this is ten seconds of
+  // waiting on a corpse and a `lock wait timeout'; with the breaker the stale
+  // stage is rolled back on contact and the update lands.
+  std::atomic<long long> took_ms(0);
+  std::thread writer([&] () {
+      try {
+	const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	session(store.memory);
+	Account current;
+	if (!find_by_id(store.memory, 1, current)) { trouble.note("writer: row missing"); return; }
+	if (std::string(current.owner.value()) != "alive")
+	  trouble.note("writer: read '" + std::string(current.owner.value()) + "', the abandoned stage leaked");
+	Account fixed(1, "fixed", 12);
+	store.memory->online_update(current, fixed);
+	store.memory->commit_transaction();
+	// +1 so a sub-millisecond pass -- the expected outcome -- still
+	// records that it ran at all; zero means the writer never got here.
+	took_ms = 1 + std::chrono::duration_cast<std::chrono::milliseconds>
+	  (std::chrono::steady_clock::now() - t0).count();
+      } catch (ZiguratException& e) {
+	trouble.note("writer: " + e.message());
+	try { store.memory->rollback_transaction(); } catch (...) { }
+      }
+    });
+  writer.join();
+  release = true;
+  abandoner.join();
+
+  Memory::lock_wait_timeout_ms = original;
+
+  ZCHECK_STR(trouble.say(), "none");
+  // Through in milliseconds, not after the ten second refusal.
+  ZCHECK(took_ms.load() > 0);
+  ZCHECK(took_ms.load() < 1000);
+
+  // And the store tells the true story: the abandoned 'doomed' version is
+  // rolled back, the breaker's repair committed nothing of its own, and the
+  // second writer's update is what a fresh session reads.
+  session(store.memory);
+  Account after;
+  ZCHECK(find_by_id(store.memory, 1, after));
+  ZCHECK_STR(std::string(after.owner.value()), "fixed");
+  ZCHECK_EQ((int)count_rows(store.memory), 1);
+  store.memory->commit_transaction();
+}
