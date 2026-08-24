@@ -1295,10 +1295,7 @@
             (if (== (-> tl_txn id) (cast size_t 0))
                 (set (-> tl_txn id) txn_id_serial))
             (pthread_mutex_unlock (aof live_txn_access)))
-          (transaction_register (-> tl_txn id)))
-      ;; LEDGER (temporary instrumentation)
-      (fprintf stderr "CI-CONTINUE id=%zu iso=%d\n" (-> tl_txn id)
-               (cast int (-> tl_txn isolation_level))))
+          (transaction_register (-> tl_txn id))))
     (transaction_reset tl_txn)
     (dba_watch0 m "Begin Transaction")
 
@@ -1325,12 +1322,7 @@
     (if (and (-> m initialized)
              (or (== tl_txn nil)
                  (== ($ (-> tl_txn pointer) hash_key) nil)))
-        (block
-          ;; LEDGER (temporary instrumentation)
-          (fprintf stderr "CI-LAZYBEGIN stale_id=%zu iso=%d\n"
-                   (cast size_t (? (!= tl_txn nil) (-> tl_txn id) 0))
-                   (cast int (? (!= tl_txn nil) (cast int (-> tl_txn isolation_level)) -1)))
-          (begin_transaction m))))
+        (begin_transaction m)))
 
   (func transaction_context_clear ((Transaction * t)) (out void)
     (let ((TxnEntry * e . #'(-> t ctx_head)))
@@ -1389,6 +1381,12 @@
             ;; only then is the intention retired
             (write_transaction m (-> t id) (cast time_t 0))
             (sync_disk m))))
+      ;; THE RECORD POINTER IS SPENT WITH THE TRANSACTION -- only the
+      ;; read-only path nulled it, so after a writing commit the next
+      ;; begin CONTINUED a committed-out transaction: its stages carried
+      ;; a retired id and the lazy breaker ate live work. The record
+      ;; chunk itself stays for the startup sweep, exactly as before.
+      (set (-> t pointer) (pointer_null))
       ;; retired from the live registry only now, with every lock
       ;; already cleared: a waiter still seeing this id on a lock must
       ;; find it live, or it would break a commit mid-flight
@@ -1533,12 +1531,6 @@
                            (not (transaction_live (-> c transaction_id))))
                       (block
                         (if (!= streams nil) ((-> streams lock)))
-                        ;; LEDGER (temporary instrumentation)
-                        (fprintf stderr "CI-BREAKER addr=%lld owner=%zu on=%d off=%d lk=%d by=%zu\n"
-                                 (cast llong (-> p address)) (-> c transaction_id)
-                                 (cast int (-> c online_state)) (cast int (-> c offline_state))
-                                 (cast int (-> c online_lock))
-                                 (cast size_t (? (!= tl_txn nil) (-> tl_txn id) 0)))
                         (dba_watch1 m "Break Stale Lock" (-> p address))
                         (rollback_pointer_apply m p)
                         continue))

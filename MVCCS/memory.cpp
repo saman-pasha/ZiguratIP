@@ -1777,6 +1777,16 @@ namespace Zigurat
     this->_sync();
     }
 
+    // THE RECORD POINTER IS SPENT WITH THE TRANSACTION. Only the read-only
+    // path nulled it, so after a writing commit the next begin CONTINUED a
+    // committed-out transaction -- its stages carried a retired id, and the
+    // lazy breaker ate live work (the wire never showed it because the
+    // request layer's rollback hygiene nulls the pointer between requests;
+    // the embedded arrangement has no such layer and went twelve reds in
+    // twelve runs). The record chunk itself stays for the startup sweep,
+    // exactly as before.
+    Memory::transaction.pointer = Pointer();
+
     // Retired from the live registry only now, with every lock already
     // cleared above: a waiter that still sees this id on a lock must find it
     // live, or it would break a lock whose commit is mid-flight.
