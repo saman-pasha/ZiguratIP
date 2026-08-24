@@ -20,6 +20,7 @@
 #include <memory>
 #include <functional>
 #include <unordered_set>
+#include <cstdio>
 
 namespace Zigurat
 {
@@ -421,15 +422,28 @@ namespace Zigurat
   template <typename _Table, typename _First>
   void BTreeIndex<_Table, _First>::_cursor_keys(BTreeNode& node, std::function<bool (int16_t, BTreeKey<_First>&)>&& callback)
   {
+    // The key chain gets the same torn-link rules as the value chains below:
+    // NULL, an address that does not resolve to an allocated record, and an
+    // address already walked all end the chain exactly as -1 does. A key
+    // chain is edited in place exactly as a value chain is, so it can tear
+    // exactly the same way -- and this walk is under every cursor and every
+    // truncate, where a torn link used to surface as a refusal (or, before
+    // the _pointer guard, a spin).
     Long tmp_address = node.keys_address;
+    if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
+    std::unordered_set<int64_t> walked;
     int16_t counter = 0;
     while (tmp_address.value() > -1) {
+
+      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s keys unresolvable=%lld head=%lld\n", this->_name.c_str(), (long long)tmp_address.value(), (long long)node.keys_address.value()); break; }
+      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s keys revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
 
       BTreeKey<_First> key;
       key.pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
       this->_memory->_offline_select(key);
 
       tmp_address = key.right_address;
+      if (tmp_address.is_null().value()) tmp_address = (int64_t)-1;
 
       if ( !callback(counter, key) )
 	break;
@@ -462,8 +476,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
-      if (!walked.insert(tmp_address.value()).second) break;
+      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s values unresolvable=%lld head=%lld\n", this->_name.c_str(), (long long)tmp_address.value(), (long long)key.values_address.value()); break; }
+      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s values revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -925,8 +939,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
-      if (!walked.insert(tmp_address.value()).second) break;
+      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s free unresolvable=%lld \n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s free revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -968,8 +982,8 @@ namespace Zigurat
 
     while (tmp_address.value() > -1) {
 
-      if (!this->_memory->_chain_resolves(tmp_address.value())) break;
-      if (!walked.insert(tmp_address.value()).second) break;
+      if (!this->_memory->_chain_resolves(tmp_address.value())) { fprintf(stderr, "TORN-LEDGER %s unlink unresolvable=%lld \n", this->_name.c_str(), (long long)tmp_address.value()); break; }
+      if (!walked.insert(tmp_address.value()).second) { fprintf(stderr, "TORN-LEDGER %s unlink revisit=%lld\n", this->_name.c_str(), (long long)tmp_address.value()); break; }
 
       Pointer pointer = this->_memory->_pointer(this->_hash_key, tmp_address);
 
@@ -1265,6 +1279,16 @@ namespace Zigurat
     // key whose rows had been deleted.
     bool do_continue = true;
     this->_cursor_values(key, [&] (int64_t, BTreeValue& current_value) -> bool {
+
+	// A value that names a row which no longer resolves to an allocated
+	// record is debris of a torn edit: skip it and keep walking, the same
+	// tolerance the chain links themselves get. Refusing the whole cursor
+	// for one torn entry made every SELECT on the bucket an error.
+	if (current_value.value.is_null().value() ||
+	    !this->_memory->_chain_resolves(current_value.value.value())) {
+	  fprintf(stderr, "TORN-LEDGER %s output row=%lld\n", this->_name.c_str(), current_value.value.is_null().value() ? -1LL : (long long)current_value.value.value());
+	  return true;
+	}
 
 	_Table object(this->_memory->_pointer(_Table::hash_key, current_value.value));
 

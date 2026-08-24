@@ -3328,8 +3328,22 @@
     (let ((BTNode node))
       (bt_node_read idx node_address (aof node))
       (let ((int64_t tmp . #'($ node keys_address))
-            (int64_t index . 0))
+            (int64_t index . 0)
+            ;; the key chain is edited in place exactly as a value chain is,
+            ;; so it tears the same way: the same resolve check and Brent's
+            ;; cycle check as bt_walk_values, ending the chain at a torn link
+            (int64_t brent_mark . -2)
+            (int64_t brent_steps . 0)
+            (int64_t brent_limit . 2))
         (while (> tmp -1)
+          (if (not (chain_resolves (-> idx m) tmp)) break)
+          (if (== tmp brent_mark) break)
+          (set brent_steps (+ brent_steps 1))
+          (if (== brent_steps brent_limit)
+              (block
+                (set brent_mark tmp)
+                (set brent_steps 0)
+                (set brent_limit (* brent_limit 2))))
           (let ((BTKey cur))
             (bt_key_read idx tmp (aof cur))
             (set tmp ($ cur right_address))
@@ -3358,6 +3372,10 @@
     (cast void counter)
     (let ((BTRowsCtx * rc . #'(cast (BTRowsCtx *) c)))
       (let ((Memory * m . #'(-> (-> rc idx) m)))
+        ;; a value naming a row that no longer resolves is debris of a torn
+        ;; edit: skip it and keep walking, as the chain links themselves do
+        (if (not (chain_resolves m (-> v value)))
+            (return #t))
         (let ((Pointer row_ptr . #'(pointer_at m (-> (-> rc idx) table_key) (-> v value)))
               (Streams * held . #'(cast (Streams *) tl_streams_held)))
           (if (!= held nil) ((-> held unlock)))
