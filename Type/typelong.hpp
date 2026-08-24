@@ -45,6 +45,14 @@ namespace Zigurat
     Long& operator=(const int64_t&);
     Long& operator=(Long&&);
     Long& operator=(const Long&);
+    // The same integral template as the constructor, for the same
+    // reason: `x = 0ul' on macOS converts equally well to int64_t's
+    // rvalue and lvalue overloads and resolves to neither. The named
+    // lvalue picks the const& overload without a second decision.
+    template <typename T,
+              typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    Long& operator=(T v)
+    { const int64_t t = static_cast<int64_t>(v); return this->operator=(t); }
 
     virtual bool operator==(std::nullptr_t) const;
     virtual bool operator==(int64_t&&) const;
@@ -57,6 +65,16 @@ namespace Zigurat
     virtual bool operator!=(const int64_t&) const;
     virtual bool operator!=(Long&&) const;
     virtual bool operator!=(const Long&) const;
+
+    // and once more for the two comparisons written against literals
+    template <typename T,
+              typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    bool operator==(T v) const
+    { const int64_t t = static_cast<int64_t>(v); return this->operator==(t); }
+    template <typename T,
+              typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    bool operator!=(T v) const
+    { const int64_t t = static_cast<int64_t>(v); return this->operator!=(t); }
     
     virtual bool operator<(const Long&) const;
     virtual bool operator<=(const Long&) const;
