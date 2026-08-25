@@ -1,5 +1,7 @@
 # ZiguratIP
 
+![Zigurat, the warrior](art/banner.svg)
+
 **Zigurat Informational Platform** — an object-relational database server, a
 programming language, and a web application server, built as one system in
 C++11 with no third-party dependencies.
