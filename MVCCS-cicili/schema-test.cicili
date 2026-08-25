@@ -1,7 +1,6 @@
 ;;;; The generated-schema test: the .cicili files under generated/ are
 ;;;; BYTE-FOR-BYTE what the Parsi compiler wrote beside the C++ pair for
-;;;; cocolog's machines table and its sequence (copied from
-;;;; home/ld/_COCOLOG::MACHINES_.cicili and _COCOLOG::MACHINES_SEQ_.cicili;
+;;;; cocolog's tables and sequences (copied from home/ld/_COCOLOG::*_.cicili;
 ;;;; regenerate with cocolog's `make schema`). If this target compiles and
 ;;;; its checks run green, a Parsi schema really does define the same
 ;;;; objects against the Cicili MVCCS engine through the def... macros.
@@ -10,6 +9,10 @@
 ;;;; packed as 2-byte length + bytes. Their indexes ship commented out
 ;;;; (the Cicili B-tree keys int64 only), so name lookups here go through
 ;;;; a table scan, which is also what the embedded cocolog backend does.
+;;;; Vector<Double> columns ride as (VECTOR col) -- dvec_t members packed
+;;;; as an int64 count and the doubles, eight bytes each, exactly as they
+;;;; are: the tensors twin here proves a vector row goes in, comes back
+;;;; bit-equal, and survives a restart.
 
 (source "schema_test.cpp"
   (make :cpp #t :compile #t
@@ -22,6 +25,7 @@
   (include <cstdint>)
   (include <cstring>)
   (include <string>)
+  (include <vector>)
   (include <pthread.h>)
   (include <unistd.h>)
   (include <time.h>)
@@ -39,8 +43,12 @@
   ;; what the Parsi compiler wrote, untouched
   (import "./generated/cocolog-machines.cicili")
   (import "./generated/cocolog-machines-seq.cicili")
+  (import "./generated/cocolog-tensors.cicili")
+  (import "./generated/cocolog-tensors-seq.cicili")
   (define-COCOLOG_MACHINES)
   (define-COCOLOG_MACHINES_SEQ)
+  (define-COCOLOG_TENSORS)
+  (define-COCOLOG_TENSORS_SEQ)
 
   (var int failures . 0)
 
@@ -99,6 +107,34 @@
       (IDX_COCOLOG_MACHINES_ID_equal m id (cast (void *) (aof c)) machine_count_cb)
       (return ($ c rows))))
 
+  ;; the VECTOR column: the one tensors row back out, vector and all
+  (struct TRowCtx
+    (member COCOLOG_TENSORS row)
+    (member int64_t hits))
+
+  (func tensor_row_cb ((void * u) (COCOLOG_TENSORS * r)) (out bool)
+    (let ((TRowCtx * c . #'(cast (TRowCtx *) u)))
+      (set (-> c hits) (+ (-> c hits) 1))
+      (set ($ (-> c row) ID) (-> r ID))
+      (set ($ (-> c row) SEQ) (-> r SEQ))
+      (set ($ (-> c row) VEC) (-> r VEC))
+      (return #t)))
+
+  ;; 1 exactly when the store holds ONE tensors row whose vector is the
+  ;; three doubles the test put in, each compared for exact equality --
+  ;; the doubles cross the row as their own eight bytes, so equality is
+  ;; the claim, not closeness
+  (func tensor_vec_ok ((Memory * m)) (out int64_t)
+    (let ((TRowCtx c))
+      (set ($ c hits) 0)
+      (COCOLOG_TENSORS_cursor m (cast (void *) (aof c)) tensor_row_cb)
+      (if (!= ($ c hits) 1) (return 0))
+      (if (!= (cast int64_t (($ ($ ($ c row) VEC) size))) 3) (return 0))
+      (if (!= (($ ($ ($ c row) VEC) at) 0) 1.5) (return 0))
+      (if (!= (($ ($ ($ c row) VEC) at) 1) -0.25) (return 0))
+      (if (!= (($ ($ ($ c row) VEC) at) 2) 3.141592653589793) (return 0))
+      (return 1)))
+
   (main
     (remove "/tmp/mvccs-schema-hexmap.bin")
     (remove "/tmp/mvccs-schema-data.bin")
@@ -115,6 +151,8 @@
         ;; commented out, so there is nothing else to attach)
         (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
+        (IDX_COCOLOG_TENSORS_ID_attach (aof mem))
+        (COCOLOG_TENSORS_SEQ_attach (aof mem))
 
         ;; three machines, their ids drawn from the generated sequence,
         ;; their names/kb/status through the generated TEXT columns
@@ -167,6 +205,22 @@
         (begin_transaction (aof mem))
 
         (check "the sequence kept its draw" (COCOLOG_MACHINES_SEQ_current) 4)
+
+        ;; one tensors row through the generated VECTOR column: three
+        ;; doubles in, and the same three back out of the cursor
+        (let ((COCOLOG_TENSORS trow))
+          (set ($ trow ID) (COCOLOG_TENSORS_SEQ_next))
+          (set ($ trow KB) (std::string "user"))
+          (set ($ trow NAME) (std::string "weights"))
+          (set ($ trow SEQ) 0)
+          (($ ($ trow VEC) push_back) 1.5)
+          (($ ($ trow VEC) push_back) -0.25)
+          (($ ($ trow VEC) push_back) 3.141592653589793)
+          (COCOLOG_TENSORS_insert (aof mem) (aof trow)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "a VECTOR column hands its doubles back equal" (tensor_vec_ok (aof mem)) 1)
+
         (sync_disk (aof mem))
         (cast void 0)))
 
@@ -180,9 +234,12 @@
                      (cast (binarystream *) (aof data)) 8192)
         (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
+        (IDX_COCOLOG_TENSORS_ID_attach (aof mem))
+        (COCOLOG_TENSORS_SEQ_attach (aof mem))
         (check "TEXT columns survive a restart" (machines_by_name (aof mem) "m-1") 1)
         (check "the generated index survives too" (id_equal_count (aof mem) 3) 1)
         (check "so does the generated sequence" (COCOLOG_MACHINES_SEQ_current) 4)
+        (check "a VECTOR column survives a restart bit-equal" (tensor_vec_ok (aof mem)) 1)
         (cast void 0)))
 
     (if (== failures 0)
