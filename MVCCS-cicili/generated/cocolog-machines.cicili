@@ -4,7 +4,8 @@
 ;;;; def... macros expand the object. Attach each index once, after
 ;;;; memory_open.
 ;;;;
-;;;; Columns, with their Parsi types (Cicili MVCCS columns are int64):
+;;;; Columns, with their Parsi types (Cicili MVCCS columns are int64,
+;;;; STRING/TEXT ride as text, Vector<Double> as a VECTOR of doubles):
 ;;;;   ID LONG
 ;;;;   NAME STRING
 ;;;;   KB STRING

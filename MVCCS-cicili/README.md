@@ -213,7 +213,10 @@ whole engine: `clock_gettime` on a `struct timespec`.
   FNV spread, not SHA-1 (equality and stability are all the engine asks
   of a key; a store written by this engine is therefore not key-compatible
   with one written by the C++ engine).
-* Columns are plain `int64_t` — the nullable `Type` layer is out of
+* Columns are plain `int64_t`, `(TEXT c)` — a `std::string` packed as a
+  16-bit length and the bytes — or `(VECTOR c)`: the real engine's
+  `Vector<Double>`, packed as an int64 count and the doubles, eight
+  bytes each, exactly as they are. The nullable `Type` layer is out of
   scope (and `doc/truncate.md` records why a store is better off
   without NULLs anyway).
 * Transactions are explicit (`begin_transaction` per session thread)

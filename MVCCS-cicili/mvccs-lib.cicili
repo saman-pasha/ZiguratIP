@@ -26,6 +26,8 @@
         (method write_std_ubyte ((uint8_t && v)) (out void))
         (method read_std_long ((int64_t & v)) (out void))
         (method write_std_long ((int64_t && v)) (out void))
+        (method read_std_double ((double & v)) (out void))
+        (method write_std_double ((double && v)) (out void))
         (method read_std_size ((size_t & v)) (out void))
         (method write_std_size ((size_t && v)) (out void))
         (method read_std_time ((time_t & v)) (out void))
@@ -46,6 +48,11 @@
   ;; binding for struct timespec and does not need one for a single call site.
   (code "int64_t mvccs_wall_micros() { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000; }")
   (decl) (func mvccs_wall_micros () (out int64_t))
+
+  ;; The VECTOR column kind's member type: what the real engine's
+  ;; Vector<Double> column is here, per doc/lib-std-c.md's `@define'
+  ;; escape. The importing target includes <vector>.
+  (@define (code "dvec_t std::vector<double>"))
 
   ;; No namespace: `module' under :cpp mangles top-level vars (an unexercised
   ;; corner of the transpiler), and this unit links against nothing that could
@@ -4258,9 +4265,12 @@
   ;; would have stamped out at instantiation, the macro stamps out at
   ;; read time -- checkable, greppable, and no template in sight.
   ;;
-  ;; Columns are int64_t. The real engine's nullable Type layer is out
-  ;; of scope here -- and the store cannot read a NULL back anyway, as
-  ;; doc/truncate.md records.
+  ;; Columns are int64_t, (TEXT c) -- a std::string stored as a 16-bit
+  ;; length and the bytes -- or (VECTOR c): the real engine's
+  ;; Vector<Double>, a dvec_t stored as an int64 count and the doubles,
+  ;; eight bytes each, exactly as they are. The nullable Type layer is
+  ;; out of scope here -- and the store cannot read a NULL back anyway,
+  ;; as doc/truncate.md records.
   ;; ==================================================================
   ;; The name may be the object's own qualified spelling -- Cicili's ::
   ;; is a name, so (deftable COCOLOG::MACHINES ID ...) needs no string:
@@ -4291,17 +4301,24 @@
            ;; a column is a symbol -- an int64 -- or (TEXT sym): a
            ;; variable-length string, stored as binarystream's std_text
            ;; (a 16-bit length and the bytes), which is what lets a row
-           ;; carry clause text and 4000-byte machine chunks. pack_size
-           ;; is a virtual, so a row's size is its own business.
+           ;; carry clause text and 4000-byte machine chunks -- or
+           ;; (VECTOR sym): a dvec_t, count then doubles. The kind
+           ;; symbol is matched by NAME, because the generated file's
+           ;; TEXT and this file's TEXT need not be the same package's.
+           ;; pack_size is a virtual, so a row's size is its own
+           ;; business.
            (colspecs (MAPCAR (LAMBDA (c)
-                               (IF (LISTP c)
-                                   (CONS (SECOND c) 'TEXT)
-                                   (CONS c 'INT)))
+                               (COND ((NOT (LISTP c)) (CONS c 'INT))
+                                     ((STRING= (SYMBOL-NAME (FIRST c)) "VECTOR")
+                                      (CONS (SECOND c) 'VECTOR))
+                                     (T (CONS (SECOND c) 'TEXT))))
                              columns))
            (intcols  (LOOP FOR c IN colspecs
                            WHEN (EQ (CDR c) 'INT) COLLECT (CAR c)))
            (textcols (LOOP FOR c IN colspecs
                            WHEN (EQ (CDR c) 'TEXT) COLLECT (CAR c)))
+           (veccols  (LOOP FOR c IN colspecs
+                           WHEN (EQ (CDR c) 'VECTOR) COLLECT (CAR c)))
            (harr    (INTERN (CONCATENATE 'STRING sname "_HASHKEY")))
            (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
            (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
@@ -4338,27 +4355,49 @@
 
         (struct ,name (inherits BaseTable)
           ,@(LOOP FOR c IN colspecs
-                  COLLECT (IF (EQ (CDR c) 'TEXT)
-                              `(member std::string ,(CAR c))
-                              `(member int64_t ,(CAR c))))
+                  COLLECT (COND ((EQ (CDR c) 'TEXT)   `(member std::string ,(CAR c)))
+                                ((EQ (CDR c) 'VECTOR) `(member dvec_t ,(CAR c)))
+                                (T                    `(member int64_t ,(CAR c)))))
           (override)
           (method pack_size () (out int64_t)
             (return ,(LET ((acc (* 8 (LENGTH intcols))))
                        (LOOP FOR c IN textcols
                              DO (SETF acc `(+ ,acc (+ 2 (cast int64_t (($ ($ this ,c) size)))))))
+                       (LOOP FOR c IN veccols
+                             DO (SETF acc `(+ ,acc (+ 8 (* 8 (cast int64_t (($ ($ this ,c) size))))))))
                        acc)))
           (override)
           (method pack ((binarystream & io)) (out void)
             ,@(LOOP FOR c IN colspecs
-                    COLLECT (IF (EQ (CDR c) 'TEXT)
-                                `(($ io write_std_text) (std::string ($ this ,(CAR c))))
-                                `(($ io write_std_long) (cast int64_t ($ this ,(CAR c)))))))
+                    COLLECT (COND
+                              ((EQ (CDR c) 'TEXT)
+                               `(($ io write_std_text) (std::string ($ this ,(CAR c)))))
+                              ((EQ (CDR c) 'VECTOR)
+                               `(let ((size_t vi . 0)
+                                      (size_t vn . #'(($ ($ this ,(CAR c)) size))))
+                                  (($ io write_std_long) (cast int64_t vn))
+                                  (while (< vi vn)
+                                    (($ io write_std_double) (cast double (($ ($ this ,(CAR c)) at) vi)))
+                                    (set vi (+ vi 1)))))
+                              (T
+                               `(($ io write_std_long) (cast int64_t ($ this ,(CAR c))))))))
           (override)
           (method unpack ((binarystream & io)) (out void)
             ,@(LOOP FOR c IN colspecs
-                    COLLECT (IF (EQ (CDR c) 'TEXT)
-                                `(($ io read_std_text) ($ this ,(CAR c)))
-                                `(($ io read_std_long) ($ this ,(CAR c))))))
+                    COLLECT (COND
+                              ((EQ (CDR c) 'TEXT)
+                               `(($ io read_std_text) ($ this ,(CAR c))))
+                              ((EQ (CDR c) 'VECTOR)
+                               `(let ((int64_t vn . 0) (int64_t vi . 0) (double vd . 0.0))
+                                  (($ ($ this ,(CAR c)) clear))
+                                  (($ io read_std_long) vn)
+                                  (($ ($ this ,(CAR c)) reserve) (cast size_t vn))
+                                  (while (< vi vn)
+                                    (($ io read_std_double) vd)
+                                    (($ ($ this ,(CAR c)) push_back) vd)
+                                    (set vi (+ vi 1)))))
+                              (T
+                               `(($ io read_std_long) ($ this ,(CAR c)))))))
           (override)
           (method map ((void * mm)) (out void)
             (if (!= ($ ,hooksvar on_map) nil)

@@ -549,7 +549,8 @@ namespace Zigurat
       cicili << ";;;; def... macros expand the object. Attach each index once, after" << std::endl;
       cicili << ";;;; memory_open." << std::endl;
       cicili << ";;;;" << std::endl;
-      cicili << ";;;; Columns, with their Parsi types (Cicili MVCCS columns are int64):" << std::endl;
+      cicili << ";;;; Columns, with their Parsi types (Cicili MVCCS columns are int64," << std::endl;
+      cicili << ";;;; STRING/TEXT ride as text, Vector<Double> as a VECTOR of doubles):" << std::endl;
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "COLUMN")
 	  cicili << ";;;;   " << expr.args[0].token.value << " " << this->_type_name(expr.args[1]) << std::endl;
@@ -566,10 +567,13 @@ namespace Zigurat
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "COLUMN") {
 	  const std::string col_type = this->_type_name(expr.args[1]);
-	  // STRING/TEXT columns ride as std::string members; everything else
-	  // is the engine's int64 column
+	  // STRING/TEXT columns ride as std::string members, Vector columns
+	  // as the engine's dvec_t (count + doubles); everything else is the
+	  // engine's int64 column
 	  if (col_type == "STRING" || col_type == "TEXT")
 	    cicili << " (TEXT " << expr.args[0].token.value << ")";
+	  else if (col_type.rfind("VECTOR", 0) == 0)
+	    cicili << " (VECTOR " << expr.args[0].token.value << ")";
 	  else
 	    cicili << " " << expr.args[0].token.value;
 	}
