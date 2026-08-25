@@ -205,6 +205,44 @@ predicate lambdas became pthread + bounded polling; `std::atomic` CAS
 became a mutex-guarded clock. One `(code …)` escape survives in the
 whole engine: `clock_gettime` on a `struct timespec`.
 
+## The last inserted version, from the first of history
+
+An update writes its new version at a new address and points it *back* at
+the version it supersedes, so a row's version chain runs newest to
+oldest — and a reader holding an old address had no road forward. The
+page scan meets a row's **first** version first; to find the one that is
+current it chased the whole growing history to its end, and that chase
+is what "a slow suite is the store ageing" was made of.
+
+The road forward is paid for with a field that was already spent.
+`commit_pointer` zeroes `query_id` when a version settles, so on every
+settled superseded version the field was dead weight. Now commit runs a
+second pass (`stamp_successor`): each new version of an update writes its
+own address into its predecessor's `query_id` — a forward link, written
+only after both sides are committed. `row_latest` is the reader's half:
+from any version — in practice the first — it follows the stamps forward
+and lands on the last inserted version in one control-read per hop,
+never touching the rows between.
+
+**The stamp is a hint and never an answer.** Every hop is verified by
+the successor's own `reference_address` pointing back at the version
+being left, so a stamp that is missing (an old store, a crash between
+flip and stamp, startup recovery), erased (a staged write over a settled
+version rolls back and zeroes the field), or torn can only end the walk
+early — it cannot land on the wrong row. Where the walk ends still goes
+through `visible` under the caller's own isolation level, and because
+stamps are written only at commit, the walk cannot overshoot onto
+another transaction's staged version: the newest stamped version is the
+newest committed one. Under SNAPSHOT the two directions compose — the
+stamps carry a reader forward to the newest, `reference_address` carries
+it back to the version alive at its snapshot.
+
+Both engines carry the change — this one and the C++ twin the server
+links — with the same guards, and the smoke tests walk eight stamps from
+a row's first version to its ninth, through a rollback that stamps
+nothing, a deletion that ends the road without erasing it, and a restart
+the stamps survive.
+
 ## Deliberate divergences
 
 * Hash keys are interned once per process and every `Pointer` aims at

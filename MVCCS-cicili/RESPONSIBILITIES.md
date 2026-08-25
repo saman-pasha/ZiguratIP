@@ -30,7 +30,14 @@ Everything here was read out of the sources at `MVCCS/` as of commit
   transaction id, owning query id, a `reference_address` linking an
   update's new version back to the version it supersedes (and a SNAPSHOT
   reader forward through the chain), and the two commit stamps
-  `create_time` / `modify_time`.
+  `create_time` / `modify_time`. On a *settled superseded* version the
+  query id field carries a second meaning: commit stamps the successor's
+  address into it (`stamp_successor`), and `row_latest` follows those
+  stamps forward — from the first version of a row to its last inserted
+  one — verifying every hop by the successor's `reference_address`
+  pointing back. Both engines write and read the stamps the same way;
+  a store from before them simply has none, and the walk ends where it
+  stands.
 * **`Pointer`** — (hash key, byte address, *data* size). The one subtlety
   it carries: a Pointer's `size` measures the record's data, while a free
   list entry's `size` measures the whole span including the control
