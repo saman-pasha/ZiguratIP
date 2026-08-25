@@ -32,6 +32,12 @@ namespace Zigurat
     static std::string user_home();
     static std::string env_var(std::string);
 
+    // The IEEE bits of a double, as the integer a text page can carry
+    // without rounding: the default decimal rendering keeps six digits and
+    // a model weight does not survive that, where the bit pattern loses
+    // nothing and reads back with one memcpy.
+    static int64_t double_bits(double);
+
     template <typename B, typename E> static B constexpr pow(B base, E exp)
     {
       return (exp == 0) ? 1 : Utility::pow<B, E>(base, exp - 1) * base;

@@ -44,6 +44,13 @@
 namespace Zigurat
 {
 
+  int64_t Utility::double_bits(double v)
+  {
+    int64_t bits;
+    std::memcpy(&bits, &v, sizeof bits);
+    return bits;
+  }
+
   std::string Utility::os_name()
   {
 #if defined(_WIN32) || defined(_WIN64)

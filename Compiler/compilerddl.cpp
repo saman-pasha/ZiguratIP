@@ -904,8 +904,16 @@ namespace Zigurat
     head << "#define " << guard_name << std::endl;
 
     head << "#include \"globals.hpp\"" << std::endl;
-    if (is_page)
+    if (is_page) {
       head << "#include \"basepage.hpp\"" << std::endl;
+      // basepage.hpp only FORWARD-declares the request and the response, so a
+      // page body's first `request.QUERY' or `response.SET_HEADER' is an
+      // "invalid use of incomplete type" unless the real headers come too.
+      // The server's request-time compile got them by accident of its include
+      // order; an offline compile with the parsi program did not.
+      head << "#include \"httprequest.hpp\"" << std::endl;
+      head << "#include \"httpresponse.hpp\"" << std::endl;
+    }
 
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "INHERITS" || expr.token.value == "REQUIRES") {
