@@ -25,6 +25,7 @@ LIBS :=  -lStreamIO \
 	-lSocketIO \
 	-lCompiler \
 	-lMVCCS \
+	-lMVCCS2 \
 	-lConnector \
 	-lHTTP \
 	-lpthread

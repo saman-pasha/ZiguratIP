@@ -313,6 +313,13 @@ namespace Zigurat
     void _write_transaction(size_t, time_t);
     
     void _commit_pointer(const Pointer&, time_t);
+
+    // The successor stamp -- commit_transaction's second pass. A settled
+    // new version of an update writes its own address into its settled
+    // predecessor's query_id, a field _commit_pointer has already zeroed
+    // and nothing will read for a query id again. row_latest is the
+    // reader's half.
+    void _stamp_successor(const Pointer&);
     // as_recovery bypasses the ownership guard: recovery -- at startup or
     // lazily from _check_lock on a dead transaction's lock -- rolls back
     // exactly the foreign stages the guard exists to protect.
@@ -374,6 +381,17 @@ namespace Zigurat
     // the query and walk the whole hash key again, which is a scan's answer to
     // the problem and means nothing when a single record was asked about.
     bool _visible(Pointer&, Streams*);
+
+    // THE LAST INSERTED VERSION, FROM THE FIRST. Follow the committed
+    // successor stamps forward from whichever version POINTER names --
+    // in practice the row's first, the one a page scan meets -- and
+    // leave it on the newest version the stamps can prove, without
+    // touching the history in between. Returns the hop count. Every hop
+    // is verified by the successor's own reference_address pointing back,
+    // so a stamp that is missing, erased, or torn only ends the walk
+    // early -- it can never land on the wrong row. The version it ends on
+    // still goes through _visible under the caller's isolation level.
+    int64_t row_latest(Pointer&);
 
     // Cursor
     void _cursor(hashkey_ptr, Streams*, std::function<bool (const Pointer&)>);

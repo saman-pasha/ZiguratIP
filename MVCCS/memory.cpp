@@ -1775,6 +1775,105 @@ namespace Zigurat
     Memory::transaction.context.emplace_back(Memory::version_time(), pointer);
   }
 
+  // THE SUCCESSOR STAMP -- how the last inserted version of a row becomes
+  // reachable from the first of its history.
+  //
+  // An update writes its new version at a NEW address and points it BACK at
+  // the version it supersedes (reference_address), so the chain runs newest
+  // to oldest and a reader holding an OLD address -- the page scan meets the
+  // oldest version first -- has no road forward: it chases the growing
+  // history to its end to find the version that is current.
+  //
+  // The road forward is paid for with a field that is already spent:
+  // _commit_pointer zeroes query_id when a version settles, so on every
+  // SETTLED superseded version the field is dead weight. At commit, each new
+  // version stamps its predecessor's query_id with its own address -- a
+  // forward link, written only after both sides are committed.
+  //
+  // THE STAMP IS A HINT AND NEVER AN ANSWER. row_latest verifies every hop
+  // by the successor's own reference_address pointing back; a stamp that is
+  // missing (an old store, a crash between flip and stamp, startup recovery,
+  // a writer on the other engine), erased (a staged write over a settled
+  // version rolls back and zeroes it), or torn can only end the walk early,
+  // never send it to the wrong row. A STAGED version carries its stager's
+  // real query id in the same field, which is why every guard below requires
+  // the settled state before the field means an address.
+  void Memory::_stamp_successor(const Pointer& pointer)
+  {
+    Control control;
+    this->_load_control(pointer, control);
+
+    // only a settled new version of an update stamps
+    if (control.online_state != RowState::NONE) return;
+    if (control.offline_state != RowState::INSERTED) return;
+    if (control.transaction_id != 0) return;
+    if (control.reference_address <= -1) return;
+    if (!this->_chain_resolves(control.reference_address)) return;
+
+    Pointer prev = this->_pointer(pointer.hash_key, control.reference_address);
+    Control pc;
+    this->_load_control(prev, pc);
+
+    // and only onto a settled superseded predecessor
+    if (pc.online_state != RowState::NONE) return;
+    if (pc.online_lock != RowLock::NONE) return;
+    if (pc.offline_state != RowState::UPDATED) return;
+    if (pc.transaction_id != 0) return;
+
+    pc.query_id = pointer.address;
+    this->_dump_control(prev, pc);
+  }
+
+  // THE LAST INSERTED VERSION, FROM THE FIRST -- the reader's half of
+  // _stamp_successor. Each hop is two control reads instead of a
+  // full-record visit; where the walk ends is not yet an answer, and the
+  // final version still goes through _visible under the caller's own
+  // isolation level. Because stamps are written only at commit, the walk
+  // cannot overshoot onto another transaction's staged version: the newest
+  // STAMPED version is the newest COMMITTED one. Brent's cycle check, as
+  // in the index chain walks: a torn stamp loop must end the walk, not
+  // hang the reader.
+  int64_t Memory::row_latest(Pointer& p)
+  {
+    int64_t hops = 0;
+    int64_t brent_mark = -2, brent_steps = 0, brent_limit = 2;
+
+    while (true) {
+      Control control;
+      this->_load_control(p, control);
+
+      // a stamp only means an address on a SETTLED superseded version
+      if (control.online_state != RowState::NONE) break;
+      if (control.online_lock != RowLock::NONE) break;
+      if (control.offline_state != RowState::UPDATED) break;
+      if (control.transaction_id != 0) break;
+      if (control.query_id <= 0) break;
+
+      int64_t succ = control.query_id;
+      if (succ == p.address) break;
+      if (!this->_chain_resolves(succ)) break;
+
+      Pointer sp = this->_pointer(p.hash_key, succ);
+      Control sc;
+      this->_load_control(sp, sc);
+
+      // the proof: a true successor points back at us
+      if (sc.reference_address != p.address) break;
+
+      if (succ == brent_mark) break;
+      brent_steps += 1;
+      if (brent_steps == brent_limit) {
+        brent_mark = succ;
+        brent_steps = 0;
+        brent_limit *= 2;
+      }
+
+      p = sp;
+      hops += 1;
+    }
+    return hops;
+  }
+
   void Memory::_commit_pointer(const Pointer& pointer, time_t commit_time)
   {
     if (this->_watcher) {
@@ -2010,6 +2109,14 @@ namespace Zigurat
     // Then the control blocks it licenses.
     for (const auto& pair : Memory::transaction.context) {
       this->_commit_pointer(pair.second, commit_time);
+    }
+    // And only then the successor stamps -- a SECOND pass, because the
+    // stamp lands in a field _commit_pointer zeroes, and a row updated
+    // twice in one transaction would have a later flip erase an earlier
+    // stamp. Reading the SETTLED states after every flip has landed is
+    // unambiguous.
+    for (const auto& pair : Memory::transaction.context) {
+      this->_stamp_successor(pair.second);
     }
     Memory::transaction.context.clear();
     this->_sync();

@@ -4,7 +4,7 @@
 #include "parser.hpp"
 #include "expression.hpp"
 #include "compiler.hpp"
-#include "memory.hpp"
+#include "engine.hpp"
 #include "globals.hpp"
 #include "tcpstream.hpp"
 #include "ipcstream.hpp"
@@ -43,9 +43,9 @@ IPCServer ipc_server;
 
 void handle_client()
 {
-  std::cout << "Transaction Opened " << Globals::memory()->transaction_id() << std::endl;
+  std::cout << "Transaction Opened " << engine_transaction_id(globals_memory()) << std::endl;
 
-  Globals::client_stream()->write_std_size(Globals::memory()->transaction_id());  
+  Globals::client_stream()->write_std_size(engine_transaction_id(globals_memory()));  
 
   std::string function;
   do {
@@ -70,14 +70,16 @@ void handle_client()
 	bool auto_commit = Globals::client_stream()->read_std_bool();
 	if (Globals::trace_mode())
 	  std::cout << "function 'auto_commit' '" << auto_commit << "' " << std::endl;
-	Globals::memory()->transaction.auto_commit = auto_commit;
+	engine_set_autocommit(globals_memory(), auto_commit ? 1 : 0);
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);
 
       } else if (function == "isolate") {
-	IsolationLevel isolation_level = (IsolationLevel)Globals::client_stream()->read_std_ubyte();
+	// the wire byte is the old Zigurat::IsolationLevel; the engine's
+	// enum carries the same members at the same values
+	::IsolationLevel wire_level = (::IsolationLevel)Globals::client_stream()->read_std_ubyte();
 	if (Globals::trace_mode())
-	  std::cout << "function 'isolate' '" << (int)isolation_level << "' " << std::endl;
-	Globals::memory()->transaction.set_isolation_level(isolation_level);
+	  std::cout << "function 'isolate' '" << (int)wire_level << "' " << std::endl;
+	engine_isolate(globals_memory(), wire_level);
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);
 
       } else if (function == "call") {
@@ -103,8 +105,8 @@ void handle_client()
 	
 	symbol();
 
-	if (Globals::memory()->transaction.auto_commit || Globals::default_autocommit_mode())
-	  Globals::memory()->commit_transaction();
+	if (engine_autocommit() != 0)
+	  commit_transaction(globals_memory());
 
 	if (library_cache_mode != LibraryPool::NONE) library_pool.close(handle);
 	
@@ -133,34 +135,34 @@ void handle_client()
       } else if (function == "commit") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'commit'" << std::endl;      
-	Globals::memory()->commit_transaction();
+	commit_transaction(globals_memory());
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);
 
       } else if (function == "rollback") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'rollback'" << std::endl;      
-	Globals::memory()->rollback_transaction();
+	rollback_transaction(globals_memory());
 	Globals::client_stream()->write_std_ubyte((uint8_t)ResultType::SUCCESSFUL_DONE);
 
       } else if (function == "dba_pagefiles") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'dba_pagefiles'" << std::endl;
-	Globals::memory()->dba_pagefiles(*Globals::client_stream());
+	dba_pagefiles(globals_memory(), Globals::client_stream());
 
       } else if (function == "dba_pointers") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'dba_pointers'" << std::endl;
-	Globals::memory()->dba_pointers(*Globals::client_stream());
+	dba_pointers(globals_memory(), Globals::client_stream());
 
       } else if (function == "dba_attach_watcher") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'dba_attach_watcher'" << std::endl;
-	Globals::memory()->dba_attach_watcher(Globals::client_stream());
+	dba_attach_watcher(globals_memory(), Globals::client_stream());
 
       } else if (function == "dba_detach_watcher") {
 	if (Globals::trace_mode())
 	  std::cout << "function 'dba_detach_watcher'" << std::endl;
-	Globals::memory()->dba_detach_watcher();
+	dba_detach_watcher(globals_memory());
 
       } else if (function.size() == 0) {
 	if (Globals::trace_mode())
@@ -207,7 +209,7 @@ void handle_client()
   // which is SUCCESSFUL_DONE. A failed compile looked like a successful one.
   Globals::client_stream()->flush();
 
-  std::cout << "Transaction Closed " << Globals::memory()->transaction_id() << std::endl;
+  std::cout << "Transaction Closed " << engine_transaction_id(globals_memory()) << std::endl;
 }
 
 namespace
@@ -224,7 +226,9 @@ namespace
     ~ConnectionScope()
     {
       Globals::clear_peer();
+      globals_clear_peer();
       Globals::set_client_stream(nullptr);
+      globals_set_client_stream(nullptr);
     }
   };
 }
@@ -234,6 +238,7 @@ void zigurat_tcp_handler(Socket::handle_t client_handle)
   ConnectionScope scope;
   std::unique_ptr<tcpstream> client_stream_deleter(new tcpstream(client_handle, server_blocking_mode, server_timeout));
   Globals::set_client_stream(client_stream_deleter.get());
+  globals_set_client_stream(client_stream_deleter.get());
   handle_client();
 }
 
@@ -249,7 +254,11 @@ void zigurat_tls_handler(tlsstream& client_stream)
 {
   ConnectionScope scope;
   Globals::set_client_stream(&client_stream);
+  globals_set_client_stream(&client_stream);
   Globals::set_peer(client_stream.peer_subject(), client_stream.peer_permissions());
+  globals_set_peer(client_stream.peer_subject().c_str());
+  for (const std::string& granted : client_stream.peer_permissions())
+    globals_add_peer_permission(granted.c_str());
 
   std::cout << "Peer '" << Globals::peer_subject() << "' permitted";
   for (const std::string& granted : Globals::peer_permissions())
@@ -264,6 +273,7 @@ void zigurat_ipc_handler(Socket::handle_t client_handle)
   ConnectionScope scope;
   std::unique_ptr<ipcstream> client_stream_deleter(new ipcstream(client_handle, server_blocking_mode, server_timeout));
   Globals::set_client_stream(client_stream_deleter.get());
+  globals_set_client_stream(client_stream_deleter.get());
   handle_client();
 }
 

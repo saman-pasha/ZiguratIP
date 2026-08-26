@@ -74,8 +74,21 @@ namespace Zigurat
 	    std::list<std::string> types;
 	    this->_catalog.list(*opt_key, "/TYPES/TYPE", types);
 
+	    // A STRING KEY RIDES AS A HASH in the Cicili engine, so its
+	    // tree orders hashes, not text: equality survives (and every
+	    // indexed lookup re-applies its full predicate to each row the
+	    // index hands back, so a collision costs a visit and never a
+	    // wrong answer), but a range over it would answer garbage.
+	    // Anything but equality on a string-keyed level scans instead.
+	    const std::string cursor_kind = this->_cursor_name(opr.token.value);
+	    const std::string& lead_type = *types.begin();
+	    const bool string_keyed = (lead_type.find("STRING") != std::string::npos ||
+				       lead_type.find("TEXT") != std::string::npos);
+
 	    std::string tab(lvl, '\t');
-    	    if (columns.size() == 1) { // Single Level Index
+    	    if (string_keyed && cursor_kind != "cursor_equal") {
+	      // fall through to the scan below
+	    } else if (columns.size() == 1) { // Single Level Index
 	      code << tab << this->_type_name << "::" << index_name << '.' << this->_cursor_name(opr.token.value) << std::endl;
 	      code << tab << "(";
 	      this->_expr.compile(opr.args[1], code);
@@ -169,8 +182,20 @@ namespace Zigurat
 
       });
 
-    // When searched column exists in columns order
-    if (opr.args[0].token.value == "$obj" && (opr.args[0].args[0].token.value == *columns_iter || 
+    // When searched column exists in columns order. On the Cicili
+    // engine, a NON-innermost level serves full and equal walks only
+    // (bt_cursor_dep / bt_cursor_equal_dep); a range there -- and any
+    // non-equality over a hashed string level -- takes the partial-
+    // search walk instead, which descends everything and filters with
+    // the full predicate: slower, never wrong.
+    const std::string level_cursor = this->_cursor_name(opr.token.value);
+    const bool level_string = ((*types_iter).find("STRING") != std::string::npos ||
+			       (*types_iter).find("TEXT") != std::string::npos);
+    const bool level_inner = (std::next(columns_iter) == columns.end());
+    const bool level_ok = (level_cursor == "cursor_equal")
+      || (level_inner && !level_string && level_cursor != "cursor");
+    if (level_ok &&
+	opr.args[0].token.value == "$obj" && (opr.args[0].args[0].token.value == *columns_iter || 
 					      (opr.args[0].args[0].token.value == "." && opr.args[0].args[0].args[0].token.value == *columns_iter))) {
 
       if (columns_iter == columns.begin()) { // Outer

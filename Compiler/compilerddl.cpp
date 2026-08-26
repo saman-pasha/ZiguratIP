@@ -245,9 +245,9 @@ namespace Zigurat
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
 
-    head << "#include \"globals.hpp\"" << std::endl;
-    head << "#include \"basetable.hpp\"" << std::endl;
-    head << "#include \"btreeindex.hpp\"" << std::endl;
+    // THE CICILI ENGINE'S CONSUMER SURFACE, and nothing of the old
+    // MVCCS: the two engines never meet in one translation unit.
+    head << "#include \"engine-compat.hpp\"" << std::endl;
     
     if (ast.args.size() > 1 && ast.args[2].token.value == "REQUIRES") {
       for (const Expression& expr : ast.args[1].args) {
@@ -258,7 +258,7 @@ namespace Zigurat
     }
 
     this->_open_namespace(ast.args[0], head);
-    head << "class " << name << " : public Zigurat::BaseTable" << std::endl;
+    head << "class " << name << " : public BaseTable" << std::endl;
     head << "{" << std::endl;
     head << "private:" << std::endl;
 
@@ -270,7 +270,6 @@ namespace Zigurat
     }
 
     head << "public:" << std::endl;
-    head << TAB1 << "using Zigurat::BaseTable::BaseTable;" << std::endl;
     head << TAB1 << "static std::string name;" << std::endl;
     head << TAB1 << "static std::vector<std::string> path;" << std::endl;
     head << TAB1 << "static Zigurat::hashkey_t hash_key;" << std::endl;
@@ -313,11 +312,22 @@ namespace Zigurat
       head.seekp(-2, std::ios::cur);
       head << "> " << std::get<3>(index) << ';' << std::endl;
     }
+    // each index's own 20-byte identity, and the attach that fills the
+    // engine-side records lazily -- a static initializer may not touch
+    // the store, because parsic loads table objects with no store open
+    for (const index_desc_t& index : indexes) {
+      head << TAB1 << "static uint8_t " << std::get<3>(index) << "_keybytes[20];" << std::endl;
+      if (std::get<0>(index).size() > 1)
+	head << TAB1 << "static uint8_t " << std::get<3>(index) << "_depbytes[20];" << std::endl;
+    }
+    head << TAB1 << "static void attach_indexes();" << std::endl;
 
     head << TAB1 << "int64_t pack_size() override;" << std::endl;
     head << TAB1 << "void prepare() override;" << std::endl;
-    head << TAB1 << "void map() override;" << std::endl;
-    head << TAB1 << "void unmap() override;" << std::endl;
+    head << TAB1 << "void pack(Zigurat::binarystream&) override;" << std::endl;
+    head << TAB1 << "void unpack(Zigurat::binarystream&) override;" << std::endl;
+    head << TAB1 << "void map(void*) override;" << std::endl;
+    head << TAB1 << "void unmap(void*) override;" << std::endl;
     // Shadows BaseTable::truncate_indexes, so Memory::truncate<T>() reaches
     // this table's indexes rather than the empty one on the base.
     head << TAB1 << "static void truncate_indexes();" << std::endl;
@@ -353,19 +363,74 @@ namespace Zigurat
     }
     
     for (const index_desc_t& index : indexes) {
-      impl << "Zigurat::BTreeIndex<" << name << ", "; 
+      impl << "Zigurat::BTreeIndex<" << name << ", ";
       for (const std::string& column : std::get<1>(index))
         impl << column << ", ";
       impl.seekp(-2, std::ios::cur);
-      impl << "> " << name << "::" << std::get<3>(index) << std::endl;
+      impl << "> " << name << "::" << std::get<3>(index) << ";" << std::endl;
 
-      impl << TAB1 << "(Globals::memory(), \"" << std::get<3>(index) << "\", "
-	   << ((std::get<4>(index)) ? "true, " : "false, ");
-      for (const std::string& column : std::get<0>(index))
-        impl << name << "::" << column << ", ";
-      impl.seekp(-2, std::ios::cur);
-      impl << ");" << std::endl;
+      // the index's identity: SHA-1 of its qualified spelling, exactly
+      // as the table's own hash key is derived
+      std::string index_key = SHA::checksum(SHA::SHA1, type_name + "::" + std::get<3>(index));
+      impl << "uint8_t " << name << "::" << std::get<3>(index) << "_keybytes[20] = {";
+      for (size_t i = 0; i < index_key.size(); i += 2)
+        impl << "0x" << index_key[i] << index_key[i + 1] << ',';
+      impl.seekp(-1, std::ios::cur);
+      impl << "};" << std::endl;
+      if (std::get<0>(index).size() > 1) {
+	std::string dep_key = SHA::checksum(SHA::SHA1, type_name + "::" + std::get<3>(index) + "~dep");
+	impl << "uint8_t " << name << "::" << std::get<3>(index) << "_depbytes[20] = {";
+	for (size_t i = 0; i < dep_key.size(); i += 2)
+	  impl << "0x" << dep_key[i] << dep_key[i + 1] << ',';
+	impl.seekp(-1, std::ios::cur);
+	impl << "};" << std::endl;
+      }
     }
+
+    // attach: fill the engine-side index records ONCE, lazily and
+    // thread-safely (a C++ magic static), the first time any data
+    // operation or index cursor needs them
+    impl << "void " << name << "::attach_indexes()" << std::endl;
+    impl << '{' << std::endl;
+    impl << TAB1 << "static bool engine_attached = ([] () -> bool {" << std::endl;
+    impl << TAB2 << "Memory* m = ::globals_memory();" << std::endl;
+    for (const index_desc_t& index : indexes) {
+      const std::string& iname = std::get<3>(index);
+      impl << TAB2 << "{" << std::endl;
+      impl << TAB3 << "::BTreeIndex* bt = &" << name << "::" << iname << ".bt;" << std::endl;
+      impl << TAB3 << "bt->m = m;" << std::endl;
+      impl << TAB3 << "bt->name = \"" << iname << "\";" << std::endl;
+      impl << TAB3 << "bt->hash_key = intern_key(" << name << "::" << iname << "_keybytes);" << std::endl;
+      impl << TAB3 << "bt->table_key = " << name << "::hash_key;" << std::endl;
+      impl << TAB3 << "bt->catalogue_id = engine_key64_bytes_fold(" << name << "::" << iname << "_keybytes);" << std::endl;
+      impl << TAB3 << "bt->is_unique = " << ((std::get<4>(index)) ? 1 : 0) << ";" << std::endl;
+      impl << TAB3 << "bt->branching_factor = 65;" << std::endl;
+      impl << TAB3 << "bt->min_degree = 64;" << std::endl;
+      impl << TAB3 << "bt->max_degree = 128;" << std::endl;
+      impl << TAB3 << "bt->root_address = -1;" << std::endl;
+      impl << TAB3 << "bt->record_pointer = pointer_null();" << std::endl;
+      impl << TAB3 << "bt->levels = " << std::get<0>(index).size() << ";" << std::endl;
+      impl << TAB3 << "bt->is_dependent = 0;" << std::endl;
+      if (std::get<0>(index).size() > 1)
+	impl << TAB3 << "bt->dep_hash_key = intern_key(" << name << "::" << iname << "_depbytes);" << std::endl;
+      else
+	impl << TAB3 << "bt->dep_hash_key = nullptr;" << std::endl;
+      impl << TAB3 << "bt_select_record(bt);" << std::endl;
+      impl << TAB2 << "}" << std::endl;
+    }
+    impl << TAB2 << "return true;" << std::endl;
+    impl << TAB1 << "})();" << std::endl;
+    impl << TAB1 << "(void)engine_attached;" << std::endl;
+    impl << '}' << std::endl;
+
+    // the ensure pointers: a static initializer that touches no store,
+    // so an index cursor's first use attaches before it walks
+    impl << "static struct " << name << "_engine_registrar_t {" << std::endl;
+    impl << TAB1 << name << "_engine_registrar_t() {" << std::endl;
+    for (const index_desc_t& index : indexes)
+      impl << TAB2 << name << "::" << std::get<3>(index) << ".ensure = &" << name << "::attach_indexes;" << std::endl;
+    impl << TAB1 << "}" << std::endl;
+    impl << "} _" << name << "_engine_registrar;" << std::endl;
 
     impl << name << "::" << name << "()" << std::endl; // Default Constructor
     impl << " : ";
@@ -425,24 +490,48 @@ namespace Zigurat
     }
     impl << '}' << std::endl;
 
-    impl << "void " << name << "::map()" << std::endl; // BTreeIndex map
+    auto emit_keys([&] (const index_desc_t& index, const char* fn) {
+	if (std::get<0>(index).size() == 1) {
+	  impl << TAB1 << fn << "(&" << name << "::" << std::get<3>(index)
+	       << ".bt, engine_key64(this->_" << std::get<0>(index)[0]
+	       << "), this->pointer.address);" << std::endl;
+	} else {
+	  impl << TAB1 << "{ int64_t ks[8];";
+	  const std::vector<std::string>& cols = std::get<0>(index);
+	  for (size_t i = 0; i < cols.size(); i++)
+	    impl << " ks[" << i << "] = engine_key64(this->_" << cols[i] << ");";
+	  impl << " " << fn << "_multi(&" << name << "::" << std::get<3>(index)
+	       << ".bt, ks, this->pointer.address); }" << std::endl;
+	}
+      });
+
+    impl << "void " << name << "::map(void*)" << std::endl; // engine bt_map
     impl << '{' << std::endl;
-    for (const index_desc_t& index : indexes) {
-      impl << TAB1 << name << "::" << std::get<3>(index) << ".map(*this);" << std::endl;
-    }
+    if (!indexes.empty())
+      impl << TAB1 << name << "::attach_indexes();" << std::endl;
+    for (const index_desc_t& index : indexes)
+      emit_keys(index, "bt_map");
     impl << '}' << std::endl;
 
-    impl << "void " << name << "::unmap()" << std::endl; // BTreeIndex unmap
+    impl << "void " << name << "::unmap(void*)" << std::endl; // engine bt_unmap
     impl << '{' << std::endl;
-    for (const index_desc_t& index : indexes) {
-      impl << TAB1 << name << "::" << std::get<3>(index) << ".unmap(*this);" << std::endl;
-    }
+    if (!indexes.empty())
+      impl << TAB1 << name << "::attach_indexes();" << std::endl;
+    for (const index_desc_t& index : indexes)
+      emit_keys(index, "bt_unmap");
     impl << '}' << std::endl;
 
-    impl << "void " << name << "::truncate_indexes()" << std::endl; // BTreeIndex truncate
+    // a truncate is the one moment the table is at its smallest: drop
+    // every index's storage wholesale, then one scan re-maps the
+    // survivors into fresh trees
+    impl << "void " << name << "::truncate_indexes()" << std::endl;
     impl << '{' << std::endl;
-    for (const index_desc_t& index : indexes) {
-      impl << TAB1 << name << "::" << std::get<3>(index) << ".truncate();" << std::endl;
+    if (!indexes.empty()) {
+      impl << TAB1 << name << "::attach_indexes();" << std::endl;
+      impl << TAB1 << "Memory* m = ::globals_memory();" << std::endl;
+      for (const index_desc_t& index : indexes)
+	impl << TAB1 << "bt_drop_storage(&" << name << "::" << std::get<3>(index) << ".bt, m);" << std::endl;
+      impl << TAB1 << "Globals::memory()->cursor<" << name << ">([] (" << name << "& r) -> bool { r.map(nullptr); return true; });" << std::endl;
     }
     impl << '}' << std::endl;
 
@@ -454,6 +543,33 @@ namespace Zigurat
         impl << "this->_" << expr.args[0].token.value << ", ";
 	has_column = true;
       }
+    }
+    if (has_column)
+      impl.seekp(-2, std::ios::cur);
+    impl << ");" << std::endl;
+    impl << '}' << std::endl;
+
+    // the virtuals the Cicili engine dispatches -- the SAME variadic
+    // pack the operators below use, so a row's bytes are identical to
+    // what the C++ engine wrote and a store carries over
+    impl << "void " << name << "::pack(Zigurat::binarystream& io)" << std::endl;
+    impl << '{' << std::endl;
+    impl << TAB1 << "io.pack(";
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "COLUMN")
+        impl << "this->_" << expr.args[0].token.value << ", ";
+    }
+    if (has_column)
+      impl.seekp(-2, std::ios::cur);
+    impl << ");" << std::endl;
+    impl << '}' << std::endl;
+
+    impl << "void " << name << "::unpack(Zigurat::binarystream& io)" << std::endl;
+    impl << '{' << std::endl;
+    impl << TAB1 << "io.unpack(";
+    for (const Expression& expr : ast.args) {
+      if (expr.token.value == "COLUMN")
+        impl << "this->_" << expr.args[0].token.value << ", ";
     }
     if (has_column)
       impl.seekp(-2, std::ios::cur);
@@ -714,7 +830,7 @@ namespace Zigurat
 
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
-    head << "#include \"globals.hpp\"" << std::endl;
+    head << "#include \"engine-compat.hpp\"" << std::endl;
 
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
@@ -907,7 +1023,7 @@ namespace Zigurat
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
 
-    head << "#include \"globals.hpp\"" << std::endl;
+    head << "#include \"engine-compat.hpp\"" << std::endl;
     if (is_page) {
       head << "#include \"basepage.hpp\"" << std::endl;
       // basepage.hpp only FORWARD-declares the request and the response, so a
@@ -1360,7 +1476,7 @@ namespace Zigurat
 
     head << "#ifndef " << guard_name << std::endl;
     head << "#define " << guard_name << std::endl;
-    head << "#include \"basesequence.hpp\"" << std::endl;
+    head << "#include \"engine-compat.hpp\"" << std::endl;
     size_t offset = 0;
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "REQUIRES") {
@@ -1375,18 +1491,23 @@ namespace Zigurat
     }
     
     this->_open_namespace(ast.args[0], head);
-    head << "class " << name << " : public Zigurat::BaseSequence<" << name << ">" << std::endl;
+    head << "class " << name << std::endl;
     head << "{" << std::endl;
+    head << "private:" << std::endl;
+    head << TAB1 << "static Sequence _seq;" << std::endl;
+    head << TAB1 << "static void _attach();" << std::endl;
     head << "public:" << std::endl;
-    head << TAB1 << "static const Zigurat::hashkey_t hash_key;" << std::endl;
+    head << TAB1 << "static Zigurat::hashkey_t hash_key;" << std::endl;
     head << TAB1 << "static const Zigurat::String NAME;" << std::endl;
     head << TAB1 << "static const std::vector<std::string> PATH;" << std::endl;
     head << TAB1 << "static const Zigurat::Long FROM;" << std::endl;
     head << TAB1 << "static const Zigurat::Long TO;" << std::endl;
     head << TAB1 << "static const Zigurat::Long STEP;" << std::endl;
-    head << TAB1 << name << "();" << std::endl;
-    head << TAB1 << name << "(Zigurat::Pointer&&);" << std::endl;
-    head << TAB1 << name << "(const Zigurat::Pointer&);" << std::endl;
+    head << TAB1 << "static Zigurat::Long CURRENT();" << std::endl;
+    head << TAB1 << "static void SET_CURRENT(Zigurat::Long);" << std::endl;
+    head << TAB1 << "static Zigurat::Long NEXT();" << std::endl;
+    head << TAB1 << "static Zigurat::Long BACK();" << std::endl;
+    head << TAB1 << "static void RESET();" << std::endl;
     head << "};" << std::endl;
     this->_close_namespace(ast.args[0], head);
     head << "#endif // " << guard_name << std::endl;
@@ -1396,7 +1517,7 @@ namespace Zigurat
     impl << "#include \"" << include_name << ".hpp\"" << std::endl;
     this->_open_namespace(ast.args[0], impl);
 
-    impl << TAB1 << "const Zigurat::hashkey_t " << type_name << "::hash_key = {";
+    impl << TAB1 << "Zigurat::hashkey_t " << type_name << "::hash_key = {";
     for (size_t i = 0; i < hash_key.size(); i+=2)
       impl << "0x" << hash_key[i] << hash_key[i + 1] << ',';
     impl.seekp(-1, std::ios::cur);
@@ -1418,17 +1539,29 @@ namespace Zigurat
     impl << TAB1 << "const Zigurat::Long " << type_name << "::STEP = ";
     this->_expr.compile(ast.args[offset + 3].args[0], impl);
     impl << ';' << std::endl;
-    impl << TAB1 << name << "::" << name << "()" << std::endl;
+    impl << TAB1 << "Sequence " << type_name << "::_seq;" << std::endl;
+    // attach lazily and once: parsic loads objects with no store open,
+    // so nothing here may run at static initialization
+    impl << TAB1 << "void " << type_name << "::_attach()" << std::endl;
     impl << TAB1 << "{" << std::endl;
+    impl << TAB2 << "static bool engine_attached = ([] () -> bool {" << std::endl;
+    impl << TAB3 << "_seq.m = ::globals_memory();" << std::endl;
+    impl << TAB3 << "_seq.name = \"" << type_name << "\";" << std::endl;
+    impl << TAB3 << "_seq.hash_key = intern_key(" << type_name << "::hash_key);" << std::endl;
+    impl << TAB3 << "_seq.from = " << type_name << "::FROM.value();" << std::endl;
+    impl << TAB3 << "_seq.to = " << type_name << "::TO.value();" << std::endl;
+    impl << TAB3 << "_seq.step = " << type_name << "::STEP.value();" << std::endl;
+    impl << TAB3 << "_seq.initialized = 0;" << std::endl;
+    impl << TAB3 << "pthread_mutex_init(&_seq.guard, nullptr);" << std::endl;
+    impl << TAB3 << "return true;" << std::endl;
+    impl << TAB2 << "})();" << std::endl;
+    impl << TAB2 << "(void)engine_attached;" << std::endl;
     impl << TAB1 << "}" << std::endl;
-    impl << TAB1 << name << "::" << name << "(Zigurat::Pointer&& pointer)" << std::endl;
-    impl << TAB1 << "{" << std::endl;
-    impl << TAB2 << "this->pointer = std::move(pointer);" << std::endl;
-    impl << TAB1 << "}" << std::endl;
-    impl << TAB1 << name << "::" << name << "(const Zigurat::Pointer& pointer)" << std::endl;
-    impl << TAB1 << "{" << std::endl;
-    impl << TAB2 << "this->pointer = pointer;" << std::endl;
-    impl << TAB1 << "}" << std::endl;
+    impl << TAB1 << "Zigurat::Long " << type_name << "::CURRENT() { _attach(); return Zigurat::Long(seq_current(&_seq)); }" << std::endl;
+    impl << TAB1 << "void " << type_name << "::SET_CURRENT(Zigurat::Long v) { _attach(); seq_set_current(&_seq, v.value()); }" << std::endl;
+    impl << TAB1 << "Zigurat::Long " << type_name << "::NEXT() { _attach(); return Zigurat::Long(seq_next(&_seq)); }" << std::endl;
+    impl << TAB1 << "Zigurat::Long " << type_name << "::BACK() { _attach(); return Zigurat::Long(seq_back(&_seq)); }" << std::endl;
+    impl << TAB1 << "void " << type_name << "::RESET() { _attach(); seq_reset(&_seq); }" << std::endl;
 
     this->_close_namespace(ast.args[0], impl);
 

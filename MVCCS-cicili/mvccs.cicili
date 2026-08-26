@@ -63,6 +63,11 @@
 
   (var int failures . 0)
 
+  ;; the FIRST version's address of the row the row_latest scenario
+  ;; updates -- kept across the restart so the stamps' durability is
+  ;; checked from the same starting point
+  (var int64_t latest_first_addr . -1)
+
   (func check ((const char * what) (int64_t got) (int64_t want)) (out void)
     (if (== got want)
         (printf "ok   %-42s %ld\n" what (cast long got))
@@ -111,6 +116,20 @@
       (Book_cursor m (cast (void *) (aof c)) find_cb)
       (if ($ c found) (set (cof out_row) ($ c row)))
       (return ($ c found))))
+
+  ;; the DML tier's twins of the two hand-rolled queries above: the
+  ;; macros must fold to the same answers the spelled-out context
+  ;; structs and lifted callbacks produce
+  (defcount dml_book_count Book () #t)
+  (deffind  dml_book_find  Book ((int64_t id)) (== (-> row id) id))
+  (defcount dml_book_over  Book ((int64_t floor)) (> (-> row value) floor))
+  (defquery dml_book_sum   Book () #t
+    (set (cof (cast (int64_t *) user))
+         (+ (cof (cast (int64_t *) user)) (-> row value))))
+  (defupdate dml_book_bump Book ((int64_t k) (int64_t v))
+             (== (-> row value) k)
+             ((value v)))
+  (defdelete dml_book_drop Book ((int64_t v)) (== (-> row value) v))
 
   ;; count matches through the index cursors
   (func book_equal_count ((Memory * m) (int64_t k)) (out int64_t)
@@ -359,6 +378,38 @@
         (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 2)
         (check "truncate spares the living" (book_count (aof mem) nil) 2)
         (check "the index survives truncate" (book_equal_count (aof mem) 42) 1)
+
+        ;; ---- the DML macros against their hand-rolled twins -----------
+        (let ((int64_t hsum . 0) (int64_t msum . 0))
+          (check "defcount twins book_count"
+                 (dml_book_count (aof mem)) (book_count (aof mem) (aof hsum)))
+          (dml_book_sum (aof mem) (cast (void *) (aof msum)))
+          (check "defquery sums what the hand walk sums" msum hsum))
+        (let ((Book a) (Book b))
+          (check "deffind finds what book_find finds"
+                 (cast int64_t (dml_book_find (aof mem) 2 (aof a))) 1)
+          (if (book_find (aof mem) 2 (aof b))
+              (check "and hands back the same row" ($ a value) ($ b value))))
+        (check "deffind misses what is not there"
+               (cast int64_t (dml_book_find (aof mem) 777 nil)) 0)
+        (check "a parameter reaches the WHERE" (dml_book_over (aof mem) 20) 1)
+        (check "defupdate rewrites the admitted row" (dml_book_bump (aof mem) 42 77) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the rewrite moved the index" (book_equal_count (aof mem) 77) 1)
+        (check "and back is the mirror" (dml_book_bump (aof mem) 77 42) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((Book tmp))
+          (set ($ tmp id) 99)
+          (set ($ tmp value) 999)
+          (Book_insert (aof mem) (aof tmp)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "defdelete removes what WHERE admits" (dml_book_drop (aof mem) 999) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "and spares the rest" (book_count (aof mem) nil) 2)
 
         ;; ---- an allocation past a page is refused ---------------------
         (let ((int64_t refused . 0))
@@ -712,6 +763,74 @@
         (commit_transaction (aof mem))
         (begin_transaction (aof mem))
 
+        ;; ---- the last inserted version, from the first of history -----
+        ;; A row is updated eight times, so its history is nine versions
+        ;; and the page scan meets the FIRST of them first. row_latest
+        ;; follows the successor stamps the commits wrote and lands on
+        ;; the ninth in eight verified hops -- the growing history in
+        ;; between is never read.
+        (let ((Book b))
+          (set ($ b id) 900)
+          (set ($ b value) 1)
+          (Book_insert (aof mem) (aof b))
+          (set latest_first_addr ($ ($ b pointer) address)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((int64_t round . 0))
+          (while (< round 8)
+            (let ((Book old_row) (Book new_row))
+              (if (book_find (aof mem) 900 (aof old_row))
+                  (block
+                    (set ($ new_row id) 900)
+                    (set ($ new_row value) (+ ($ old_row value) 1))
+                    (Book_update (aof mem) (aof old_row) (aof new_row)))))
+            (commit_transaction (aof mem))
+            (begin_transaction (aof mem))
+            (set round (+ round 1))))
+        (let ((Pointer p . #'(pointer_at (aof mem) (Book_key) latest_first_addr))
+              (int64_t hops . 0))
+          (set hops (row_latest (aof mem) (aof p)))
+          (check "eight stamps walked from the first version" hops 8)
+          (let ((Book got))
+            (set ($ got pointer) p)
+            (read_row (aof mem) (cast (BaseTable *) (aof got)))
+            (check "and they end on the last inserted version" ($ got value) 9)))
+        ;; a version nothing superseded has nowhere to hop
+        (let ((Book fresh))
+          (if (book_find (aof mem) 100 (aof fresh))
+              (let ((Pointer p2 . #'($ fresh pointer))
+                    (int64_t hops2 . 0))
+                (set hops2 (row_latest (aof mem) (aof p2)))
+                (check "a current version stands still" hops2 0))))
+        ;; a rolled-back update stamps nothing: the road still ends at nine
+        (let ((Book old_row) (Book new_row))
+          (if (book_find (aof mem) 900 (aof old_row))
+              (block
+                (set ($ new_row id) 900)
+                (set ($ new_row value) 1000)
+                (Book_update (aof mem) (aof old_row) (aof new_row)))))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((Pointer p . #'(pointer_at (aof mem) (Book_key) latest_first_addr))
+              (int64_t hops . 0))
+          (set hops (row_latest (aof mem) (aof p)))
+          (check "a rollback stamped nothing" hops 8)
+          (let ((Book got))
+            (set ($ got pointer) p)
+            (read_row (aof mem) (cast (BaseTable *) (aof got)))
+            (check "and the road still ends where it did" ($ got value) 9)))
+        ;; deletion ends the road without erasing it -- the walk arrives
+        ;; at the last inserted version, whose control then says deleted
+        (let ((Book doomed))
+          (if (book_find (aof mem) 900 (aof doomed))
+              (Book_delete (aof mem) (aof doomed))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((Pointer p . #'(pointer_at (aof mem) (Book_key) latest_first_addr))
+              (int64_t hops . 0))
+          (set hops (row_latest (aof mem) (aof p)))
+          (check "the walk survives the row's deletion" hops 8))
+
         (sync_disk (aof mem))
         (cast void 0)))
 
@@ -724,6 +843,12 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
         (check "the store survives a restart" (book_count (aof mem) nil) 22)
+
+        ;; the stamps are rows like everything else, so they restart too
+        (let ((Pointer p . #'(pointer_at (aof mem) (Book_key) latest_first_addr))
+              (int64_t hops . 0))
+          (set hops (row_latest (aof mem) (aof p)))
+          (check "the stamps survive a restart" hops 8))
 
         ;; attach finds the catalogue records written last time -- the
         ;; roots come back, nothing re-inserts
