@@ -1,0 +1,73 @@
+;;;; The Cicili MVCCS as ONE SHARED LIBRARY -- the keystone of replacing
+;;;; the C++ engine.
+;;;;
+;;;; Until now the engine was a macro: every target that wanted it
+;;;; expanded its own copy (mvccs_test, schema_test, cocolog's embed).
+;;;; That is the right shape for an embedded store and the wrong one for
+;;;; the SERVER, whose Parsi-compiled procedure objects are separate .so
+;;;; files that must all speak to ONE engine instance in one process.
+;;;; This target expands the engine exactly once, adds the thin wrappers
+;;;; consumers need so no RAII struct ever crosses the boundary, and
+;;;; build.sh links it as libMVCCS2.so.
+;;;;
+;;;; engine.hpp beside it is the consumer's view: the enums, the POD
+;;;; Pointer, BaseTable verbatim (a generated table subclasses it, so
+;;;; the vtable must match to the byte -- build.sh diffs the header's
+;;;; copy against the emitted one), an OPAQUE Memory, and declarations.
+;;;; Consumers never see Streams, Statement, or a thread-local.
+
+(source "engine.cpp"
+  (make :cpp #t :compile #t)
+
+  (include <cstdio>)
+  (include <cstdint>)
+  (include <cstring>)
+  (include <string>)
+  (include <vector>)
+  (include <pthread.h>)
+  (include <unistd.h>)
+  (include <time.h>)
+  (include "/home/user/ZiguratIP/Core/zexception.hpp")
+  (include "/home/user/ZiguratIP/Core/utility.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/binarystream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/filestream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/bufferstream.hpp")
+  (include "/home/user/ZiguratIP/StreamIO/textstream.hpp")
+  (include <ctype.h>)
+
+  (import "./mvccs-lib.cicili")
+  (mvccs-engine)
+
+  ;; ==================================================================
+  ;; The consumer surface -- what a Parsi-compiled object or a server
+  ;; binding calls that the engine's free functions do not already give.
+  ;; ==================================================================
+
+  ;; Memory is opaque to consumers; they hold a Memory* and never lay
+  ;; one out. The pair below is the whole of its lifetime.
+  (func engine_memory_new () (out Memory *)
+    (return (new* Memory)))
+
+  (func engine_memory_delete ((Memory * m)) (out void)
+    (delete* m))
+
+  ;; The guarded cursor -- cursor_walk wants a Streams guard, and Streams
+  ;; is an RAII struct whose inline body reaches the engine's
+  ;; thread-locals. It stays inside the library; a consumer calls this.
+  ;; tl_want_shared exactly as deftable's cursor sets it: shared when the
+  ;; isolation writes nothing, decided by the guard's own constructor.
+  (func engine_cursor ((Memory * m) (const uint8_t * hash_key) (void * ctx)
+                       (func cb ((void * c) (Pointer * p)) (out bool)))
+        (out void)
+    (set tl_want_shared 1)
+    (letin* ((streams (Streams m)))
+      (cursor_walk m hash_key (aof streams) ctx cb)
+      (cast void 0)))
+
+  ;; The transaction the thread is in is a thread-local; a consumer names
+  ;; the level and the engine finds the transaction.
+  (func engine_set_isolation ((IsolationLevel level)) (out void)
+    (if (!= tl_txn nil)
+        (set_isolation_level tl_txn level)))
+
+  ) ; source

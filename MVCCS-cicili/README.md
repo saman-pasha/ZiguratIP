@@ -243,6 +243,29 @@ a row's first version to its ninth, through a rollback that stamps
 nothing, a deletion that ends the road without erasing it, and a restart
 the stamps survive.
 
+## One engine instance, behind a header
+
+The engine was born a macro: every target expanded its own copy, which
+is the right shape for an embedded store and the wrong one for the
+server, whose Parsi-compiled procedure objects are separate `.so` files
+that must all speak to one engine in one process. `engine.cicili`
+expands the engine exactly once and builds **`libMVCCS2.so`**;
+`engine.hpp` is the consumer's view of it — the enums, `Pointer` and
+`BaseTable` copied verbatim from the emitted C++ (build.sh diffs the
+copies on every build, so a drift is a build failure rather than a
+vtable crash), an *opaque* `Memory`, and free-function declarations.
+Nothing RAII crosses the boundary: the guarded cursor and the
+isolation setter live inside the library as `engine_*` wrappers.
+
+`consumer-test.cpp` is the keystone proof, and the first consumer: a
+table subclass compiled by plain g++ against the header only — exactly
+the shape the Parsi compiler's emission will take — driving insert,
+commit, the guarded cursor, updates, `row_latest` across the version
+chain, rollback, and a restart, all green against the shared library.
+The road from here to retiring the C++ twin runs through the compiler's
+emission and the server's `load*` bindings, with a both-engines-one-
+store parallel run as the acceptance gate.
+
 ## Deliberate divergences
 
 * Hash keys are interned once per process and every `Pointer` aims at

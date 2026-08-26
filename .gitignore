@@ -140,3 +140,5 @@ emacs/*.elc
 # VSCode extension build products
 vscode/node_modules/
 vscode/*.vsix
+MVCCS-cicili/engine.cpp
+MVCCS-cicili/consumer_test
