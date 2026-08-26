@@ -44,3 +44,27 @@ PY
 g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
   -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
+
+# the contention suite: the old Test/test_contention.cpp scenarios, run
+# through engine-compat.hpp -- the exact surface a compiled object uses --
+# with each "connection" a thread holding its own transaction
+INCDIR=$(cd "$HERE/../home/include" && pwd)
+g++ -g -O0 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lType -lCryptography -lpthread \
+  -Wl,-rpath,"$LIBDIR"
+"$HERE/contention_test"
+
+# the carry-over acceptance: the OLD engine writes a store, the NEW one
+# opens it -- rows carry byte-identically, indexes rebuild. Two programs
+# because the two engines must never share a store from one process.
+g++ -g -O0 -std=c++17 "$HERE/carryover-old.cpp" -o "$HERE/carryover_old" \
+  -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
+  -Wl,-rpath,"$LIBDIR"
+g++ -g -O0 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lType -lpthread \
+  -Wl,-rpath,"$LIBDIR"
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_old"
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
