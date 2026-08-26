@@ -8,7 +8,7 @@
 ;;;; files that must all speak to ONE engine instance in one process.
 ;;;; This target expands the engine exactly once, adds the thin wrappers
 ;;;; consumers need so no RAII struct ever crosses the boundary, and
-;;;; build.sh links it as libMVCCS2.so.
+;;;; build.sh links it as libMVCCS.so.
 ;;;;
 ;;;; engine.hpp beside it is the consumer's view: the enums, the POD
 ;;;; Pointer, BaseTable verbatim (a generated table subclasses it, so
@@ -98,6 +98,26 @@
     (return (? (!= tl_txn nil)
                (-> tl_txn auto_commit)
                (cast int64_t (globals_default_autocommit_mode)))))
+
+  ;; what this thread's transaction runs at right now -- the default
+  ;; when none is open, which is also what transaction_reset restores
+  (func engine_isolation () (out IsolationLevel)
+    (return (? (!= tl_txn nil)
+               (-> tl_txn isolation_level)
+               (globals_default_isolation_level))))
+
+  ;; the bounded waits' knob, for tests that shrink or stretch them;
+  ;; answers the previous value
+  (func engine_set_lock_wait_ms ((int v)) (out int)
+    (let ((int old . lock_wait_timeout_ms))
+      (set lock_wait_timeout_ms v)
+      (return old)))
+
+  ;; the registry loses this transaction, exactly as it does when its
+  ;; owner dies without commit or rollback -- the stale-lock breaker's
+  ;; test stages debris with it
+  (func engine_retire_transaction ((size_t transaction_id)) (out void)
+    (transaction_retire transaction_id))
 
   ;; A TEXT COLUMN AS AN INT64 INDEX KEY. The Cicili B-tree keys are
   ;; int64 only; a String-keyed Parsi index rides as this fold of the

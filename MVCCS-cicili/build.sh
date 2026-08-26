@@ -13,11 +13,11 @@ if [ -f "$HERE/schema-test.cicili" ]; then
   sbcl --script cicili.lisp "$HERE/schema-test.cicili"
 fi
 
-# ---- the engine as ONE shared library: libMVCCS2.so ------------------
+# ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
 # wrappers; consumers compile with plain g++ against engine.hpp.
 sbcl --script cicili.lisp "$HERE/engine.cicili"
-g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS2.so" \
+g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
   -L"$LIBDIR" -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 
 # THE HEADER MAY NOT DRIFT. engine.hpp copies Pointer and BaseTable
@@ -40,7 +40,31 @@ for name in ('Pointer','BaseTable','BTreeIndex'):
 sys.exit(bad)
 PY
 
-# and the keystone consumer: plain g++, engine.hpp, libMVCCS2.so only
+# and the keystone consumer: plain g++, engine.hpp, libMVCCS.so only
 g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
-  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
+
+# the contention suite: the old Test/test_contention.cpp scenarios, run
+# through engine-compat.hpp -- the exact surface a compiled object uses --
+# with each "connection" a thread holding its own transaction
+INCDIR=$(cd "$HERE/../home/include" && pwd)
+g++ -g -O0 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
+  -Wl,-rpath,"$LIBDIR"
+"$HERE/contention_test"
+
+# the carry-over acceptance: a store the OLD engine wrote, opened by the
+# NEW one -- rows carry byte-identically, indexes rebuild. The old engine
+# is retired, so the store is GOLDEN: the last one carryover-old.cpp ever
+# wrote, checked in under golden/, handed to the reader as a scratch copy
+# (the reader writes into it -- an update and an insert are part of the
+# proof).
+g++ -g -O0 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lpthread \
+  -Wl,-rpath,"$LIBDIR"
+cp "$HERE/golden/carryover-hexmap.bin" /tmp/mvccs-carryover-hexmap.bin
+cp "$HERE/golden/carryover-data.bin"   /tmp/mvccs-carryover-data.bin
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"

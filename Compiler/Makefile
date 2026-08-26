@@ -2,7 +2,8 @@
 PROJECT := Compiler
 TYPE := Library
 
-HEADERS := tokenizeexception.hpp \
+HEADERS := globals.hpp \
+	tokenizeexception.hpp \
 	tokentype.hpp \
 	token.hpp \
 	tokenizer.hpp \
@@ -15,7 +16,8 @@ HEADERS := tokenizeexception.hpp \
 	wherecompiler.hpp \
 	compiler.hpp
 
-SOURCES := tokenizeexception.cpp \
+SOURCES := globals.cpp \
+	tokenizeexception.cpp \
 	tokenizer.cpp \
 	expression.cpp \
 	parseexception.cpp \

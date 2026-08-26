@@ -288,13 +288,15 @@ struct EngineMemoryHandle {
   void rollback_transaction () { ::rollback_transaction(m); }
 };
 
-// HIDDEN, AND IT IS LOAD-BEARING: while both engines live in one server
-// process, the OLD engine's `class Globals' statics carry these exact
-// mangled names -- _ZN7Globals6memoryEv and friends -- and a dlopen'd
-// object whose inline Globals::memory() stayed default-visible bound to
-// the old one through the global scope, took its null Zigurat::Memory*
-// for an EngineMemoryHandle*, and died on the first insert. Hidden,
-// every object resolves these inside itself, where they mean this file.
+// HIDDEN, AND IT IS LOAD-BEARING: the server's `class Globals' (the
+// parser/compiler/peer bookkeeping, in the Compiler library since the
+// old engine retired) carries these exact mangled names --
+// _ZN7Globals6memoryEv and friends once did, client_stream still does --
+// and a dlopen'd object whose inline forwards stayed default-visible
+// bound to that class through the global scope: a null pointer of the
+// wrong type, dead on the first insert, back when the old engine still
+// defined memory(). Hidden, every object resolves these inside itself,
+// where they mean this file.
 namespace Globals {
   __attribute__((visibility("hidden")))
   inline EngineMemoryHandle * memory () {

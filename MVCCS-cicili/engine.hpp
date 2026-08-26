@@ -1,5 +1,5 @@
 // engine.hpp -- the consumer's view of the Cicili MVCCS shared library
-// (libMVCCS2.so, built from engine.cicili).
+// (libMVCCS.so, built from engine.cicili).
 //
 // WHAT A CONSUMER IS: a Parsi-compiled procedure object, a server
 // binding, or a test -- C++ compiled by plain g++ against this header,
@@ -190,6 +190,9 @@ size_t engine_transaction_id (Memory * m);
 void engine_isolate (Memory * m, IsolationLevel level);
 void engine_set_autocommit (Memory * m, int64_t v);
 int64_t engine_autocommit ();
+IsolationLevel engine_isolation ();
+int  engine_set_lock_wait_ms (int v);   // answers the previous value
+void engine_retire_transaction (size_t transaction_id);
 
 // turns the shared-reader side on; called by whoever opened the store
 void memory_reader_paths (Memory * m, const char * hex, const char * data);

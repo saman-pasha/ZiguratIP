@@ -98,7 +98,7 @@ void load_memory(const Configuration &conf)
   std::cout << "Memory page size: '" << memory_page_size << "'" << std::endl;
 
   // The Cicili engine: one Memory for the process, opaque behind
-  // libMVCCS2. Compiled objects reach it through globals_memory() --
+  // libMVCCS. Compiled objects reach it through globals_memory() --
   // that is what engine-compat.hpp's Globals::memory() forwards to --
   // and each table attaches its own indexes on first touch, so nothing
   // here wires a catalogue index the way the old engine did.

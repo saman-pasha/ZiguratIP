@@ -249,7 +249,7 @@ The engine was born a macro: every target expanded its own copy, which
 is the right shape for an embedded store and the wrong one for the
 server, whose Parsi-compiled procedure objects are separate `.so` files
 that must all speak to one engine in one process. `engine.cicili`
-expands the engine exactly once and builds **`libMVCCS2.so`**;
+expands the engine exactly once and builds **`libMVCCS.so`**;
 `engine.hpp` is the consumer's view of it — the enums, `Pointer` and
 `BaseTable` copied verbatim from the emitted C++ (build.sh diffs the
 copies on every build, so a drift is a build failure rather than a
@@ -330,7 +330,7 @@ both.
 ## The server runs on this engine now
 
 The replacement landed in three passes. **Pass 1** made the engine ONE
-shared library, `libMVCCS2.so` — the macro expanded once, consumers
+shared library, `libMVCCS.so` — the macro expanded once, consumers
 plain g++ against `engine.hpp`, nothing RAII crossing the boundary.
 **Pass 2** retargeted the Parsi compiler's generated C++ onto it
 through `engine-compat.hpp`, which keeps every spelling the DML
@@ -358,6 +358,18 @@ dlopen'd object bound to the old one through the global scope — a null
 insert. The compat `Globals` functions are
 `visibility("hidden")` now, so every object resolves them inside
 itself; the comment beside them says why they must stay so.
+
+**Pass 5 retired the C++ engine.** `MVCCS/` is gone; this directory
+holds the one MVCCS and `build.sh` links it as **`libMVCCS.so`** -- the
+old name, because there is only one engine to name. What outlived the
+old tree moved out first: the server's `class Globals` (parser,
+compiler, peers -- the bookkeeping the engine never owned) lives in the
+Compiler library now, `isolationlevel.hpp` beside the Connector's other
+wire types. The old engine's own test files retired with it --
+`test_contention.cpp` lives on here as `contention-test.cpp`, and the
+carry-over acceptance keeps running against `golden/`: the last store
+the old engine ever wrote, checked in, opened by the new engine on
+every build.
 
 The engine also carries a DML tier for Cicili consumers — `defquery`,
 `defcount`, `deffind`, `defupdate`, `defdelete` in `mvccs-lib.cicili` —

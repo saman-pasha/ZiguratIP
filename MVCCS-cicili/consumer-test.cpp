@@ -1,6 +1,6 @@
 // The keystone proof: a consumer compiled by PLAIN g++ against
 // engine.hpp -- exactly the shape the Parsi compiler will emit -- talks
-// to the one engine instance inside libMVCCS2.so.
+// to the one engine instance inside libMVCCS.so.
 //
 // What crosses the boundary here is everything the replacement rests
 // on: an opaque Memory built and freed by the library; a BaseTable
@@ -180,7 +180,7 @@ int main () {
     engine_memory_delete(m);
   }
 
-  if (failures == 0) printf("\nconsumer against libMVCCS2.so: all green\n");
+  if (failures == 0) printf("\nconsumer against libMVCCS.so: all green\n");
   else printf("\nconsumer: %d FAILED\n", failures);
   return failures;
 }

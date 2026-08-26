@@ -11,7 +11,7 @@ PROJECTS := Core \
 	SocketIO \
 	Connector \
 	HTTP \
-	MVCCS \
+	MVCCS-cicili \
 	Compiler \
 	ca \
 	parsi \
