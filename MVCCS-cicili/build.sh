@@ -8,15 +8,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LIBDIR=$(cd "$HERE/../home/lib" && pwd)
 set -e
 cd "$CICILI"
-sbcl --script cicili.lisp "$HERE/mvccs.cicili"
+sbcl --script cicili.lisp --release "$HERE/mvccs.cicili"
 if [ -f "$HERE/schema-test.cicili" ]; then
-  sbcl --script cicili.lisp "$HERE/schema-test.cicili"
+  sbcl --script cicili.lisp --release "$HERE/schema-test.cicili"
 fi
 
 # ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
 # wrappers; consumers compile with plain g++ against engine.hpp.
-sbcl --script cicili.lisp "$HERE/engine.cicili"
+sbcl --script cicili.lisp --release "$HERE/engine.cicili"
 g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
   -L"$LIBDIR" -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 
@@ -41,7 +41,7 @@ sys.exit(bad)
 PY
 
 # and the keystone consumer: plain g++, engine.hpp, libMVCCS.so only
-g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
+g++ -O3 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
 
@@ -49,7 +49,7 @@ g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
 # through engine-compat.hpp -- the exact surface a compiled object uses --
 # with each "connection" a thread holding its own transaction
 INCDIR=$(cd "$HERE/../home/include" && pwd)
-g++ -g -O0 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
+g++ -O3 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
   -Wl,-rpath,"$LIBDIR"
@@ -61,7 +61,7 @@ g++ -g -O0 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
 # wrote, checked in under golden/, handed to the reader as a scratch copy
 # (the reader writes into it -- an update and an insert are part of the
 # proof).
-g++ -g -O0 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
+g++ -O3 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lpthread \
   -Wl,-rpath,"$LIBDIR"
@@ -73,7 +73,7 @@ LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
 # the reclaim pass returns the cost and converges, steady churn+reclaim
 # stays flat, and the store file plateaus. The structural checks are
 # deterministic; the timing ratios carry 3x headroom on purpose.
-g++ -g -O2 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
+g++ -O3 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
   -I"$HERE" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"
