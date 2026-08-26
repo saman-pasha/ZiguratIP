@@ -5,3 +5,6 @@ mvccs_test
 .libs/
 schema_test
 schema_test.cpp
+contention_test
+carryover_old
+carryover_new
