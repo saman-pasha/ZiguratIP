@@ -54,7 +54,7 @@
 #include "resulttype.hpp"
 #include "zexception.hpp"
 #include "utility.hpp"
-#include "/home/user/ZiguratIP/StreamIO/textstream.hpp"
+#include "textstream.hpp"
 #include <iostream>
 #include <utility>
 

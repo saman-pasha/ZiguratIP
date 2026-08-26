@@ -3,15 +3,55 @@
 # The transpiler runs from its own checkout (its builtins live there) and
 # changes into each target's directory itself, so "./" imports resolve
 # beside the target.
-CICILI=${CICILI:-/home/user/cicili}
+# NO ABSOLUTE PATH TO ANYBODY'S HOME. This file and everything it names
+# used to spell one developer's checkout -- /home/user/... -- into
+# .cicili includes, link flags, test sources and the drift check below,
+# 51 times across this directory. The workspace therefore built on
+# exactly one machine, and the first attempt to build it anywhere else
+# died at `cannot find -lMVCCS' with the real cause fifty lines up. The
+# headers this engine needs are published into ../home/include by every
+# other project's `headers' target, and this one now includes them the
+# way the rest of the repository does: by name, found relatively.
+CICILI=${CICILI:-$HOME/cicili}
 HERE=$(cd "$(dirname "$0")" && pwd)
-LIBDIR=$(cd "$HERE/../home/lib" && pwd)
+LIBDIR=$(cd "$HERE/.." && pwd)/home/lib
+mkdir -p "$LIBDIR"
 set -e
 cd "$CICILI"
+# LD_LIBRARY_PATH rather than an rpath: the rpath these two carried was
+# an absolute path into one developer's home, and a RELATIVE rpath would
+# resolve against whatever directory the caller happened to be in. A
+# test binary this script runs itself does not need a promise that
+# outlives the script.
+LIB_ENV="$(cd "$HERE/.." && pwd)/home/lib"
+LD_LIBRARY_PATH="$LIB_ENV${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
 sbcl --script cicili.lisp --release "$HERE/mvccs.cicili"
 if [ -f "$HERE/schema-test.cicili" ]; then
   sbcl --script cicili.lisp --release "$HERE/schema-test.cicili"
 fi
+
+# The headers this engine includes live in ../home/include, and every
+# project's `headers' target is what puts them there. The workspace's
+# top-level `all: headers' does that before any project builds -- but
+# THIS SCRIPT ALSO RUNS ON ITS OWN, and in a fresh clone home/include is
+# empty. Found by building a relocated clone: the includes resolved on
+# the development machine only because years of earlier builds had
+# already filled that directory.
+INCDIR=$(cd "$HERE/.." && pwd)/home/include
+mkdir -p "$INCDIR"
+if [ ! -f "$INCDIR/binarystream.hpp" ] || [ ! -f "$INCDIR/zexception.hpp" ]; then
+  echo "== publishing the workspace headers first (home/include was empty)"
+  make -C "$HERE/.." headers >/dev/null 2>&1 || true
+fi
+for h in zexception.hpp utility.hpp binarystream.hpp filestream.hpp \
+         bufferstream.hpp textstream.hpp; do
+  if [ ! -f "$INCDIR/$h" ]; then
+    echo "   $h is not in $INCDIR and the engine includes it -- run 'make headers' at the workspace root" >&2
+    exit 1
+  fi
+done
+cp "$HERE/engine.hpp" "$HERE/engine-compat.hpp" "$INCDIR/"
 
 # ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
@@ -24,10 +64,12 @@ g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
 # verbatim from the emitted engine.cpp -- a generated table subclasses
 # BaseTable, so the vtable must match to the byte. A drift is a build
 # failure here, never a latent crash in a procedure object.
-python3 - <<'PY'
+MVCCS_HERE="$HERE" python3 - <<'PY'
 import io, re, sys
-emitted = io.open(r'''/home/user/ZiguratIP/MVCCS-cicili/engine.cpp''',encoding='utf-8').read()
-header  = io.open(r'''/home/user/ZiguratIP/MVCCS-cicili/engine.hpp''',encoding='utf-8').read()
+import os
+here    = os.environ['MVCCS_HERE']
+emitted = io.open(os.path.join(here, 'engine.cpp'), encoding='utf-8').read()
+header  = io.open(os.path.join(here, 'engine.hpp'), encoding='utf-8').read()
 def block(src, name):
     m = re.search(r'struct %s \{.*?\n\};' % name, src, re.S)
     return re.sub(r'\s+', ' ', m.group(0)) if m else None
@@ -41,14 +83,13 @@ sys.exit(bad)
 PY
 
 # and the keystone consumer: plain g++, engine.hpp, libMVCCS.so only
-g++ -O3 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
+g++ -O3 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
 
 # the contention suite: the old Test/test_contention.cpp scenarios, run
 # through engine-compat.hpp -- the exact surface a compiled object uses --
 # with each "connection" a thread holding its own transaction
-INCDIR=$(cd "$HERE/../home/include" && pwd)
 g++ -O3 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
@@ -74,6 +115,6 @@ LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
 # stays flat, and the store file plateaus. The structural checks are
 # deterministic; the timing ratios carry 3x headroom on purpose.
 g++ -O3 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
-  -I"$HERE" \
+  -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"

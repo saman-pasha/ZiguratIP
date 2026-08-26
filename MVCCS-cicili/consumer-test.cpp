@@ -14,7 +14,7 @@
 #include <cstring>
 #include <string>
 #include "engine.hpp"
-#include "/home/user/ZiguratIP/StreamIO/filestream.hpp"
+#include "../home/include/filestream.hpp"
 
 // the 20-byte table key a Parsi compile would emit (any stable bytes do
 // for the proof; the real emission carries the SHA-1-derived key)
