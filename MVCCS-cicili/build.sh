@@ -32,7 +32,7 @@ def block(src, name):
     m = re.search(r'struct %s \{.*?\n\};' % name, src, re.S)
     return re.sub(r'\s+', ' ', m.group(0)) if m else None
 bad = 0
-for name in ('Pointer','BaseTable'):
+for name in ('Pointer','BaseTable','BTreeIndex'):
     e, h = block(emitted, name), block(header, name)
     h = h and h.replace('Zigurat::binarystream','binarystream')
     if e != h:

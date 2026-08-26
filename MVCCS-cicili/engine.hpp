@@ -68,7 +68,25 @@ struct BaseTable {
 };
 // ----------------------------------------------------------------------
 
-struct Memory;   // opaque: engine_memory_new / engine_memory_delete
+// -- verbatim from engine.cpp (checked by build.sh) --------------------
+struct Memory;   // opaque here; full definition stays in the library
+struct BTreeIndex {
+  Memory * m ;
+  const char * name ;
+  const uint8_t * hash_key ;
+  const uint8_t * table_key ;
+  int64_t catalogue_id ;
+  int64_t is_unique ;
+  int64_t branching_factor ;
+  int64_t min_degree ;
+  int64_t max_degree ;
+  int64_t root_address ;
+  Pointer record_pointer ;
+  int64_t levels ;
+  int64_t is_dependent ;
+  const uint8_t * dep_hash_key ;
+};
+// ----------------------------------------------------------------------
 
 // lifetime
 Memory * engine_memory_new ();
@@ -99,5 +117,37 @@ void engine_cursor (Memory * m, const uint8_t * hash_key, void * ctx,
 
 // the last inserted version, from the first of a row's history
 int64_t row_latest (Memory * m, Pointer * p);
+
+// -- the B-tree index tier ---------------------------------------------
+// A consumer holds a BTreeIndex instance by value at file scope, fills
+// its fields the way the defindex expansion's attach does -- intern_key
+// on the 20-byte index key, the table's key, catalogue id, branching --
+// and calls bt_select_record once per session to find or create its
+// catalogue record. Its table's map/unmap virtuals then call bt_map and
+// bt_unmap; the cursors judge visibility themselves and need no guard
+// from the caller.
+Pointer pointer_null ();
+const uint8_t * intern_key (const uint8_t * key);
+void bt_select_record (BTreeIndex * idx);
+void bt_map (BTreeIndex * idx, int64_t k, int64_t value);
+void bt_unmap (BTreeIndex * idx, int64_t k, int64_t value);
+void bt_map_multi (BTreeIndex * idx, int64_t * ks, int64_t value);
+void bt_unmap_multi (BTreeIndex * idx, int64_t * ks, int64_t value);
+void bt_unmap_key (BTreeIndex * idx, int64_t k);
+void bt_drop_storage (BTreeIndex * idx, Memory * m);
+bool bt_cursor_rows_deep (BTreeIndex * idx, void * user,
+                          bool (*rcb) (void * c, Pointer * p));
+bool bt_cursor_equal_multi (BTreeIndex * idx, int64_t * ks, void * user,
+                            bool (*rcb) (void * c, Pointer * p));
+void bt_cursor_not_equal (BTreeIndex * idx, int64_t k, void * user,
+                          bool (*rcb) (void * c, Pointer * p));
+void bt_cursor_less_than (BTreeIndex * idx, int64_t k, void * user,
+                          bool (*rcb) (void * c, Pointer * p));
+void bt_cursor_less_than_equal (BTreeIndex * idx, int64_t k, void * user,
+                                bool (*rcb) (void * c, Pointer * p));
+void bt_cursor_greater_than (BTreeIndex * idx, int64_t k, void * user,
+                             bool (*rcb) (void * c, Pointer * p));
+void bt_cursor_greater_than_equal (BTreeIndex * idx, int64_t k, void * user,
+                                   bool (*rcb) (void * c, Pointer * p));
 
 #endif

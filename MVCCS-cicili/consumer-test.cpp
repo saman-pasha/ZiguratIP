@@ -20,6 +20,12 @@
 // for the proof; the real emission carries the SHA-1-derived key)
 static uint8_t ITEM_KEY[20] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 };
 
+// the index on Item.value -- an instance held by value and attached the
+// way the defindex expansion's attach does, which is exactly what the
+// Parsi compiler's emission will write
+static uint8_t IDX_KEY[20] = { 21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40 };
+static BTreeIndex IDX_ITEM_VALUE;
+
 struct Item : public BaseTable {
   int64_t id = 0;
   int64_t value = 0;
@@ -30,7 +36,31 @@ struct Item : public BaseTable {
   void unpack (Zigurat::binarystream& io) override {
     io.read_std_long(id); io.read_std_long(value);
   }
+  void map (void*) override {
+    bt_map(&IDX_ITEM_VALUE, value, pointer.address);
+  }
+  void unmap (void*) override {
+    bt_unmap(&IDX_ITEM_VALUE, value, pointer.address);
+  }
 };
+
+static void idx_attach (Memory* m) {
+  IDX_ITEM_VALUE.m = m;
+  IDX_ITEM_VALUE.name = "IDX_ITEM_VALUE";
+  IDX_ITEM_VALUE.hash_key = intern_key(IDX_KEY);
+  IDX_ITEM_VALUE.table_key = ITEM_KEY;
+  IDX_ITEM_VALUE.catalogue_id = 424242;
+  IDX_ITEM_VALUE.is_unique = 0;
+  IDX_ITEM_VALUE.branching_factor = 3;
+  IDX_ITEM_VALUE.min_degree = 2;
+  IDX_ITEM_VALUE.max_degree = 4;
+  IDX_ITEM_VALUE.root_address = -1;
+  IDX_ITEM_VALUE.record_pointer = pointer_null();
+  IDX_ITEM_VALUE.levels = 1;
+  IDX_ITEM_VALUE.is_dependent = 0;
+  IDX_ITEM_VALUE.dep_hash_key = nullptr;
+  bt_select_record(&IDX_ITEM_VALUE);
+}
 
 static int failures = 0;
 static void check (const char* what, long got, long want) {
@@ -62,6 +92,7 @@ int main () {
     Memory* m = engine_memory_new();
     g_m = m;
     memory_open(m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+    idx_attach(m);
     begin_transaction(m);
 
     Pointer first; memset(&first, 0, sizeof first);
@@ -100,6 +131,19 @@ int main () {
     read_row(m, &latest);
     check("and lands on the last inserted version", latest.value, 32);
 
+    // the index moved with the updates: 30 left it, 32 carries the row
+    { Scan e{0,0,0,{},false};
+      long ks[1]; ks[0] = 32;
+      bt_cursor_equal_multi(&IDX_ITEM_VALUE, (int64_t*)ks, &e, scan_cb);
+      check("the index finds the updated value", e.rows, 1);
+      Scan e2{0,0,0,{},false};
+      ks[0] = 30;
+      bt_cursor_equal_multi(&IDX_ITEM_VALUE, (int64_t*)ks, &e2, scan_cb);
+      check("and the superseded value left it", e2.rows, 0);
+      Scan g{0,0,0,{},false};
+      bt_cursor_greater_than(&IDX_ITEM_VALUE, 20, &g, scan_cb);
+      check("a range cursor crosses the boundary too", g.rows, 3); }
+
     // a rollback undoes what a consumer staged
     { Scan f{0,0,3,{},false};
       engine_cursor(m, ITEM_KEY, &f, scan_cb);
@@ -123,10 +167,15 @@ int main () {
     Memory* m = engine_memory_new();
     g_m = m;
     memory_open(m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+    idx_attach(m);
     begin_transaction(m);
     Scan s{0,0,0,{},false};
     engine_cursor(m, ITEM_KEY, &s, scan_cb);
     check("the consumer's store survives a restart", s.rows, 5);
+    Scan e{0,0,0,{},false};
+    long ks[1]; ks[0] = 32;
+    bt_cursor_equal_multi(&IDX_ITEM_VALUE, (int64_t*)ks, &e, scan_cb);
+    check("and the index found its catalogue record", e.rows, 1);
     commit_transaction(m);
     engine_memory_delete(m);
   }
