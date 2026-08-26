@@ -30,6 +30,7 @@
 
 #include "engine.hpp"
 #include <string>
+#include <cstring>   // strlen, for the const char* key64 overload
 #include <vector>
 #include <array>
 #include <pthread.h>
@@ -147,6 +148,23 @@ inline int64_t engine_key64 (const Zigurat::UShort& v)  { return (int64_t)v.valu
 inline int64_t engine_key64 (const Zigurat::UInt& v)    { return (int64_t)v.value(); }
 inline int64_t engine_key64 (const Zigurat::ULong& v)   { return (int64_t)v.value(); }
 inline int64_t engine_key64 (const Zigurat::Timestamp& v) { return (int64_t)v.value(); }
+// A STRING LITERAL NEEDS ITS OWN OVERLOAD, and without one this whole
+// family is ambiguous for it. `const char[N]' decays to `const char*',
+// and from there it reaches std::string, Zigurat::String and
+// Zigurat::Text by a user-defined conversion -- but ALSO Zigurat::Bool,
+// because pointer-to-bool is a standard conversion and Bool converts
+// from bool. Several user-defined conversions of equal rank is exactly
+// the definition of ambiguous, and the compiler said so:
+//
+//   demo/03-pages.parsi:66: error: call of overloaded
+//     'engine_key64(const char [18])' is ambiguous
+//
+// which is a Parsi PAGE failing to compile over a literal key -- found
+// building ZiguratIP's own demo, which had stopped compiling entirely.
+// This overload takes the literal by array-to-pointer decay alone, no
+// user-defined conversion, so it wins outright and the set is
+// unambiguous again.
+inline int64_t engine_key64 (const char* s)             { return engine_text_key(s, strlen(s)); }
 inline int64_t engine_key64 (const std::string& s)      { return engine_text_key(s.data(), s.size()); }
 inline int64_t engine_key64 (const Zigurat::String& s)  { return engine_key64(s.value()); }
 inline int64_t engine_key64 (const Zigurat::Text& s)    { return engine_key64(s.value()); }
