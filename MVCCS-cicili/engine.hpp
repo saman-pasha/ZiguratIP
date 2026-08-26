@@ -1,5 +1,5 @@
 // engine.hpp -- the consumer's view of the Cicili MVCCS shared library
-// (libMVCCS2.so, built from engine.cicili).
+// (libMVCCS.so, built from engine.cicili).
 //
 // WHAT A CONSUMER IS: a Parsi-compiled procedure object, a server
 // binding, or a test -- C++ compiled by plain g++ against this header,

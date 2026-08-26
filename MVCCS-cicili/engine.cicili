@@ -8,7 +8,7 @@
 ;;;; files that must all speak to ONE engine instance in one process.
 ;;;; This target expands the engine exactly once, adds the thin wrappers
 ;;;; consumers need so no RAII struct ever crosses the boundary, and
-;;;; build.sh links it as libMVCCS2.so.
+;;;; build.sh links it as libMVCCS.so.
 ;;;;
 ;;;; engine.hpp beside it is the consumer's view: the enums, the POD
 ;;;; Pointer, BaseTable verbatim (a generated table subclasses it, so

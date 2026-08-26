@@ -33,7 +33,7 @@ hexmap ends inside the chunk at 29987569464559153
 with an address out of nowhere — or a `Pointer` assembled from somebody else's
 offset, a walk into it, and the server gone.
 
-`Memory::Streams` (`MVCCS/memory.hpp`) is what stops that. It is a guard over
+`Streams` (the engine, `MVCCS-cicili/mvccs-lib.cicili`) is what stops that. It is a guard over
 both mutexes with two properties that a plain `lock_guard` pair cannot have:
 
 * **It nests.** `online_insert` holds the streams and then calls `object.map()`,

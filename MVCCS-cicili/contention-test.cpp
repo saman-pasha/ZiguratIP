@@ -1081,7 +1081,7 @@ int main ()
   serializable_wait_gives_up();
   dead_lock_breaks_on_contact();
 
-  printf("\ncontention against libMVCCS2.so: %s (%d failures)\n",
+  printf("\ncontention against libMVCCS.so: %s (%d failures)\n",
          failures == 0 ? "all green" : "RED", failures);
   return failures != 0;
 }

@@ -1,7 +1,11 @@
 // The OLD engine's half of the carry-over acceptance: write rows the way
 // the C++ MVCCS always wrote them -- five inserts, one update so a
 // version chain exists -- into a store the NEW engine will open next.
-// carryover-new.cpp is the other half; build.sh runs them in order.
+//
+// HISTORICAL: this file needed MVCCS/ to build, and MVCCS/ is retired.
+// The last store it wrote is checked in under golden/ and stays the
+// acceptance's input; the source stays as the record of how those bytes
+// were made. carryover-new.cpp is the half that still runs.
 
 #include <cstdio>
 #include <string>

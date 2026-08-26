@@ -13,11 +13,11 @@ if [ -f "$HERE/schema-test.cicili" ]; then
   sbcl --script cicili.lisp "$HERE/schema-test.cicili"
 fi
 
-# ---- the engine as ONE shared library: libMVCCS2.so ------------------
+# ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
 # wrappers; consumers compile with plain g++ against engine.hpp.
 sbcl --script cicili.lisp "$HERE/engine.cicili"
-g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS2.so" \
+g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
   -L"$LIBDIR" -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 
 # THE HEADER MAY NOT DRIFT. engine.hpp copies Pointer and BaseTable
@@ -40,9 +40,9 @@ for name in ('Pointer','BaseTable','BTreeIndex'):
 sys.exit(bad)
 PY
 
-# and the keystone consumer: plain g++, engine.hpp, libMVCCS2.so only
+# and the keystone consumer: plain g++, engine.hpp, libMVCCS.so only
 g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
-  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
 
 # the contention suite: the old Test/test_contention.cpp scenarios, run
@@ -51,20 +51,20 @@ g++ -g -O0 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" \
 INCDIR=$(cd "$HERE/../home/include" && pwd)
 g++ -g -O0 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
   -I"$HERE" -I"$INCDIR" \
-  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lType -lCryptography -lpthread \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
   -Wl,-rpath,"$LIBDIR"
 "$HERE/contention_test"
 
-# the carry-over acceptance: the OLD engine writes a store, the NEW one
-# opens it -- rows carry byte-identically, indexes rebuild. Two programs
-# because the two engines must never share a store from one process.
-g++ -g -O0 -std=c++17 "$HERE/carryover-old.cpp" -o "$HERE/carryover_old" \
-  -I"$INCDIR" \
-  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
-  -Wl,-rpath,"$LIBDIR"
+# the carry-over acceptance: a store the OLD engine wrote, opened by the
+# NEW one -- rows carry byte-identically, indexes rebuild. The old engine
+# is retired, so the store is GOLDEN: the last one carryover-old.cpp ever
+# wrote, checked in under golden/, handed to the reader as a scratch copy
+# (the reader writes into it -- an update and an insert are part of the
+# proof).
 g++ -g -O0 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
   -I"$HERE" -I"$INCDIR" \
-  -L"$LIBDIR" -lMVCCS2 -lCore -lStreamIO -lType -lpthread \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lpthread \
   -Wl,-rpath,"$LIBDIR"
-LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_old"
+cp "$HERE/golden/carryover-hexmap.bin" /tmp/mvccs-carryover-hexmap.bin
+cp "$HERE/golden/carryover-data.bin"   /tmp/mvccs-carryover-data.bin
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"

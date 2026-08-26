@@ -1,5 +1,4 @@
 #include "globals.hpp"
-#include "memory.hpp"
 #include "utility.hpp"
 
 
@@ -16,31 +15,9 @@ thread_local bool Globals::_identified = false;
 thread_local std::string Globals::_peer_subject;
 thread_local std::vector<std::string> Globals::_peer_permissions;
 
-Zigurat::binarystream* Globals::_memory_hexmap_stream = nullptr;
-Zigurat::binarystream* Globals::_memory_data_stream = nullptr;
-Zigurat::Memory* Globals::_memory = nullptr;
 Zigurat::Parser* Globals::_parser = nullptr;
 Zigurat::Compiler* Globals::_compiler = nullptr;
 
-
-namespace
-{
-  // One byte, at a different address in every copy of this library that a
-  // process has loaded. Which sounds like a thing that cannot happen, and is
-  // exactly what does happen when home/lib is rebuilt underneath a running
-  // server: the loader resolves a compiled object's dependencies afresh, finds
-  // a file that is no longer the one it mapped, and maps it again. Everything
-  // above then runs against a second Globals, whose streams were never set.
-  char runtime_instance = 0;
-}
-
-// Deliberately not a member: what asks the question is the server, holding a
-// library it has just opened, and it has to be able to ask through that
-// library's own symbols. See require_runtime in the servers.
-extern "C" const void* zigurat_runtime_instance()
-{
-  return &runtime_instance;
-}
 
 
 bool Globals::reset_mode()
@@ -90,21 +67,6 @@ Zigurat::binarystream* const Globals::client_stream()
 Zigurat::textstream* const Globals::echo_stream()
 {
   return _echo_stream;
-}
-
-Zigurat::binarystream* const Globals::memory_hexmap_stream()
-{
-  return _memory_hexmap_stream;
-}
-
-Zigurat::binarystream* const Globals::memory_data_stream()
-{
-  return _memory_data_stream;
-}
-
-Zigurat::Memory* const Globals::memory()
-{
-  return _memory;
 }
 
 Zigurat::Parser* const Globals::parser()
@@ -246,21 +208,6 @@ void Globals::clear_peer()
 void Globals::set_echo_stream(Zigurat::textstream* echo_stream)
 {
   _echo_stream = echo_stream;
-}
-
-void Globals::set_memory_hexmap_stream(Zigurat::binarystream* memory_hexmap_stream)
-{
-  _memory_hexmap_stream = memory_hexmap_stream;
-}
-
-void Globals::set_memory_data_stream(Zigurat::binarystream* memory_data_stream)
-{
-  _memory_data_stream = memory_data_stream;
-}
-
-void Globals::set_memory(Zigurat::Memory* memory)
-{
-  _memory = memory;
 }
 
 void Globals::set_parser(Zigurat::Parser* parser)

@@ -66,7 +66,7 @@ inline void require_runtime(LibraryLoader::handle_t handle)
   instance_t instance = nullptr;
   try {
     // Through the library's own dependencies, which is the whole point: this
-    // finds whichever libMVCCS2 that object was bound to, not ours.
+    // finds whichever libMVCCS that object was bound to, not ours.
     instance = (instance_t)LibraryLoader::symbol(handle, "mvccs_runtime_instance");
   } catch (const std::exception&) {
     throw ZiguratException(7803, "this object is not bound to a storage engine this server knows;"

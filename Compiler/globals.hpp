@@ -13,7 +13,6 @@
 
 namespace Zigurat
 {
-  class Memory;
   class Parser;
   class Compiler;
 }
@@ -105,9 +104,6 @@ class Globals
   static thread_local std::string _peer_subject;
   static thread_local std::vector<std::string> _peer_permissions;
 
-  static Zigurat::binarystream* _memory_hexmap_stream;
-  static Zigurat::binarystream* _memory_data_stream;
-  static Zigurat::Memory* _memory;
   static Zigurat::Parser* _parser;
   static Zigurat::Compiler* _compiler;
 
@@ -121,9 +117,6 @@ class Globals
   static Zigurat::binarystream* const client_stream();
   static Zigurat::textstream* const echo_stream();
 
-  static Zigurat::binarystream* const memory_hexmap_stream();
-  static Zigurat::binarystream* const memory_data_stream();
-  static Zigurat::Memory* const memory();
   static Zigurat::Parser* const parser();
   static Zigurat::Compiler* const compiler();
 
@@ -152,9 +145,6 @@ class Globals
   static void set_peer(const std::string&, const std::vector<std::string>&);
   static void clear_peer();
 
-  static void set_memory_hexmap_stream(Zigurat::binarystream*);
-  static void set_memory_data_stream(Zigurat::binarystream*);
-  static void set_memory(Zigurat::Memory*);
   static void set_parser(Zigurat::Parser*);
   static void set_compiler(Zigurat::Compiler*);
 };

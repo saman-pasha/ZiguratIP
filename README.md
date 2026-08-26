@@ -827,7 +827,7 @@ Threading/      thread pool
 SocketIO/       sockets, TCP/IPC streams, TLS records
 Connector/      client library for the binary protocol
 HTTP/           request, response, server, session
-MVCCS/          the storage engine
+MVCCS-cicili/   the storage engine, written in Cicili, built as libMVCCS.so
 Compiler/       tokenizer, parser, Parsi to C++ compiler
 Library/        shared object loader and pool
 System/         built-in catalogue objects, written in Parsi

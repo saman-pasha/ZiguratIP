@@ -2,6 +2,12 @@
 // carryover-old.cpp wrote with the C++ MVCCS and prove the claim the
 // replacement rests on -- ROWS CARRY BYTE-IDENTICALLY, INDEXES REBUILD.
 //
+// THE STORE IS GOLDEN NOW. carryover-old.cpp needed the old engine to
+// build, and the old engine is retired; the last store it ever wrote is
+// checked in under golden/ and build.sh hands a scratch COPY of it to
+// this reader -- the acceptance keeps running against real old-engine
+// bytes long after the engine that wrote them is gone.
+//
 //   - the five rows read back through the Cicili engine's cursor, the
 //     rewrite's committed version and not its superseded one;
 //   - a fresh index built over the carried rows answers by key;

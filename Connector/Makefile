@@ -5,6 +5,7 @@ TYPE := Library
 HEADERS := connector.hpp \
 	connectorexception.hpp \
 	resulttype.hpp \
+	isolationlevel.hpp \
 	rpcpool.hpp
 
 SOURCES := connector.cpp \
