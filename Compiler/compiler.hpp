@@ -82,7 +82,7 @@ namespace Zigurat
     std::vector<std::string> _libs = {"Core", "StreamIO", "Type", "Library",
 				      "Compression", "Encoding", "Cryptography",
 				      "Configuration", "Threading", "SocketIO",
-				      "MVCCS", "HTTP", "pthread"};
+				      "MVCCS2", "HTTP", "pthread"};
 
     permit_t _permit;
 

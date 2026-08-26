@@ -710,13 +710,10 @@ namespace Zigurat
       code << tab << "});" << std::endl;
       code << tab << obj << ".join();" << std::endl;
     } else if (ast.args[0].token.value == "ISOLATION") {
-      // Memory::transaction is a static thread_local Transaction -- a value, not
-      // a pointer. This emitted `transaction->' and so every procedure carrying
-      // a TRANSACTION ISOLATION LEVEL clause failed to compile, with an error
-      // about `->' on a non-pointer type pointing at the PROCEDURE line rather
-      // than at the clause. The documented syntax has never worked; nothing in
-      // the tree used it, so nothing said so.
-      std::string setter = "Zigurat::Memory::transaction.set_isolation_level(Zigurat::IsolationLevel::";
+      // The engine keeps the transaction thread-local behind the library
+      // boundary, so the level is set through a free function; the enum's
+      // members carry the same names the old Zigurat::IsolationLevel had.
+      std::string setter = "engine_set_isolation(IsolationLevel::";
 
       if (ast.args[0].args[0].token.value == "UNCOMMITTED") {
 	code << tab << setter << "READ_UNCOMMITTED);" << std::endl;
