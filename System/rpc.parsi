@@ -1,7 +1,6 @@
 INCLUDE '"httprequest.hpp"';
 INCLUDE '"httpresponse.hpp"';
 INCLUDE '"session.hpp"';
-INCLUDE '"globals.hpp"';
 INCLUDE '"rpcpool.hpp"';
 INCLUDE '"zexception.hpp"';
 
@@ -26,7 +25,7 @@ PUBLIC:
 			-- page forgets it, so the owner can never be silently empty.
 			CALL `Zigurat::`Session::`INITIALIZE(request, response);
 			DECLARE owner AS String = `Zigurat::`RPCPool::`owner(
-				`Globals::`peer_subject(), `Zigurat::`Session::ID().`value());
+				`globals_peer_subject(), `Zigurat::`Session::ID().`value());
 
 			IF request.query('do') == 'id' BEGIN
 				-- A new connection, and the transaction it carries is the name
@@ -44,7 +43,7 @@ PUBLIC:
 
 				DECLARE isolation_level AS String = request.query('iso_lvl');
 				IF isolation_level == 'd' BEGIN
-					CALL con.isolate(CAST<IsolationLevel>(CAST<`uint8_t>(`Globals::`default_isolation_level())));
+					CALL con.isolate(CAST<IsolationLevel>(CAST<`uint8_t>(`globals_default_isolation_level())));
 				END ELSE IF isolation_level == 'u' BEGIN
 					CALL con.isolate(IsolationLevel::READ_UNCOMMITTED);
 				END ELSE IF isolation_level == 'c' BEGIN

@@ -3,7 +3,7 @@
 #include "filestream.hpp"
 #include "textstream.hpp"
 #include "basepage.hpp"
-#include "memory.hpp"
+#include "engine.hpp"
 #include "globals.hpp"
 #include "httprequest.hpp"
 #include "httpresponse.hpp"
@@ -91,13 +91,13 @@ namespace
   public:
     RequestScope()
     {
-      if (Globals::memory()) Globals::memory()->begin_transaction();
+      if (globals_memory()) begin_transaction(globals_memory());
     }
 
     void commit()
     {
-      if (Globals::memory() && !this->_committed) {
-	Globals::memory()->commit_transaction();
+      if (globals_memory() && !this->_committed) {
+	commit_transaction(globals_memory());
 	this->_committed = true;
       }
     }
@@ -107,14 +107,17 @@ namespace
       try {
 	// Anything the page left uncommitted is discarded: a request that did
 	// not finish cleanly must not leave half its writes behind.
-	if (Globals::memory() && !this->_committed) Globals::memory()->rollback_transaction();
+	if (globals_memory() && !this->_committed) rollback_transaction(globals_memory());
       } catch (...) {
       }
 
       Session::RELEASE();
       Globals::clear_peer();
+      globals_clear_peer();
       Globals::set_echo_stream(nullptr);
       Globals::set_client_stream(nullptr);
+      globals_set_echo_stream(nullptr);
+      globals_set_client_stream(nullptr);
     }
   };
 }
@@ -126,18 +129,24 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
   std::unique_ptr<HTTPResponse> response_deleter(response);
 
   Globals::set_client_stream(client);
+  globals_set_client_stream(client);
 
   // Over a secure connection the visitor is whoever their certificate says, on
   // every request, with no cookie and no login: HTTP is stateless and so is
   // this. The worker threads are pooled, so RequestScope unbinds it again on
   // the way out. A plain connection has no peer, and nothing is enforced.
-  if (tlsstream* secure = dynamic_cast<tlsstream*>(client))
+  if (tlsstream* secure = dynamic_cast<tlsstream*>(client)) {
     Globals::set_peer(secure->peer_subject(), secure->peer_permissions());
+    globals_set_peer(secure->peer_subject().c_str());
+    for (const std::string& granted : secure->peer_permissions())
+      globals_add_peer_permission(granted.c_str());
+  }
 
   std::unique_ptr<textstream> echo_deleter(new textstream);
 
   response->set_echo_buffer(echo_deleter.get());
   Globals::set_echo_stream(echo_deleter.get());
+  globals_set_echo_stream(echo_deleter.get());
 
   // Sweep idle sessions before serving, so the store cannot grow without bound.
   Session::EXPIRE(session_timeout);

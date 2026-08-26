@@ -1,18 +1,17 @@
 #include "ziguratipexception.hpp"
 #include "globals.hpp"
 #include "filestream.hpp"
-#include "memory.hpp"
-#include "btreerecord.hpp"
-#include "btreeindex.hpp"
+#include "engine.hpp"
 #include "configuration.hpp"
 #include "shared.cpp"
 #include <ctime>
+#include <cstring>
 #include <fstream>
 
 
 using namespace Zigurat;
 
-IsolationLevel isolation_level = IsolationLevel::READ_COMMITTED;
+Zigurat::IsolationLevel isolation_level = Zigurat::IsolationLevel::READ_COMMITTED;
 size_t         memory_page_size = 8192;
 filestream     memory_hexmap_file;
 filestream     memory_data_file;
@@ -21,6 +20,9 @@ filestream     memory_data_file;
 void load_memory(const Configuration &conf)
 {
   clock_t begin_time = clock();
+
+  globals_set_trace_mode(Globals::trace_mode() ? 1 : 0);
+  globals_set_reset_mode(Globals::reset_mode() ? 1 : 0);
 
   std::string value;
 
@@ -33,24 +35,28 @@ void load_memory(const Configuration &conf)
     else
       throw ZiguratIPException("invalid value for '/TRANSACTION/MODE'");
   }
+  globals_set_default_autocommit_mode(Globals::default_autocommit_mode() ? 1 : 0);
   std::cout << "Transaction mode: '" << ((Globals::default_autocommit_mode()) ? "AUTOCOMMIT" : "NON-AUTOCOMMIT" ) << "'" << std::endl;
 
   if (conf.get("/TRANSACTION/ISOLATION_LEVEL", value)) {
     std::string isolation_levelstr = Utility::to_upper(Utility::trim(value));
     if (isolation_levelstr == "READ-UNCOMMITTED")
-      isolation_level = IsolationLevel::READ_UNCOMMITTED;
+      isolation_level = Zigurat::IsolationLevel::READ_UNCOMMITTED;
     else if (isolation_levelstr == "READ-COMMITTED")
-      isolation_level = IsolationLevel::READ_COMMITTED;
+      isolation_level = Zigurat::IsolationLevel::READ_COMMITTED;
     else if (isolation_levelstr == "REPEATABLE-READ")
-      isolation_level = IsolationLevel::REPEATABLE_READ;
+      isolation_level = Zigurat::IsolationLevel::REPEATABLE_READ;
     else if (isolation_levelstr == "SNAPSHOT")
-      isolation_level = IsolationLevel::SNAPSHOT;
+      isolation_level = Zigurat::IsolationLevel::SNAPSHOT;
     else if (isolation_levelstr == "SERIALIZABLE")
-      isolation_level = IsolationLevel::SERIALIZABLE;
+      isolation_level = Zigurat::IsolationLevel::SERIALIZABLE;
     else
       throw ZiguratIPException("invalid value for '/TRANSACTION/ISOLATION_LEVEL'");
     Globals::set_default_isolation_level(isolation_level);
   }
+  // the two enums carry the same members at the same values; the engine's
+  // is the one the transactions actually run at
+  globals_set_default_isolation_level((::IsolationLevel)(int)Globals::default_isolation_level());
   std::cout << "Transaction isolation level: '" << (int)Globals::default_isolation_level() << "'" << std::endl;
 
   const std::string hexmap_path = home_path + "data/hexmap";
@@ -80,13 +86,10 @@ void load_memory(const Configuration &conf)
     throw ZiguratIPException("invalid hexmap file");
   if (!memory_data_file.good())
     throw ZiguratIPException("invalid data file");
-  
+
   std::cout << "Hexmap file: '" << hexmap_path << "'" << std::endl;
   std::cout << "Data file: '" << data_path << "'" << std::endl;
-  
-  Globals::set_memory_hexmap_stream(&memory_hexmap_file);
-  Globals::set_memory_data_stream(&memory_data_file);
-  
+
   if (conf.get("/MEMORY/PAGE_SIZE", value) || conf.get("/MEMORY/MEMORY_PAGE_SIZE", value) ||
       conf.get("/MEMORY/BLOCK_SIZE", value)) {
     std::stringstream bsss(value);
@@ -94,9 +97,14 @@ void load_memory(const Configuration &conf)
   }
   std::cout << "Memory page size: '" << memory_page_size << "'" << std::endl;
 
-  Globals::set_memory(new Memory(*Globals::memory_hexmap_stream(),
-				 *Globals::memory_data_stream(),
-				 memory_page_size));
+  // The Cicili engine: one Memory for the process, opaque behind
+  // libMVCCS2. Compiled objects reach it through globals_memory() --
+  // that is what engine-compat.hpp's Globals::memory() forwards to --
+  // and each table attaches its own indexes on first touch, so nothing
+  // here wires a catalogue index the way the old engine did.
+  ::Memory* engine_memory = engine_memory_new();
+  memory_open(engine_memory, &memory_hexmap_file, &memory_data_file, (int64_t)memory_page_size);
+  globals_set_memory(engine_memory);
 
   // Parallel reads are THE DEFAULT: read-only cursors take the streams guard
   // shared and read through per-thread streams instead of queueing on the one
@@ -105,17 +113,12 @@ void load_memory(const Configuration &conf)
   {
     const char* par_reads = std::getenv("ZIGURATIP_PARALLEL_READS");
     if (par_reads == nullptr || std::strcmp(par_reads, "0") != 0) {
-      Globals::memory()->reader_paths(hexmap_path, data_path);
+      memory_reader_paths(engine_memory, hexmap_path.c_str(), data_path.c_str());
       std::cout << "Parallel reads: on" << std::endl;
     } else {
       std::cout << "Parallel reads: off (ZIGURATIP_PARALLEL_READS=0)" << std::endl;
     }
   }
-
-  BTreeRecord::IDX_ZIGURAT_BTREERECORD_HASH_NAME = new BTreeIndex<BTreeRecord, String>
-    (Globals::memory(), "IDX_ZIGURAT_BTREERECORD_HASH_NAME", true, BTreeRecord::hash_name);
-
-  Globals::memory()->commit_transaction();
 
   clock_t end_time = clock();
 

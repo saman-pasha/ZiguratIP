@@ -20,7 +20,7 @@ extern bool        trace_mode;
 extern bool        reset_mode;
 
 // Memory 
-extern IsolationLevel isolation_level;
+extern Zigurat::IsolationLevel isolation_level;
 extern size_t         memory_page_size;
 extern filestream     memory_hexmap_file;
 extern filestream     memory_data_file;
@@ -48,7 +48,7 @@ extern bool     compiler_remote_mode;
 // writes its rows through a second Globals whose client stream was never set,
 // which is a null pointer, and the server dies inside the user's procedure.
 // The only cure is a restart, so say so before running any of it.
-extern "C" const void* zigurat_runtime_instance();
+extern "C" const void* mvccs_runtime_instance();
 
 inline void require_runtime(LibraryLoader::handle_t handle)
 {
@@ -66,14 +66,14 @@ inline void require_runtime(LibraryLoader::handle_t handle)
   instance_t instance = nullptr;
   try {
     // Through the library's own dependencies, which is the whole point: this
-    // finds whichever libMVCCS that object was bound to, not ours.
-    instance = (instance_t)LibraryLoader::symbol(handle, "zigurat_runtime_instance");
+    // finds whichever libMVCCS2 that object was bound to, not ours.
+    instance = (instance_t)LibraryLoader::symbol(handle, "mvccs_runtime_instance");
   } catch (const std::exception&) {
     throw ZiguratException(7803, "this object is not bound to a storage engine this server knows;"
 			   " the libraries under it have changed, restart the server");
   }
 
-  if (instance() != zigurat_runtime_instance())
+  if (instance() != mvccs_runtime_instance())
     throw ZiguratException(7804, "this object is bound to a second copy of the storage engine:"
 			   " the libraries were replaced while the server was running,"
 			   " restart it");

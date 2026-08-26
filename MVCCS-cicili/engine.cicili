@@ -70,6 +70,35 @@
     (if (!= tl_txn nil)
         (set_isolation_level tl_txn level)))
 
+  ;; ------------------------------------------------------------------
+  ;; The server's connection surface. A pooled thread serves one
+  ;; connection at a time; each of these stages a transaction first --
+  ;; a begin on an open transaction continues it -- so a fresh thread's
+  ;; first touch opens its transaction exactly where the old engine's
+  ;; thread-local Transaction did.
+  ;; ------------------------------------------------------------------
+  (func engine_transaction_id ((Memory * m)) (out size_t)
+    (stage_needs_transaction m)
+    (return (? (!= tl_txn nil) (-> tl_txn id) (cast size_t 0))))
+
+  (func engine_isolate ((Memory * m) (IsolationLevel level)) (out void)
+    (stage_needs_transaction m)
+    (if (!= tl_txn nil)
+        (set_isolation_level tl_txn level)))
+
+  (func engine_set_autocommit ((Memory * m) (int64_t v)) (out void)
+    (stage_needs_transaction m)
+    (if (!= tl_txn nil)
+        (set (-> tl_txn auto_commit) v)))
+
+  ;; the connection's setting when one is open, the instance default
+  ;; when none is -- the pair the old `transaction.auto_commit ||
+  ;; default_autocommit_mode()' test asked for, in one answer
+  (func engine_autocommit () (out int64_t)
+    (return (? (!= tl_txn nil)
+               (-> tl_txn auto_commit)
+               (cast int64_t (globals_default_autocommit_mode)))))
+
   ;; A TEXT COLUMN AS AN INT64 INDEX KEY. The Cicili B-tree keys are
   ;; int64 only; a String-keyed Parsi index rides as this fold of the
   ;; text -- FNV-1a 64, masked positive. TWO STRINGS CAN COLLIDE, and

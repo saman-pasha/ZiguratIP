@@ -327,6 +327,44 @@ the same twelve-worker group test the server passes. A Parsi schema
 now compiles to either engine from one source, and cocolog runs on
 both.
 
+## The server runs on this engine now
+
+The replacement landed in three passes. **Pass 1** made the engine ONE
+shared library, `libMVCCS2.so` — the macro expanded once, consumers
+plain g++ against `engine.hpp`, nothing RAII crossing the boundary.
+**Pass 2** retargeted the Parsi compiler's generated C++ onto it
+through `engine-compat.hpp`, which keeps every spelling the DML
+emitters use — `Globals::memory()->cursor<T>`, `T::IDX.cursor_equal`,
+the ALL-CAPS type family, the keyword macros — and changes the engine
+under them; the whole cocolog application (schema, procedures, pages)
+compiles and dlopens against it. String index keys ride as a 64-bit
+FNV-1a fold; every indexed lookup re-applies its full WHERE predicate,
+so a collision costs a row visit and never a wrong answer, and the
+WHERE compiler routes any non-equality over a hashed level to a scan.
+**Pass 3** rewired `ziguratip` itself: `load_memory` opens the store
+with `engine_memory_new`/`memory_open` and `globals_set_memory`, the
+binary protocol's transaction verbs ride `engine_transaction_id`,
+`engine_isolate`, `engine_set_autocommit`, `commit_transaction` and
+`rollback_transaction`, Zeytun's per-request transaction does the
+same, and the runtime canary became `mvccs_runtime_instance`. The old
+`libMVCCS` stays linked only for the server's own `class Globals`
+(parser, compiler, peers) until it is retired.
+
+ONE LESSON COST A CRASH: while both engines live in one process, the
+old `class Globals` statics and the compat header's
+`namespace Globals` inlines carry IDENTICAL mangled names, and a
+dlopen'd object bound to the old one through the global scope — a null
+`Zigurat::Memory*` taken for an engine handle, dead on the first
+insert. The compat `Globals` functions are
+`visibility("hidden")` now, so every object resolves them inside
+itself; the comment beside them says why they must stay so.
+
+The engine also carries a DML tier for Cicili consumers — `defquery`,
+`defcount`, `deffind`, `defupdate`, `defdelete` in `mvccs-lib.cicili` —
+each folding the context struct, lifted callback and runner that
+hand-written queries spell out; `mvccs.cicili` proves them against the
+hand-rolled twins they replace.
+
 ## Found upstream while porting — and now fixed in the C++ too
 
 Every cluster below is **fixed in the original sources** in the same

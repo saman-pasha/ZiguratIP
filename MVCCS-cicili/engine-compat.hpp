@@ -132,9 +132,21 @@ namespace Zigurat {
 }
 
 // ---- a value becomes an int64 index key ------------------------------
+// The whole integral family folds losslessly; floating keys are NOT
+// offered on purpose -- a Double folded to int64 would order wrongly,
+// and a schema that wants one should hear it from the compiler here.
 inline int64_t engine_key64 (int64_t v)                 { return v; }
 inline int64_t engine_key64 (const Zigurat::Long& v)    { return v.value(); }
 inline int64_t engine_key64 (const Zigurat::Int& v)     { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::Bool& v)    { return (int64_t)(v.value() ? 1 : 0); }
+inline int64_t engine_key64 (const Zigurat::Char& v)    { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::Byte& v)    { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::UByte& v)   { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::Short& v)   { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::UShort& v)  { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::UInt& v)    { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::ULong& v)   { return (int64_t)v.value(); }
+inline int64_t engine_key64 (const Zigurat::Timestamp& v) { return (int64_t)v.value(); }
 inline int64_t engine_key64 (const std::string& s)      { return engine_text_key(s.data(), s.size()); }
 inline int64_t engine_key64 (const Zigurat::String& s)  { return engine_key64(s.value()); }
 inline int64_t engine_key64 (const Zigurat::Text& s)    { return engine_key64(s.value()); }
@@ -276,13 +288,23 @@ struct EngineMemoryHandle {
   void rollback_transaction () { ::rollback_transaction(m); }
 };
 
+// HIDDEN, AND IT IS LOAD-BEARING: while both engines live in one server
+// process, the OLD engine's `class Globals' statics carry these exact
+// mangled names -- _ZN7Globals6memoryEv and friends -- and a dlopen'd
+// object whose inline Globals::memory() stayed default-visible bound to
+// the old one through the global scope, took its null Zigurat::Memory*
+// for an EngineMemoryHandle*, and died on the first insert. Hidden,
+// every object resolves these inside itself, where they mean this file.
 namespace Globals {
+  __attribute__((visibility("hidden")))
   inline EngineMemoryHandle * memory () {
     static thread_local EngineMemoryHandle h;
     h.m = ::globals_memory();
     return &h;
   }
+  __attribute__((visibility("hidden")))
   inline Zigurat::binarystream * client_stream () { return ::globals_client_stream(); }
+  __attribute__((visibility("hidden")))
   inline Zigurat::textstream * echo_stream ()   { return ::globals_echo_stream(); }
 }
 

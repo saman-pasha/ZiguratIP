@@ -139,6 +139,12 @@ bool bt_cursor_rows_deep (BTreeIndex * idx, void * user,
                           bool (*rcb) (void * c, Pointer * p));
 bool bt_cursor_equal_multi (BTreeIndex * idx, int64_t * ks, void * user,
                             bool (*rcb) (void * c, Pointer * p));
+// the dependent-handle walks over a composite index's non-innermost
+// levels: the callback is handed each next-level index, stack-built
+bool bt_cursor_dep (BTreeIndex * idx, void * user,
+                    bool (*dcb) (void * c, BTreeIndex * dep));
+bool bt_cursor_equal_dep (BTreeIndex * idx, int64_t k, void * user,
+                          bool (*dcb) (void * c, BTreeIndex * dep));
 void bt_cursor_not_equal (BTreeIndex * idx, int64_t k, void * user,
                           bool (*rcb) (void * c, Pointer * p));
 void bt_cursor_less_than (BTreeIndex * idx, int64_t k, void * user,
@@ -149,5 +155,53 @@ void bt_cursor_greater_than (BTreeIndex * idx, int64_t k, void * user,
                              bool (*rcb) (void * c, Pointer * p));
 void bt_cursor_greater_than_equal (BTreeIndex * idx, int64_t k, void * user,
                                    bool (*rcb) (void * c, Pointer * p));
+
+// -- the server surface ------------------------------------------------
+// What ziguratip's own bindings call: the engine-side globals a
+// generated object reads (through engine-compat.hpp's Globals::
+// forwards), the connection-scoped transaction knobs, the reader-path
+// switch for parallel reads, and the DBA plumbing behind the binary
+// protocol's dba_* functions.
+namespace Zigurat { class textstream; }
+
+Memory * globals_memory ();
+void globals_set_memory (Memory * m);
+Zigurat::binarystream * globals_client_stream ();
+void globals_set_client_stream (Zigurat::binarystream * stream);
+Zigurat::textstream * globals_echo_stream ();
+void globals_set_echo_stream (Zigurat::textstream * stream);
+int  globals_default_autocommit_mode ();
+void globals_set_default_autocommit_mode (int v);
+IsolationLevel globals_default_isolation_level ();
+void globals_set_default_isolation_level (IsolationLevel lvl);
+int  globals_trace_mode ();
+void globals_set_trace_mode (int v);
+int  globals_reset_mode ();
+void globals_set_reset_mode (int v);
+const char * globals_peer_subject ();
+void globals_set_peer (const char * subject);
+void globals_add_peer_permission (const char * granted);
+void globals_clear_peer ();
+int  globals_identified ();
+
+// each stages a transaction first: a begin on an open transaction
+// continues it, so a pooled thread's first touch opens its own
+size_t engine_transaction_id (Memory * m);
+void engine_isolate (Memory * m, IsolationLevel level);
+void engine_set_autocommit (Memory * m, int64_t v);
+int64_t engine_autocommit ();
+
+// turns the shared-reader side on; called by whoever opened the store
+void memory_reader_paths (Memory * m, const char * hex, const char * data);
+
+// the DBA plumbing behind the binary protocol
+void dba_pagefiles (Memory * m, Zigurat::binarystream * out);
+void dba_pointers (Memory * m, Zigurat::binarystream * out);
+void dba_attach_watcher (Memory * m, Zigurat::binarystream * out);
+void dba_detach_watcher (Memory * m);
+
+// the one-byte canary: a different address in every mapped copy of the
+// engine, so a server can refuse an object bound to a second copy
+extern "C" const void * mvccs_runtime_instance ();
 
 #endif
