@@ -21,7 +21,7 @@
 
 #include <cstdint>
 #include <ctime>
-#include "/home/user/ZiguratIP/StreamIO/binarystream.hpp"
+#include "binarystream.hpp"
 
 typedef enum RowState {
   ROW_NONE = 0,

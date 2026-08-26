@@ -39,7 +39,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include "engine.hpp"
-#include "/home/user/ZiguratIP/StreamIO/filestream.hpp"
+#include "../home/include/filestream.hpp"
 
 static const char* HEX_PATH = "/tmp/mvccs-ageing-hexmap.bin";
 static const char* DAT_PATH = "/tmp/mvccs-ageing-data.bin";

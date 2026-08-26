@@ -18,9 +18,8 @@
 (source "mvccs.cpp"
   (make :cpp #t :compile #t
         :link ("-lmvccs.o" "-o" "mvccs_test"
-               "-L/home/user/ZiguratIP/home/lib" "-lCore" "-lStreamIO"
-               "-lpthread"
-               "-Wl,-rpath,/home/user/ZiguratIP/home/lib"))
+               "-L../home/lib" "-lCore" "-lStreamIO"
+               "-lpthread"))
 
   (include <cstdio>)
   (include <cstdint>)
@@ -30,12 +29,12 @@
   (include <pthread.h>)
   (include <unistd.h>)
   (include <time.h>)
-  (include "/home/user/ZiguratIP/Core/zexception.hpp")
-  (include "/home/user/ZiguratIP/Core/utility.hpp")
-  (include "/home/user/ZiguratIP/StreamIO/binarystream.hpp")
-  (include "/home/user/ZiguratIP/StreamIO/filestream.hpp")
-  (include "/home/user/ZiguratIP/StreamIO/bufferstream.hpp")
-  (include "/home/user/ZiguratIP/StreamIO/textstream.hpp")
+  (include "../home/include/zexception.hpp")
+  (include "../home/include/utility.hpp")
+  (include "../home/include/binarystream.hpp")
+  (include "../home/include/filestream.hpp")
+  (include "../home/include/bufferstream.hpp")
+  (include "../home/include/textstream.hpp")
   (include <ctype.h>)
 
   (import "./mvccs-lib.cicili")

@@ -33,7 +33,7 @@
 #include <thread>
 #include <vector>
 #include "engine-compat.hpp"
-#include "/home/user/ZiguratIP/StreamIO/filestream.hpp"
+#include "../home/include/filestream.hpp"
 
 // --- an indexed table, as compilerddl.cpp emits it --------------------------
 
