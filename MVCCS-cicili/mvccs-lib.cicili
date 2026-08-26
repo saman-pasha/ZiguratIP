@@ -4953,4 +4953,273 @@
           (return (seq_back (aof ,seqname))))
         (func ,wreset () (out void)
           (seq_reset (aof ,seqname))))))
+
+  ;; ==================================================================
+  ;; The DML tier. What the Parsi compiler's SELECT/UPDATE/DELETE
+  ;; emission does with capturing lambdas, a Cicili consumer does with
+  ;; these: each macro folds the context struct, the lifted callback
+  ;; and the runner that hand-written queries spell out one by one.
+  ;;
+  ;; The WHERE argument is any Cicili boolean form; inside it `row' is
+  ;; the current row (a TABLE *) and every declared parameter is in
+  ;; scope by its own name. Parameters are (type name) pairs; a type is
+  ;; one symbol (int64_t, std::string).
+  ;;
+  ;;   (defcount  book_count Book ((int64_t k)) (== (-> row value) k))
+  ;;   (deffind   book_find  Book ((int64_t id)) (== (-> row id) id))
+  ;;   (defdelete loan_drop  Loan ((int64_t b)) (== (-> row book_id) b))
+  ;;   (defupdate reprice    Book ((int64_t f) (int64_t v))
+  ;;              (== (-> row value) f)
+  ;;              ((value v)))
+  ;;   (defquery  book_sum   Book () #t
+  ;;     (set (cof (cast (int64_t *) user))
+  ;;          (+ (cof (cast (int64_t *) user)) (-> row value))))
+  ;;
+  ;; All of them walk the table's own cursor -- the visibility rules
+  ;; ride with it -- and apply WHERE to every row, exactly as the
+  ;; generated C++ scan does. An indexed walk stays what it always
+  ;; was: the defindex wrappers, called by hand where the key is known.
+  ;; ==================================================================
+
+  ;; defquery -- the general fold: run BODY for each row WHERE admits.
+  ;; The runner takes (Memory * m), the parameters, and a (void * user)
+  ;; that reaches BODY untouched -- the accumulator's seat, since
+  ;; nothing here captures.
+  (DEFMACRO defquery (name table params where &BODY body)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (tname   (FUNCALL qfold (FUNCALL qjoin table)))
+           (table   (INTERN tname))
+           (tcur    (INTERN (CONCATENATE 'STRING tname "_cursor")))
+           (sname   (SYMBOL-NAME name))
+           (name    (INTERN sname))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_QCtx")))
+           (cbname  (INTERN (CONCATENATE 'STRING sname "_qcb")))
+           (cbbody  `((if ,where (block ,@body))
+                      (return #t))))
+      `($$$
+        (struct ,ctxname
+          ,@(LOOP FOR p IN params COLLECT `(member ,(FIRST p) ,(SECOND p)))
+          (member void * user))
+        (func ,cbname ((void * u) (,table * row)) (out bool)
+          (let ((,ctxname * qq . #'(cast (,ctxname *) u)))
+            (let ((void * user . #'(-> qq user)))
+              ,@(IF params
+                    `((let ,(LOOP FOR p IN params
+                                  COLLECT `(,(FIRST p) ,(SECOND p) . #'(-> qq ,(SECOND p))))
+                        ,@cbbody))
+                    cbbody))))
+        (func ,name ((Memory * m) ,@params (void * user)) (out void)
+          (let ((,ctxname qq))
+            ,@(LOOP FOR p IN params COLLECT `(set ($ qq ,(SECOND p)) ,(SECOND p)))
+            (set ($ qq user) user)
+            (,tcur m (cast (void *) (aof qq)) ,cbname))))))
+
+  ;; defcount -- how many rows WHERE admits
+  (DEFMACRO defcount (name table params where)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (tname   (FUNCALL qfold (FUNCALL qjoin table)))
+           (table   (INTERN tname))
+           (tcur    (INTERN (CONCATENATE 'STRING tname "_cursor")))
+           (sname   (SYMBOL-NAME name))
+           (name    (INTERN sname))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_QCtx")))
+           (cbname  (INTERN (CONCATENATE 'STRING sname "_qcb")))
+           (cbbody  `((if ,where (set (-> qq hits) (+ (-> qq hits) 1)))
+                      (return #t))))
+      `($$$
+        (struct ,ctxname
+          ,@(LOOP FOR p IN params COLLECT `(member ,(FIRST p) ,(SECOND p)))
+          (member int64_t hits))
+        (func ,cbname ((void * u) (,table * row)) (out bool)
+          (let ((,ctxname * qq . #'(cast (,ctxname *) u)))
+            ,@(IF params
+                  `((let ,(LOOP FOR p IN params
+                                COLLECT `(,(FIRST p) ,(SECOND p) . #'(-> qq ,(SECOND p))))
+                      ,@cbbody))
+                  cbbody)))
+        (func ,name ((Memory * m) ,@params) (out int64_t)
+          (let ((,ctxname qq))
+            ,@(LOOP FOR p IN params COLLECT `(set ($ qq ,(SECOND p)) ,(SECOND p)))
+            (set ($ qq hits) 0)
+            (,tcur m (cast (void *) (aof qq)) ,cbname)
+            (return ($ qq hits)))))))
+
+  ;; deffind -- the first row WHERE admits, copied to out_row; the walk
+  ;; stops at the hit. Returns 1 found, 0 not.
+  (DEFMACRO deffind (name table params where)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (tname   (FUNCALL qfold (FUNCALL qjoin table)))
+           (table   (INTERN tname))
+           (tcur    (INTERN (CONCATENATE 'STRING tname "_cursor")))
+           (sname   (SYMBOL-NAME name))
+           (name    (INTERN sname))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_QCtx")))
+           (cbname  (INTERN (CONCATENATE 'STRING sname "_qcb")))
+           (cbbody  `((if ,where
+                          (block
+                            (set (-> qq row) (cof row))
+                            (set (-> qq found) 1)
+                            (return #f)))
+                      (return #t))))
+      `($$$
+        (struct ,ctxname
+          ,@(LOOP FOR p IN params COLLECT `(member ,(FIRST p) ,(SECOND p)))
+          (member ,table row)
+          (member int found))
+        (func ,cbname ((void * u) (,table * row)) (out bool)
+          (let ((,ctxname * qq . #'(cast (,ctxname *) u)))
+            ,@(IF params
+                  `((let ,(LOOP FOR p IN params
+                                COLLECT `(,(FIRST p) ,(SECOND p) . #'(-> qq ,(SECOND p))))
+                      ,@cbbody))
+                  cbbody)))
+        (func ,name ((Memory * m) ,@params (,table * out_row)) (out int)
+          (let ((,ctxname qq))
+            ,@(LOOP FOR p IN params COLLECT `(set ($ qq ,(SECOND p)) ,(SECOND p)))
+            (set ($ qq found) 0)
+            (,tcur m (cast (void *) (aof qq)) ,cbname)
+            (if (and (== ($ qq found) 1) (!= out_row nil))
+                (set (cof out_row) ($ qq row)))
+            (return ($ qq found)))))))
+
+  ;; defdelete -- online_delete every row WHERE admits, inside the
+  ;; walk, exactly as the generated DELETE ... WHERE does. Returns how
+  ;; many.
+  (DEFMACRO defdelete (name table params where)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (tname   (FUNCALL qfold (FUNCALL qjoin table)))
+           (table   (INTERN tname))
+           (tcur    (INTERN (CONCATENATE 'STRING tname "_cursor")))
+           (tdel    (INTERN (CONCATENATE 'STRING tname "_delete")))
+           (sname   (SYMBOL-NAME name))
+           (name    (INTERN sname))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_QCtx")))
+           (cbname  (INTERN (CONCATENATE 'STRING sname "_qcb")))
+           (cbbody  `((if ,where
+                          (block
+                            (,tdel (-> qq m) row)
+                            (set (-> qq hits) (+ (-> qq hits) 1))))
+                      (return #t))))
+      `($$$
+        (struct ,ctxname
+          ,@(LOOP FOR p IN params COLLECT `(member ,(FIRST p) ,(SECOND p)))
+          (member Memory * m)
+          (member int64_t hits))
+        (func ,cbname ((void * u) (,table * row)) (out bool)
+          (let ((,ctxname * qq . #'(cast (,ctxname *) u)))
+            ,@(IF params
+                  `((let ,(LOOP FOR p IN params
+                                COLLECT `(,(FIRST p) ,(SECOND p) . #'(-> qq ,(SECOND p))))
+                      ,@cbbody))
+                  cbbody)))
+        (func ,name ((Memory * m) ,@params) (out int64_t)
+          (let ((,ctxname qq))
+            ,@(LOOP FOR p IN params COLLECT `(set ($ qq ,(SECOND p)) ,(SECOND p)))
+            (set ($ qq m) m)
+            (set ($ qq hits) 0)
+            (,tcur m (cast (void *) (aof qq)) ,cbname)
+            (return ($ qq hits)))))))
+
+  ;; defupdate -- for every row WHERE admits: copy it, apply the SET
+  ;; pairs ((column expr) ...), online_update old to new -- the
+  ;; generated UPDATE ... SET ... WHERE, folded. An expr sees `row'
+  ;; (the OLD row) and the parameters. Returns how many.
+  (DEFMACRO defupdate (name table params where sets)
+    (LET* ((qjoin (LAMBDA (n)
+                    (IF (LISTP n)
+                        (FORMAT NIL "~{~A~^::~}" (CDR n))
+                        (SYMBOL-NAME n))))
+           (qfold (LAMBDA (q)
+                    (LET ((out NIL) (i 0) (n (LENGTH q)))
+                      (LOOP WHILE (< i n)
+                            DO (LET ((ch (CHAR q i)))
+                                 (IF (AND (CHAR= ch #\:) (< (+ i 1) n)
+                                          (CHAR= (CHAR q (+ i 1)) #\:))
+                                     (PROGN (PUSH #\_ out) (SETF i (+ i 2)))
+                                     (PROGN (PUSH ch out) (SETF i (+ i 1))))))
+                      (COERCE (NREVERSE out) 'STRING))))
+           (tname   (FUNCALL qfold (FUNCALL qjoin table)))
+           (table   (INTERN tname))
+           (tcur    (INTERN (CONCATENATE 'STRING tname "_cursor")))
+           (tupd    (INTERN (CONCATENATE 'STRING tname "_update")))
+           (sname   (SYMBOL-NAME name))
+           (name    (INTERN sname))
+           (ctxname (INTERN (CONCATENATE 'STRING sname "_QCtx")))
+           (cbname  (INTERN (CONCATENATE 'STRING sname "_qcb")))
+           (cbbody  `((if ,where
+                          (block
+                            (let ((,table nr))
+                              (set nr (cof row))
+                              ,@(LOOP FOR s IN sets
+                                      COLLECT `(set ($ nr ,(FIRST s)) ,(SECOND s)))
+                              (,tupd (-> qq m) row (aof nr)))
+                            (set (-> qq hits) (+ (-> qq hits) 1))))
+                      (return #t))))
+      `($$$
+        (struct ,ctxname
+          ,@(LOOP FOR p IN params COLLECT `(member ,(FIRST p) ,(SECOND p)))
+          (member Memory * m)
+          (member int64_t hits))
+        (func ,cbname ((void * u) (,table * row)) (out bool)
+          (let ((,ctxname * qq . #'(cast (,ctxname *) u)))
+            ,@(IF params
+                  `((let ,(LOOP FOR p IN params
+                                COLLECT `(,(FIRST p) ,(SECOND p) . #'(-> qq ,(SECOND p))))
+                      ,@cbbody))
+                  cbbody)))
+        (func ,name ((Memory * m) ,@params) (out int64_t)
+          (let ((,ctxname qq))
+            ,@(LOOP FOR p IN params COLLECT `(set ($ qq ,(SECOND p)) ,(SECOND p)))
+            (set ($ qq m) m)
+            (set ($ qq hits) 0)
+            (,tcur m (cast (void *) (aof qq)) ,cbname)
+            (return ($ qq hits)))))))
 ))

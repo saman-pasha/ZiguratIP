@@ -117,6 +117,20 @@
       (if ($ c found) (set (cof out_row) ($ c row)))
       (return ($ c found))))
 
+  ;; the DML tier's twins of the two hand-rolled queries above: the
+  ;; macros must fold to the same answers the spelled-out context
+  ;; structs and lifted callbacks produce
+  (defcount dml_book_count Book () #t)
+  (deffind  dml_book_find  Book ((int64_t id)) (== (-> row id) id))
+  (defcount dml_book_over  Book ((int64_t floor)) (> (-> row value) floor))
+  (defquery dml_book_sum   Book () #t
+    (set (cof (cast (int64_t *) user))
+         (+ (cof (cast (int64_t *) user)) (-> row value))))
+  (defupdate dml_book_bump Book ((int64_t k) (int64_t v))
+             (== (-> row value) k)
+             ((value v)))
+  (defdelete dml_book_drop Book ((int64_t v)) (== (-> row value) v))
+
   ;; count matches through the index cursors
   (func book_equal_count ((Memory * m) (int64_t k)) (out int64_t)
     (let ((CountCtx c))
@@ -364,6 +378,38 @@
         (check "truncate frees the settled dead" (cast int64_t (Book_truncate (aof mem))) 2)
         (check "truncate spares the living" (book_count (aof mem) nil) 2)
         (check "the index survives truncate" (book_equal_count (aof mem) 42) 1)
+
+        ;; ---- the DML macros against their hand-rolled twins -----------
+        (let ((int64_t hsum . 0) (int64_t msum . 0))
+          (check "defcount twins book_count"
+                 (dml_book_count (aof mem)) (book_count (aof mem) (aof hsum)))
+          (dml_book_sum (aof mem) (cast (void *) (aof msum)))
+          (check "defquery sums what the hand walk sums" msum hsum))
+        (let ((Book a) (Book b))
+          (check "deffind finds what book_find finds"
+                 (cast int64_t (dml_book_find (aof mem) 2 (aof a))) 1)
+          (if (book_find (aof mem) 2 (aof b))
+              (check "and hands back the same row" ($ a value) ($ b value))))
+        (check "deffind misses what is not there"
+               (cast int64_t (dml_book_find (aof mem) 777 nil)) 0)
+        (check "a parameter reaches the WHERE" (dml_book_over (aof mem) 20) 1)
+        (check "defupdate rewrites the admitted row" (dml_book_bump (aof mem) 42 77) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "the rewrite moved the index" (book_equal_count (aof mem) 77) 1)
+        (check "and back is the mirror" (dml_book_bump (aof mem) 77 42) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((Book tmp))
+          (set ($ tmp id) 99)
+          (set ($ tmp value) 999)
+          (Book_insert (aof mem) (aof tmp)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "defdelete removes what WHERE admits" (dml_book_drop (aof mem) 999) 1)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "and spares the rest" (book_count (aof mem) nil) 2)
 
         ;; ---- an allocation past a page is refused ---------------------
         (let ((int64_t refused . 0))
