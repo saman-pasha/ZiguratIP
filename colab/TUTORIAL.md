@@ -107,13 +107,36 @@ CALL con.open();
 CALL con.compile(request.post('code'));
 ```
 
-That is a compiler behind an HTTP form. `demo/build.sh` does not build it, and `home/ld`
-is gitignored, so a fresh clone has none — but if you have compiled `System/` yourself it
-is sitting there, and the tunnel would publish it.
+That is a compiler behind an HTTP form, and **the ordinary workspace build produces
+it.** `System` is in the top-level `PROJECTS` list and `System/Makefile` compiles
+`compiler.parsi` and `compilerdrawer.parsi` into `home/ld` like any other page — so
+`make` gives you both, every time, on any machine.
 
-**This is not hypothetical.** Run against this repository's own working checkout, the
-check found two objects — the compiler page and the drawer that renders it — both left
-over from ordinary development. That is exactly the situation it exists to catch.
+This paragraph used to say the opposite: that `demo/build.sh` does not build it, `home/ld`
+is gitignored, and *"a fresh clone has none"*. That was true of `demo/build.sh` and false
+of the thing most people run. It was corrected when a **fresh Colab VM** — one `make
+MODE=Release` and nothing else, no `System/` built by hand — hit the check with exactly
+the two objects below.
+
+**So this is not the leftover-from-development case; it is the default case.** The check
+finds `lib_COMPILER_.so` and `lib_COMPILERDRAWER_.so` on a clean build, which makes it
+the thing standing between a standard install and a compiler published behind an
+unauthenticated URL.
+
+**The fix is to move them out of `home/ld`, not to override the check:**
+
+```sh
+mkdir -p "$ZIGURATIP_HOME/ld-disabled"
+mv "$ZIGURATIP_HOME"/ld/lib_COMPILER_.so "$ZIGURATIP_HOME"/ld/lib_COMPILERDRAWER_.so \
+   "$ZIGURATIP_HOME"/ld-disabled/
+mv "$ZIGURATIP_HOME"/catalog/_COMPILER_.conf "$ZIGURATIP_HOME"/catalog/_COMPILERDRAWER_.conf \
+   "$ZIGURATIP_HOME"/ld-disabled/
+```
+
+Moved rather than deleted, so a `mv` back restores them; the object and its catalogue
+entry travel together so the pair never disagrees. Nothing else needs them — pages are
+compiled offline by `parsi`, which is the supported way and the reason the network
+compiler stays off. Restart the server afterwards.
 
 The check names what it found and stops. `I_UNDERSTAND = True` overrides it; the only
 good reason to set that is a tunnel nobody else can actually reach.
