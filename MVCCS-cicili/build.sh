@@ -68,3 +68,12 @@ g++ -g -O0 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
 cp "$HERE/golden/carryover-hexmap.bin" /tmp/mvccs-carryover-hexmap.bin
 cp "$HERE/golden/carryover-data.bin"   /tmp/mvccs-carryover-data.bin
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
+
+# ageing is bounded: the slowdown a working store accumulates is real,
+# the reclaim pass returns the cost and converges, steady churn+reclaim
+# stays flat, and the store file plateaus. The structural checks are
+# deterministic; the timing ratios carry 3x headroom on purpose.
+g++ -g -O2 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
+  -I"$HERE" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"
