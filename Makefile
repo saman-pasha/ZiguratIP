@@ -21,7 +21,7 @@ PROJECTS := Core \
 	System
 
 #export COMPILER := clang++
-export MODE := Debug
+export MODE := Release
 
 ifeq ($(OS),Windows_NT)
 	SEP := &

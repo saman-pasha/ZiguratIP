@@ -26,9 +26,12 @@ ifeq ($(MODE),Debug)
 	LDFLAGS := $(LDFLAGS) -g
 else ifeq ($(MODE),Release)
 	# Release used to add nothing at all, so a release build was an unoptimised
-	# one that had merely lost its debug symbols.
-	CXXFLAGS := $(CXXFLAGS) -O2
-	LDFLAGS := $(LDFLAGS) -O2
+	# one that had merely lost its debug symbols. -O3 to match Cicili's own
+	# release set: the engine is built by Cicili at -O3, and a server compiled
+	# below its own storage engine's optimisation level is a mismatch nobody
+	# chose on purpose.
+	CXXFLAGS := $(CXXFLAGS) -O3
+	LDFLAGS := $(LDFLAGS) -O3
 else
 	$(error $(PROJECT) Accepted MODEs are Debug|Release!)	
 endif
