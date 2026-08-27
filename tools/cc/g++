@@ -1,0 +1,3 @@
+#!/bin/sh
+# Cicili names `g++' outright; this is how the build says otherwise.
+exec "$(dirname "$0")/cxx" "$@"

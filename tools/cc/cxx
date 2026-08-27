@@ -1,0 +1,28 @@
+#!/bin/sh
+# The C++ compiler this repository builds with, plus the one flag Ubuntu
+# makes necessary. See ./README for the whole story; the short version is
+# that clang picks the NEWEST gcc it can find to borrow libstdc++ from,
+# and on Ubuntu 24.04 that is gcc-14's runtime directory -- which ships no
+# C++ headers at all. Every C++ file then dies at
+#
+#     fatal error: 'string' file not found
+#
+# naming a header that is plainly installed. So: pick the newest gcc
+# install dir that actually HAS a header set, and say so.
+#
+# IT IS COMPUTED, NOT WRITTEN DOWN. A hardcoded 13 is a build that breaks
+# on the next machine, and this cost an afternoon once already.
+cxx=${CICILI_CXX:-clang++}
+case "$cxx" in
+  *clang*)
+    if [ -z "$CICILI_GCC_DIR" ]; then
+      for d in $(ls -1d /usr/lib/gcc/*/[0-9]* 2>/dev/null | sort -Vr); do
+        if [ -d "/usr/include/c++/${d##*/}" ]; then CICILI_GCC_DIR=$d; break; fi
+      done
+    fi
+    if [ -n "$CICILI_GCC_DIR" ]; then
+      exec "$cxx" "--gcc-install-dir=$CICILI_GCC_DIR" "$@"
+    fi
+    ;;
+esac
+exec "$cxx" "$@"

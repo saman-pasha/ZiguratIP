@@ -14,6 +14,8 @@
 # way the rest of the repository does: by name, found relatively.
 CICILI=${CICILI:-$HOME/cicili}
 HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+. "$ROOT/tools/cc/env.sh"
 LIBDIR=$(cd "$HERE/.." && pwd)/home/lib
 mkdir -p "$LIBDIR"
 set -e
@@ -55,9 +57,9 @@ cp "$HERE/engine.hpp" "$HERE/engine-compat.hpp" "$INCDIR/"
 
 # ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
-# wrappers; consumers compile with plain g++ against engine.hpp.
+# wrappers; consumers compile with plain $CXX against engine.hpp.
 sbcl --script cicili.lisp --release "$HERE/engine.cicili"
-g++ -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
+"$CXX" -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
   -L"$LIBDIR" -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 
 # THE HEADER MAY NOT DRIFT. engine.hpp copies Pointer and BaseTable
@@ -82,15 +84,16 @@ for name in ('Pointer','BaseTable','BTreeIndex'):
 sys.exit(bad)
 PY
 
-# and the keystone consumer: plain g++, engine.hpp, libMVCCS.so only
-g++ -O3 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" -I"$INCDIR" \
+# and the keystone consumer: a plain C++ compiler, engine.hpp,
+# libMVCCS.so only -- no Cicili, no engine sources
+"$CXX" -O3 "$HERE/consumer-test.cpp" -o "$HERE/consumer_test" -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 "$HERE/consumer_test"
 
 # the contention suite: the old Test/test_contention.cpp scenarios, run
 # through engine-compat.hpp -- the exact surface a compiled object uses --
 # with each "connection" a thread holding its own transaction
-g++ -O3 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
+"$CXX" -O3 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lCryptography -lpthread \
   -Wl,-rpath,"$LIBDIR"
@@ -102,7 +105,7 @@ g++ -O3 -std=c++17 "$HERE/contention-test.cpp" -o "$HERE/contention_test" \
 # wrote, checked in under golden/, handed to the reader as a scratch copy
 # (the reader writes into it -- an update and an insert are part of the
 # proof).
-g++ -O3 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
+"$CXX" -O3 -std=c++17 "$HERE/carryover-new.cpp" -o "$HERE/carryover_new" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lpthread \
   -Wl,-rpath,"$LIBDIR"
@@ -114,7 +117,7 @@ LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
 # the reclaim pass returns the cost and converges, steady churn+reclaim
 # stays flat, and the store file plateaus. The structural checks are
 # deterministic; the timing ratios carry 3x headroom on purpose.
-g++ -O3 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
+"$CXX" -O3 -std=c++17 "$HERE/ageing-test.cpp" -o "$HERE/ageing_test" \
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"

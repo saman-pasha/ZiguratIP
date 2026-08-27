@@ -1,0 +1,51 @@
+The toolchain, in one directory.
+
+    cc      the C compiler this workspace builds with: clang
+    cxx     the C++ compiler: clang++, plus one flag (below)
+    gcc     a shim onto ./cc,  for the one step that names gcc outright
+    g++     a shim onto ./cxx, likewise
+    env.sh  sourced by MVCCS-cicili/build.sh; sets CC, CXX and PATH
+
+WHY cxx IS A SCRIPT AND NOT A SYMLINK. clang has no C++ standard library
+of its own on Linux: it borrows libstdc++ from a gcc installation, and it
+picks the NEWEST one it can find. On Ubuntu 24.04 that is
+/usr/lib/gcc/x86_64-linux-gnu/14 -- a runtime directory shipped by
+libgcc-14, holding crtbegin.o and libgcc_s.so and NOT ONE C++ HEADER,
+because g++ itself is 13.3 and the headers are under /usr/include/c++/13.
+Every C++ file then fails with
+
+    fatal error: 'string' file not found
+
+naming a header that is installed and readable. ./cxx walks the gcc
+install dirs newest-first, takes the first that has a matching header set,
+and passes --gcc-install-dir. It is COMPUTED rather than written down: a
+hardcoded 13 is a build that breaks on the next machine.
+
+WHY gcc AND g++ EXIST AT ALL. Cicili's config.lisp names the compiler
+outright --
+
+    'compiler `("libtool" "--tag=CC" "--mode=compile" "gcc" ,@opt ,*verbose*)
+
+-- on Linux, and clang on Darwin. There is no environment override, and a
+target's own :compile list is appended AFTER the base, so it can add flags
+but cannot rename the program. ZiguratIP does not patch Cicili, so the
+build puts this directory on PATH for that step instead.
+
+THE PATCH CICILI WOULD WANT, offered rather than applied:
+
+    (let* ((os  (software-type))
+           (cc  (or (uiop:getenv "CICILI_CC")  (if (string= os "Darwin") "clang"   "gcc")))
+           (cxx (or (uiop:getenv "CICILI_CXX") (if (string= os "Darwin") "clang++" "g++")))
+           ...)
+
+and then `,cc' / `,cxx' where the strings are now. Two of the four files
+here go away with it.
+
+EVERYTHING ELSE ALREADY HAD THE LEVER. Makefile.global reads COMPILER, so
+the C++ projects were always `make COMPILER=...'; the workspace Makefile
+now says which one rather than leaving it commented out.
+
+GOING BACK TO GCC: `make COMPILER=g++', or CICILI_CC=gcc CICILI_CXX=g++
+for the scripts. Nothing here is load-bearing on clang. What is
+load-bearing is that all of it agrees -- cocolog links libCore into its
+own binary, so this is not a per-repository choice.

@@ -15,7 +15,17 @@
 ;;;; bit-equal, and survives a restart.
 
 (source "schema_test.cpp"
-  (make :cpp #t :compile #t
+  (make :cpp #t
+        ;; TWO CLANG-ONLY COMPLAINTS ABOUT CORRECT EMISSION: the
+        ;; paren-wrapped `while ((x == 0))' the transpiler writes, and
+        ;; the unbraced else-if chain. Cicili treats any unrecognised
+        ;; compiler chatter as FATAL, so under clang the first of these
+        ;; stopped the build outright -- an `Unhandled SIMPLE-ERROR'
+        ;; whose text was a -Wparentheses-equality warning. gcc ignores
+        ;; unknown -Wno- options, so both flags travel to every platform.
+        ;; cocolog.cicili and embed.cicili carry the same pair.
+        :compile ("-Wno-parentheses-equality" "-Wno-dangling-else"
+                  "-c" "schema_test.cpp")
         :link ("-lschema_test.o" "-o" "schema_test"
                "-L../home/lib" "-lCore" "-lStreamIO"
                "-lpthread"))
