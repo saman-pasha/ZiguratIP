@@ -1,0 +1,3 @@
+#!/bin/sh
+# The C compiler this repository builds with. See ./README.
+exec "${CICILI_CC:-clang}" "$@"

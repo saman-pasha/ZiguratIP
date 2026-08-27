@@ -1,0 +1,3 @@
+#!/bin/sh
+# Cicili names `gcc' outright; this is how the build says otherwise.
+exec "$(dirname "$0")/cc" "$@"
