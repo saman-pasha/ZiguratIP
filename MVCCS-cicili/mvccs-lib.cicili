@@ -2836,12 +2836,16 @@
   ;; Each link is asked Memory's visibility question directly; under
   ;; SNAPSHOT the answer can be an older version, so the value is read
   ;; again from wherever the pointer moved to.
-  (func bt_walk_values ((BTreeIndex * idx) (BTKey * key) (void * ctx)
-                        (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
+  ;;
+  ;; The walk is split so a caller that KNOWS where its target sits --
+  ;; the unmap resume mark below -- can start mid-chain: bt_walk_values
+  ;; is the head-anchored spelling, bt_walk_values_from the general one.
+  (func bt_walk_values_from ((BTreeIndex * idx) (int64_t start) (void * ctx)
+                             (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
         (out void)
     (let ((Memory * m . #'(-> idx m))
           (int64_t counter . -1)
-          (int64_t tmp . #'(-> key values_address))
+          (int64_t tmp . start)
           ;; Brent's cycle check, in three integers: remember a mark, double
           ;; the distance each time it is moved, and a link that comes back
           ;; to the mark is a chain pointing into itself -- a torn edit's
@@ -2879,6 +2883,11 @@
                   (set counter (+ counter 1))
                   (if (not (vcb ctx counter (aof v)))
                       (return)))))))))
+
+  (func bt_walk_values ((BTreeIndex * idx) (BTKey * key) (void * ctx)
+                        (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
+        (out void)
+    (bt_walk_values_from idx (-> key values_address) ctx vcb))
 
   ;; ---- map (insert) --------------------------------------------------
   (decl) (func bt_split_node ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
@@ -3201,12 +3210,37 @@
         (cast void 0))))
 
   ;; ---- unmap: one row's entry, never the key's whole chain ----------
-  (struct BTUnmapCtx (member int64_t value) (member BTreeIndex * idx))
+  ;;
+  ;; AND NEVER THE SAME CHAIN TWICE IN ONE STATEMENT. A mass DELETE's
+  ;; i-th row used to find its entry by walking the key's chain from the
+  ;; head, past the i-1 entries the same statement had already staged
+  ;; dead -- ~3200 clauses of one knowledge base cost ~30 seconds, all
+  ;; of it re-reading dead links (measured from cocolog's forget_all).
+  ;; Entries join a chain at its HEAD, so any two rows enter every
+  ;; index's chain in the same relative order they were inserted -- and
+  ;; a scan deletes them in chain order, whichever index it rides. So
+  ;; each unmap REMEMBERS where it ended, per (transaction, index, key),
+  ;; and the next unmap on that key starts there: the whole statement is
+  ;; one walk per chain. The mark is a HINT and never an answer -- a
+  ;; miss (an entry inserted since, a scan in another order) falls back
+  ;; to the head, so the mark can only save work, never lose an entry.
+  ;; It is transaction-stamped because only an address this transaction
+  ;; itself staged dead is pinned against TRUNCATE reclaiming it; a mark
+  ;; from a retired transaction is ignored, never followed.
+  (struct UnmapMark
+    (member size_t txn)
+    (member BTreeIndex * idx)
+    (member int64_t key)
+    (member int64_t addr))
+  (thread-local) (var UnmapMark tl_unmap_marks [64])
+
+  (struct BTUnmapCtx (member int64_t value) (member BTreeIndex * idx) (member int64_t found))
   (func bt_unmap_vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
     (cast void counter)
     (let ((BTUnmapCtx * uc . #'(cast (BTUnmapCtx *) c)))
       (if (== (-> v value) (-> uc value))
           (block
+            (set (-> uc found) ($ (-> v pointer) address))
             (bt_delete_value (-> uc idx) v)
             (return #f)))
       (return #t)))
@@ -3229,10 +3263,30 @@
                    (set stop 1))))
             ((== k ($ cur key))
              (block
-               (let ((BTUnmapCtx uc))
+               (let ((BTUnmapCtx uc)
+                     (int slot . #'(cast int (bitand k 63)))
+                     (UnmapMark * mark . #'(aof (nth slot tl_unmap_marks))))
                  (set ($ uc value) value)
                  (set ($ uc idx) idx)
-                 (bt_walk_values idx (aof cur) (cast (void *) (aof uc)) bt_unmap_vcb))
+                 (set ($ uc found) -1)
+                 ;; this transaction's mark on this (index, key): resume there
+                 (if (!= tl_txn nil)
+                     (if (and (== (-> mark txn) (-> tl_txn id))
+                              (and (== (-> mark idx) idx)
+                                   (and (== (-> mark key) k)
+                                        (> (-> mark addr) -1))))
+                         (bt_walk_values_from idx (-> mark addr)
+                                              (cast (void *) (aof uc)) bt_unmap_vcb)))
+                 ;; the hint missed, or there was none: the head answers
+                 (if (== ($ uc found) -1)
+                     (bt_walk_values idx (aof cur) (cast (void *) (aof uc)) bt_unmap_vcb))
+                 (if (!= tl_txn nil)
+                     (if (> ($ uc found) -1)
+                         (block
+                           (set (-> mark txn) (-> tl_txn id))
+                           (set (-> mark idx) idx)
+                           (set (-> mark key) k)
+                           (set (-> mark addr) ($ uc found))))))
                (set stop 1)))
             (#t
              (if (and (!= (-> node is_internal) 0)
