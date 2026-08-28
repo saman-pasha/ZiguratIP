@@ -225,6 +225,19 @@ namespace
   {
     ~ConnectionScope()
     {
+      // A vanished client's transaction dies with its connection. Every
+      // error path in handle_client breaks out of the conversation with
+      // neither commit nor rollback, and a pooled thread keeps the id
+      // registered as live -- so the staged work stood as debris the lazy
+      // stale-lock breaker rightly refused to break, and every later
+      // touch of those rows waited its whole lock timeout on a
+      // transaction nothing would ever finish (measured from cocolog: a
+      // client that timed out mid-forget wedged the knowledge base until
+      // the server restarted). A destructor is the one place that runs on
+      // every way out, the error reply throwing into a dead stream
+      // included. A transaction the client committed has nothing staged,
+      // so this is a no-op on the clean path.
+      try { rollback_transaction(globals_memory()); } catch (...) {}
       Globals::clear_peer();
       globals_clear_peer();
       Globals::set_client_stream(nullptr);
