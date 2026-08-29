@@ -26,7 +26,24 @@
         ;; whose text was a -Wparentheses-equality warning. gcc ignores
         ;; unknown -Wno- options, so both flags travel to every platform.
         ;; cocolog.cicili and embed.cicili carry the same pair.
-        :compile ("-Wno-parentheses-equality" "-Wno-dangling-else"
+        ;;
+        ;; AND THE STANDARD, SAID OUT LOUD. Every makefile in this
+        ;; workspace compiles with -std=c++17; these Cicili targets did
+        ;; not say, and inherited whatever the compiler defaulted to --
+        ;; gnu++17 on Ubuntu's clang, C++14 on Apple's. Under C++14
+        ;; there is no guaranteed copy elision, so the transpiler's
+        ;; `filestream f = filestream(...)' needs a copy constructor the
+        ;; class deletes, and the build died at `call to
+        ;; implicitly-deleted copy constructor' naming a line that is
+        ;; correct C++17. gnu++17 rather than c++17 because the emitted
+        ;; code uses statement expressions, a GNU extension both
+        ;; compilers accept.
+        ;; A THIRD, FROM APPLE'S SDK: `sprintf' is marked deprecated
+        ;; there, and a deprecation is a warning -- which Cicili treats
+        ;; as fatal, so the build stopped naming a function that works.
+        ;; Silenced in the target's own list, as the other two are.
+        :compile ("-std=gnu++17" "-Wno-deprecated-declarations"
+                  "-Wno-parentheses-equality" "-Wno-dangling-else"
                   "-c" "engine.cpp"))
 
   (include <cstdio>)
