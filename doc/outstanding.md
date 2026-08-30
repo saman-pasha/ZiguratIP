@@ -454,3 +454,53 @@ To cover it on Linux the libraries would need per-build `SONAME`s, or the object
 would need its dependency resolved by full path. Both change how every object is
 linked, to exercise one guard, so neither is obviously worth it. macOS still
 runs the test for real.
+
+---
+
+## The engine's insert path
+
+Measured in `MVCCS-cicili/README.md`, "Insertion time, measured"; the
+benchmarks are `MVCCS-cicili/bench/`. The unmap-mark eviction is fixed;
+these are the costs that remain, ranked by what they were measured to be
+worth, and none of them is speculative.
+
+### A B-tree node's keys are one row each
+
+`bt_map_rec` / `bt_unmap_rec` / every `bt_*_rec` read a node's keys as a
+linked list of `BTKey` records, each a `pointer_at` (the hexmap, one byte
+at a time) plus a seek and an unpack. At branching 65 a descent is ~200
+records, and it is 0.84 ms of the 1.8 ms a clause costs over the wire --
+growing with the tree, because a rightmost insert walks the whole root and
+the whole leaf. Packing a node's keys into the node record, or caching
+node-plus-keys in memory under the streams guard, turns ~200 reads into one.
+
+### Every seek is a syscall
+
+The two store streams are `std::filebuf`s, and a `filebuf` discards its
+buffer on every `seekg`/`seekp`; `pointer_at` reads the hexmap a byte at a
+time through that. `pread`/`pwrite` on the descriptor, or the hexmap
+`mmap`ed (it is one byte per chunk), removes most of the syscalls every
+operation pays.
+
+### A sequence's keys always go right
+
+The primary key from a sequence is larger than every key before it, and
+`bt_map_rec` still walks the root and the rightmost leaf to find that out.
+A per-index "rightmost leaf" hint, checked before the descent, makes the
+common insert O(1) in reads.
+
+### Dead links leave a chain only at vacuum
+
+`bt_unlink_dead_values` runs from TRUNCATE alone, so a chain carries every
+dead version until then and every walk pays for them (`vacuum` itself took
+31 s on the measured base). A walk that passes a settled dead link could
+unlink it, as vacuum does, and chains would stop growing between vacuums.
+
+### One clause, one round trip
+
+cocolog's `assert_clause` is called once per clause -- 7000 round trips for
+7000 clauses. A bulk procedure carrying N clauses per call is the wire's
+share of the remaining cost; and on cocolog's side the rewrite-whole-
+predicate sync is what multiplies the delete cost in the first place (an
+incremental assert would insert one row at the next ordinal).
+

@@ -3227,12 +3227,32 @@
   ;; It is transaction-stamped because only an address this transaction
   ;; itself staged dead is pinned against TRUNCATE reclaiming it; a mark
   ;; from a retired transaction is ignored, never followed.
+  ;;
+  ;; THE SLOT IS THE INDEX'S, NOT THE KEY'S. The table was first filed by
+  ;; `key & 63' alone, and a table has more than one index: cocolog's
+  ;; clauses carry a PRIMARY KEY drawn from a sequence beside the two
+  ;; chain indexes (kb, name), and a sequence's keys sweep all 64 slots,
+  ;; so every ~64 rows the primary key's unmap landed on the chain's slot
+  ;; and evicted its mark -- and the next unmap on that chain walked from
+  ;; the head again, past every newer row and every dead link. Measured
+  ;; (bench/delete-bench.cpp): 0.09 ms a row with the mark intact, 1.37
+  ;; with a sequence-keyed index beside it; in the server, 82% of a
+  ;; forget_clauses inside this walk, 3.8 ms a row on a fresh base and
+  ;; 16.6 with 14000 dead links. So the slot is chosen by the INDEX (its
+  ;; address), with four sub-slots by key so a statement that alternates
+  ;; between a few keys of one index keeps a mark for each; an index's
+  ;; own keys can evict only its own marks, and a miss still costs work,
+  ;; never an entry.
   (struct UnmapMark
     (member size_t txn)
     (member BTreeIndex * idx)
     (member int64_t key)
     (member int64_t addr))
-  (thread-local) (var UnmapMark tl_unmap_marks [64])
+  (thread-local) (var UnmapMark tl_unmap_marks [256])
+
+  (func unmap_mark_slot ((BTreeIndex * idx) (int64_t k)) (out int)
+    (return (cast int (+ (* (bitand (>> (cast size_t idx) 4) 63) 4)
+                         (bitand k 3)))))
 
   (struct BTUnmapCtx (member int64_t value) (member BTreeIndex * idx) (member int64_t found))
   (func bt_unmap_vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)
@@ -3264,7 +3284,7 @@
             ((== k ($ cur key))
              (block
                (let ((BTUnmapCtx uc)
-                     (int slot . #'(cast int (bitand k 63)))
+                     (int slot . #'(unmap_mark_slot idx k))
                      (UnmapMark * mark . #'(aof (nth slot tl_unmap_marks))))
                  (set ($ uc value) value)
                  (set ($ uc idx) idx)

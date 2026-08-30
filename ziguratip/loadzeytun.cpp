@@ -225,7 +225,8 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
 	require_objects(handle);
       } catch (const ZiguratException& refused) {
 	std::cout << "Zeytun: refusing '" << name << "': " << refused.message() << std::endl;
-	if (library_cache_mode != LibraryPool::NONE) library_pool.close(handle);
+	// NONE closes; a cache keeps what it cached -- see loadzigurat.cpp
+	if (library_cache_mode == LibraryPool::NONE) library_pool.close(handle);
 	throw HTTPException("403 Forbidden");
       }
 
@@ -239,7 +240,7 @@ void zeytun_handler (binarystream* client, HTTPRequest* request, HTTPResponse* r
       page->PAGE_LOAD();
       del_sym(page);
 
-      if (library_cache_mode != LibraryPool::NONE) library_pool.close(handle);
+      if (library_cache_mode == LibraryPool::NONE) library_pool.close(handle);
 
     } else {
 
