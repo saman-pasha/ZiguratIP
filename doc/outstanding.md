@@ -464,15 +464,18 @@ benchmarks are `MVCCS-cicili/bench/`. The unmap-mark eviction is fixed;
 these are the costs that remain, ranked by what they were measured to be
 worth, and none of them is speculative.
 
-### A B-tree node's keys are one row each
+### A B-tree node's keys are one row each -- cached now, still one row each
 
 `bt_map_rec` / `bt_unmap_rec` / every `bt_*_rec` read a node's keys as a
 linked list of `BTKey` records, each a `pointer_at` (the hexmap, one byte
 at a time) plus a seek and an unpack. At branching 65 a descent is ~200
-records, and it is 0.84 ms of the 1.8 ms a clause costs over the wire --
-growing with the tree, because a rightmost insert walks the whole root and
-the whole leaf. Packing a node's keys into the node record, or caching
-node-plus-keys in memory under the streams guard, turns ~200 reads into one.
+records, and it was 0.84 ms of the 1.8 ms a clause cost over the wire.
+The record cache (`BTCache`, `mvccs-lib.cicili`) makes those ~200 reads
+lookups -- 0.11 ms a row now -- without touching the format. What remains
+true: the first descent after a restart, and every record a collision
+evicts, still pays the read; packing a node's keys into the node record
+would make the cold path as cheap as the warm one, at the price of a
+format both engines would have to agree on.
 
 ### Every seek is a syscall
 

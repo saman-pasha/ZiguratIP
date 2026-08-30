@@ -606,7 +606,15 @@
     (member pthread_mutex_t free_list_access)
     ;; the DBA watcher: one line per engine operation goes through this
     ;; stream while it is attached; detached on the first write failure
-    (member binarystream * watcher))
+    (member binarystream * watcher)
+    ;; the B-tree record cache -- a BTCache, opaque here because the tree's
+    ;; records are defined after Memory; see "The B-tree record cache"
+    (member void * bt_cache))
+
+  ;; the cache's hooks into the memory tier, defined with the tree below
+  (decl) (func bt_cache_new () (out void *))
+  (decl) (func bt_cache_reset ((Memory * m)) (out void))
+  (decl) (func bt_cache_forget ((Memory * m) (int64_t address)) (out void))
 
   ;; ==================================================================
   ;; Streams -- THE guard. One pair of shared streams for the whole
@@ -1150,6 +1158,7 @@
 
   (func free_pointer ((Memory * m) (const Pointer * p)) (out void)
     (dba_watch2 m "Free" (-> p address) (-> p size))
+    (bt_cache_forget m (-> p address))
     (let ((int64_t from . #'(ptr_hexmap p))
           (int64_t count . #'(ptr_actual_count p))
           (int64_t full_count . 0)
@@ -2228,6 +2237,8 @@
   (func offline_insert ((Memory * m) (const uint8_t * hash_key) (BaseTable * obj)) (out void)
     (set (-> obj pointer) (allocate m hash_key ((-> obj pack_size))))
     (dba_watch1 m "Offline Insert" ($ (-> obj pointer) address))
+    ;; the address may be a freed record's, and the cache may still hold it
+    (bt_cache_forget m ($ (-> obj pointer) address))
     ;; THE DATA LANDS BEFORE THE ALLOCATION IS MARKED. The old order flushed
     ;; the hexmap marking first, so a process that died between the two
     ;; flushes left an ALLOCATED record whose bytes were never written --
@@ -2253,6 +2264,7 @@
 
   (func offline_update ((Memory * m) (BaseTable * obj)) (out void)
     (dba_watch1 m "Offline Update" ($ (-> obj pointer) address))
+    (bt_cache_forget m ($ (-> obj pointer) address))
     (let ((Control control))
       (control_clear (aof control))
       (load_control m (aof (-> obj pointer)) (aof control))
@@ -2532,6 +2544,9 @@
     (set (-> m pages) nil)
     (set (-> m frees) nil)
     (set (-> m watcher) nil)
+    ;; a fresh cache per open, never the field's old value: a Memory on the
+    ;; stack or from a bare `new' arrives with that pointer indeterminate
+    (set (-> m bt_cache) (bt_cache_new))
     (pthread_mutex_init (aof (-> m hexmap_access)) nil)
     (pthread_mutex_init (aof (-> m data_access)) nil)
     (pthread_mutex_init (aof (-> m page_list_access)) nil)
@@ -2661,6 +2676,125 @@
     (set (-> k key) 0)
     (set (-> k pointer) (pointer_null)))
 
+  ;; ==================================================================
+  ;; The B-tree record cache.
+  ;;
+  ;; A node's keys are one record each, so a descent at branching 65
+  ;; reads ~200 records -- a pointer_at over the hexmap, a seek and an
+  ;; unpack apiece, through a filebuf that drops its buffer at every
+  ;; seek -- and that was 0.85 ms of every insert, growing with the
+  ;; tree (bench/insert-bench.cpp, scenario D). Nodes and keys are
+  ;; OFFLINE records: no version, no rollback, written in place through
+  ;; offline_insert / offline_update and released through free_pointer,
+  ;; so a copy in memory is stale only after one of those three, and
+  ;; each of them forgets the address. Direct-mapped, tagged by address,
+  ;; bounded, no allocation on the hot path; a collision costs a re-read,
+  ;; never a wrong answer. One mutex, because readers under the SHARED
+  ;; streams guard fill it concurrently. The on-disk format is untouched
+  ;; -- a store written by the C++ engine reads the same.
+  ;; ==================================================================
+  ;; 4096 node slots and 16384 key slots, the numbers written out: a
+  ;; #define of one's own is invisible to Cicili (CLAUDE.md)
+
+  (struct BTNodeSlot (member int64_t addr) (member BTNode node))
+  (struct BTKeySlot (member int64_t addr) (member BTKey key))
+  (struct BTCache
+    (member pthread_mutex_t access)
+    (member BTNodeSlot nodes [4096])
+    (member BTKeySlot keys [16384]))
+
+  (func bt_cache_clear_slots ((BTCache * c)) (out void)
+    (let ((int i . 0))
+      (while (< i 4096)
+        (set ($ (nth i (-> c nodes)) addr) -1)
+        (set i (+ i 1))))
+    (let ((int i . 0))
+      (while (< i 16384)
+        (set ($ (nth i (-> c keys)) addr) -1)
+        (set i (+ i 1)))))
+
+  (func bt_cache_new () (out void *)
+    (let ((BTCache * c . #'(new* BTCache)))
+      (pthread_mutex_init (aof (-> c access)) nil)
+      (bt_cache_clear_slots c)
+      (return (cast (void *) c))))
+
+  (func bt_cache_free ((Memory * m)) (out void)
+    (if (!= (-> m bt_cache) nil)
+        (block
+          (delete* (cast (BTCache *) (-> m bt_cache)))
+          (set (-> m bt_cache) nil))))
+
+  (func bt_cache_reset ((Memory * m)) (out void)
+    (if (== (-> m bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
+      (pthread_mutex_lock (aof (-> c access)))
+      (bt_cache_clear_slots c)
+      (pthread_mutex_unlock (aof (-> c access)))))
+
+  ;; records sit at least a control block apart, so the address over 64
+  ;; spreads neighbours across slots
+  (func bt_cache_node_slot ((int64_t address)) (out int)
+    (return (cast int (bitand (>> address 6) 4095))))
+  (func bt_cache_key_slot ((int64_t address)) (out int)
+    (return (cast int (bitand (>> address 6) 16383))))
+
+  (func bt_cache_forget ((Memory * m) (int64_t address)) (out void)
+    (if (== (-> m bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
+          (int ns . #'(bt_cache_node_slot address))
+          (int ks . #'(bt_cache_key_slot address)))
+      (pthread_mutex_lock (aof (-> c access)))
+      (if (== ($ (nth ns (-> c nodes)) addr) address)
+          (set ($ (nth ns (-> c nodes)) addr) -1))
+      (if (== ($ (nth ks (-> c keys)) addr) address)
+          (set ($ (nth ks (-> c keys)) addr) -1))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
+  (func bt_cache_node_get ((Memory * m) (int64_t address) (BTNode * out)) (out int)
+    (if (== (-> m bt_cache) nil) (return 0))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
+          (int ns . #'(bt_cache_node_slot address))
+          (int hit . 0))
+      (pthread_mutex_lock (aof (-> c access)))
+      (if (== ($ (nth ns (-> c nodes)) addr) address)
+          (block
+            (set (cof out) ($ (nth ns (-> c nodes)) node))
+            (set hit 1)))
+      (pthread_mutex_unlock (aof (-> c access)))
+      (return hit)))
+
+  (func bt_cache_node_put ((Memory * m) (const BTNode * node)) (out void)
+    (if (== (-> m bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
+          (int ns . #'(bt_cache_node_slot ($ (-> node pointer) address))))
+      (pthread_mutex_lock (aof (-> c access)))
+      (set ($ (nth ns (-> c nodes)) node) (cof node))
+      (set ($ (nth ns (-> c nodes)) addr) ($ (-> node pointer) address))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
+  (func bt_cache_key_get ((Memory * m) (int64_t address) (BTKey * out)) (out int)
+    (if (== (-> m bt_cache) nil) (return 0))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
+          (int ks . #'(bt_cache_key_slot address))
+          (int hit . 0))
+      (pthread_mutex_lock (aof (-> c access)))
+      (if (== ($ (nth ks (-> c keys)) addr) address)
+          (block
+            (set (cof out) ($ (nth ks (-> c keys)) key))
+            (set hit 1)))
+      (pthread_mutex_unlock (aof (-> c access)))
+      (return hit)))
+
+  (func bt_cache_key_put ((Memory * m) (const BTKey * key)) (out void)
+    (if (== (-> m bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
+          (int ks . #'(bt_cache_key_slot ($ (-> key pointer) address))))
+      (pthread_mutex_lock (aof (-> c access)))
+      (set ($ (nth ks (-> c keys)) key) (cof key))
+      (set ($ (nth ks (-> c keys)) addr) ($ (-> key pointer) address))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
   (struct BTValue (inherits BaseTable)
     (member int64_t value)
     (member int64_t next_address)
@@ -2718,15 +2852,19 @@
   ;; ---- node / key readers (_btreenode / _btreekey) ------------------
   (func bt_node_read ((BTreeIndex * idx) (int64_t address) (BTNode * node)) (out void)
     (let ((Memory * m . #'(-> idx m)))
+      (if (bt_cache_node_get m address node) (return))
       (set (-> node pointer) (pointer_at m (-> idx hash_key) address))
       ((-> (-> m data_io) seekg) (ptr_data (aof (-> node pointer))) std::ios::beg)
-      ((-> node unpack) (cof (-> m data_io)))))
+      ((-> node unpack) (cof (-> m data_io)))
+      (bt_cache_node_put m node)))
 
   (func bt_key_read ((BTreeIndex * idx) (int64_t address) (BTKey * key)) (out void)
     (let ((Memory * m . #'(-> idx m)))
+      (if (bt_cache_key_get m address key) (return))
       (set (-> key pointer) (pointer_at m (-> idx hash_key) address))
       ((-> (-> m data_io) seekg) (ptr_data (aof (-> key pointer))) std::ios::beg)
-      ((-> key unpack) (cof (-> m data_io)))))
+      ((-> key unpack) (cof (-> m data_io)))
+      (bt_cache_key_put m key)))
 
   ;; a dependent level, built on the stack per descent exactly as the
   ;; original builds its dependent_index: same store, same tuning, the
@@ -4148,6 +4286,8 @@
   ;; the allocator wholesale, and the survivors -- read through the
   ;; table's own cursor -- are mapped into a fresh tree.
   (func drop_key_pages ((Memory * m) (const uint8_t * key)) (out void)
+    ;; whole pages go back: every cached record of this key is stale
+    (bt_cache_reset m)
     (pthread_mutex_lock (aof (-> m page_list_access)))
     (pthread_mutex_lock (aof (-> m free_list_access)))
     ;; the key's free entries first: their space is about to sit inside

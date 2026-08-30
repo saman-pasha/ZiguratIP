@@ -543,13 +543,38 @@ they were measured to be worth.
 | `vacuum` | 31-33 s | 31-48 s -- unchanged; it is the chain walk, "Dead links leave a chain only at vacuum" in `doc/outstanding.md` |
 
 The delete now costs what the control experiment said it should, and
-history no longer changes it. What the rewrite still pays is the
-inserts -- 1.8-2 ms a clause, the descent above -- which is the next
-item on the outstanding list, not this one. `CACHE_MODE: GLOBAL` made no
-measurable difference to the fresh load (13.9 s against 12.7), so the
-per-call floor is the round trip and the statement, not the `dlopen`;
-the default stays GLOBAL because the `dlclose` it exposed was a bug
-either way.
+history no longer changes it. `CACHE_MODE: GLOBAL` made no measurable
+difference to the fresh load (13.9 s against 12.7), so the per-call
+floor is the round trip and the statement, not the `dlopen`; the
+default stays GLOBAL because the `dlclose` it exposed was a bug either
+way.
+
+**And after the record cache** -- the second fix, the descent. Nodes
+and keys are offline records, written in place through three functions
+and released through one, so a direct-mapped copy in memory tagged by
+address (4096 nodes, 16384 keys, one mutex, forgotten at every write
+and free; the `BTCache` comment in `mvccs-lib.cicili`) turns the ~200
+record reads of a descent into lookups. The on-disk format is
+untouched. Same machine, same benchmarks, the three columns being
+before anything, after the mark fix, after the cache:
+
+| measurement | before | mark fix | + cache |
+|---|---|---|---|
+| engine, insert, branching 65, sequential keys (the server's primary key) | 0.85 ms/row, growing | 0.85 | **0.11 ms/row**, flat (first quarter 0.19 s, third 0.39) |
+| engine, insert, branching 65, shuffled keys | 0.44 | 0.44 | **0.16** |
+| engine, delete via `cursor_equal`, chain + unique id | 1.37 | 0.56 | **0.12** |
+| consult 7000 into a fresh base | 12.7 s | 13.9 | **6.0 s** |
+| second / third consult of the same 7000 (rewrites) | 51.6 / 94.3 s | 32.0 / 50.8 | **10.9 / 16.3 s** |
+| `retractall` of 21000 clauses, 21000 dead links behind | 116.6 s | 21.6 | **9.6 s** |
+| `forget` of the whole base | 59.5 s | 19.5 | **7.5 s** |
+| consult after vacuum (a rewrite) | 52.3 s | 32.6 | **11.2 s** |
+| `vacuum` | 31-33 s | 31-48 | 26-30 s |
+
+So the question's own number -- a rewrite of 7000 clauses over history
+-- went from the 50-120 s range to 10-16 s, and a fresh load from 1.8
+ms a clause to 0.86. What is left of that is the wire: one round trip
+and one statement per clause, `doc/outstanding.md`'s last item. The
+`vacuum` is the chain walk it always was.
 
 ## Build and run
 

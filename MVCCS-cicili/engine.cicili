@@ -76,6 +76,7 @@
     (return (new* Memory)))
 
   (func engine_memory_delete ((Memory * m)) (out void)
+    (bt_cache_free m)
     (delete* m))
 
   ;; The guarded cursor -- cursor_walk wants a Streams guard, and Streams
