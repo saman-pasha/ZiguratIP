@@ -473,6 +473,109 @@ Still the dialect, worked with rather than around:
 
 None of these blocked the port; every one had an in-language answer.
 
+## Insertion time, measured -- and where it actually went
+
+The question was "7000 inserts take ~70 seconds; why?" -- asked of this
+engine, and answered by measuring it from three heights: the engine
+alone (`bench/`), the server over the wire (a cocolog `consult`), and a
+`sample` of the live server mid-statement. Every number below is from
+one Mac (APFS, Apple clang), and the benchmark that produced it ships
+in `bench/` so the next machine can disagree with a number rather than
+a sentence.
+
+**The engine inserts fast.** 7000 rows in one transaction:
+
+| scenario | time | per row |
+|---|---|---|
+| no index | 0.081 s | 0.012 ms |
+| one index, branching 3 | 1.6 s | 0.23 ms |
+| one index, branching 65, sequential keys -- the server's `PRIMARY KEY` from a sequence | 5.9 s | 0.84 ms, and growing: first quarter 1.09 s, third 2.97 s |
+| no index, one transaction per row | 2.5 s | 0.35 ms -- the commit's six fsyncs, 0.043 ms each here |
+
+**Over the wire, a fresh knowledge base loads at 1.8 ms a clause**,
+linearly (1000 / 3500 / 7000 clauses: 1.8 / 6.5 / 12.7 s), in ONE
+transaction, the client at 3% CPU. So 70 seconds is not a fresh load.
+It is a REWRITE: cocolog writes a predicate back as `forget_clauses`
+plus every clause again, and the second consult of the same 7000 into
+the same base took 51.6 s, the third 94.3 s; a `retractall` of 7000
+clauses whose chain carried 14000 dead links took 116.6 s -- 16.7 ms a
+row, for a delete.
+
+**The delete was the finding.** A `sample` of the server during
+`forget_clauses` put 82% of its time in `bt_unmap_rec` ->
+`bt_walk_values_from`: the value-chain walk the unmap resume mark
+exists to prevent. In the engine alone, through `cursor_equal` -- the
+statement's own shape -- the mark works: 0.087 ms a row, and 0.112
+with 14000 dead links behind the live ones. Add a second index keyed by
+the row id, as the server's table has, and it is 1.37 ms a row; make
+those id keys avoid the chain's slot and it is 0.58. The mark table was
+filed by `key & 63`, and a sequence's keys sweep all 64 slots: every
+~64 rows the primary key's unmap evicted the chain's mark, and the next
+unmap on that chain walked from the head -- past every newer row of the
+base and every dead link, which is why history made it worse. The fix
+files the slot by the INDEX, four sub-slots by key (the `UnmapMark`
+comment in `mvccs-lib.cicili` has the whole story), and the numbers
+after it are below.
+
+**What is left in the 1.8 ms**, in order: ~0.85 ms the branching-65
+descent -- a node's keys are one row each, read through a `filebuf`
+that drops its buffer on every seek, so a descent is ~200 records and
+several syscalls apiece; ~0.3-0.5 ms the round trip and the
+statement's own framing (a `dlopen` per call under `CACHE_MODE: NONE`
+was suspected and measured out -- see the table below; the default is
+GLOBAL now anyway, and the close that would have unloaded a cached
+object is fixed with it, `ziguratip/loadzigurat.cpp`); the rest the
+row, two chain links, the sequence, and two flushes per record. The fixes that remain are in
+`doc/outstanding.md` under "The engine's insert path", ranked by what
+they were measured to be worth.
+
+**After the fix** (same machine, same benchmarks):
+
+| measurement | before | after |
+|---|---|---|
+| engine, delete via `cursor_equal`, chain + unique id index (the server's shape) | 1.37 ms/row | **0.56 ms/row** -- and 0.58 with 14000 dead links, where the same run was 1.41 |
+| `retractall` of 21000 clauses with 21000 dead links behind them | 116.6 s | **21.6 s** |
+| `forget` of the whole base | 59.5 s | **19.5 s** |
+| second consult of the same 7000 (a rewrite: forget 7000, write 14000) | 51.6 s | **32.0 s** |
+| third | 94.3 s | **50.8 s** |
+| consult after vacuum (forget 7000, write 14000) | 52.3 s | **32.6 s** |
+| consult 7000 into a fresh base | 12.7 s | 13.9 s -- unchanged: the insert path was never the fault |
+| `vacuum` | 31-33 s | 31-48 s -- unchanged; it is the chain walk, "Dead links leave a chain only at vacuum" in `doc/outstanding.md` |
+
+The delete now costs what the control experiment said it should, and
+history no longer changes it. `CACHE_MODE: GLOBAL` made no measurable
+difference to the fresh load (13.9 s against 12.7), so the per-call
+floor is the round trip and the statement, not the `dlopen`; the
+default stays GLOBAL because the `dlclose` it exposed was a bug either
+way.
+
+**And after the record cache** -- the second fix, the descent. Nodes
+and keys are offline records, written in place through three functions
+and released through one, so a direct-mapped copy in memory tagged by
+address (4096 nodes, 16384 keys, one mutex, forgotten at every write
+and free; the `BTCache` comment in `mvccs-lib.cicili`) turns the ~200
+record reads of a descent into lookups. The on-disk format is
+untouched. Same machine, same benchmarks, the three columns being
+before anything, after the mark fix, after the cache:
+
+| measurement | before | mark fix | + cache |
+|---|---|---|---|
+| engine, insert, branching 65, sequential keys (the server's primary key) | 0.85 ms/row, growing | 0.85 | **0.11 ms/row**, flat (first quarter 0.19 s, third 0.39) |
+| engine, insert, branching 65, shuffled keys | 0.44 | 0.44 | **0.16** |
+| engine, delete via `cursor_equal`, chain + unique id | 1.37 | 0.56 | **0.12** |
+| consult 7000 into a fresh base | 12.7 s | 13.9 | **6.0 s** |
+| second / third consult of the same 7000 (rewrites) | 51.6 / 94.3 s | 32.0 / 50.8 | **10.9 / 16.3 s** |
+| `retractall` of 21000 clauses, 21000 dead links behind | 116.6 s | 21.6 | **9.6 s** |
+| `forget` of the whole base | 59.5 s | 19.5 | **7.5 s** |
+| consult after vacuum (a rewrite) | 52.3 s | 32.6 | **11.2 s** |
+| `vacuum` | 31-33 s | 31-48 | 26-30 s |
+
+So the question's own number -- a rewrite of 7000 clauses over history
+-- went from the 50-120 s range to 10-16 s, and a fresh load from 1.8
+ms a clause to 0.86. What is left of that is the wire: one round trip
+and one statement per clause, `doc/outstanding.md`'s last item. The
+`vacuum` is the chain walk it always was.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout

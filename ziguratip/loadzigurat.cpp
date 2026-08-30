@@ -108,7 +108,13 @@ void handle_client()
 	if (engine_autocommit() != 0)
 	  commit_transaction(globals_memory());
 
-	if (library_cache_mode != LibraryPool::NONE) library_pool.close(handle);
+	// CLOSED ONLY WHEN NOTHING CACHES IT. This read `!= NONE', which
+	// dlclosed the handle the GLOBAL and LOCAL caches were still holding
+	// -- the pool had dlopened each object once, so the first call's
+	// close unloaded it and the cache kept a handle to nothing -- while
+	// NONE, whose promise is a fresh load per use, never closed and so
+	// never reloaded. NONE closes; a cache keeps what it cached.
+	if (library_cache_mode == LibraryPool::NONE) library_pool.close(handle);
 	
       } else if (function == "compile") {
 	if (Globals::trace_mode())
