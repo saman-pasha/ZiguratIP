@@ -529,52 +529,45 @@ row, two chain links, the sequence, and two flushes per record. The fixes that r
 `doc/outstanding.md` under "The engine's insert path", ranked by what
 they were measured to be worth.
 
-**After the fix** (same machine, same benchmarks):
+**After the fixes** -- same machine, same benchmarks, timed by the
+shell's own clock. (A first draft of this table was timed by a helper
+that called `python3` through a pyenv shim costing 1.8-3.7 s a call, and
+every "after" number in it was inflated by that; the engine-level rows,
+timed inside the benchmark, were never affected. These are the
+re-measured numbers, three configurations run back to back on one
+server: the mark fix alone; the mark fix and the record cache; both plus
+cocolog's pipelined client.)
 
-| measurement | before | after |
-|---|---|---|
-| engine, delete via `cursor_equal`, chain + unique id index (the server's shape) | 1.37 ms/row | **0.56 ms/row** -- and 0.58 with 14000 dead links, where the same run was 1.41 |
-| `retractall` of 21000 clauses with 21000 dead links behind them | 116.6 s | **21.6 s** |
-| `forget` of the whole base | 59.5 s | **19.5 s** |
-| second consult of the same 7000 (a rewrite: forget 7000, write 14000) | 51.6 s | **32.0 s** |
-| third | 94.3 s | **50.8 s** |
-| consult after vacuum (forget 7000, write 14000) | 52.3 s | **32.6 s** |
-| consult 7000 into a fresh base | 12.7 s | 13.9 s -- unchanged: the insert path was never the fault |
-| `vacuum` | 31-33 s | 31-48 s -- unchanged; it is the chain walk, "Dead links leave a chain only at vacuum" in `doc/outstanding.md` |
+| measurement | before | mark fix | + record cache | + pipelined client |
+|---|---|---|---|---|
+| engine, insert, branching 65, sequential keys (the server's primary key) | 0.85 ms/row, growing | 0.85 | **0.11 ms/row**, flat | -- |
+| engine, insert, branching 65, shuffled keys | 0.44 | 0.44 | **0.16** | -- |
+| engine, delete via `cursor_equal`, chain + unique id (the server's shape) | 1.37 | 0.56 | **0.12** | -- |
+| consult 7000 into a fresh base | 12.7 s | 11.4 | 3.1 | **2.5 s** |
+| second / third consult of the same 7000 (rewrites) | 51.6 / 94.3 s | 28.5 / 51.6 | 8.2 / 13.3 | **8.0 / 11.9 s** |
+| `retractall` of 21000 clauses, 21000 dead links behind | 116.6 s | 22.4 | 7.2 | **7.5 s** |
+| `forget` of the whole base | 59.5 s | 12.9 | 5.1 | **5.2 s** |
+| consult after vacuum (a rewrite) | 52.3 s | 24.6 | 8.7 | **7.5 s** |
+| `vacuum` | 31-33 s | 19-21 | 20-24 | 20-24 s |
 
-The delete now costs what the control experiment said it should, and
-history no longer changes it. `CACHE_MODE: GLOBAL` made no measurable
-difference to the fresh load (13.9 s against 12.7), so the per-call
-floor is the round trip and the statement, not the `dlopen`; the
-default stays GLOBAL because the `dlclose` it exposed was a bug either
-way.
-
-**And after the record cache** -- the second fix, the descent. Nodes
-and keys are offline records, written in place through three functions
-and released through one, so a direct-mapped copy in memory tagged by
-address (4096 nodes, 16384 keys, one mutex, forgotten at every write
-and free; the `BTCache` comment in `mvccs-lib.cicili`) turns the ~200
-record reads of a descent into lookups. The on-disk format is
-untouched. Same machine, same benchmarks, the three columns being
-before anything, after the mark fix, after the cache:
-
-| measurement | before | mark fix | + cache |
-|---|---|---|---|
-| engine, insert, branching 65, sequential keys (the server's primary key) | 0.85 ms/row, growing | 0.85 | **0.11 ms/row**, flat (first quarter 0.19 s, third 0.39) |
-| engine, insert, branching 65, shuffled keys | 0.44 | 0.44 | **0.16** |
-| engine, delete via `cursor_equal`, chain + unique id | 1.37 | 0.56 | **0.12** |
-| consult 7000 into a fresh base | 12.7 s | 13.9 | **6.0 s** |
-| second / third consult of the same 7000 (rewrites) | 51.6 / 94.3 s | 32.0 / 50.8 | **10.9 / 16.3 s** |
-| `retractall` of 21000 clauses, 21000 dead links behind | 116.6 s | 21.6 | **9.6 s** |
-| `forget` of the whole base | 59.5 s | 19.5 | **7.5 s** |
-| consult after vacuum (a rewrite) | 52.3 s | 32.6 | **11.2 s** |
-| `vacuum` | 31-33 s | 31-48 | 26-30 s |
-
-So the question's own number -- a rewrite of 7000 clauses over history
--- went from the 50-120 s range to 10-16 s, and a fresh load from 1.8
-ms a clause to 0.86. What is left of that is the wire: one round trip
-and one statement per clause, `doc/outstanding.md`'s last item. The
-`vacuum` is the chain walk it always was.
+Three things the columns say. The mark fix is the delete side only, as
+it should be: the fresh load barely moves, the rewrites and the
+retractall fall by two to five times. The record cache is everything
+that descends a tree, so it takes the fresh load from 11.4 s to 3.1 and
+the rewrites down again. The pipelined client (cocolog's, not this
+repository's: `zg_call_send` / `zg_call_wait` in `client/zigurat.c`,
+up to 128 calls in flight) is worth 0.6 s on a fresh load and nothing
+on a rewrite, because what a rewrite pays now is the statements and the
+commit, not the waits: a `sample` of the server during a consult puts
+the remaining time in `commit_transaction` -- 28000 control blocks
+flipped through the same buffer-dropping seeks the tree used to pay --
+and in the statement's own work. Those are the next items; the wire is
+no longer one. `CACHE_MODE: GLOBAL` made no measurable difference to
+any row, so the per-call floor was never the `dlopen`; the default
+stays GLOBAL because the `dlclose` it exposed was a bug either way. So
+the question's own number -- a rewrite of 7000 clauses over history --
+went from the 50-120 s range to 8-12 s, and a fresh load from 1.8 ms a
+clause to 0.36.
 
 ## Build and run
 

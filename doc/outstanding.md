@@ -499,11 +499,26 @@ dead version until then and every walk pays for them (`vacuum` itself took
 31 s on the measured base). A walk that passes a settled dead link could
 unlink it, as vacuum does, and chains would stop growing between vacuums.
 
-### One clause, one round trip
+### One clause, one round trip -- pipelined now
 
-cocolog's `assert_clause` is called once per clause -- 7000 round trips for
-7000 clauses. A bulk procedure carrying N clauses per call is the wire's
-share of the remaining cost; and on cocolog's side the rewrite-whole-
-predicate sync is what multiplies the delete cost in the first place (an
-incremental assert would insert one row at the next ordinal).
+cocolog's `assert_clause` is called once per clause, and a call was three
+waits on the wire (the verb's acknowledgement, the name's, the answer).
+cocolog's client now sends up to 128 calls ahead of the answers
+(`zg_call_send` / `zg_call_wait`), which was worth 0.6 s of a 3.1 s fresh
+load and nothing on a rewrite. What a load pays now, per a `sample` of the
+server: the statement's own work, and `commit_transaction` -- one
+`load_control` and one `dump_control` per staged pointer, 28000 of them for
+7000 rows with three indexes, each pair a seek that drops the filebuf's
+buffer. A bulk procedure carrying N clauses per call would still cut the
+statements' framing; and on cocolog's side the rewrite-whole-predicate
+sync is what multiplies the delete cost in the first place (an incremental
+assert would insert one row at the next ordinal).
+
+### The commit flips every control block through the same seeks
+
+`commit_pointer` and `stamp_successor` walk the transaction's context and
+`load_control` / `dump_control` each pointer -- four seeks and their flushes
+a pointer -- and then `sync_disk` three times. For a 7000-row load that is
+28000 pointers and about a second of the 2.5 s. Batching the control writes
+by page, or the `pread`/`pwrite` item above, takes most of it.
 
