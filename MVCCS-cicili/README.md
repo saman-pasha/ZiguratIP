@@ -642,6 +642,42 @@ and 72 000 on the new. Both walks size their snapshot to the list now,
 and the walked set is a byte per page number, grown as pages appear.
 Nothing in the format changed.
 
+## The hole in the page, and the walk that went a phase out of step
+
+The oldest bug of the hunt, found last, on the live store, byte by
+byte. The in-page walk that `cursor_walk` and `dead_pointers` share
+assumed a page is a dense run of records: three hexmap bytes of
+control, then data chunks, then the next record. But a page also holds
+HOLES -- the free tail a first-fit split leaves behind, the span a
+reclaim freed -- and the walk consumed a hole's bytes as a control
+block and then read every record after it one phase out of step: live
+rows that no cursor, no index rebuild and no reclaim could see. A
+knowledge base then lost single clauses at every vacuum -- the rebuild
+dropped what the walk could not show it -- and the loss looked random
+because it depended on where the allocator had split. `sides/2` gone
+from eleven bases, one `hex_direction/2` row at a time, four
+`map_tile/3` rows of 960: the family's year of "store transients" has
+this shape.
+
+The proof was forensic: a raw scan of a snapshot found 14 live
+`unit_hurry/2` records where the index answered 12, and the hexmap
+before the first missed record read `[144 144 198 0 0 64]` -- a record
+ending, then a three-chunk hole, exactly a control block wide. The
+startup walk had learned this lesson long ago and wrote it down ("a
+read straight through a SHORT free run into the record behind it...
+one byte decides"); the fix gives the other two walks the same one
+byte: a record's first chunk always carries the high bit, a free chunk
+never does, so a low byte advances the walk by one and nothing else.
+`bench/composite-check.cpp` pins the worst case deliberately -- a
+7-chunk span reclaimed, a 4-chunk row allocated into it, the 3-chunk
+tail as the hole, and the row behind it must still answer.
+
+A vacuum on the fixed engine HEALS a store the bug damaged: the
+rebuild finally sees the hidden rows and maps them back -- one pass
+brought a live store from 170 000 visible rows to 263 000, and every
+base that had "lost" clauses answered whole again. Rows hidden by the
+bug were never gone; they were unlit.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout
