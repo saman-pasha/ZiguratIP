@@ -2002,7 +2002,21 @@
                   (control_clear (aof control))
                   (set pointer_address (* hexmap_address CHUNK_SIZE))
 
+                  ;; FREE OR RECORD IS DECIDED FROM THE FIRST HEXMAP BYTE --
+                  ;; the startup walk's own rule, which this walk never had:
+                  ;; a free hole inside the page (the tail an allocation's
+                  ;; split leaves, the span a reclaim freed) is not a record,
+                  ;; and consuming its bytes as a control block read every
+                  ;; record after it one phase out of step -- live rows a
+                  ;; page held that no cursor, no rebuild and no reclaim
+                  ;; could see, which is a base losing single clauses at
+                  ;; every vacuum. A record's first chunk always carries the
+                  ;; high bit; a free chunk never does. One byte decides.
                   (set hex_byte (nth i hexbuf))
+                  (if (== (bitand hex_byte 128) 0)
+                      (block
+                        (set i (+ i 1))
+                        continue))
                   (set online_state (cast RowState (bitand hex_byte 12)))
                   (set online_lock (cast RowLock (bitand hex_byte 3)))
                   (set hex_byte (nth (+ i 1) hexbuf))
@@ -2361,6 +2375,14 @@
 
                 ((-> (-> m hexmap_io) seekg) hexmap_address std::ios::beg)
                 ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
+                ;; free or record, from the first byte -- the same resync as
+                ;; the cursor's: a hole consumed as a control block hid every
+                ;; record behind it from the reclaim too, so the dead rows a
+                ;; hole shadowed were never taken and the base only grew
+                (if (== (bitand hex_byte 128) 0)
+                    (block
+                      (set i (+ i 1))
+                      continue))
                 (set online_state (cast RowState (bitand hex_byte 12)))
                 (set online_lock (cast RowLock (bitand hex_byte 3)))
                 ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)

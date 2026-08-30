@@ -147,6 +147,24 @@ namespace Zigurat
 			  index_name, columns, ++columns_iter, types, ++types_iter);
 	  }
 	} else { // Partial Search
+	  // NO KEY COLUMN LEFT: the levels above bound every column of the
+	  // key, so `_btreeindex_' here is the innermost handle and its
+	  // cursor hands out rows. `kb == K AND flag == 1' over a (kb, name)
+	  // key lands here when `flag' is not a key column at all. Before
+	  // this branch existed the loop below ran ZERO times and emitted
+	  // NOTHING -- an empty lambda, a cursor that opened and closed, no
+	  // rows, no error; predicates.zt's D lines were its first victim.
+	  if (std::next(columns_iter) == columns.end()) {
+	    code << tab << "_btreeindex_.cursor" << std::endl;
+	    code << tab << "([&] (" << this->_type_name << "& " << this->_name << ") -> bool {" << std::endl;
+	    code << tab << this->_compiler.TAB1 << "if (";
+	    this->_expr.compile(where.args[0], code);
+	    code << ") {" << std::endl;
+	    content(lvl + 2);
+	    code << tab << this->_compiler.TAB1 << "}" << std::endl;
+	    code << tab << this->_compiler.TAB1 << "return true;" << std::endl;
+	    code << tab << "});" << std::endl;
+	  }
 	  while (++columns_iter != columns.end()) {
 	    ++types_iter;
 

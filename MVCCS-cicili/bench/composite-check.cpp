@@ -132,6 +132,54 @@ int main (int argc, char** argv) {
            (wrong || rows2.n != KBS * NAMES * PER) ? "FAIL" : "ok  ", pass + 1, rows.n, freed, rows2.n, wrong);
     if (wrong || rows2.n != KBS * NAMES * PER) failures++;
   }
+  // THE HOLE THE PAGE WALK TRIPPED ON, pinned. An allocation's first-fit
+  // split leaves a free tail inside a page; the in-page walk used to
+  // consume a hole's bytes as a control block and read every record after
+  // it one phase out of step -- live rows no cursor, no rebuild and no
+  // reclaim could see (a knowledge base losing single clauses at every
+  // vacuum, hunted on the live store byte by byte). Making the hole is
+  // deliberate: a 64-byte-data row (7 chunks with its control) deleted and
+  // reclaimed leaves a 7-chunk span; a 16-byte row (4 chunks) allocated
+  // into it leaves a 3-chunk tail -- a hole exactly a control block wide,
+  // the worst case -- and the row inserted AFTER the wide one lands past
+  // the hole in the same page. Every row must still answer.
+  {
+    struct Wide : public BaseTable {
+      int64_t a=0,b=0,c=0,d_=0,e=0,f=0,g=0,h_=0;
+      int64_t pack_size () override { return 64; }
+      void pack (Zigurat::binarystream& io) override { io.write_std_long(a); io.write_std_long(b); io.write_std_long(c); io.write_std_long(d_); io.write_std_long(e); io.write_std_long(f); io.write_std_long(g); io.write_std_long(h_); }
+      void unpack (Zigurat::binarystream& io) override { io.read_std_long(a); io.read_std_long(b); io.read_std_long(c); io.read_std_long(d_); io.read_std_long(e); io.read_std_long(f); io.read_std_long(g); io.read_std_long(h_); }
+      void map (void*) override {} void unmap (void*) override {}
+    };
+    struct Narrow : public BaseTable {
+      int64_t v=0, w=0;
+      int64_t pack_size () override { return 16; }
+      void pack (Zigurat::binarystream& io) override { io.write_std_long(v); io.write_std_long(w); }
+      void unpack (Zigurat::binarystream& io) override { io.read_std_long(v); io.read_std_long(w); }
+      void map (void*) override {} void unmap (void*) override {}
+    };
+    static uint8_t HOLE_KEY[20] = { 61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80 };
+    Narrow n1; n1.v = 1; online_insert(g_m, HOLE_KEY, &n1);
+    Wide w1; w1.a = 2; online_insert(g_m, HOLE_KEY, &w1);
+    Narrow n2; n2.v = 3; online_insert(g_m, HOLE_KEY, &n2);
+    commit_transaction(g_m); begin_transaction(g_m);
+    online_delete(g_m, &w1);
+    commit_transaction(g_m); begin_transaction(g_m);
+    truncate_key(g_m, HOLE_KEY);            // reclaims the wide row: a 7-chunk span
+    Narrow n3; n3.v = 4; online_insert(g_m, HOLE_KEY, &n3);   // takes 4 chunks, leaves a 3-chunk hole
+    Narrow n4; n4.v = 5; online_insert(g_m, HOLE_KEY, &n4);
+    commit_transaction(g_m); begin_transaction(g_m);
+    long seen = 0; long sum = 0;
+    engine_cursor(g_m, HOLE_KEY, nullptr, [] (void*, Pointer*) -> bool { return true; });
+    struct Acc { long n; long s; } acc{0,0};
+    engine_cursor(g_m, HOLE_KEY, &acc, [] (void* u, Pointer* p) -> bool {
+      Narrow r; r.pointer = *p; read_row(g_m, &r);
+      ((Acc*)u)->n++; ((Acc*)u)->s += r.v; return true; });
+    seen = acc.n; sum = acc.s;
+    printf("%s hole walk: 4 narrow rows live behind a 3-chunk hole, the cursor sees %ld (values sum %ld, want 13)\n",
+           (seen == 4 && sum == 13) ? "ok  " : "FAIL", seen, sum);
+    if (!(seen == 4 && sum == 13)) failures++;
+  }
   commit_transaction(g_m); engine_memory_delete(g_m); delete h; delete d;
   printf("composite: %s\n", failures ? "WRONG ANSWERS" : "every pair answers the same both ways");
   return failures;
