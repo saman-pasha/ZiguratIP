@@ -1923,24 +1923,50 @@
       ;; that existed -- the twelve workers then bounced saves and
       ;; loads between the twins forever. So the walk repeats over
       ;; whatever pages appeared, until a pass adds none.
-      (let ((int64_t walked_addrs [1024])
-            (int64_t walked_total . 0)
+      ;;
+      ;; AND NO PAGE IS LEFT UNWALKED. The snapshot used to live in fixed
+      ;; arrays -- 512 entries a round, 1024 walked in all -- and a table
+      ;; past 1024 pages (8 MB at the default page) was silently walked
+      ;; only that far: every full scan answered a prefix of the table,
+      ;; and the index REBUILD at TRUNCATE, which walks the table this
+      ;; way, mapped a prefix and dropped the rest -- a base of 377
+      ;; predicates lost hex_direction/2's first clause at one vacuum
+      ;; and the whole predicate at the next, the vacuum's own live count
+      ;; drifting with it. The arrays are the list's size now, and the
+      ;; walked set is a byte per page number, grown as pages appear.
+      (let ((uint8_t * walked . nil)
+            (int64_t walked_cap . 0)
             (int walk_done . 0)
             (int rounds . 0))
        (while (and (== walk_done 0) (< rounds 16))
         (set rounds (+ rounds 1))
         (let ((int64_t page_total . 0)
-              (const uint8_t * page_keys [512])
-              (int64_t page_addrs [512]))
+              (int64_t page_cap . 1)
+              (const uint8_t ** page_keys . nil)
+              (int64_t * page_addrs . nil))
         (pthread_mutex_lock (aof (-> m page_list_access)))
         (let ((PageEntry * e . #'(-> m pages)))
-          (while (and (!= e nil) (< page_total 512))
+          (while (!= e nil)
+            (set page_cap (+ page_cap 1))
+            (set e (-> e next))))
+        (set page_keys (cast (const uint8_t **)
+                             (calloc (cast size_t page_cap) (sizeof size_t))))   ;; a pointer's size: sizeof takes one token
+        (set page_addrs (cast (int64_t *) (calloc (cast size_t page_cap) (sizeof int64_t))))
+        (let ((PageEntry * e . #'(-> m pages)))
+          (while (!= e nil)
             (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
-                (let ((int seen . 0) (int64_t w . 0))
-                  (while (< w walked_total)
-                    (if (== (nth w walked_addrs) (-> e address)) (set seen 1))
-                    (set w (+ w 1)))
-                  (if (== seen 0)
+                (let ((int64_t pn . #'(/ (-> e address) (-> m page_size))))
+                  (if (>= pn walked_cap)
+                      (let ((int64_t ncap . #'(* 2 (+ pn 1024)))
+                            (uint8_t * grown . #'(cast (uint8_t *) (calloc (cast size_t ncap) 1))))
+                        (if (!= walked nil)
+                            (block
+                              (memcpy (cast (void *) grown) (cast (void *) walked)
+                                      (cast size_t walked_cap))
+                              (free (cast (void *) walked))))
+                        (set walked grown)
+                        (set walked_cap ncap)))
+                  (if (== (nth pn walked) 0)
                       (block
                         (set (nth page_total page_keys) (-> e key))
                         (set (nth page_total page_addrs) (-> e address))
@@ -1949,12 +1975,12 @@
         (pthread_mutex_unlock (aof (-> m page_list_access)))
 
         (if (== page_total 0) (set walk_done 1))
+        ;; marked walked before the walk, as before: a page that appears
+        ;; during it is the next round's
         (let ((int64_t pt . 0))
-          (while (and (< pt page_total) (< walked_total 1024))
-            (set (nth walked_total walked_addrs) (nth pt page_addrs))
-            (set walked_total (+ walked_total 1))
+          (while (< pt page_total)
+            (set (nth (/ (nth pt page_addrs) (-> m page_size)) walked) 1)
             (set pt (+ pt 1))))
-        (if (>= walked_total 1024) (set walk_done 1))
 
         (let ((int64_t page_n . 0))
           (while (< page_n page_total)
@@ -2107,7 +2133,10 @@
                                           (set page_stale #f)))))))
                         ;; not the last chunk yet
                         (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
-              (set page_n (+ page_n 1)))))))))
+              (set page_n (+ page_n 1)))))
+          (free (cast (void *) page_keys))
+          (free (cast (void *) page_addrs))))
+        (if (!= walked nil) (free (cast (void *) walked)))))
 
     (set tl_cursor_id (- tl_cursor_id 1)))
 
@@ -2287,16 +2316,28 @@
     (member Pointer ptr)
     (member DeadList * next))
 
+  ;; THE SNAPSHOT IS THE LIST'S SIZE, as the cursor's is now: the fixed
+  ;; 512 it had meant a table past 512 pages was reclaimed only that far
+  ;; -- a rewrite left its dead rows behind where the vacuum walked no
+  ;; further, and the base grew on every pass
   (func dead_pointers ((Memory * m) (const uint8_t * hash_key)) (out DeadList *)
     (let ((DeadList * head . nil)
           (uint8_t hex_byte . 0)
           (int64_t page_total . 0)
-          (const uint8_t * page_keys [512])
-          (int64_t page_addrs [512]))
+          (int64_t page_cap . 1)
+          (const uint8_t ** page_keys . nil)
+          (int64_t * page_addrs . nil))
 
       (pthread_mutex_lock (aof (-> m page_list_access)))
       (let ((PageEntry * e . #'(-> m pages)))
-        (while (and (!= e nil) (< page_total 512))
+        (while (!= e nil)
+          (set page_cap (+ page_cap 1))
+          (set e (-> e next))))
+      (set page_keys (cast (const uint8_t **)
+                           (calloc (cast size_t page_cap) (sizeof size_t))))   ;; a pointer's size: sizeof takes one token
+      (set page_addrs (cast (int64_t *) (calloc (cast size_t page_cap) (sizeof int64_t))))
+      (let ((PageEntry * e . #'(-> m pages)))
+        (while (!= e nil)
           (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
               (block
                 (set (nth page_total page_keys) (-> e key))
@@ -2361,6 +2402,8 @@
                                       (set head d))))))
                       (set pointer_size (+ pointer_size CHUNK_SIZE)))))))
             (set page_n (+ page_n 1)))))
+      (free (cast (void *) page_keys))
+      (free (cast (void *) page_addrs))
       (return head)))
 
   (func truncate_key ((Memory * m) (const uint8_t * hash_key)) (out size_t)
@@ -2714,6 +2757,10 @@
         (set i (+ i 1)))))
 
   (func bt_cache_new () (out void *)
+    ;; MVCCS_NO_CACHE in the environment runs without the cache -- every
+    ;; accessor answers nothing for a nil cache -- so a suspicion about it
+    ;; is one run away from an answer
+    (if (!= (getenv "MVCCS_NO_CACHE") nil) (return nil))
     (let ((BTCache * c . #'(new* BTCache)))
       (pthread_mutex_init (aof (-> c access)) nil)
       (bt_cache_clear_slots c)

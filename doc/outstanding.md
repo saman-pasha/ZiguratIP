@@ -521,3 +521,12 @@ assert would insert one row at the next ordinal).
 memory: the 7000-row commit went from 0.25 s to 0.008. The three
 `sync_disk`s remain, and they are the whole cost of a transaction per row.
 
+### The page cursor's other fixed buffer
+
+`cursor_walk` and `dead_pointers` read a page's hexmap into `uint8_t
+hexbuf[4096]`, which holds a page of 8192 bytes at 8 bytes a chunk and
+not one of 65536 (`MEMORY/PAGE_SIZE` is a setting). The snapshot arrays
+beside it were the ones that bit (see the README, "The page walk that
+stopped at 1024 pages") and are sized to the list now; this one waits
+for a page size that needs it.
+
