@@ -477,13 +477,13 @@ evicts, still pays the read; packing a node's keys into the node record
 would make the cold path as cheap as the warm one, at the price of a
 format both engines would have to agree on.
 
-### Every seek is a syscall
+### Every seek is a syscall -- not any more
 
-The two store streams are `std::filebuf`s, and a `filebuf` discards its
-buffer on every `seekg`/`seekp`; `pointer_at` reads the hexmap a byte at a
-time through that. `pread`/`pwrite` on the descriptor, or the hexmap
-`mmap`ed (it is one byte per chunk), removes most of the syscalls every
-operation pays.
+The two store streams were `std::filebuf`s, and a filebuf discards its
+buffer on every seek. `StreamIO/mapstream` maps the files instead
+(`MEMORY/STORE_IO: MAP`, the default); the engine is untouched. What is
+left of the item: cocolog's EMBEDDED store still opens filestreams
+(`embed/embed.cicili`), and a platform without `mmap` runs `FILE`.
 
 ### A sequence's keys always go right
 
@@ -514,11 +514,10 @@ statements' framing; and on cocolog's side the rewrite-whole-predicate
 sync is what multiplies the delete cost in the first place (an incremental
 assert would insert one row at the next ordinal).
 
-### The commit flips every control block through the same seeks
+### The commit flips every control block through the same seeks -- mapped now
 
-`commit_pointer` and `stamp_successor` walk the transaction's context and
-`load_control` / `dump_control` each pointer -- four seeks and their flushes
-a pointer -- and then `sync_disk` three times. For a 7000-row load that is
-28000 pointers and about a second of the 2.5 s. Batching the control writes
-by page, or the `pread`/`pwrite` item above, takes most of it.
+`commit_pointer` and `stamp_successor` still `load_control` /
+`dump_control` each staged pointer, but over the mapped store that is
+memory: the 7000-row commit went from 0.25 s to 0.008. The three
+`sync_disk`s remain, and they are the whole cost of a transaction per row.
 

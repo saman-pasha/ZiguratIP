@@ -29,8 +29,8 @@ void load_zeytun(const Configuration&);
 
 void sigabrt_handler(int code)
 {
-  memory_hexmap_file.flush();
-  memory_data_file.flush();
+  if (memory_hexmap_stream != nullptr) memory_hexmap_stream->flush();
+  if (memory_data_stream != nullptr) memory_data_stream->flush();
 }
 
 namespace

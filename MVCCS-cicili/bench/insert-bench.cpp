@@ -20,6 +20,15 @@
 #include <chrono>
 #include "engine.hpp"
 #include "filestream.hpp"
+#include "mapstream.hpp"
+// STORE_MAP=1 in the environment opens the store mapped (mapstream) instead
+// of through a filebuf (filestream): the same engine over two kinds of stream
+static Zigurat::binarystream* open_store (const char* path, bool fresh) {
+  const std::ios_base::openmode mode = std::ios::in | std::ios::out | (fresh ? std::ios::trunc : (std::ios_base::openmode)0);
+  const char* env = getenv("STORE_MAP");
+  if (env && env[0] == '1') return new Zigurat::mapstream(std::string(path), mode);
+  return new Zigurat::filestream(std::string(path), mode);
+}
 
 static uint8_t ITEM_KEY[20] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 };
 static uint8_t IDX_KEY[20]  = { 21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40 };
@@ -52,10 +61,10 @@ static double now () {
 
 static void run (const char* label, long n, bool index, bool per_row_txn) {
   remove("/tmp/mvccs-insert-bench-hexmap.bin"); remove("/tmp/mvccs-insert-bench-data.bin");
-  Zigurat::filestream h(std::string("/tmp/mvccs-insert-bench-hexmap.bin"), std::ios::in | std::ios::out | std::ios::trunc);
-  Zigurat::filestream d(std::string("/tmp/mvccs-insert-bench-data.bin"), std::ios::in | std::ios::out | std::ios::trunc);
+  Zigurat::binarystream* h = open_store("/tmp/mvccs-insert-bench-hexmap.bin", true);
+  Zigurat::binarystream* d = open_store("/tmp/mvccs-insert-bench-data.bin", true);
   Memory* m = engine_memory_new();
-  memory_open(m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+  memory_open(m, h, d, 8192);
   use_index = index;
   if (index) idx_attach(m);
   begin_transaction(m);
