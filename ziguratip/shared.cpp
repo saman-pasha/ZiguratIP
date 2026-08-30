@@ -24,6 +24,9 @@ extern Zigurat::IsolationLevel isolation_level;
 extern size_t         memory_page_size;
 extern filestream     memory_hexmap_file;
 extern filestream     memory_data_file;
+// whichever pair the store was opened on -- mapped or filebuf
+extern binarystream*  memory_hexmap_stream;
+extern binarystream*  memory_data_stream;
 
 // Library Pool
 extern std::string            library_path;

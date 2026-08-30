@@ -33,7 +33,17 @@
 #include <thread>
 #include <vector>
 #include "engine-compat.hpp"
+#include <cstdlib>
 #include "../home/include/filestream.hpp"
+#include "../home/include/mapstream.hpp"
+// STORE_MAP=1 in the environment opens the store mapped (mapstream) rather
+// than through a filebuf (filestream): the same suite over both kinds of
+// stream. Streams are heap objects here so the choice is one function.
+static Zigurat::binarystream* open_store (const char* path, std::ios_base::openmode mode) {
+  const char* env = getenv("STORE_MAP");
+  if (env && env[0] == '1') return new Zigurat::mapstream(std::string(path), mode);
+  return new Zigurat::filestream(std::string(path), mode);
+}
 
 // --- an indexed table, as compilerddl.cpp emits it --------------------------
 
@@ -1055,12 +1065,12 @@ int main ()
 {
   remove("/tmp/mvccs-contention-hexmap.bin");
   remove("/tmp/mvccs-contention-data.bin");
-  Zigurat::filestream h(std::string("/tmp/mvccs-contention-hexmap.bin"),
-                        std::ios::in | std::ios::out | std::ios::trunc);
-  Zigurat::filestream d(std::string("/tmp/mvccs-contention-data.bin"),
-                        std::ios::in | std::ios::out | std::ios::trunc);
+  Zigurat::binarystream* h = open_store("/tmp/mvccs-contention-hexmap.bin",
+                                        std::ios::in | std::ios::out | std::ios::trunc);
+  Zigurat::binarystream* d = open_store("/tmp/mvccs-contention-data.bin",
+                                        std::ios::in | std::ios::out | std::ios::trunc);
   MEM = engine_memory_new();
-  memory_open(MEM, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+  memory_open(MEM, h, d, 8192);
   globals_set_memory(MEM);
   memory_reader_paths(MEM, "/tmp/mvccs-contention-hexmap.bin",
                       "/tmp/mvccs-contention-data.bin");

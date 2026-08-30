@@ -33,6 +33,15 @@
 #include <chrono>
 #include "engine.hpp"
 #include "filestream.hpp"
+#include "mapstream.hpp"
+// STORE_MAP=1 in the environment opens the store mapped (mapstream) instead
+// of through a filebuf (filestream): the same engine over two kinds of stream
+static Zigurat::binarystream* open_store (const char* path, bool fresh) {
+  const std::ios_base::openmode mode = std::ios::in | std::ios::out | (fresh ? std::ios::trunc : (std::ios_base::openmode)0);
+  const char* env = getenv("STORE_MAP");
+  if (env && env[0] == '1') return new Zigurat::mapstream(std::string(path), mode);
+  return new Zigurat::filestream(std::string(path), mode);
+}
 static uint8_t ITEM_KEY[20] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 };
 static uint8_t IDX_KEY[20]  = { 21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40 };
 static BTreeIndex IDX, IDX2; static Memory* g_m; static bool two_idx = false; static bool slot_safe = false;
@@ -77,9 +86,9 @@ int main (int argc, char** argv) {
   long n = argc > 1 ? atol(argv[1]) : 7000; bool newest = argc > 2; bool via_eq = argc > 2 && std::string(argv[2]).rfind("equal",0) == 0; two_idx = argc > 2 && (std::string(argv[2]) == "equal2" || std::string(argv[2]) == "equal3"); slot_safe = argc > 2 && std::string(argv[2]) == "equal3";
   printf("indexes: %s\n", two_idx ? "kb-like chain + unique id (the server shape)" : "kb-like chain only");
   remove("/tmp/mvccs-delete-bench-hexmap.bin"); remove("/tmp/mvccs-delete-bench-data.bin");
-  Zigurat::filestream h(std::string("/tmp/mvccs-delete-bench-hexmap.bin"), std::ios::in | std::ios::out | std::ios::trunc);
-  Zigurat::filestream d(std::string("/tmp/mvccs-delete-bench-data.bin"), std::ios::in | std::ios::out | std::ios::trunc);
-  g_m = engine_memory_new(); memory_open(g_m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+  Zigurat::binarystream* h = open_store("/tmp/mvccs-delete-bench-hexmap.bin", true);
+  Zigurat::binarystream* d = open_store("/tmp/mvccs-delete-bench-data.bin", true);
+  g_m = engine_memory_new(); memory_open(g_m, h, d, 8192);
   idx_attach(g_m); begin_transaction(g_m);
   printf("G  one key, %ld live, delete all (%s first):\n", n, newest ? "newest" : "oldest"); insert_n(n); if (via_eq) delete_via_equal(); else delete_all(newest);
   printf("H  ... again with %ld dead links in the chain:\n", n); insert_n(n); if (via_eq) delete_via_equal(); else delete_all(newest);

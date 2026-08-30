@@ -569,6 +569,58 @@ the question's own number -- a rewrite of 7000 clauses over history --
 went from the 50-120 s range to 8-12 s, and a fresh load from 1.8 ms a
 clause to 0.36.
 
+## The mapped store -- and the seeks are gone
+
+The next item after the record cache was the I/O itself: the two store
+streams were `std::filebuf`s, and a filebuf drops its buffer at every
+seek, so an engine that seeks before every read and every write paid a
+syscall or two per access -- a commit of 7000 rows flipped 28000
+control blocks that way, and every control read, hexmap byte and chain
+link did the same. `StreamIO/mapbuf` is a `std::streambuf` over `mmap`
+and `mapstream` is `filestream`'s shape over it: a seek is an integer,
+a read a memcpy, the kernel's page cache the buffer, every mapping of
+the file sharing it. The engine is untouched -- it holds a
+`binarystream*` and never knew what was behind it -- and the server
+chooses with `MEMORY/STORE_IO: MAP` (the default now) or `FILE`. Three
+rules the buffer keeps, because the engine depends on them: the file is
+EXACTLY as long as what was written (address space is reserved ahead,
+the file grows by the bytes of each write, `page_count = length /
+page_size` stays true); ONE position shared by reads and writes, as a
+filebuf has; and a read-only mapping learns a writer's growth by itself
+(fstat when a read reaches past the length it knew), so per-thread
+readers over a growing store keep answering. Durability is `msync` of
+the written range and then `fsync`, in the same data-before-hexmap
+order as before. `Test/test_streamio.cpp` pins the three rules.
+
+Same machine, same benchmarks, timed by the shell; the last column is
+the store mapped, everything before it in place:
+
+| measurement | before all | + mark, cache, pipelined client | **+ mapped store** |
+|---|---|---|---|
+| engine, insert, branching 65, sequential keys | 0.85 ms/row | 0.096 | **0.031 ms/row** |
+| engine, commit of those 7000 rows | 0.25 s | 0.25 | **0.008 s** |
+| engine, delete via `cursor_equal`, chain + unique id | 1.37 ms/row | 0.108 | **0.004 ms/row** |
+| engine, one transaction per row (six syncs each) | 0.35 ms/row | 0.35 | 0.38 -- the syncs, unchanged |
+| consult 7000 into a fresh base | 12.7 s | 2.5 | **0.7 s** |
+| second / third consult of the same 7000 (rewrites) | 51.6 / 94.3 s | 8.0 / 11.9 | **1.4 / 2.1 s** |
+| `retractall` of 21000 clauses, 21000 dead links behind | 116.6 s | 7.5 | **0.8 s** |
+| `forget` of the whole base | 59.5 s | 5.2 | **0.5 s** |
+| consult after vacuum (a rewrite) | 52.3 s | 7.5 | **1.5 s** |
+| `vacuum` | 31-33 s | 20-24 | **1.0-1.7 s** |
+
+So the question's own number -- 7000 clauses rewritten over history --
+is 1.4-2.1 s where it was 50-120, and a fresh load is 0.1 ms a clause
+where it was 1.8. What the engine's suites say: consumer is green over
+the mapped store (`STORE_MAP=1 ./consumer_test`), contention over it
+fails at the same macOS `rewrite vs index` line it fails at over a
+filebuf and nowhere before it, and the two Cicili suites, which open
+filestreams, pass as before -- which is the point of the engine not
+knowing. cocolog's store cases and its 7000-clause sequence above ran
+against the mapped server. The record cache still stands in front of
+the mapping, and
+still earns its place: a cached descent is lookups, a mapped one is
+memcpys with a `pointer_at` walk of the hexmap in front of each.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout

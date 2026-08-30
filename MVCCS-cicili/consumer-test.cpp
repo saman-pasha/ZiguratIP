@@ -14,7 +14,17 @@
 #include <cstring>
 #include <string>
 #include "engine.hpp"
+#include <cstdlib>
 #include "../home/include/filestream.hpp"
+#include "../home/include/mapstream.hpp"
+// STORE_MAP=1 in the environment opens the store mapped (mapstream) rather
+// than through a filebuf (filestream): the same suite over both kinds of
+// stream. Streams are heap objects here so the choice is one function.
+static Zigurat::binarystream* open_store (const char* path, std::ios_base::openmode mode) {
+  const char* env = getenv("STORE_MAP");
+  if (env && env[0] == '1') return new Zigurat::mapstream(std::string(path), mode);
+  return new Zigurat::filestream(std::string(path), mode);
+}
 
 // the 20-byte table key a Parsi compile would emit (any stable bytes do
 // for the proof; the real emission carries the SHA-1-derived key)
@@ -85,13 +95,13 @@ int main () {
   remove("/tmp/mvccs-consumer-data.bin");
   { // trunc on the first open: a fresh store is CREATED, exactly as the
     // engine's own smoke test opens its first session
-    Zigurat::filestream h(std::string("/tmp/mvccs-consumer-hexmap.bin"),
-                          std::ios::in | std::ios::out | std::ios::trunc);
-    Zigurat::filestream d(std::string("/tmp/mvccs-consumer-data.bin"),
-                          std::ios::in | std::ios::out | std::ios::trunc);
+    Zigurat::binarystream* h = open_store("/tmp/mvccs-consumer-hexmap.bin",
+                                          std::ios::in | std::ios::out | std::ios::trunc);
+    Zigurat::binarystream* d = open_store("/tmp/mvccs-consumer-data.bin",
+                                          std::ios::in | std::ios::out | std::ios::trunc);
     Memory* m = engine_memory_new();
     g_m = m;
-    memory_open(m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+    memory_open(m, h, d, 8192);
     idx_attach(m);
     begin_transaction(m);
 
@@ -157,16 +167,17 @@ int main () {
 
     commit_transaction(m);
     engine_memory_delete(m);
+    delete h; delete d;
   }
 
   // and the store survives the process: a second Memory over the files
-  { Zigurat::filestream h(std::string("/tmp/mvccs-consumer-hexmap.bin"),
-                          std::ios::in | std::ios::out);
-    Zigurat::filestream d(std::string("/tmp/mvccs-consumer-data.bin"),
-                          std::ios::in | std::ios::out);
+  { Zigurat::binarystream* h = open_store("/tmp/mvccs-consumer-hexmap.bin",
+                                          std::ios::in | std::ios::out);
+    Zigurat::binarystream* d = open_store("/tmp/mvccs-consumer-data.bin",
+                                          std::ios::in | std::ios::out);
     Memory* m = engine_memory_new();
     g_m = m;
-    memory_open(m, (Zigurat::binarystream*)&h, (Zigurat::binarystream*)&d, 8192);
+    memory_open(m, h, d, 8192);
     idx_attach(m);
     begin_transaction(m);
     Scan s{0,0,0,{},false};
@@ -178,6 +189,7 @@ int main () {
     check("and the index found its catalogue record", e.rows, 1);
     commit_transaction(m);
     engine_memory_delete(m);
+    delete h; delete d;
   }
 
   if (failures == 0) printf("\nconsumer against libMVCCS.so: all green\n");

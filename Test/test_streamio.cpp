@@ -3,6 +3,7 @@
 #include "arraybuf.hpp"
 #include "bufferstream.hpp"
 #include "filestream.hpp"
+#include "mapstream.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -287,6 +288,81 @@ ZTEST(StreamIO, filestream_roundtrip)
   }
 
   std::remove(path.c_str());
+}
+
+ZTEST(StreamIO, mapstream_roundtrip_and_grows_exactly)
+{
+  const std::string path = "/tmp/ziguratip-test-mapstream.bin";
+  std::remove(path.c_str());
+
+  {
+    mapstream out(path, std::ios_base::out | std::ios_base::trunc);
+    ZCHECK(out.is_open());
+    out.write_std_ulong((uint64_t)0x0102030405060708ull);
+    out.write_std_text(std::string("mapped"));
+    // the file is exactly as long as what was written: 8 + 2 + 6
+    ZCHECK_EQ((long)out.length(), 16L);
+    // a fill is one write, and the file grows by exactly it
+    out.seekp(0, std::ios_base::end);
+    out.fill_n(8192, (char)0);
+    ZCHECK_EQ((long)out.length(), 16L + 8192L);
+    // one position, as a filebuf has: a seekp then a read reads there
+    out.seekp(8, std::ios_base::beg);
+    ZCHECK_STR(out.read_std_text(), "mapped");
+    ZCHECK(out.sync_to_disk());
+    out.close();
+    ZCHECK(!out.is_open());
+  }
+
+  {
+    mapstream in(path, std::ios_base::in);
+    ZCHECK(in.is_open());
+    ZCHECK_EQ(in.read_std_ulong(), (uint64_t)0x0102030405060708ull);
+    ZCHECK_STR(in.read_std_text(), "mapped");
+    ZCHECK_EQ((long)in.length(), 16L + 8192L);
+    // a read past the end fails and sets eof, and clear() recovers, as
+    // the engine expects of its streams
+    in.seekg(16 + 8192, std::ios_base::beg);
+    uint8_t byte = 7;
+    in.read_std_ubyte(byte);
+    ZCHECK(!in.good());
+    in.clear();
+    in.seekg(0, std::ios_base::beg);
+    ZCHECK(in.good());
+    // a reader is refused a write, loudly rather than silently
+    in.write_std_ubyte((uint8_t)1);
+    ZCHECK(!in.good());
+    in.close();
+  }
+
+  std::remove(path.c_str());
+}
+
+ZTEST(StreamIO, mapstream_reader_sees_a_writers_growth)
+{
+  const std::string path = "/tmp/ziguratip-test-mapstream-grow.bin";
+  std::remove(path.c_str());
+
+  mapstream writer(path, std::ios_base::out | std::ios_base::trunc);
+  writer.write_std_long((int64_t)1);
+  mapstream reader(path, std::ios_base::in);
+  ZCHECK_EQ(reader.read_std_long(), (int64_t)1);
+  // the writer appends after the reader opened: no flush, no reopen, and
+  // the reader's next read past its known end finds the new bytes
+  writer.seekp(0, std::ios_base::end);
+  writer.write_std_long((int64_t)2);
+  ZCHECK_EQ(reader.read_std_long(), (int64_t)2);
+  ZCHECK_EQ((long)reader.length(), 16L);
+  reader.close();
+  writer.close();
+  std::remove(path.c_str());
+}
+
+ZTEST(StreamIO, mapstream_a_missing_file_is_a_failed_stream)
+{
+  mapstream in("/tmp/ziguratip-test-mapstream-absent.bin", std::ios_base::in);
+  ZCHECK(!in.is_open());
+  ZCHECK(!in.good());
 }
 
 ZTEST(StreamIO, binarystream_length_and_at)

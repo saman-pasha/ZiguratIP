@@ -1,6 +1,7 @@
 #include "ziguratipexception.hpp"
 #include "globals.hpp"
 #include "filestream.hpp"
+#include "mapstream.hpp"
 #include "engine.hpp"
 #include "configuration.hpp"
 #include "shared.cpp"
@@ -13,8 +14,14 @@ using namespace Zigurat;
 
 Zigurat::IsolationLevel isolation_level = Zigurat::IsolationLevel::READ_COMMITTED;
 size_t         memory_page_size = 8192;
+// the two store streams: mapped by default (MEMORY/STORE_IO: MAP), a
+// filebuf on request (FILE) -- see mapbuf.hpp for what the mapping buys
 filestream     memory_hexmap_file;
 filestream     memory_data_file;
+mapstream      memory_hexmap_map;
+mapstream      memory_data_map;
+binarystream*  memory_hexmap_stream = nullptr;
+binarystream*  memory_data_stream = nullptr;
 
 
 void load_memory(const Configuration &conf)
@@ -79,13 +86,33 @@ void load_memory(const Configuration &conf)
   const std::ios_base::openmode store_mode = std::ios::in | std::ios::out | std::ios::binary |
     (Globals::reset_mode() ? std::ios::trunc : (std::ios_base::openmode)0);
 
-  memory_hexmap_file.open(hexmap_path, store_mode);
-  memory_data_file.open(data_path, store_mode);
-
-  if (!memory_hexmap_file.good())
-    throw ZiguratIPException("invalid hexmap file");
-  if (!memory_data_file.good())
-    throw ZiguratIPException("invalid data file");
+  bool mapped = true;
+  if (conf.get("/MEMORY/STORE_IO", value)) {
+    value = Utility::to_upper(Utility::trim(value));
+    if (value == "MAP") mapped = true;
+    else if (value == "FILE") mapped = false;
+    else throw ZiguratIPException("invalid value for '/MEMORY/STORE_IO'");
+  }
+  if (mapped) {
+    memory_hexmap_map.open(hexmap_path, store_mode);
+    memory_data_map.open(data_path, store_mode);
+    if (!memory_hexmap_map.good())
+      throw ZiguratIPException("invalid hexmap file");
+    if (!memory_data_map.good())
+      throw ZiguratIPException("invalid data file");
+    memory_hexmap_stream = &memory_hexmap_map;
+    memory_data_stream = &memory_data_map;
+  } else {
+    memory_hexmap_file.open(hexmap_path, store_mode);
+    memory_data_file.open(data_path, store_mode);
+    if (!memory_hexmap_file.good())
+      throw ZiguratIPException("invalid hexmap file");
+    if (!memory_data_file.good())
+      throw ZiguratIPException("invalid data file");
+    memory_hexmap_stream = &memory_hexmap_file;
+    memory_data_stream = &memory_data_file;
+  }
+  std::cout << "Store I/O: '" << (mapped ? "MAP" : "FILE") << "'" << std::endl;
 
   std::cout << "Hexmap file: '" << hexmap_path << "'" << std::endl;
   std::cout << "Data file: '" << data_path << "'" << std::endl;
@@ -103,7 +130,7 @@ void load_memory(const Configuration &conf)
   // and each table attaches its own indexes on first touch, so nothing
   // here wires a catalogue index the way the old engine did.
   ::Memory* engine_memory = engine_memory_new();
-  memory_open(engine_memory, &memory_hexmap_file, &memory_data_file, (int64_t)memory_page_size);
+  memory_open(engine_memory, memory_hexmap_stream, memory_data_stream, (int64_t)memory_page_size);
   globals_set_memory(engine_memory);
 
   // Parallel reads are THE DEFAULT: read-only cursors take the streams guard

@@ -6,6 +6,7 @@
 #
 #   sh bench/build.sh            # both, at 7000 rows
 #   sh bench/build.sh 20000      # another N
+#   STORE_MAP=1 sh bench/build.sh  # the same over a memory-mapped store
 #
 # Every number in ../README.md's "Insertion time, measured" came from here.
 HERE=$(cd "$(dirname "$0")" && pwd)
