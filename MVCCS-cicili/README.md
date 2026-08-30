@@ -621,6 +621,27 @@ the mapping, and
 still earns its place: a cached descent is lookups, a mapped one is
 memcpys with a `pointer_at` walk of the hexmap in front of each.
 
+## The page walk that stopped at 1024 pages
+
+Found by the composite index, and older than everything above. The
+page-scan cursor -- `cursor_walk`, what a SELECT without an index, the
+vacuum's counts and the index REBUILD at TRUNCATE all walk -- snapshotted
+the table's page list into fixed arrays: 512 entries a round, 1024
+walked in all, and `walk_done` when the 1024 were spent. A table past
+1024 pages (8 MB at the default page) was therefore walked only that
+far, silently: every full scan answered a prefix of the table, and the
+rebuild mapped a prefix into the fresh trees and dropped the rest. A
+knowledge base of 377 predicates lost `hex_direction/2`'s first clause
+at one vacuum and the whole predicate at the next; the vacuum's own
+live count drifted by thousands between passes; and `dead_pointers`,
+the walk TRUNCATE reclaims by, had the same 512, so a rewrite past 512
+pages left its dead rows where the vacuum walked no further and the
+base grew on every pass. `bench/composite-check.cpp` at `3 4000` --
+144 000 rows, past the cap -- reclaimed 0 dead rows on the old walk
+and 72 000 on the new. Both walks size their snapshot to the list now,
+and the walked set is a byte per page number, grown as pages appear.
+Nothing in the format changed.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout

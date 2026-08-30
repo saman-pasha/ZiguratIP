@@ -16,13 +16,16 @@ LIBDIR="$ROOT/home/lib"
 INCDIR="$ROOT/home/include"
 N=${1:-7000}
 set -e
-for b in insert delete; do
-  "$CXX" -O3 -std=gnu++17 -Wno-deprecated-declarations "$HERE/$b-bench.cpp" \
-    -o "$HERE/${b}_bench" -I"$HERE/.." -I"$INCDIR" \
+for b in insert delete composite; do
+  "$CXX" -O3 -std=gnu++17 -Wno-deprecated-declarations "$HERE/$b-$( [ $b = composite ] && echo check || echo bench ).cpp" \
+    -o "$HERE/${b}_$( [ $b = composite ] && echo check || echo bench )" -I"$HERE/.." -I"$INCDIR" \
     -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 done
 echo "== insert_bench $N"
 "$HERE/insert_bench" "$N"
+echo "== composite_check $N/7 pairs, then past 1024 pages"
+"$HERE/composite_check" 3 $(( N / 7 ))
+"$HERE/composite_check" 3 4000 | tail -1
 for mode in equal equal2 equal3; do
   echo "== delete_bench $N $mode"
   "$HERE/delete_bench" "$N" "$mode" | grep -v ' done, '
