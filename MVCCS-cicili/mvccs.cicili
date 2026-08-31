@@ -61,6 +61,7 @@
   (include "../home/include/utility.hpp")
   (include "../home/include/binarystream.hpp")
   (include "../home/include/filestream.hpp")
+  (include "../home/include/mapstream.hpp")
   (include "../home/include/bufferstream.hpp")
   (include "../home/include/textstream.hpp")
   (include <ctype.h>)

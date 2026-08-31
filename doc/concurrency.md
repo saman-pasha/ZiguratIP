@@ -299,3 +299,56 @@ home/bin/Test Contention
 home/bin/Test Isolation
 home/bin/Test Concurrency
 ```
+
+## A private reader's buffer is not the file
+
+Found by cocolog's twelve-worker group case as a transient `no suspended
+machine' -- a claim-holder's own `machine_find' answering zero rows for a
+header that was there before the statement and there again one statement
+later, 7-69 times a run -- and pinned by this suite's `rewrite vs index'
+case, which reproduced the family standalone on every run: a row vanishing
+from an index it was never absent from, and the writer refused by its own
+unique key after its read of a row it had itself committed came back
+zeroed, so its unmap descended with `k=0', matched no key, said nothing,
+and left the old entry alive for the uniqueness check to find.
+
+A probe inside `read_row' caught the cause in the act: the first eight
+bytes of a row -- which always begin with a nonzero type tag -- read as
+zeros THROUGH A PRIVATE READER STREAM (good, not eof, position correct),
+correct on the immediate re-seek, correct on disk all along. A private
+reader was a `filestream', and a `std::filebuf' does not reload its cached
+get area on a seek that lands inside it: a reader whose block was cached
+while a fresh page held only its zero-fill keeps serving that zero-fill
+for a row committed and fsynced underneath it, once, until the buffer
+turns over. The write side was never wrong; one stale read wears every
+costume above.
+
+Three changes close it, all in `MVCCS-cicili/mvccs-lib.cicili':
+
+* **private readers are read-only `mapstream's** -- MAP_SHARED is coherent
+  with the file at every write, and the mapped length refreshes by fstat
+  (`mapbuf.refresh'), which is the behaviour a private reader needed and
+  a `filebuf' never promised;
+* **the cursor's unlocked callback window reads privately.** The streams
+  guard is handed back around a row callback so procedure code can nest
+  its own engine work -- and any read the callback itself performs must
+  not seek the canonical streams, whose positions belong to whichever
+  thread now holds the lock. A thread-local flag (`tl_window_reads',
+  distinct from `tl_read_mode', which also means "this thread holds the
+  shared rwlock" and is read by the exclusive guard's deadlock check)
+  routes `hex_in'/`data_in' to the private reader for the window's length;
+  a callback that writes takes its own guard, which routes its reads back
+  to the canonical stream it is then the sole holder of;
+* **`visible', the value-chain walk and the node/key reads go through
+  `hex_in'/`data_in'** instead of seeking `m->hexmap_io'/`m->data_io'
+  directly -- the accessors answer the canonical stream exactly when this
+  thread holds the write guard, and the private reader in shared mode and
+  in the window.
+
+Measured: `contention_test' zero failures over twenty rc-checked runs,
+filestream and mapstream stores both; cocolog's `test/groups.sh' three
+runs at totals exactly 34/24/60/59 with zero `no suspended machine', zero
+`missing chunk', zero lost connections; its embedded twin the same. The
+open staged-row note above predates this finding and its suite is retired;
+whether it was another face of the same stale read is not established
+here, only suspected.

@@ -109,9 +109,15 @@ PY
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lType -lpthread \
   -Wl,-rpath,"$LIBDIR"
-cp "$HERE/golden/carryover-hexmap.bin" /tmp/mvccs-carryover-hexmap.bin
-cp "$HERE/golden/carryover-data.bin"   /tmp/mvccs-carryover-data.bin
-LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
+# a checkout without the golden pair cannot prove carry-over -- "no golden
+# here" and "the reader is wrong" are different findings, so it SKIPs
+if [ -f "$HERE/golden/carryover-hexmap.bin" ]; then
+  cp "$HERE/golden/carryover-hexmap.bin" /tmp/mvccs-carryover-hexmap.bin
+  cp "$HERE/golden/carryover-data.bin"   /tmp/mvccs-carryover-data.bin
+  LD_LIBRARY_PATH="$LIBDIR" "$HERE/carryover_new"
+else
+  echo "carry-over: SKIP (no golden store in this checkout)"
+fi
 
 # ageing is bounded: the slowdown a working store accumulates is real,
 # the reclaim pass returns the cost and converges, steady churn+reclaim

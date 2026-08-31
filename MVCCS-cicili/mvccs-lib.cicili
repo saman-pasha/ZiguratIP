@@ -627,6 +627,10 @@
   ;; nonzero while this thread holds the guard SHARED: its reads go through
   ;; the thread's own read-only streams, and writers are excluded wholesale
   (thread-local) (var int tl_read_mode . 0)
+  ;; reads inside a cursor's UNLOCKED callback window go private -- a flag
+  ;; of its own, because tl_read_mode also means "this thread holds the
+  ;; shared rwlock", which the exclusive guard's deadlock check reads.
+  (thread-local) (var int tl_window_reads . 0)
   (thread-local) (var binarystream * tl_rd_hex . nil)
   (thread-local) (var binarystream * tl_rd_data . nil)
   ;; the next Streams constructed on this thread would LIKE to be shared;
@@ -646,13 +650,22 @@
         (return 0))
     (return 1))
 
+  ;; MAPSTREAMS, NOT FILESTREAMS. A private filestream's filebuf caches a
+  ;; get area and a seek inside it does not reload -- so a reader whose
+  ;; block was cached while a fresh page held only its zero-fill kept
+  ;; answering ZEROS for a row committed and fsynced underneath it, once,
+  ;; healing on the next reload. Measured in the act: read_row's first
+  ;; eight bytes all zero on a private stream (good, right position),
+  ;; correct on the immediate re-seek, correct on disk all along. A
+  ;; read-only mapbuf is coherent with the file by MAP_SHARED and
+  ;; refreshes its length by fstat -- it is what a private reader is.
   (func reader_ensure ((Memory * m)) (out void)
     (if (!= tl_rd_hex nil) (return))
     (set tl_rd_hex (cast (binarystream *)
-                         (new* Zigurat::filestream (std::string (-> m rd_hex_path))
+                         (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
                                std::ios::in)))
     (set tl_rd_data (cast (binarystream *)
-                          (new* Zigurat::filestream (std::string (-> m rd_data_path))
+                          (new* Zigurat::mapstream (std::string (-> m rd_data_path))
                                 std::ios::in))))
 
   ;; which stream a READ goes through: the thread's private one under a
@@ -660,12 +673,14 @@
   ;; write guard, where the canonical stream is the only place this
   ;; thread's own unflushed bytes can be read back from
   (func hex_in ((Memory * m)) (out binarystream *)
-    (if (or (== tl_read_mode 0) (!= tl_streams_held nil)) (return (-> m hexmap_io)))
+    (if (!= tl_streams_held nil) (return (-> m hexmap_io)))
+    (if (and (== tl_read_mode 0) (== tl_window_reads 0)) (return (-> m hexmap_io)))
     (reader_ensure m)
     (return tl_rd_hex))
 
   (func data_in ((Memory * m)) (out binarystream *)
-    (if (or (== tl_read_mode 0) (!= tl_streams_held nil)) (return (-> m data_io)))
+    (if (!= tl_streams_held nil) (return (-> m data_io)))
+    (if (and (== tl_read_mode 0) (== tl_window_reads 0)) (return (-> m data_io)))
     (reader_ensure m)
     (return tl_rd_data))
 
@@ -1711,12 +1726,22 @@
           (IsolationLevel level . READ_UNCOMMITTED))
       (control_clear (aof control))
 
-      ((-> (-> m hexmap_io) seekg) (addr_hexmap (-> p address)) std::ios::beg)
-      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
-      (set online_state (cast RowState (bitand hex_byte 12)))
-      (set online_lock (cast RowLock (bitand hex_byte 3)))
-      ((-> (-> m hexmap_io) read_std_ubyte) hex_byte)
-      (set offline_state (cast RowState (bitand hex_byte 12)))
+      ;; THE PER-THREAD READER, NEVER THE CANONICAL STREAM. Shared-mode
+      ;; readers run concurrently by design, and this seek-then-read on
+      ;; `m->hexmap_io' was the one read in the visibility path that
+      ;; bypassed hex_in: two readers interleaving here answered each
+      ;; other's byte, and a row's state was judged from the wrong
+      ;; address. Measured by contention_test's `rewrite vs index': a row
+      ;; vanishing from an index it was never absent from, and a writer
+      ;; refused by its own unique key after reading a garbled row.
+      (let ((binarystream * vhio . #'(hex_in m)))
+        (if (not ((-> vhio good))) ((-> vhio clear)))
+        ((-> vhio seekg) (addr_hexmap (-> p address)) std::ios::beg)
+        ((-> vhio read_std_ubyte) hex_byte)
+        (set online_state (cast RowState (bitand hex_byte 12)))
+        (set online_lock (cast RowLock (bitand hex_byte 3)))
+        ((-> vhio read_std_ubyte) hex_byte)
+        (set offline_state (cast RowState (bitand hex_byte 12))))
 
       (if (-> m initialized) (set level (-> tl_txn isolation_level)))
 
@@ -2135,11 +2160,20 @@
                                           ;; the streams go back before the caller's
                                           ;; callback: it is procedure code, and the
                                           ;; ordinary thing for it to do is update the
-                                          ;; row it was handed
-                                          (if (!= streams nil) ((-> streams unlock)))
-                                          (if (not (callback ctx (aof pointer)))
-                                              (set i (-> m hbpp)))
-                                          (if (!= streams nil) ((-> streams lock)))
+                                          ;; row it was handed. Reads inside the
+                                          ;; window go through the thread's private
+                                          ;; reader -- see bt_output_vcb for the
+                                          ;; measurement behind the flag.
+                                          (let ((int old_rm . tl_window_reads)
+                                                (int flip . #'(? (and (!= streams nil)
+                                                                      (== 1 (reader_eligible m)))
+                                                               1 0)))
+                                            (if (!= streams nil) ((-> streams unlock)))
+                                            (if (== flip 1) (set tl_window_reads 1))
+                                            (if (not (callback ctx (aof pointer)))
+                                                (set i (-> m hbpp)))
+                                            (if (== flip 1) (set tl_window_reads old_rm))
+                                            (if (!= streams nil) ((-> streams lock))))
                                           (set page_stale #t)))
                                     (if (and page_stale (< i (-> m hbpp)))
                                         (block
@@ -2158,13 +2192,11 @@
   ;; guard of its own -- the cursor has handed the streams back by the
   ;; time anything calls this
   (func read_row ((Memory * m) (BaseTable * obj)) (out void)
-    (set tl_want_shared 1)
-    (letin* ((streams (Streams m)))
-      (let ((binarystream * dio . #'(data_in m)))
-        (if (not ((-> dio good))) ((-> dio clear)))
-        ((-> dio seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
-        ((-> obj unpack) (cof dio)))
-      (cast void 0)))
+    (dba_watch1 m "Read Row" ($ (-> obj pointer) address))
+    (let ((binarystream * dio . #'(data_in m)))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+      ((-> obj unpack) (cof dio))))
 
   ;; ==================================================================
   ;; ISUD -- the staged writes
@@ -2923,16 +2955,20 @@
     (let ((Memory * m . #'(-> idx m)))
       (if (bt_cache_node_get m address node) (return))
       (set (-> node pointer) (pointer_at m (-> idx hash_key) address))
-      ((-> (-> m data_io) seekg) (ptr_data (aof (-> node pointer))) std::ios::beg)
-      ((-> node unpack) (cof (-> m data_io)))
+      (let ((binarystream * ndio . #'(data_in m)))
+        (if (not ((-> ndio good))) ((-> ndio clear)))
+        ((-> ndio seekg) (ptr_data (aof (-> node pointer))) std::ios::beg)
+        ((-> node unpack) (cof ndio)))
       (bt_cache_node_put m node)))
 
   (func bt_key_read ((BTreeIndex * idx) (int64_t address) (BTKey * key)) (out void)
     (let ((Memory * m . #'(-> idx m)))
       (if (bt_cache_key_get m address key) (return))
       (set (-> key pointer) (pointer_at m (-> idx hash_key) address))
-      ((-> (-> m data_io) seekg) (ptr_data (aof (-> key pointer))) std::ios::beg)
-      ((-> key unpack) (cof (-> m data_io)))
+      (let ((binarystream * kdio . #'(data_in m)))
+        (if (not ((-> kdio good))) ((-> kdio clear)))
+        ((-> kdio seekg) (ptr_data (aof (-> key pointer))) std::ios::beg)
+        ((-> key unpack) (cof kdio)))
       (bt_cache_key_put m key)))
 
   ;; a dependent level, built on the stack per descent exactly as the
@@ -3039,14 +3075,6 @@
       ((-> (-> m hexmap_io) flush))
       ((-> (-> m data_io) flush))))
 
-  ;; ---- one key's values, newest first (_cursor_values) --------------
-  ;; Each link is asked Memory's visibility question directly; under
-  ;; SNAPSHOT the answer can be an older version, so the value is read
-  ;; again from wherever the pointer moved to.
-  ;;
-  ;; The walk is split so a caller that KNOWS where its target sits --
-  ;; the unmap resume mark below -- can start mid-chain: bt_walk_values
-  ;; is the head-anchored spelling, bt_walk_values_from the general one.
   (func bt_walk_values_from ((BTreeIndex * idx) (int64_t start) (void * ctx)
                              (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
         (out void)
@@ -3073,8 +3101,10 @@
               (set brent_limit (* brent_limit 2))))
         (let ((Pointer pointer . #'(pointer_at m (-> idx hash_key) tmp))
               (BTValue v))
-          ((-> (-> m data_io) seekg) (ptr_data (aof pointer)) std::ios::beg)
-          (($ v unpack) (cof (-> m data_io)))
+          (let ((binarystream * wdio . #'(data_in m)))
+            (if (not ((-> wdio good))) ((-> wdio clear)))
+            ((-> wdio seekg) (ptr_data (aof pointer)) std::ios::beg)
+            (($ v unpack) (cof wdio)))
           ;; advanced before the callback, so a callback that deletes the
           ;; value it was handed does not lose the rest of the chain
           (set tmp ($ v next_address))
@@ -3084,8 +3114,10 @@
                 (block
                   (if (!= ($ vp address) ($ pointer address))
                       (block
-                        ((-> (-> m data_io) seekg) (ptr_data (aof vp)) std::ios::beg)
-                        (($ v unpack) (cof (-> m data_io)))))
+                        (let ((binarystream * wdio2 . #'(data_in m)))
+                          (if (not ((-> wdio2 good))) ((-> wdio2 clear)))
+                          ((-> wdio2 seekg) (ptr_data (aof vp)) std::ios::beg)
+                          (($ v unpack) (cof wdio2)))))
                   (set ($ v pointer) vp)
                   (set counter (+ counter 1))
                   (if (not (vcb ctx counter (aof v)))
@@ -3881,10 +3913,33 @@
         (if (not (chain_resolves m (-> v value)))
             (return #t))
         (let ((Pointer row_ptr . #'(pointer_at m (-> (-> rc idx) table_key) (-> v value)))
-              (Streams * held . #'(cast (Streams *) tl_streams_held)))
-          (if (!= held nil) ((-> held unlock)))
-          (set (-> rc cont) (? ((-> rc rcb) (-> rc user) (aof row_ptr)) 1 0))
-          (if (!= held nil) ((-> held lock)))
+              (Streams * held . #'(cast (Streams *) tl_streams_held))
+              ;; THE UNLOCKED WINDOW READS PRIVATELY. The guard goes back
+              ;; around the callback so it can nest engine work -- and any
+              ;; read the callback itself does (read_row above all) must
+              ;; NOT touch the canonical streams, whose positions now
+              ;; belong to whichever thread holds the lock. Unmarked, the
+              ;; row unpacked from wherever another cursor had seeked the
+              ;; canonical stream: an id of 0, an unmap that found no key
+              ;; and said nothing, the old entry left alive for the unique
+              ;; check to refuse -- contention_test's `rewrite vs index',
+              ;; red on every run. Flagging read_mode for the window sends
+              ;; hex_in/data_in to the thread's private reader; a callback
+              ;; that WRITES takes its own guard, which routes its reads
+              ;; back to the canonical stream it is then sole holder of.
+              (int old_rm . tl_window_reads))
+          ;; the flag flips ONLY when an exclusive guard was actually
+          ;; released: that is the one case where another thread can now
+          ;; hold the canonical streams. A guard-less single-threaded
+          ;; caller keeps canonical -- its own unflushed bytes live there.
+          ;; and only for a store that HAS private readers to give --
+          ;; reader_eligible is the same gate a shared guard passes.
+          (let ((int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0)))
+            (if (!= held nil) ((-> held unlock)))
+            (if (== flip 1) (set tl_window_reads 1))
+            (set (-> rc cont) (? ((-> rc rcb) (-> rc user) (aof row_ptr)) 1 0))
+            (if (== flip 1) (set tl_window_reads old_rm))
+            (if (!= held nil) ((-> held lock))))
           (return (== (-> rc cont) 1))))))
 
   (func bt_cursor_output ((BTreeIndex * idx) (BTKey * key) (void * user)
