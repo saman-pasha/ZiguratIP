@@ -1,12 +1,18 @@
 
+# THE ORDER IS THE LINK ORDER. Each project links the libraries before it,
+# and a fresh tree has nothing else -- so Configuration goes before
+# Cryptography, which links -lConfiguration. With the two the other way
+# round a fresh clone lost Cryptography at its link and SocketIO, Connector,
+# HTTP and Compiler with it: five of fourteen, all for one file made a
+# moment later. An incremental tree never shows it, which is how it hid.
 PROJECTS := Core \
 	StreamIO \
 	Type \
 	Library \
 	Encoding \
 	Compression \
-	Cryptography \
 	Configuration \
+	Cryptography \
 	Threading \
 	SocketIO \
 	Connector \
