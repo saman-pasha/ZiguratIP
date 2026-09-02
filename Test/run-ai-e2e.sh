@@ -156,7 +156,8 @@ if [ -n "$LIBTORCH" ]; then
   # ignored, and it failed as a missing <torch/torch.h> that looked like a
   # broken $LIBTORCH.
   #
-  # -std=c++17 rather than the c++11 the config ships: libtorch 2.x does not
+  # -std=c++17 said by the object itself, so it holds against a configuration
+  # older than the one shipped (c++17 now; it was c++11): libtorch 2.x does not
   # compile under c++11 at all. The object's flags are appended after the
   # configured ones and the last -std on the line wins.
   sed -e 's|#include "torch_stub.hpp"|#include <torch/torch.h>|' \

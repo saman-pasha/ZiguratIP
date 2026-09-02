@@ -70,7 +70,7 @@ namespace
       << "\t/PARSER/PATTERNS_FILE       $HOME_PATH/etc/patterns.conf" << std::endl
       << "\t/PARSER/TRACE_MODE          FALSE  --! prints the parse !--" << std::endl
       << "\t/COMPILER/CPP               c++    --! must be on PATH !--" << std::endl
-      << "\t/COMPILER/CPP_FLAGS         -Wall -std=c++11 -fPIC" << std::endl
+      << "\t/COMPILER/CPP_FLAGS         -Wall -std=c++17 -fPIC" << std::endl
       << "\t/COMPILER/LD_FLAGS          -shared" << std::endl
       << "\t/COMPILER/INCLUDE_PATH      $HOME_PATH/include" << std::endl
       << "\t/COMPILER/OBJ_PATH          $HOME_PATH/obj" << std::endl
@@ -192,7 +192,7 @@ static int run(int argc, char* argv[])
     // Compiler takes its toolchain and paths explicitly now, read from the
     // same configuration keys and defaults load_compiler uses in the server.
     std::string cpp = "c++";
-    std::string cpp_flags = "-Wall -std=c++11 -fPIC";
+    std::string cpp_flags = "-Wall -std=c++17 -fPIC";
     std::string ld_flags = "-shared";
     conf.get("/COMPILER/CPP", cpp);
     conf.get("/COMPILER/CPP_FLAGS", cpp_flags);

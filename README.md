@@ -4,7 +4,7 @@
 
 **Zigurat Informational Platform** — an object-relational database server, a
 programming language, and a web application server, built as one system in
-C++11 with no third-party dependencies.
+C++17 with no third-party dependencies.
 
 Write a table, a stored procedure and a web page in the same language, in the
 same file, against the same transaction. The server compiles what you write to
@@ -63,7 +63,7 @@ come back.
 
 ### Requirements
 
-A C++11 compiler and GNU make. Nothing else. The server also invokes a C++
+A C++17 compiler and GNU make. Nothing else. The server also invokes a C++
 compiler at runtime to build Parsi objects, so one must stay on `PATH`.
 
 ### Build
@@ -270,7 +270,7 @@ int main()
 }
 EOF
 
-c++ -std=c++11 -I$ZIGURATIP_HOME/include count.cpp -o count \
+c++ -std=c++17 -I$ZIGURATIP_HOME/include count.cpp -o count \
     -L$ZIGURATIP_HOME/lib -lConnector -lCore -lStreamIO -lType -lSocketIO \
     -lCryptography -lEncoding -lConfiguration -lThreading -lLibrary -lCompression
 ./count
@@ -498,7 +498,7 @@ int main()
 ```
 
 ```bash
-c++ -std=c++11 -I$ZIGURATIP_HOME/include client.cpp -o client \
+c++ -std=c++17 -I$ZIGURATIP_HOME/include client.cpp -o client \
     -L$ZIGURATIP_HOME/lib -lConnector -lCore -lStreamIO -lSocketIO \
     -lType -lConfiguration -lCryptography -lEncoding
 ```

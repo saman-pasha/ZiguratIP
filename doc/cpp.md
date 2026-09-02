@@ -33,7 +33,7 @@ reaches the compiler, which is where a header search path and a language
 standard have to be.
 
 An object's flags are appended after the configured `COMPILER/CPP_FLAGS`, so
-`COMPILE '-std=c++17';` wins over a `-std=c++11` in the configuration — the last
+`COMPILE '-std=c++17';` wins over an older `-std` in the configuration — the last
 `-std` on a `g++` or `clang++` line is the one that applies. libtorch 2.x needs
 exactly that, and it is what `Test/ai/classifier.parsi` is compiled with:
 

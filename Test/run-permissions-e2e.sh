@@ -177,7 +177,7 @@ COMPILER:
 	# own, on loopback, for the length of one run. Nothing shipped enables it.
 	REMOTE_MODE: TRUE
 	CPP:       c++
-	CPP_FLAGS: -Wall -std=c++11 -fPIC
+	CPP_FLAGS: -Wall -std=c++17 -fPIC
 	LD_FLAGS:  -shared
 	TRACE_MODE: FALSE
 
@@ -206,7 +206,7 @@ CONF
 
 echo "building the probe"
 PROBE="$WORK/e2e-probe"
-c++ -Wall -std=c++11 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$PROBE" \
+c++ -Wall -std=c++17 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$PROBE" \
     "$HERE/e2e-probe.cpp" \
     -lConnector -lCore -lStreamIO -lType -lSocketIO -lCryptography \
     -lEncoding -lConfiguration -lThreading -lLibrary -lCompression

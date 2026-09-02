@@ -107,9 +107,9 @@ namespace Zigurat
     // same -- the same command parses both.
     static std::string diagnostic(const std::string&, const std::string&);
 
-    // Enough of a filesystem to keep a directory of small files. C++11 has no
-    // <filesystem>, and pulling one in for four calls would cost more than it
-    // saves.
+    // Enough of a filesystem to keep a directory of small files. Written under
+    // C++11, which had no <filesystem>; the workspace is C++17 now, but pulling
+    // it in for four calls would still cost more than it saves.
     static bool file_exists(const std::string&);
     static bool make_directory(const std::string&);
     static bool remove_file(const std::string&);

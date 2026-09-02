@@ -10,7 +10,13 @@ ifdef COMPILER
 endif
 
 ifndef CXXFLAGS
-	CXXFLAGS := -Wall -std=c++11
+	# C++17, the standard the rest of the workspace already spoke: the shipped
+	# ziguratip-*.conf compile Parsi objects at -std=c++17, the Cicili-emitted
+	# engine says gnu++17, and every cocolog module is c++17. These fourteen
+	# projects were the last at c++11. NOTE that <Project>-<OS>-<CXX>.depend
+	# files embed the compile line, so an existing tree keeps building at the
+	# old standard until `make clean' regenerates them.
+	CXXFLAGS := -Wall -std=c++17
 endif
 
 ifndef LDFLAGS

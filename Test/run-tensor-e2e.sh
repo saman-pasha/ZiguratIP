@@ -50,7 +50,7 @@ echo "compiling the procedure"
   echo "FAIL parsi could not compile demo::tensor_sum:"; tail -15 "$WORK/compile.log"; exit 1; }
 
 echo "building the probe"
-c++ -Wall -std=c++11 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$WORK/probe" \
+c++ -Wall -std=c++17 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$WORK/probe" \
     "$HERE/e2e-probe.cpp" \
     -lConnector -lCore -lStreamIO -lType -lSocketIO -lCryptography \
     -lEncoding -lConfiguration -lThreading -lLibrary -lCompression

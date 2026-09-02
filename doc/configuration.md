@@ -52,7 +52,7 @@ Defines path to c++ compiler. Default value is c++.
 
 ## COMPILER/CPP_FLAGS
 
-Defines flags for compiling libraries. Default value is -Wall -std=c++11 -fPIC.
+Defines flags for compiling libraries. Default value is -Wall -std=c++17 -fPIC -O3, which is what every shipped `ziguratip-*.conf` carries.
 
 ## COMPILER/LD_FLAGS
 

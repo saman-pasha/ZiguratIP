@@ -15,7 +15,7 @@ Compiler compiler;
 void load_compiler(const Configuration &config)
 {
   std::string cpp = "c++";
-  std::string cpp_flags = "-Wall -std=c++11 -fPIC";
+  std::string cpp_flags = "-Wall -std=c++17 -fPIC";
   std::string ld_flags = "-shared";
 
   config.get("/COMPILER/CPP", cpp);

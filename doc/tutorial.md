@@ -34,7 +34,7 @@ engine, the compiler, the HTTP layer, the RSA and AES and SHA — is in the tree
 
 ## 2. Building
 
-You need a C++11 compiler and `make`. The compiler is needed at **run time** as
+You need a C++17 compiler and `make`. The compiler is needed at **run time** as
 well, because the server compiles Parsi sources while it is running.
 
 ```bash
