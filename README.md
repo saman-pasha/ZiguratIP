@@ -66,6 +66,10 @@ come back.
 A C++17 compiler and GNU make. Nothing else. The server also invokes a C++
 compiler at runtime to build Parsi objects, so one must stay on `PATH`.
 
+`install/install-linux.sh` (Debian, Ubuntu, Fedora) and `install/install-macos.sh`
+take a fresh clone to a built `home/`, packages included; [install/README.md](install/README.md)
+says what they do and what they know that cost time to learn.
+
 ### Build
 
 ```bash
