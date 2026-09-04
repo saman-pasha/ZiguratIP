@@ -11,6 +11,12 @@
 #include <vector>
 #include <cstdint>
 #include <algorithm>
+// std::back_inserter, used by the three set operations below. It arrived
+// through <algorithm> on libc++ 21 and earlier and does NOT on 23, whose
+// transitive includes have been taken out -- so a build with Homebrew's
+// clang stopped at `no member named back_inserter in namespace std' while
+// Apple's compiled the same line. Asked for by name here.
+#include <iterator>
 
 // BSD/Darwin declare the byte order conversions as macros in <sys/_endian.h>,
 // which would rewrite the member declarations below. Utility provides its own
