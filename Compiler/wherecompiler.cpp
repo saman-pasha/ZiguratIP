@@ -168,36 +168,54 @@ namespace Zigurat
 	    code << tab << this->_compiler.TAB1 << "return true;" << std::endl;
 	    code << tab << "});" << std::endl;
 	  }
+	  // THE LEVELS BELOW THE BOUND ONE NEST, they are not siblings. A
+	  // middle level's walk hands its lambda the NEXT dependent handle, and
+	  // the row walk belongs INSIDE that lambda, on that handle -- so each
+	  // middle level opens a lambda that stays open until the innermost row
+	  // walk has been written, and the lambdas close in reverse. Written as
+	  // siblings -- every middle walk returning at once, the row walk then
+	  // called on the OUTER handle -- this compiled for two levels, where
+	  // there is no middle, and failed for three: `kb == K' over cocolog's
+	  // (kb, name, arity) handed a row lambda to a handle two levels deep,
+	  // `no matching function for call to object of type lambda'.
+	  int opened = 0;
 	  while (++columns_iter != columns.end()) {
 	    ++types_iter;
+	    std::string tabn(lvl + opened, '\t');
 
 	    if (columns_iter == --columns.end()) { // Inner
 
-	      code << tab << "_btreeindex_.cursor" << std::endl;
-	      code << tab << "([&] (" << this->_type_name << "& " << this->_name << ") -> bool {" << std::endl;
-	      code << tab << this->_compiler.TAB1 << "if (";
+	      code << tabn << "_btreeindex_.cursor" << std::endl;
+	      code << tabn << "([&] (" << this->_type_name << "& " << this->_name << ") -> bool {" << std::endl;
+	      code << tabn << this->_compiler.TAB1 << "if (";
 	      this->_expr.compile(where.args[0], code);
 	      code << ") {" << std::endl;	
-	      content(lvl + 2);
-	      code << tab << this->_compiler.TAB1 << "}" << std::endl;
-	      code << tab << this->_compiler.TAB1 << "return true;" << std::endl;
-	      code << tab << "});" << std::endl;
+	      content(lvl + opened + 2);
+	      code << tabn << this->_compiler.TAB1 << "}" << std::endl;
+	      code << tabn << this->_compiler.TAB1 << "return true;" << std::endl;
+	      code << tabn << "});" << std::endl;
 
-	    } else { // Middle
+	    } else { // Middle: open the walk over the dependent levels, and leave it open
 
-	      code << tab << "_btreeindex_.cursor" << std::endl;
-	      code << tab << "([&] (Zigurat::BTreeIndex<" << this->_type_name << ", ";
+	      code << tabn << "_btreeindex_.cursor" << std::endl;
+	      code << tabn << "([&] (Zigurat::BTreeIndex<" << this->_type_name << ", ";
 	      std::list<std::string>::iterator iter = types_iter;
 	      while (++iter != types.end()) {
 		code << *iter << ", ";
 	      }
 	      code.seekp(-2, std::ios::cur);
 	      code << ">& _btreeindex_) -> bool {" << std::endl;
-	      code << tab << this->_compiler.TAB1 << "return true;" << std::endl;
-	      code << tab << "});" << std::endl;
+	      ++opened;
 
 	    }
 
+	  }
+	  // and close every middle walk, innermost first
+	  while (opened > 0) {
+	    --opened;
+	    std::string tabn(lvl + opened, '\t');
+	    code << tabn << this->_compiler.TAB1 << "return true;" << std::endl;
+	    code << tabn << "});" << std::endl;
 	  }
 	}
 

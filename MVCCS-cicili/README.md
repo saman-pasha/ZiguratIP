@@ -227,6 +227,20 @@ walked whole, which is what the server's WHERE compiler emits for a
 predicate on the first column only; cocolog's embedded store walks a
 `(kb name)` index for one kb that way).
 
+**A composite may be any depth, and the WHERE compiler descends it.** A
+predicate that binds only the leading column of a `(kb, name, arity)` key
+reaches the index through `cursor_equal` on that level and must then walk
+every dependent level whole down to the rows; the compiler wrote those
+lower walks as SIBLINGS — each middle level's lambda returning at once,
+the row walk then called on the OUTER handle — which compiled for two
+levels, where there is no middle, and failed for three with `no matching
+function for call to object of type lambda`. cocolog's `predicates_of`
+over its `(kb, name, arity)` index was the first to meet it. Each middle
+level now opens a lambda that stays open until the innermost row walk is
+written, and they close in reverse; `Test/run-keys-e2e.sh` proves it on
+`demo::triple` — four rows under `a == 'x'`, two under `(a, b)`, one under
+all three, and the generated C++ grepped for both dependent handles.
+
 `_attach` answers **1 the first time a store meets the index** — its
 catalogue row was just created, and whatever rows the table already
 holds are not in the tree — and `_rebuild` then fills the tree from

@@ -66,6 +66,17 @@ for want in "IDX_DEMO_PRICES_AMOUNT.cursor_less_than" \
   else check "the WHERE walks $want" "scan" "index"; fi
 done
 
+# and the three-level composite: its leading-only WHERE must reach the index
+# and DESCEND -- a middle level's lambda enclosing the row walk -- which is
+# what the compiler got wrong for anything past two levels
+TRIPLE="$HOME_DIR/tmp/_DEMO::TRIPLE_CHECK_.cpp"
+if grep -q "IDX_DEMO_TRIPLE_A_B_C.cursor_equal" "$TRIPLE" 2>/dev/null; then check "the three-level WHERE walks IDX_DEMO_TRIPLE_A_B_C" "index" "index"
+else check "the three-level WHERE walks IDX_DEMO_TRIPLE_A_B_C" "scan" "index"; fi
+if grep -q "BTreeIndex<DEMO::TRIPLE, STRING, INT>& _btreeindex_) -> bool {" "$TRIPLE" 2>/dev/null \
+   && grep -q "BTreeIndex<DEMO::TRIPLE, INT>& _btreeindex_) -> bool {" "$TRIPLE" 2>/dev/null; then
+  check "the leading-only walk opens both dependent levels" "nested" "nested"
+else check "the leading-only walk opens both dependent levels" "flat" "nested"; fi
+
 echo "building the probe"
 c++ -Wall -std=c++17 -I"$HOME_DIR/include" -L"$HOME_DIR/lib" -o "$WORK/probe" \
     "$HERE/e2e-probe.cpp" \
@@ -90,6 +101,10 @@ for run in 1 2; do
   check "run $run: two below zero, two at least 1.5, the two zeros one key, 'b' once, [1,2] thrice, [2,1] thrice, [1] never, the twin refused" \
         "$GOT" "10331222"
 done
+
+OUT=$("$WORK/probe" - - - 127.0.0.1 2160 callret demo::triple_check 2>&1 || true)
+GOT=$(echo "$OUT" | sed -n 's/^returned \([0-9-]*\).*/\1/p')
+check "the three-level composite: four under a, two under (a, b), one under (a, b, c)" "$GOT" "124"
 
 kill -0 "$SERVER_PID" 2>/dev/null && check "the server survived" "yes" "yes" \
                                   || check "the server survived" "it died" "yes"

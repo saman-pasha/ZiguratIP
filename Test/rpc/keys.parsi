@@ -103,3 +103,55 @@ BEGIN
     SET code = code * ten + below;
     RETURN code;
 END
+
+-- A THREE-LEVEL COMPOSITE, and the WHERE that binds only its first column.
+-- The compiler used to write the levels below the bound one as SIBLINGS --
+-- every middle walk returning at once, the row walk then called on the
+-- OUTER handle -- which compiled for two levels, where there is no middle,
+-- and failed for three: cocolog's (kb, name, arity) met it first. Each
+-- middle level now opens a lambda that stays open until the row walk is
+-- written, and they close in reverse. One number, one decimal place each:
+--
+--     1 * (rows with a == 'x')                     4   -- two levels walked whole
+--    10 * (rows with a == 'x' AND b == 'p')        2   -- one level walked
+--   100 * (rows with a == 'x', b == 'p', c == 2)   1   -- every level bound
+--                                              = 124
+
+TABLE demo::triple
+BEGIN
+    COLUMN id AS Long   PRIMARY KEY;
+    COLUMN a  AS String NOT NULL;
+    COLUMN b  AS String NOT NULL;
+    COLUMN c  AS Int    NOT NULL;
+    INDEX KEY (a, b, c);
+END
+
+PROCEDURE demo::triple_check() RETURNS Long
+REQUIRES demo::triple
+BEGIN
+    DELETE FROM demo::triple;
+
+    INSERT INTO demo::triple VALUES (1, 'x', 'p', 1);
+    INSERT INTO demo::triple VALUES (2, 'x', 'p', 2);
+    INSERT INTO demo::triple VALUES (3, 'x', 'q', 1);
+    INSERT INTO demo::triple VALUES (4, 'x', 'q', 2);
+    INSERT INTO demo::triple VALUES (5, 'y', 'p', 1);
+
+    DECLARE ax AS String = 'x';
+    DECLARE bp AS String = 'p';
+    DECLARE c2 AS Int = 2;
+    DECLARE by_a AS Long = 0;
+    DECLARE by_ab AS Long = 0;
+    DECLARE by_abc AS Long = 0;
+    SELECT by_a = by_a + 1 FROM demo::triple WHERE a == ax;
+    SELECT by_ab = by_ab + 1 FROM demo::triple WHERE a == ax AND b == bp;
+    SELECT by_abc = by_abc + 1 FROM demo::triple WHERE a == ax AND b == bp AND c == c2;
+
+    DECLARE ten AS Long = 10;
+    DECLARE hundred AS Long = 100;
+    DECLARE total AS Long = 0;
+    SET total = by_abc * hundred;
+    SET total = total + by_ab * ten;
+    SET total = total + by_a;
+    RETURN total;
+END
