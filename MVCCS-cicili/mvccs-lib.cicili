@@ -60,6 +60,74 @@
   (using namespace Zigurat)
 
     ;; ----------------------------------------------------------------
+    ;; A COLUMN VALUE BECOMES AN INT64 KEY. The B-tree's key is one
+    ;; int64 -- BTKey packs it in a 56-byte record and every bt_* takes
+    ;; it as such -- so every column kind folds to one, and these four
+    ;; rules are the whole of it. defindex applies them per column kind
+    ;; at expansion time; the server's generated C++ reaches the same
+    ;; three through engine.cicili's exports, so a key is the same
+    ;; number whichever side derived it.
+    ;;
+    ;;   INT     the value itself
+    ;;   REAL    an ORDER-PRESERVING fold of the IEEE double: the bit
+    ;;           pattern as a signed int64 already orders the positives;
+    ;;           the negatives order backwards, so their low 63 bits are
+    ;;           flipped. -0.0 is +0.0 first, or equality would split
+    ;;           them. Ranges over a REAL index are therefore real ranges.
+    ;;   TEXT    FNV-1a 64 of the bytes, masked positive. TWO STRINGS CAN
+    ;;           COLLIDE, and the trade is taken openly: every consumer
+    ;;           re-applies its own predicate to each row the index hands
+    ;;           back, so a collision costs a wasted row visit and never a
+    ;;           wrong answer. Order is hash order, so defindex emits no
+    ;;           range family over a hashed key. A UNIQUE hashed key can
+    ;;           falsely refuse a distinct value -- at 2^63 a lottery
+    ;;           nobody wins, and it refuses loudly.
+    ;;   VECTOR  FNV-1a 64 over the REAL fold of each element, masked
+    ;;           positive: equality over the whole vector, hashed like TEXT.
+    ;; ----------------------------------------------------------------
+    (func fnv_basis64 () (out uint64_t)
+      ;; the FNV-1a 64 offset basis, composed from halves so no literal
+      ;; overflows a signed reader anywhere between Lisp and C++
+      (return (+ (* (cast uint64_t 3421674724) (cast uint64_t 4294967296))
+                 (cast uint64_t 2216829733))))
+
+    (func fnv_word64 ((uint64_t h) (int64_t word)) (out uint64_t)
+      (let ((uint64_t x . #'(cast uint64_t word)))
+        (for ((int b . 0)) (< b 8) ((++ b))
+          (set h (xor h (bitand x (cast uint64_t 255))))
+          (set h (* h (cast uint64_t 1099511628211)))
+          (set x (>> x 8)))
+        (return h)))
+
+    (func text_key64 ((const char * s) (size_t n)) (out int64_t)
+      (let ((uint64_t h . #'(fnv_basis64)))
+        (for ((size_t i . 0)) (< i n) ((++ i))
+          (set h (xor h (cast uint64_t (cast uint8_t (nth i s)))))
+          (set h (* h (cast uint64_t 1099511628211))))
+        (return (cast int64_t (bitand h (cast uint64_t 9223372036854775807))))))
+
+    (func real_key64 ((double d)) (out int64_t)
+      (let ((double v . d)
+            (int64_t bits . 0))
+        (if (== v 0.0) (set v 0.0))
+        (memcpy (cast (void *) (aof bits)) (cast (const void *) (aof v)) 8)
+        (if (< bits 0) (set bits (xor bits 9223372036854775807)))
+        (return bits)))
+
+    (func words_key64 ((const int64_t * w) (size_t n)) (out int64_t)
+      (let ((uint64_t h . #'(fnv_basis64)))
+        (for ((size_t i . 0)) (< i n) ((++ i))
+          (set h (fnv_word64 h (nth i w))))
+        (return (cast int64_t (bitand h (cast uint64_t 9223372036854775807))))))
+
+    (func dvec_key64 ((const dvec_t & v)) (out int64_t)
+      (let ((uint64_t h . #'(fnv_basis64))
+            (size_t n . #'(($ v size))))
+        (for ((size_t i . 0)) (< i n) ((++ i))
+          (set h (fnv_word64 h (real_key64 (($ v at) i)))))
+        (return (cast int64_t (bitand h (cast uint64_t 9223372036854775807))))))
+
+    ;; ----------------------------------------------------------------
     ;; The vocabulary
     ;; ----------------------------------------------------------------
 
@@ -3020,7 +3088,10 @@
               (return #f)))
         (return #t))))
 
-  (func bt_select_record ((BTreeIndex * idx)) (out void)
+  ;; answers 1 when the store met this index for the first time -- its
+  ;; catalogue row was just created, and a table with rows already in it
+  ;; has none of them in the tree until the consumer rebuilds it
+  (func bt_select_record ((BTreeIndex * idx)) (out int)
     (let ((BTSelCtx sc))
       (set ($ sc idx) idx)
       (set ($ sc found) 0)
@@ -3031,7 +3102,10 @@
       ;; not recording a hit left the original catalogue re-inserting
       ;; its own row on every restart; same rule here
       (if (== ($ sc found) 0)
-          (bt_insert_record idx))))
+          (block
+            (bt_insert_record idx)
+            (return 1)))
+      (return 0)))
 
   (func bt_update_record ((BTreeIndex * idx)) (out void)
     (let ((BTRecord rec))
@@ -4733,11 +4807,11 @@
   ;; read time -- checkable, greppable, and no template in sight.
   ;;
   ;; Columns are int64_t, (TEXT c) -- a std::string stored as a 16-bit
-  ;; length and the bytes -- or (VECTOR c): the real engine's
-  ;; Vector<Double>, a dvec_t stored as an int64 count and the doubles,
-  ;; eight bytes each, exactly as they are. The nullable Type layer is
-  ;; out of scope here -- and the store cannot read a NULL back anyway,
-  ;; as doc/truncate.md records.
+  ;; length and the bytes -- (REAL c): a double, eight bytes as they
+  ;; are -- or (VECTOR c): the real engine's Vector<Double>, a dvec_t
+  ;; stored as an int64 count and the doubles, eight bytes each. The
+  ;; nullable Type layer is out of scope here -- and the store cannot
+  ;; read a NULL back anyway, as doc/truncate.md records.
   ;; ==================================================================
   ;; The name may be the object's own qualified spelling -- Cicili's ::
   ;; is a name, so (deftable COCOLOG::MACHINES ID ...) needs no string:
@@ -4769,15 +4843,17 @@
            ;; variable-length string, stored as binarystream's std_text
            ;; (a 16-bit length and the bytes), which is what lets a row
            ;; carry clause text and 4000-byte machine chunks -- or
-           ;; (VECTOR sym): a dvec_t, count then doubles. The kind
-           ;; symbol is matched by NAME, because the generated file's
-           ;; TEXT and this file's TEXT need not be the same package's.
-           ;; pack_size is a virtual, so a row's size is its own
-           ;; business.
+           ;; (VECTOR sym): a dvec_t, count then doubles -- or (REAL
+           ;; sym): a double, eight bytes as they are. The kind symbol
+           ;; is matched by NAME, because the generated file's TEXT and
+           ;; this file's TEXT need not be the same package's. pack_size
+           ;; is a virtual, so a row's size is its own business.
            (colspecs (MAPCAR (LAMBDA (c)
                                (COND ((NOT (LISTP c)) (CONS c 'INT))
                                      ((STRING= (SYMBOL-NAME (FIRST c)) "VECTOR")
                                       (CONS (SECOND c) 'VECTOR))
+                                     ((STRING= (SYMBOL-NAME (FIRST c)) "REAL")
+                                      (CONS (SECOND c) 'REAL))
                                      (T (CONS (SECOND c) 'TEXT))))
                              columns))
            (intcols  (LOOP FOR c IN colspecs
@@ -4786,6 +4862,8 @@
                            WHEN (EQ (CDR c) 'TEXT) COLLECT (CAR c)))
            (veccols  (LOOP FOR c IN colspecs
                            WHEN (EQ (CDR c) 'VECTOR) COLLECT (CAR c)))
+           (realcols (LOOP FOR c IN colspecs
+                           WHEN (EQ (CDR c) 'REAL) COLLECT (CAR c)))
            (harr    (INTERN (CONCATENATE 'STRING sname "_HASHKEY")))
            (hready  (INTERN (CONCATENATE 'STRING sname "_hashkey_ready")))
            (kname   (INTERN (CONCATENATE 'STRING sname "_key")))
@@ -4810,6 +4888,12 @@
                                              #xFFFFFFFF))
                              (PUSH (LOGAND (ASH h -16) #xFF) out))
                     (NREVERSE out))))
+      ;; THE COLUMN KINDS OUTLIVE THIS EXPANSION. defindex expands after
+      ;; this form and with only a column's name in hand, so the kinds
+      ;; ride on the table symbol's plist -- the one place two macro
+      ;; expansions in one image can meet -- and defindex reads them
+      ;; back to fold each key by its kind
+      (SETF (GET name 'mvccs-colspecs) colspecs)
       `($$$
         ;; the seam an index attaches through: what the C++ engine wired
         ;; with per-class statics and generated map() bodies, a table
@@ -4824,10 +4908,11 @@
           ,@(LOOP FOR c IN colspecs
                   COLLECT (COND ((EQ (CDR c) 'TEXT)   `(member std::string ,(CAR c)))
                                 ((EQ (CDR c) 'VECTOR) `(member dvec_t ,(CAR c)))
+                                ((EQ (CDR c) 'REAL)   `(member double ,(CAR c)))
                                 (T                    `(member int64_t ,(CAR c)))))
           (override)
           (method pack_size () (out int64_t)
-            (return ,(LET ((acc (* 8 (LENGTH intcols))))
+            (return ,(LET ((acc (* 8 (+ (LENGTH intcols) (LENGTH realcols)))))
                        (LOOP FOR c IN textcols
                              DO (SETF acc `(+ ,acc (+ 2 (cast int64_t (($ ($ this ,c) size)))))))
                        (LOOP FOR c IN veccols
@@ -4846,6 +4931,8 @@
                                   (while (< vi vn)
                                     (($ io write_std_double) (cast double (($ ($ this ,(CAR c)) at) vi)))
                                     (set vi (+ vi 1)))))
+                              ((EQ (CDR c) 'REAL)
+                               `(($ io write_std_double) (cast double ($ this ,(CAR c)))))
                               (T
                                `(($ io write_std_long) (cast int64_t ($ this ,(CAR c))))))))
           (override)
@@ -4863,6 +4950,8 @@
                                     (($ io read_std_double) vd)
                                     (($ ($ this ,(CAR c)) push_back) vd)
                                     (set vi (+ vi 1)))))
+                              ((EQ (CDR c) 'REAL)
+                               `(($ io read_std_double) ($ this ,(CAR c))))
                               (T
                                `(($ io read_std_long) ($ this ,(CAR c)))))))
           (override)
@@ -4940,9 +5029,21 @@
   ;;   (defindex IDX_BOOK_VALUE Book value 0 65)
   ;;                            table col unique branching
   ;;
-  ;; Attaching hooks the index into the table's map/unmap/truncate seam.
-  ;; One index per table (the last attach wins the hooks) -- chaining is
-  ;; where a second index would go.
+  ;; EVERY COLUMN KIND IS INDEXABLE. The column's kind -- read back from
+  ;; what its deftable recorded -- decides how the key folds to the
+  ;; tree's int64 (the rules beside text_key64) and what the wrappers
+  ;; take: an INT index's _equal takes an int64_t, a TEXT index's a
+  ;; const std::string &, a REAL index's a double, a VECTOR index's a
+  ;; const dvec_t &. INT and REAL keys keep their order and get the
+  ;; range family; TEXT and VECTOR keys are hashes and get equality
+  ;; only. A consumer of a hashed index re-checks the column on each
+  ;; row it is handed -- a collision is a wasted visit, never a wrong
+  ;; answer -- and the rule is the server's too.
+  ;;
+  ;; Attaching hooks the index into the table's map/unmap/truncate seam;
+  ;; several indexes chain on one table. _attach answers 1 the first
+  ;; time a store meets the index, and _rebuild then fills its tree from
+  ;; the rows the table already holds.
   ;; ==================================================================
   (DEFMACRO defindex (idxname table column unique branching)
     (LET* ((qjoin (LAMBDA (n)
@@ -4966,6 +5067,46 @@
            (table    (INTERN tname))
            (cols     (IF (LISTP column) column (LIST column)))
            (nlev     (LENGTH cols))
+           ;; the column kinds deftable left on the table symbol: what
+           ;; decides how each key folds to the tree's int64 (see the
+           ;; key rules beside text_key64). A table this file never
+           ;; declared, or a column the table does not have, is a
+           ;; mistake at expansion time, not a C++ error three files on.
+           (colspecs (OR (GET table 'mvccs-colspecs)
+                         (ERROR "defindex ~A: no (deftable ~A ...) precedes it, so the columns' kinds are unknown"
+                                iname tname)))
+           (kind-of  (LAMBDA (c)
+                       (LET ((spec (FIND (SYMBOL-NAME c) colspecs
+                                         :KEY (LAMBDA (s) (SYMBOL-NAME (CAR s)))
+                                         :TEST #'STRING=)))
+                         (IF spec
+                             (CDR spec)
+                             (ERROR "defindex ~A: ~A is not a column of ~A" iname c tname)))))
+           (kinds    (MAPCAR kind-of cols))
+           ;; the row's key for one column: the member itself, or its fold
+           (rowkey   (LAMBDA (c)
+                       (CASE (FUNCALL kind-of c)
+                         (TEXT   `(text_key64 (($ (-> r ,c) data)) (($ (-> r ,c) size))))
+                         (VECTOR `(dvec_key64 (-> r ,c)))
+                         (REAL   `(real_key64 (-> r ,c)))
+                         (T      `(-> r ,c)))))
+           ;; a wrapper's key parameter is typed by the column's kind, and
+           ;; folded the same way the row's key was
+           (ptype    (LAMBDA (k)
+                       (CASE k
+                         (TEXT   '(const std::string &))
+                         (VECTOR '(const dvec_t &))
+                         (REAL   '(double))
+                         (T      '(int64_t)))))
+           (pfold    (LAMBDA (k p)
+                       (CASE k
+                         (TEXT   `(text_key64 (($ ,p data)) (($ ,p size))))
+                         (VECTOR `(dvec_key64 ,p))
+                         (REAL   `(real_key64 ,p))
+                         (T      p))))
+           ;; the range family exists only where the tree's order is the
+           ;; column's order: a hashed kind gets equality and nothing else
+           (ordered  (AND (= nlev 1) (MEMBER (FIRST kinds) '(INT REAL))))
            (harr     (INTERN (CONCATENATE 'STRING iname "_HASHKEY")))
            (hready   (INTERN (CONCATENATE 'STRING iname "_hashkey_ready")))
            (keyfn    (INTERN (CONCATENATE 'STRING iname "_key")))
@@ -4973,6 +5114,7 @@
            (dephready (INTERN (CONCATENATE 'STRING iname "_dep_hashkey_ready")))
            (depkeyfn (INTERN (CONCATENATE 'STRING iname "_dep_key")))
            (attach   (INTERN (CONCATENATE 'STRING iname "_attach")))
+           (irebuild (INTERN (CONCATENATE 'STRING iname "_rebuild")))
            (prevvar  (INTERN (CONCATENATE 'STRING iname "_prev_hooks")))
            (regvar   (INTERN (CONCATENATE 'STRING iname "_registered")))
            (domap    (INTERN (CONCATENATE 'STRING iname "_do_map")))
@@ -4982,6 +5124,8 @@
            (tcur     (INTERN (CONCATENATE 'STRING tname "_cursor")))
            (icur     (INTERN (CONCATENATE 'STRING iname "_cursor")))
            (ieq      (INTERN (CONCATENATE 'STRING iname "_equal")))
+           (ieqfirst (INTERN (CONCATENATE 'STRING iname "_equal_first")))
+           (ieqfdep  (INTERN (CONCATENATE 'STRING iname "_equal_first_dep")))
            (ineq     (INTERN (CONCATENATE 'STRING iname "_not_equal")))
            (ilt      (INTERN (CONCATENATE 'STRING iname "_less_than")))
            (ilte     (INTERN (CONCATENATE 'STRING iname "_less_than_equal")))
@@ -5056,19 +5200,19 @@
                   (if (!= ($ ,prevvar on_map) nil)
                       (($ ,prevvar on_map) mm rr))
                   (let ((,table * r . #'(cast (,table *) rr)))
-                    (bt_map (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address))))
+                    (bt_map (aof ,idxname) ,(FUNCALL rowkey (FIRST cols)) ($ (-> r pointer) address))))
                 (func ,dounmap ((void * mm) (void * rr)) (out void)
                   (if (!= ($ ,prevvar on_unmap) nil)
                       (($ ,prevvar on_unmap) mm rr))
                   (let ((,table * r . #'(cast (,table *) rr)))
-                    (bt_unmap (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address)))))
+                    (bt_unmap (aof ,idxname) ,(FUNCALL rowkey (FIRST cols)) ($ (-> r pointer) address)))))
               `((func ,domap ((void * mm) (void * rr)) (out void)
                   (if (!= ($ ,prevvar on_map) nil)
                       (($ ,prevvar on_map) mm rr))
                   (let ((,table * r . #'(cast (,table *) rr))
                         (int64_t ks [8]))
                     ,@(LOOP FOR c IN cols FOR i FROM 0
-                            COLLECT `(set (nth ,i ks) (-> r ,c)))
+                            COLLECT `(set (nth ,i ks) ,(FUNCALL rowkey c)))
                     (bt_map_multi (aof ,idxname) ks ($ (-> r pointer) address))))
                 (func ,dounmap ((void * mm) (void * rr)) (out void)
                   (if (!= ($ ,prevvar on_unmap) nil)
@@ -5076,22 +5220,32 @@
                   (let ((,table * r . #'(cast (,table *) rr))
                         (int64_t ks [8]))
                     ,@(LOOP FOR c IN cols FOR i FROM 0
-                            COLLECT `(set (nth ,i ks) (-> r ,c)))
+                            COLLECT `(set (nth ,i ks) ,(FUNCALL rowkey c)))
                     (bt_unmap_multi (aof ,idxname) ks ($ (-> r pointer) address))))))
 
         ;; the rebuild's row hand: THIS index only -- domap chains the
-        ;; other indexes' hooks, and each of them rebuilds itself
+        ;; other indexes' hooks, and each of them rebuilds itself. A row
+        ;; the tree REFUSES -- a UNIQUE key the rows already hold twice
+        ;; -- is counted for the caller (u, when it is not nil) rather
+        ;; than thrown: this runs inside a cursor's callback window, and
+        ;; an exception out of one would leave the streams guard behind.
         ,@(IF (= nlev 1)
               `((func ,rebuildcb ((void * u) (,table * r)) (out bool)
-                  (cast void u)
-                  (bt_map (aof ,idxname) (-> r ,(FIRST cols)) ($ (-> r pointer) address))
+                  (try (bt_map (aof ,idxname) ,(FUNCALL rowkey (FIRST cols)) ($ (-> r pointer) address))
+                       (catch ((const IndexException & e))
+                         (cast void e)
+                         (if (!= u nil)
+                             (set (cof (cast (int64_t *) u)) (+ (cof (cast (int64_t *) u)) 1)))))
                   (return #t)))
               `((func ,rebuildcb ((void * u) (,table * r)) (out bool)
-                  (cast void u)
                   (let ((int64_t ks [8]))
                     ,@(LOOP FOR c IN cols FOR i FROM 0
-                            COLLECT `(set (nth ,i ks) (-> r ,c)))
-                    (bt_map_multi (aof ,idxname) ks ($ (-> r pointer) address)))
+                            COLLECT `(set (nth ,i ks) ,(FUNCALL rowkey c)))
+                    (try (bt_map_multi (aof ,idxname) ks ($ (-> r pointer) address))
+                         (catch ((const IndexException & e))
+                           (cast void e)
+                           (if (!= u nil)
+                               (set (cof (cast (int64_t *) u)) (+ (cof (cast (int64_t *) u)) 1))))))
                   (return #t))))
 
         ;; a truncate is the one moment the table is at its smallest, so
@@ -5104,7 +5258,13 @@
           (bt_drop_storage (aof ,idxname) (cast (Memory *) mm))
           (,tcur (cast (Memory *) mm) nil ,rebuildcb))
 
-        (func ,attach ((Memory * m)) (out void)
+        ;; answers 1 when the STORE met this index for the first time:
+        ;; its catalogue row was just created, and whatever rows the
+        ;; table already holds are not in the tree. The consumer then
+        ;; calls the _rebuild below -- inside its own transaction, so the
+        ;; index lands with the commit it chooses -- and 0 every open
+        ;; after that.
+        (func ,attach ((Memory * m)) (out int)
           (set ($ ,idxname m) m)
           (set ($ ,idxname name) ,iname)
           (set ($ ,idxname hash_key) (intern_key (,keyfn)))
@@ -5121,16 +5281,34 @@
           ,(IF (> nlev 1)
                `(set ($ ,idxname dep_hash_key) (intern_key (,depkeyfn)))
                `(set ($ ,idxname dep_hash_key) nil))
-          (bt_select_record (aof ,idxname))
-          (if (== ,regvar 0)
-              (block
-                (set ($ ,prevvar on_map) ($ ,hooksvar on_map))
-                (set ($ ,prevvar on_unmap) ($ ,hooksvar on_unmap))
-                (set ($ ,prevvar on_truncate) ($ ,hooksvar on_truncate))
-                (set ($ ,hooksvar on_map) ,domap)
-                (set ($ ,hooksvar on_unmap) ,dounmap)
-                (set ($ ,hooksvar on_truncate) ,dotrunc)
-                (set ,regvar 1))))
+          (let ((int fresh . #'(bt_select_record (aof ,idxname))))
+            (if (== ,regvar 0)
+                (block
+                  (set ($ ,prevvar on_map) ($ ,hooksvar on_map))
+                  (set ($ ,prevvar on_unmap) ($ ,hooksvar on_unmap))
+                  (set ($ ,prevvar on_truncate) ($ ,hooksvar on_truncate))
+                  (set ($ ,hooksvar on_map) ,domap)
+                  (set ($ ,hooksvar on_unmap) ,dounmap)
+                  (set ($ ,hooksvar on_truncate) ,dotrunc)
+                  (set ,regvar 1)))
+            (return fresh)))
+
+        ;; the tree over the rows already there: storage dropped, then
+        ;; one table walk maps every row into a fresh tree. What the
+        ;; truncate hook does for the whole chain, for THIS index alone.
+        ;; Exclusive for the walk -- the callback writes nodes and keys,
+        ;; and the table cursor's own shared guard nests under this one
+        ;; as a no-op. Answers how many rows the tree refused: 0 is a
+        ;; complete index; anything else is a UNIQUE key the table
+        ;; already holds twice, and the caller decides what that means.
+        (func ,irebuild ((Memory * m)) (out int64_t)
+          (let ((int64_t refused . 0))
+            (bt_drop_storage (aof ,idxname) m)
+            (set tl_want_shared 0)
+            (letin* ((streams (Streams m)))
+              (,tcur m (cast (void *) (aof refused)) ,rebuildcb)
+              (cast void 0))
+            (return refused)))
 
         ;; the full row walk descends every level by itself
         (func ,icur ((Memory * m) (void * user)
@@ -5141,9 +5319,11 @@
             (set ($ cc cb) cb)
             (bt_cursor_rows_deep (aof ,idxname) (cast (void *) (aof cc)) ,shim)))
 
-        ;; equality over the whole tuple: one key parameter per column
+        ;; equality over the whole tuple: one key parameter per column,
+        ;; typed by the column's kind and folded as the row's key was
         (func ,ieq ((Memory * m)
-                    ,@(LOOP FOR kp IN kparams COLLECT `(int64_t ,kp))
+                    ,@(LOOP FOR kp IN kparams FOR k IN kinds
+                            COLLECT `(,@(FUNCALL ptype k) ,kp))
                     (void * user)
                     (func cb ((void * u) (,table * r)) (out bool))) (out void)
           (let ((,ctxname cc)
@@ -5151,57 +5331,79 @@
             (set ($ cc m) m)
             (set ($ cc user) user)
             (set ($ cc cb) cb)
-            ,@(LOOP FOR kp IN kparams FOR i FROM 0
-                    COLLECT `(set (nth ,i ks) ,kp))
+            ,@(LOOP FOR kp IN kparams FOR k IN kinds FOR i FROM 0
+                    COLLECT `(set (nth ,i ks) ,(FUNCALL pfold k kp)))
             (bt_cursor_equal_multi (aof ,idxname) ks (cast (void *) (aof cc)) ,shim)))
 
+        ;; a composite answers its LEADING column alone: equality on the
+        ;; first level, every dependent level walked whole -- the rows a
+        ;; (kb name) index holds for one kb. What the server's WHERE
+        ;; compiler emits for a predicate on the first column only.
+        ,@(IF (> nlev 1)
+              `((func ,ieqfdep ((void * c) (BTreeIndex * dep)) (out bool)
+                  (return (bt_cursor_rows_deep dep c ,shim)))
+                (func ,ieqfirst ((Memory * m) (,@(FUNCALL ptype (FIRST kinds)) k) (void * user)
+                                 (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                  (let ((,ctxname cc))
+                    (set ($ cc m) m)
+                    (set ($ cc user) user)
+                    (set ($ cc cb) cb)
+                    (bt_cursor_equal_dep (aof ,idxname) ,(FUNCALL pfold (FIRST kinds) 'k)
+                                         (cast (void *) (aof cc)) ,ieqfdep))))
+              '())
+
         ;; the range family stays single-column: on a composite index the
-        ;; engine's *_dep cursors hand the dependent levels to the caller
-        ,@(IF (= nlev 1)
-              `((func ,ineq ((Memory * m) (int64_t k) (void * user)
-                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
-                  (let ((,ctxname cc))
-                    (set ($ cc m) m)
-                    (set ($ cc user) user)
-                    (set ($ cc cb) cb)
-                    (bt_cursor_not_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-                (func ,ilt ((Memory * m) (int64_t k) (void * user)
-                            (func cb ((void * u) (,table * r)) (out bool))) (out void)
-                  (let ((,ctxname cc))
-                    (set ($ cc m) m)
-                    (set ($ cc user) user)
-                    (set ($ cc cb) cb)
-                    (bt_cursor_less_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-                (func ,ilte ((Memory * m) (int64_t k) (void * user)
-                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
-                  (let ((,ctxname cc))
-                    (set ($ cc m) m)
-                    (set ($ cc user) user)
-                    (set ($ cc cb) cb)
-                    (bt_cursor_less_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-                (func ,igt ((Memory * m) (int64_t k) (void * user)
-                            (func cb ((void * u) (,table * r)) (out bool))) (out void)
-                  (let ((,ctxname cc))
-                    (set ($ cc m) m)
-                    (set ($ cc user) user)
-                    (set ($ cc cb) cb)
-                    (bt_cursor_greater_than (aof ,idxname) k (cast (void *) (aof cc)) ,shim)))
-                (func ,igte ((Memory * m) (int64_t k) (void * user)
-                             (func cb ((void * u) (,table * r)) (out bool))) (out void)
-                  (let ((,ctxname cc))
-                    (set ($ cc m) m)
-                    (set ($ cc user) user)
-                    (set ($ cc cb) cb)
-                    (bt_cursor_greater_than_equal (aof ,idxname) k (cast (void *) (aof cc)) ,shim))))
+        ;; engine's *_dep cursors hand the dependent levels to the caller.
+        ;; And it exists only over an ORDERED kind -- a hashed key's tree
+        ;; is in hash order, and a range over it would answer garbage, so
+        ;; a TEXT or VECTOR index has equality and nothing else.
+        ,@(IF ordered
+              (LET ((kt (FUNCALL ptype (FIRST kinds)))
+                    (kf (FUNCALL pfold (FIRST kinds) 'k)))
+                `((func ,ineq ((Memory * m) (,@kt k) (void * user)
+                               (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                    (let ((,ctxname cc))
+                      (set ($ cc m) m)
+                      (set ($ cc user) user)
+                      (set ($ cc cb) cb)
+                      (bt_cursor_not_equal (aof ,idxname) ,kf (cast (void *) (aof cc)) ,shim)))
+                  (func ,ilt ((Memory * m) (,@kt k) (void * user)
+                              (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                    (let ((,ctxname cc))
+                      (set ($ cc m) m)
+                      (set ($ cc user) user)
+                      (set ($ cc cb) cb)
+                      (bt_cursor_less_than (aof ,idxname) ,kf (cast (void *) (aof cc)) ,shim)))
+                  (func ,ilte ((Memory * m) (,@kt k) (void * user)
+                               (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                    (let ((,ctxname cc))
+                      (set ($ cc m) m)
+                      (set ($ cc user) user)
+                      (set ($ cc cb) cb)
+                      (bt_cursor_less_than_equal (aof ,idxname) ,kf (cast (void *) (aof cc)) ,shim)))
+                  (func ,igt ((Memory * m) (,@kt k) (void * user)
+                              (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                    (let ((,ctxname cc))
+                      (set ($ cc m) m)
+                      (set ($ cc user) user)
+                      (set ($ cc cb) cb)
+                      (bt_cursor_greater_than (aof ,idxname) ,kf (cast (void *) (aof cc)) ,shim)))
+                  (func ,igte ((Memory * m) (,@kt k) (void * user)
+                               (func cb ((void * u) (,table * r)) (out bool))) (out void)
+                    (let ((,ctxname cc))
+                      (set ($ cc m) m)
+                      (set ($ cc user) user)
+                      (set ($ cc cb) cb)
+                      (bt_cursor_greater_than_equal (aof ,idxname) ,kf (cast (void *) (aof cc)) ,shim)))))
               '())
 
         ;; true key deletion, single-level only -- the composite
         ;; semantics upstream are unfinished and the engine refuses them
         ,@(IF (= nlev 1)
               `((func ,(INTERN (CONCATENATE 'STRING iname "_unmap_key"))
-                      ((Memory * m) (int64_t k)) (out void)
+                      ((Memory * m) (,@(FUNCALL ptype (FIRST kinds)) k)) (out void)
                   (cast void m)
-                  (bt_unmap_key (aof ,idxname) k)))
+                  (bt_unmap_key (aof ,idxname) ,(FUNCALL pfold (FIRST kinds) 'k))))
               '())
 
         (func ,itrunc ((Memory * m)) (out size_t)

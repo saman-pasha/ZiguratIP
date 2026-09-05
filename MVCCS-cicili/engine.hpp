@@ -123,12 +123,14 @@ int64_t row_latest (Memory * m, Pointer * p);
 // its fields the way the defindex expansion's attach does -- intern_key
 // on the 20-byte index key, the table's key, catalogue id, branching --
 // and calls bt_select_record once per session to find or create its
-// catalogue record. Its table's map/unmap virtuals then call bt_map and
-// bt_unmap; the cursors judge visibility themselves and need no guard
-// from the caller.
+// catalogue record -- it answers 1 when it CREATED one, meaning the
+// store met this index for the first time and the table's existing
+// rows are not in the tree. Its table's map/unmap virtuals then call
+// bt_map and bt_unmap; the cursors judge visibility themselves and need
+// no guard from the caller.
 Pointer pointer_null ();
 const uint8_t * intern_key (const uint8_t * key);
-void bt_select_record (BTreeIndex * idx);
+int  bt_select_record (BTreeIndex * idx);
 void bt_map (BTreeIndex * idx, int64_t k, int64_t value);
 void bt_unmap (BTreeIndex * idx, int64_t k, int64_t value);
 void bt_map_multi (BTreeIndex * idx, int64_t * ks, int64_t value);

@@ -5,7 +5,7 @@
 ```ebnf
 TRY BEGIN
     [parsi_clause]*
-END CATCH Exception AS variable BEGIN
+END CATCH variable AS Exception BEGIN
     [parsi_clause]*
 END
 
@@ -22,7 +22,7 @@ See also: [Parsi Clauses](parsi.md)
 ```parsi
 TRY BEGIN
     INSERT INTO human_resources::employees VALUES (1, 'pitarugi');
-END CATCH Exception AS ex BEGIN
+END CATCH ex AS Exception BEGIN
     IF ex.code() == 1002 BEGIN
         INSERT INTO log_table VALUES (Timestamp::now(), ex.message());
     END ELSE BEGIN

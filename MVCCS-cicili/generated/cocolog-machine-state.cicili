@@ -5,7 +5,10 @@
 ;;;; memory_open.
 ;;;;
 ;;;; Columns, with their Parsi types (Cicili MVCCS columns are int64,
-;;;; STRING/TEXT ride as text, Vector<Double> as a VECTOR of doubles):
+;;;; STRING/TEXT ride as TEXT, FLOAT/DOUBLE/REAL as REAL, Vector<Double>
+;;;; as a VECTOR of doubles). Every index is a defindex: an INT or REAL
+;;;; key keeps its order, a TEXT or VECTOR key is a hash -- equality
+;;;; only, the row re-checked by the consumer:
 ;;;;   ID LONG
 ;;;;   MACHINE_ID LONG
 ;;;;   SEQ INT

@@ -20,10 +20,16 @@
 // static trampoline -- the engine's callbacks are C-shaped on purpose,
 // and the adapter is where the two calling conventions meet.
 //
-// STRING INDEX KEYS ride as engine_text_key's 64-bit fold -- see the
-// note beside it in engine.cicili: collisions cost a wasted row visit,
-// never a wrong answer, because every generated lookup re-applies its
-// full WHERE predicate to each row the index hands back.
+// EVERY PARSI TYPE IS AN INDEX KEY, through the engine_key64 family
+// below: the integral family as itself, Float/Double/Real through the
+// engine's order-preserving fold (so a range over one is a real
+// range), String/Text through engine_text_key's 64-bit hash and a
+// Vector through engine_words_key over its elements' folds -- see the
+// note beside them in engine.cicili. A hash can collide, and that
+// costs a wasted row visit, never a wrong answer, because every
+// generated lookup re-applies its full WHERE predicate to each row the
+// index hands back; and the WHERE compiler takes only EQUALITY to a
+// hashed key, since its tree is in hash order.
 
 #ifndef MVCCS_CICILI_ENGINE_COMPAT_HPP
 #define MVCCS_CICILI_ENGINE_COMPAT_HPP
@@ -59,7 +65,10 @@
 #include <iostream>
 #include <utility>
 
-int64_t engine_text_key (const char * s, size_t n);
+// the engine's key rules, exported -- see engine.cicili beside them
+int64_t engine_text_key  (const char * s, size_t n);
+int64_t engine_real_key  (double d);
+int64_t engine_words_key (const int64_t * w, size_t n);
 
 // THE PARSI KEYWORD MACROS, verbatim from the old globals.hpp: the
 // expression compiler emits these spellings and generated code cannot
@@ -133,10 +142,34 @@ namespace Zigurat {
 }
 
 // ---- a value becomes an int64 index key ------------------------------
-// The whole integral family folds losslessly; floating keys are NOT
-// offered on purpose -- a Double folded to int64 would order wrongly,
-// and a schema that wants one should hear it from the compiler here.
-inline int64_t engine_key64 (int64_t v)                 { return v; }
+// The whole integral family folds losslessly (ULong above 2^63 wraps
+// negative: equality holds, order does not, and it always was so).
+// Floating keys go through the engine's order-preserving fold, so
+// they range correctly; a Float widens and a Real narrows to double
+// first.
+//
+// THE BUILTIN TYPES EACH GET THEIR OWN OVERLOAD, because a Parsi
+// literal reaches this family as the bare C++ value the expression
+// compiler wrote -- `WHERE amount < 0.0' arrives as a double, `id == 5'
+// as an int -- and with one int64_t overload and one double overload
+// an int would be ambiguous between them (both are conversions of
+// equal rank), while with an int64_t overload alone a double would
+// silently pick it and truncate the key. Exact matches leave no such
+// choice: every integer literal type folds as itself, every floating
+// one through the order-preserving fold; char, short and bool reach
+// `int' by promotion, which beats every conversion.
+inline int64_t engine_key64 (int v)                     { return (int64_t)v; }
+inline int64_t engine_key64 (long v)                    { return (int64_t)v; }
+inline int64_t engine_key64 (long long v)               { return (int64_t)v; }
+inline int64_t engine_key64 (unsigned v)                { return (int64_t)v; }
+inline int64_t engine_key64 (unsigned long v)           { return (int64_t)v; }
+inline int64_t engine_key64 (unsigned long long v)      { return (int64_t)v; }
+inline int64_t engine_key64 (float v)                   { return engine_real_key((double)v); }
+inline int64_t engine_key64 (double v)                  { return engine_real_key(v); }
+inline int64_t engine_key64 (long double v)             { return engine_real_key((double)v); }
+inline int64_t engine_key64 (const Zigurat::Float& v)   { return engine_real_key((double)v.value()); }
+inline int64_t engine_key64 (const Zigurat::Double& v)  { return engine_real_key(v.value()); }
+inline int64_t engine_key64 (const Zigurat::Real& v)    { return engine_real_key((double)v.value()); }
 inline int64_t engine_key64 (const Zigurat::Long& v)    { return v.value(); }
 inline int64_t engine_key64 (const Zigurat::Int& v)     { return (int64_t)v.value(); }
 inline int64_t engine_key64 (const Zigurat::Bool& v)    { return (int64_t)(v.value() ? 1 : 0); }
@@ -168,6 +201,17 @@ inline int64_t engine_key64 (const char* s)             { return engine_text_key
 inline int64_t engine_key64 (const std::string& s)      { return engine_text_key(s.data(), s.size()); }
 inline int64_t engine_key64 (const Zigurat::String& s)  { return engine_key64(s.value()); }
 inline int64_t engine_key64 (const Zigurat::Text& s)    { return engine_key64(s.value()); }
+// A VECTOR is a key by its whole content: each element folded by its
+// own rule above, the words hashed together -- for a Vector<Double>
+// the same number the engine's dvec_key64 derives for the column.
+template <typename T>
+inline int64_t engine_key64 (const Zigurat::Vector<T>& v) {
+  const std::vector<T>& elements = v.value();
+  std::vector<int64_t> words;
+  words.reserve(elements.size());
+  for (size_t i = 0; i < elements.size(); i++) words.push_back(engine_key64(elements[i]));
+  return engine_words_key(words.data(), words.size());
+}
 
 // ---- capturing lambdas over C-shaped callbacks -----------------------
 template <typename T, typename F>

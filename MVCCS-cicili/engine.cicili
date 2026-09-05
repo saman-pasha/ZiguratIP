@@ -149,25 +149,33 @@
   (func engine_retire_transaction ((size_t transaction_id)) (out void)
     (transaction_retire transaction_id))
 
-  ;; A TEXT COLUMN AS AN INT64 INDEX KEY. The Cicili B-tree keys are
-  ;; int64 only; a String-keyed Parsi index rides as this fold of the
-  ;; text -- FNV-1a 64, masked positive. TWO STRINGS CAN COLLIDE, and
-  ;; the trade is taken openly, exactly as the leader draw's
-  ;; grindability was: every generated lookup re-applies its full WHERE
-  ;; predicate to each row the index hands back, so a collision costs a
-  ;; wasted row visit and never a wrong answer. The one place the trade
-  ;; shows is a UNIQUE string key, where a collision would falsely
-  ;; refuse a distinct value -- at 2^63 that is a lottery nobody wins,
-  ;; and it refuses loudly rather than corrupting anything.
+  ;; A COLUMN VALUE AS AN INT64 INDEX KEY. The Cicili B-tree keys are
+  ;; int64 only, and the engine's key rules -- beside text_key64 in
+  ;; mvccs-lib.cicili -- fold every column kind to one. These three
+  ;; export them, so the Parsi compiler's generated C++ derives the same
+  ;; key from the same value that a defindex expansion does:
+  ;;
+  ;;   text   FNV-1a 64 of the bytes, masked positive. TWO STRINGS CAN
+  ;;          COLLIDE, and the trade is taken openly, exactly as the
+  ;;          leader draw's grindability was: every generated lookup
+  ;;          re-applies its full WHERE predicate to each row the index
+  ;;          hands back, so a collision costs a wasted row visit and
+  ;;          never a wrong answer. The one place the trade shows is a
+  ;;          UNIQUE string key, where a collision would falsely refuse
+  ;;          a distinct value -- at 2^63 that is a lottery nobody wins,
+  ;;          and it refuses loudly rather than corrupting anything.
+  ;;   real   the IEEE double folded ORDER-PRESERVING, so a range over a
+  ;;          Double key is a real range.
+  ;;   words  FNV-1a 64 over int64 words, masked positive -- what a
+  ;;          Vector key is, each element folded first by its own rule.
   (func engine_text_key ((const char * s) (size_t n)) (out int64_t)
-    ;; the FNV-1a 64 offset basis, composed from halves so no literal
-    ;; overflows a signed reader anywhere between Lisp and C++
-    (let ((uint64_t h . #'(+ (* (cast uint64_t 3421674724) (cast uint64_t 4294967296))
-                             (cast uint64_t 2216829733))))
-      (for ((size_t i . 0)) (< i n) ((++ i))
-        (set h (xor h (cast uint64_t (cast uint8_t (nth i s)))))
-        (set h (* h (cast uint64_t 1099511628211))))
-      (return (cast int64_t (bitand h (cast uint64_t 9223372036854775807))))))
+    (return (text_key64 s n)))
+
+  (func engine_real_key ((double d)) (out int64_t)
+    (return (real_key64 d)))
+
+  (func engine_words_key ((const int64_t * w) (size_t n)) (out int64_t)
+    (return (words_key64 w n)))
 
   ;; The catalogue-id rule generated attachers use: the key's first
   ;; eight bytes folded to a positive int64 -- the same rule the

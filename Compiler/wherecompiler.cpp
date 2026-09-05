@@ -74,16 +74,19 @@ namespace Zigurat
 	    std::list<std::string> types;
 	    this->_catalog.list(*opt_key, "/TYPES/TYPE", types);
 
-	    // A STRING KEY RIDES AS A HASH in the Cicili engine, so its
-	    // tree orders hashes, not text: equality survives (and every
-	    // indexed lookup re-applies its full predicate to each row the
-	    // index hands back, so a collision costs a visit and never a
-	    // wrong answer), but a range over it would answer garbage.
-	    // Anything but equality on a string-keyed level scans instead.
+	    // A STRING OR VECTOR KEY RIDES AS A HASH in the Cicili engine,
+	    // so its tree orders hashes, not values: equality survives (and
+	    // every indexed lookup re-applies its full predicate to each row
+	    // the index hands back, so a collision costs a visit and never
+	    // a wrong answer), but a range over it would answer garbage.
+	    // Anything but equality on a hashed level scans instead. The
+	    // floating family is NOT hashed -- its fold keeps the order --
+	    // so a Double key ranges like a Long one.
 	    const std::string cursor_kind = this->_cursor_name(opr.token.value);
 	    const std::string& lead_type = *types.begin();
 	    const bool string_keyed = (lead_type.find("STRING") != std::string::npos ||
-				       lead_type.find("TEXT") != std::string::npos);
+				       lead_type.find("TEXT") != std::string::npos ||
+				       lead_type.find("VECTOR") != std::string::npos);
 
 	    std::string tab(lvl, '\t');
     	    if (string_keyed && cursor_kind != "cursor_equal") {
@@ -203,12 +206,13 @@ namespace Zigurat
     // When searched column exists in columns order. On the Cicili
     // engine, a NON-innermost level serves full and equal walks only
     // (bt_cursor_dep / bt_cursor_equal_dep); a range there -- and any
-    // non-equality over a hashed string level -- takes the partial-
-    // search walk instead, which descends everything and filters with
-    // the full predicate: slower, never wrong.
+    // non-equality over a hashed string or vector level -- takes the
+    // partial-search walk instead, which descends everything and
+    // filters with the full predicate: slower, never wrong.
     const std::string level_cursor = this->_cursor_name(opr.token.value);
     const bool level_string = ((*types_iter).find("STRING") != std::string::npos ||
-			       (*types_iter).find("TEXT") != std::string::npos);
+			       (*types_iter).find("TEXT") != std::string::npos ||
+			       (*types_iter).find("VECTOR") != std::string::npos);
     const bool level_inner = (std::next(columns_iter) == columns.end());
     const bool level_ok = (level_cursor == "cursor_equal")
       || (level_inner && !level_string && level_cursor != "cursor");

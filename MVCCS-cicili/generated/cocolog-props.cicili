@@ -5,7 +5,10 @@
 ;;;; memory_open.
 ;;;;
 ;;;; Columns, with their Parsi types (Cicili MVCCS columns are int64,
-;;;; STRING/TEXT ride as text, Vector<Double> as a VECTOR of doubles):
+;;;; STRING/TEXT ride as TEXT, FLOAT/DOUBLE/REAL as REAL, Vector<Double>
+;;;; as a VECTOR of doubles). Every index is a defindex: an INT or REAL
+;;;; key keeps its order, a TEXT or VECTOR key is a hash -- equality
+;;;; only, the row re-checked by the consumer:
 ;;;;   ID LONG
 ;;;;   KB STRING
 ;;;;   NAME STRING
@@ -16,6 +19,5 @@
   '($$$
     (deftable COCOLOG::PROPS ID (TEXT KB) (TEXT NAME) ARITY DYNAMIC)
     (defindex IDX_COCOLOG_PROPS_ID COCOLOG::PROPS ID 1 65)
-    ;; string-keyed, no Cicili B-tree:    (defindex IDX_COCOLOG_PROPS_KB COCOLOG::PROPS KB 0 65)
-    ;; string-keyed, no Cicili B-tree:    (defindex IDX_COCOLOG_PROPS_NAME COCOLOG::PROPS NAME 0 65)
+    (defindex IDX_COCOLOG_PROPS_KB_NAME COCOLOG::PROPS (KB NAME) 0 65)
     ))

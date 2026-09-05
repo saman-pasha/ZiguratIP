@@ -88,6 +88,17 @@
   (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
 
   (deftable Memo "smoke::Memo" id (TEXT body))
+  ;; a UNIQUE index over the text itself: the key is the text's hash,
+  ;; the wrappers take a std::string, and only equality exists
+  (defindex IDX_MEMO_BODY Memo body 1 3)
+
+  ;; every column kind is a key: a REAL index keeps the doubles' order,
+  ;; so it ranges; a VECTOR index matches a whole vector
+  (deftable Price "smoke::Price" id (REAL amount))
+  (defindex IDX_PRICE_AMOUNT Price amount 0 3)
+
+  (deftable Emb "smoke::Emb" id (VECTOR v))
+  (defindex IDX_EMB_V Emb v 0 3)
 
   (var int failures . 0)
 
@@ -234,6 +245,13 @@
       (IDX_LOAN_MB_equal m a b (cast (void *) (aof c)) loan_n_cb)
       (return ($ c rows))))
 
+  ;; the composite by its leading column alone: one member's every loan
+  (func loan_first_count ((Memory * m) (int64_t a)) (out int64_t)
+    (let ((NRowsCtx c))
+      (set ($ c rows) 0)
+      (IDX_LOAN_MB_equal_first m a (cast (void *) (aof c)) loan_n_cb)
+      (return ($ c rows))))
+
   (func loan_all_count ((Memory * m)) (out int64_t)
     (let ((NRowsCtx c))
       (set ($ c rows) 0)
@@ -270,6 +288,95 @@
           (if (!= 0 (strcmp (($ (-> r body) c_str)) "parent(tom, bob)."))
               (set (-> c rows) -1000)))
       (return #t)))
+
+  ;; through the TEXT index. A hit is a row whose body IS the text: the
+  ;; re-check every consumer of a hashed key owes, since the tree hands
+  ;; back every row whose hash matches, and two texts can share one.
+  (struct TextHits
+    (member const char * want)
+    (member int64_t hits)
+    (member Memo row))
+
+  (func memo_hit_cb ((void * u) (Memo * r)) (out bool)
+    (let ((TextHits * c . #'(cast (TextHits *) u)))
+      (if (== 0 (strcmp (($ (-> r body) c_str)) (-> c want)))
+          (block
+            (set (-> c hits) (+ (-> c hits) 1))
+            (set (-> c row) (cof r))))
+      (return #t)))
+
+  (func memo_equal_count ((Memory * m) (const char * body)) (out int64_t)
+    (let ((TextHits c))
+      (set ($ c want) body)
+      (set ($ c hits) 0)
+      (IDX_MEMO_BODY_equal m (std::string body) (cast (void *) (aof c)) memo_hit_cb)
+      (return ($ c hits))))
+
+  (func memo_take ((Memory * m) (const char * body) (Memo * out_row)) (out int64_t)
+    (let ((TextHits c))
+      (set ($ c want) body)
+      (set ($ c hits) 0)
+      (IDX_MEMO_BODY_equal m (std::string body) (cast (void *) (aof c)) memo_hit_cb)
+      (if (> ($ c hits) 0) (set (cof out_row) ($ c row)))
+      (return ($ c hits))))
+
+  ;; through the REAL index: counts, the range wrappers doing the work
+  (struct RealCount
+    (member int64_t rows))
+
+  (func price_cb ((void * u) (Price * r)) (out bool)
+    (let ((RealCount * c . #'(cast (RealCount *) u)))
+      (cast void r)
+      (set (-> c rows) (+ (-> c rows) 1))
+      (return #t)))
+
+  (func price_put ((Memory * m) (int64_t id) (double amount)) (out void)
+    (let ((Price p))
+      (set ($ p id) id)
+      (set ($ p amount) amount)
+      (Price_insert m (aof p))))
+
+  (func price_equal_count ((Memory * m) (double k)) (out int64_t)
+    (let ((RealCount c))
+      (set ($ c rows) 0)
+      (IDX_PRICE_AMOUNT_equal m k (cast (void *) (aof c)) price_cb)
+      (return ($ c rows))))
+
+  (func price_lt_count ((Memory * m) (double k)) (out int64_t)
+    (let ((RealCount c))
+      (set ($ c rows) 0)
+      (IDX_PRICE_AMOUNT_less_than m k (cast (void *) (aof c)) price_cb)
+      (return ($ c rows))))
+
+  (func price_gte_count ((Memory * m) (double k)) (out int64_t)
+    (let ((RealCount c))
+      (set ($ c rows) 0)
+      (IDX_PRICE_AMOUNT_greater_than_equal m k (cast (void *) (aof c)) price_cb)
+      (return ($ c rows))))
+
+  (func price_ne_count ((Memory * m) (double k)) (out int64_t)
+    (let ((RealCount c))
+      (set ($ c rows) 0)
+      (IDX_PRICE_AMOUNT_not_equal m k (cast (void *) (aof c)) price_cb)
+      (return ($ c rows))))
+
+  ;; through the VECTOR index, the whole vector re-checked on each row
+  (struct VecHits
+    (member const dvec_t * want)
+    (member int64_t hits))
+
+  (func emb_cb ((void * u) (Emb * r)) (out bool)
+    (let ((VecHits * c . #'(cast (VecHits *) u)))
+      (if (== (-> r v) (cof (-> c want)))
+          (set (-> c hits) (+ (-> c hits) 1)))
+      (return #t)))
+
+  (func emb_equal_count ((Memory * m) (const dvec_t & k)) (out int64_t)
+    (let ((VecHits c))
+      (set ($ c want) (aof k))
+      (set ($ c hits) 0)
+      (IDX_EMB_V_equal m k (cast (void *) (aof c)) emb_cb)
+      (return ($ c hits))))
 
   ;; a session that updates one row and commits, for the SNAPSHOT test
   (func update_worker ((void * arg)) (out void *)
@@ -344,11 +451,17 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
 
-        ;; the indexes: attached once, before anything writes
-        (IDX_BOOK_VALUE_attach (aof mem))
+        ;; the indexes: attached once, before anything writes. A fresh
+        ;; store meets every one of them for the first time, and attach
+        ;; says so -- with no rows yet, there is nothing to rebuild
+        (check "a fresh store meets the index for the first time"
+               (IDX_BOOK_VALUE_attach (aof mem)) 1)
         (IDX_TAG_K_attach (aof mem))
         (IDX_LOAN_MB_attach (aof mem))
         (IDX_PAIR_AB_attach (aof mem))
+        (IDX_MEMO_BODY_attach (aof mem))
+        (IDX_PRICE_AMOUNT_attach (aof mem))
+        (IDX_EMB_V_attach (aof mem))
 
         ;; ---- insert three, commit, read back --------------------------
         (let ((int64_t i . 1))
@@ -551,6 +664,8 @@
 
         (check "composite equal finds its cell" (loan_equal_count (aof mem) 3 4) 1)
         (check "composite cursor sees the grid" (loan_all_count (aof mem)) 30)
+        (check "composite equal_first finds a member's row of six" (loan_first_count (aof mem) 3) 6)
+        (check "and nothing for a member never seen" (loan_first_count (aof mem) 9) 0)
 
         ;; a second row in one cell: the non-unique tuple buckets
         (let ((Loan l))
@@ -744,6 +859,86 @@
           (check "text rows come back" ($ sc rows) 2)
           (check "byte for byte" ($ sc bytes) 17))
 
+        ;; ---- every column kind is an index key ------------------------
+        ;; the TEXT index: equality through the hash, the row re-checked
+        (check "a TEXT key finds its row" (memo_equal_count (aof mem) "parent(tom, bob).") 1)
+        (check "the empty text is a key too" (memo_equal_count (aof mem) "") 1)
+        (check "a text never stored is not found" (memo_equal_count (aof mem) "parent(bob, ann).") 0)
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((Memo dup))
+                   (set ($ dup id) 3)
+                   (set ($ dup body) (std::string "parent(tom, bob)."))
+                   (Memo_insert (aof mem) (aof dup))))
+               (catch ((const IndexException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "a UNIQUE text key refuses the same text again" refused 1))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "and the refusal left one behind" (memo_equal_count (aof mem) "parent(tom, bob).") 1)
+        ;; an update re-keys: the old text leaves the tree, the new one enters
+        (let ((Memo old_row) (Memo new_row))
+          (check "the row comes back through its text key"
+                 (memo_take (aof mem) "parent(tom, bob)." (aof old_row)) 1)
+          (set new_row old_row)
+          (set ($ new_row body) (std::string "parent(tom, liz)."))
+          (Memo_update (aof mem) (aof old_row) (aof new_row)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "an update unmaps the old text" (memo_equal_count (aof mem) "parent(tom, bob).") 0)
+        (check "and maps the new one" (memo_equal_count (aof mem) "parent(tom, liz).") 1)
+        (let ((Memo gone))
+          (if (> (memo_take (aof mem) "parent(tom, liz)." (aof gone)) 0)
+              (Memo_delete (aof mem) (aof gone))))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "a delete unmaps the text key" (memo_equal_count (aof mem) "parent(tom, liz).") 0)
+        (check "the other text is untouched" (memo_equal_count (aof mem) "") 1)
+
+        ;; the REAL index: the fold keeps the doubles' order, so the
+        ;; range family ranges -- and the two zeros are one key
+        (price_put (aof mem) 1 -2.5)
+        (price_put (aof mem) 2 -1.0)
+        (price_put (aof mem) 3 -0.0)
+        (price_put (aof mem) 4 0.0)
+        (price_put (aof mem) 5 1.5)
+        (price_put (aof mem) 6 3.25)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "a REAL key finds its row" (price_equal_count (aof mem) 1.5) 1)
+        (check "a negative REAL key finds its row" (price_equal_count (aof mem) -1.0) 1)
+        (check "-0.0 and 0.0 are one key" (price_equal_count (aof mem) 0.0) 2)
+        (check "less_than zero: the two negatives" (price_lt_count (aof mem) 0.0) 2)
+        (check "less_than -1.0: the one below it" (price_lt_count (aof mem) -1.0) 1)
+        (check "greater_than_equal 1.5: the top two" (price_gte_count (aof mem) 1.5) 2)
+        (check "greater_than_equal the minimum: all six" (price_gte_count (aof mem) -2.5) 6)
+        (check "not_equal 1.5: the other five" (price_ne_count (aof mem) 1.5) 5)
+
+        ;; the VECTOR index: the whole vector is the key, in order
+        (let ((Emb e1) (Emb e2))
+          (set ($ e1 id) 1)
+          (($ ($ e1 v) push_back) 1.0)
+          (($ ($ e1 v) push_back) 2.0)
+          (Emb_insert (aof mem) (aof e1))
+          (set ($ e2 id) 2)
+          (($ ($ e2 v) push_back) 2.0)
+          (($ ($ e2 v) push_back) 1.0)
+          (Emb_insert (aof mem) (aof e2)))
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (let ((dvec_t q))
+          (($ q push_back) 1.0)
+          (($ q push_back) 2.0)
+          (check "a VECTOR key matches the whole vector" (emb_equal_count (aof mem) q) 1))
+        (let ((dvec_t q))
+          (($ q push_back) 2.0)
+          (($ q push_back) 1.0)
+          (check "in its own order" (emb_equal_count (aof mem) q) 1))
+        (let ((dvec_t q))
+          (($ q push_back) 1.0)
+          (check "and not by a prefix" (emb_equal_count (aof mem) q) 0))
+
         ;; ---- a dead transaction's lock breaks on contact --------------
         ;; abandon_worker leaves row 300 EXCLUSIVE-locked by a transaction
         ;; nothing will ever finish. Before the breaker this update burned
@@ -879,14 +1074,24 @@
           (check "the stamps survive a restart" hops 8))
 
         ;; attach finds the catalogue records written last time -- the
-        ;; roots come back, nothing re-inserts
-        (IDX_BOOK_VALUE_attach (aof mem))
+        ;; roots come back, nothing re-inserts, and attach says so
+        (check "a reopened store knows the index" (IDX_BOOK_VALUE_attach (aof mem)) 0)
         (IDX_TAG_K_attach (aof mem))
         (IDX_LOAN_MB_attach (aof mem))
         (IDX_PAIR_AB_attach (aof mem))
+        (IDX_MEMO_BODY_attach (aof mem))
+        (IDX_PRICE_AMOUNT_attach (aof mem))
+        (IDX_EMB_V_attach (aof mem))
         (check "the index survives it too" (book_equal_count (aof mem) 500) 1)
+        (check "the TEXT index survives it too" (memo_equal_count (aof mem) "") 1)
+        (check "the REAL index survives it too, in order" (price_lt_count (aof mem) 0.0) 2)
+        (let ((dvec_t q))
+          (($ q push_back) 2.0)
+          (($ q push_back) 1.0)
+          (check "the VECTOR index survives it too" (emb_equal_count (aof mem) q) 1))
         (check "the composite survives it too" (loan_equal_count (aof mem) 3 4) 1)
         (check "the whole grid survives it too" (loan_all_count (aof mem)) 30)
+        (check "and its leading level still answers alone" (loan_first_count (aof mem) 3) 6)
         (let ((TagOrdCtx oc))
           (set ($ oc rows) 0) (set ($ oc last) 0) (set ($ oc ascending) 1)
           (IDX_TAG_K_cursor (aof mem) (cast (void *) (aof oc)) tag_ord_cb)

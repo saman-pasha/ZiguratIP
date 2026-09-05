@@ -125,17 +125,21 @@ namespace Zigurat
     std::string full_name = this->_full_name(ast.args[0]);
     std::vector<index_desc_t> indexes;
 
+    // A KEY'S TYPE IS THE WHOLE TYPE NAME, not the token that starts it:
+    // `Vector<Double>' is one key type, and the token alone (`Vector') would
+    // instantiate BTreeIndex<T, Vector> -- which is not a type. For a
+    // plain type the name IS the token, so nothing else changes.
     for (const Expression& expr : ast.args) {
       if (expr.token.value == "COLUMN") {
 	if (expr.args.size() > 2) {
 	  if (expr.args[2].token.value == "PRIMARY") {
-	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{expr.args[1].token.value}, 
+	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{this->_type_name(expr.args[1])},
 				 expr.args[2].token.value, "IDX_" + full_name + "_" + expr.args[0].token.value, true);
 	  } else if (expr.args[2].token.value == "UNIQUE") {
-	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{expr.args[1].token.value}, 
+	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{this->_type_name(expr.args[1])},
 				 expr.args[2].token.value, "IDX_" + full_name + "_" + expr.args[0].token.value, true);
 	  } else if (expr.args[2].token.value == "INDEX") {
-	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{expr.args[1].token.value}, 
+	    indexes.emplace_back(std::vector<std::string>{expr.args[0].token.value}, std::vector<std::string>{this->_type_name(expr.args[1])},
 				 expr.args[2].token.value, "IDX_" + full_name + "_" + expr.args[0].token.value, false);
 	  }
 	}
@@ -148,7 +152,7 @@ namespace Zigurat
 	  bool found = false;
 	  for (const Expression& expr : ast.args) {
 	    if (expr.token.value == "COLUMN" && expr.args[0].token.value == column) {
-	      types.push_back(expr.args[1].token.value);
+	      types.push_back(this->_type_name(expr.args[1]));
 	      found = true;
 	    }
 	  }
@@ -666,7 +670,10 @@ namespace Zigurat
       cicili << ";;;; memory_open." << std::endl;
       cicili << ";;;;" << std::endl;
       cicili << ";;;; Columns, with their Parsi types (Cicili MVCCS columns are int64," << std::endl;
-      cicili << ";;;; STRING/TEXT ride as text, Vector<Double> as a VECTOR of doubles):" << std::endl;
+      cicili << ";;;; STRING/TEXT ride as TEXT, FLOAT/DOUBLE/REAL as REAL, Vector<Double>" << std::endl;
+      cicili << ";;;; as a VECTOR of doubles). Every index is a defindex: an INT or REAL" << std::endl;
+      cicili << ";;;; key keeps its order, a TEXT or VECTOR key is a hash -- equality" << std::endl;
+      cicili << ";;;; only, the row re-checked by the consumer:" << std::endl;
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "COLUMN")
 	  cicili << ";;;;   " << expr.args[0].token.value << " " << this->_type_name(expr.args[1]) << std::endl;
@@ -683,11 +690,13 @@ namespace Zigurat
       for (const Expression& expr : ast.args) {
 	if (expr.token.value == "COLUMN") {
 	  const std::string col_type = this->_type_name(expr.args[1]);
-	  // STRING/TEXT columns ride as std::string members, Vector columns
-	  // as the engine's dvec_t (count + doubles); everything else is the
-	  // engine's int64 column
+	  // STRING/TEXT columns ride as std::string members, the floating
+	  // family as a double, Vector columns as the engine's dvec_t (count
+	  // + doubles); everything else is the engine's int64 column
 	  if (col_type == "STRING" || col_type == "TEXT")
 	    cicili << " (TEXT " << expr.args[0].token.value << ")";
+	  else if (col_type == "FLOAT" || col_type == "DOUBLE" || col_type == "REAL")
+	    cicili << " (REAL " << expr.args[0].token.value << ")";
 	  else if (col_type.rfind("VECTOR", 0) == 0)
 	    cicili << " (VECTOR " << expr.args[0].token.value << ")";
 	  else
@@ -697,15 +706,11 @@ namespace Zigurat
       cicili << ")" << std::endl;
 
       // branching 65 is the Long-key factor the C++ engine derives from the
-      // key type's width; the Cicili engine takes it as a parameter
+      // key type's width; the Cicili engine takes it as a parameter. Every
+      // index ships as a real defindex: the engine folds each key by its
+      // column's kind (a STRING/TEXT or Vector key is its hash, equality
+      // only) exactly as the C++ pair's engine_key64 does
       for (const index_desc_t& index : indexes) {
-	// the Cicili engine's B-tree keys are int64 only: an index over a
-	// STRING/TEXT column ships commented out, as a record of the C++
-	// pair's shape -- scans stand in for it
-	bool string_keyed = false;
-	for (const std::string& key_type : std::get<1>(index))
-	  if (key_type == "STRING" || key_type == "TEXT") string_keyed = true;
-	if (string_keyed) cicili << "    ;; string-keyed, no Cicili B-tree:";
 	cicili << "    (defindex " << std::get<3>(index) << " " << type_name << " ";
 	const std::vector<std::string>& columns = std::get<0>(index);
 	if (columns.size() == 1) {

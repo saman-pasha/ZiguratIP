@@ -6,9 +6,13 @@
 ;;;; objects against the Cicili MVCCS engine through the def... macros.
 ;;;;
 ;;;; STRING/TEXT Parsi columns ride as (TEXT col) -- std::string members
-;;;; packed as 2-byte length + bytes. Their indexes ship commented out
-;;;; (the Cicili B-tree keys int64 only), so name lookups here go through
-;;;; a table scan, which is also what the embedded cocolog backend does.
+;;;; packed as 2-byte length + bytes -- and their indexes are real: a
+;;;; String-keyed Parsi index is a defindex over the TEXT column, keyed
+;;;; by the text's hash, equality only, with the row re-checked by the
+;;;; consumer. The name lookups here go both ways, scan and index, and
+;;;; the UNIQUE name is enforced. An index a store meets for the first
+;;;; time over a table with rows (the KB index, attached only at the
+;;;; reopen) is rebuilt from them, and the rebuild is durable.
 ;;;; Vector<Double> columns ride as (VECTOR col) -- dvec_t members packed
 ;;;; as an int64 count and the doubles, eight bytes each, exactly as they
 ;;;; are: the tensors twin here proves a vector row goes in, comes back
@@ -97,8 +101,9 @@
       (set (-> c id_sum) (+ (-> c id_sum) (-> r ID)))
       (return #t)))
 
-  ;; name lookup by scan: what stands in for the commented-out
-  ;; string-keyed IDX_COCOLOG_MACHINES_NAME
+  ;; name lookup by scan, and the same through the generated TEXT index
+  ;; -- the callback re-checks the name either way, which is what a
+  ;; consumer of a hashed key owes
   (struct MNameCtx
     (member const char * target)
     (member int64_t hits)
@@ -127,6 +132,28 @@
       (set ($ c id) 0)
       (COCOLOG_MACHINES_cursor m (cast (void *) (aof c)) machine_name_cb)
       (return ($ c id))))
+
+  (func machines_by_name_idx ((Memory * m) (const char * name)) (out int64_t)
+    (let ((MNameCtx c))
+      (set ($ c target) name)
+      (set ($ c hits) 0)
+      (set ($ c id) 0)
+      (IDX_COCOLOG_MACHINES_NAME_equal m (std::string name) (cast (void *) (aof c)) machine_name_cb)
+      (return ($ c hits))))
+
+  (func machine_kb_cb ((void * u) (COCOLOG_MACHINES * r)) (out bool)
+    (let ((MNameCtx * c . #'(cast (MNameCtx *) u)))
+      (if (== 0 (strcmp (($ (-> r KB) c_str)) (-> c target)))
+          (set (-> c hits) (+ (-> c hits) 1)))
+      (return #t)))
+
+  (func machines_by_kb_idx ((Memory * m) (const char * kb)) (out int64_t)
+    (let ((MNameCtx c))
+      (set ($ c target) kb)
+      (set ($ c hits) 0)
+      (set ($ c id) 0)
+      (IDX_COCOLOG_MACHINES_KB_equal m (std::string kb) (cast (void *) (aof c)) machine_kb_cb)
+      (return ($ c hits))))
 
   (func id_equal_count ((Memory * m) (int64_t id)) (out int64_t)
     (let ((MCountCtx c))
@@ -175,9 +202,11 @@
                      (cast (binarystream *) (aof data)) 8192)
 
         ;; the generated objects, attached exactly as their comments say:
-        ;; the ID index and the sequence (the string-keyed indexes ship
-        ;; commented out, so there is nothing else to attach)
+        ;; the ID index, the UNIQUE name index and the sequence. The KB
+        ;; index is left for the reopen, on purpose: it is then an index
+        ;; the store meets for the first time over a table with rows.
         (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
+        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
         (IDX_COCOLOG_TENSORS_ID_attach (aof mem))
         (COCOLOG_TENSORS_SEQ_attach (aof mem))
@@ -213,6 +242,29 @@
         (check "the scan pairs name with its id" (machine_id_by_name (aof mem) "m-2") 3)
         (check "the generated ID index finds one" (id_equal_count (aof mem) 2) 1)
         (check "and misses what was never drawn" (id_equal_count (aof mem) 99) 0)
+        (check "the generated TEXT index finds one" (machines_by_name_idx (aof mem) "m-1") 1)
+        (check "and misses what was never there" (machines_by_name_idx (aof mem) "m-9") 0)
+
+        ;; the generated UNIQUE name, enforced through the hash: a twin
+        ;; of m-1 under a fresh id is refused, and the refusal leaves the
+        ;; one behind
+        (let ((int64_t refused . 0))
+          (try (block
+                 (let ((COCOLOG_MACHINES twin))
+                   (set ($ twin ID) 77)
+                   (set ($ twin NAME) (std::string "m-1"))
+                   (set ($ twin KB) (std::string "user"))
+                   (set ($ twin STATUS) (std::string "idle"))
+                   (set ($ twin CHUNKS) 0)
+                   (set ($ twin NOTE) (std::string ""))
+                   (COCOLOG_MACHINES_insert (aof mem) (aof twin))))
+               (catch ((const IndexException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "the generated UNIQUE name refuses a twin" refused 1))
+        (rollback_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (check "and the refusal left the one behind" (machines_by_name_idx (aof mem) "m-1") 1)
 
         ;; ID is the schema's PRIMARY key; the generated index enforces it
         (let ((int64_t refused . 0))
@@ -261,13 +313,46 @@
         (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
                      (cast (binarystream *) (aof data)) 8192)
         (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
+        (check "a reopened store knows its TEXT index"
+               (IDX_COCOLOG_MACHINES_NAME_attach (aof mem)) 0)
         (COCOLOG_MACHINES_SEQ_attach (aof mem))
         (IDX_COCOLOG_TENSORS_ID_attach (aof mem))
         (COCOLOG_TENSORS_SEQ_attach (aof mem))
         (check "TEXT columns survive a restart" (machines_by_name (aof mem) "m-1") 1)
         (check "the generated index survives too" (id_equal_count (aof mem) 3) 1)
+        (check "the generated TEXT index survives too" (machines_by_name_idx (aof mem) "m-2") 1)
         (check "so does the generated sequence" (COCOLOG_MACHINES_SEQ_current) 4)
         (check "a VECTOR column survives a restart bit-equal" (tensor_vec_ok (aof mem)) 1)
+
+        ;; an index the store meets for the first time, over a table that
+        ;; already has rows: attach says so, and until the rebuild the
+        ;; tree is empty
+        (check "a new index over an old table: attach says so"
+               (IDX_COCOLOG_MACHINES_KB_attach (aof mem)) 1)
+        (check "and its tree is empty until rebuilt" (machines_by_kb_idx (aof mem) "user") 0)
+        (IDX_COCOLOG_MACHINES_KB_rebuild (aof mem))
+        (check "the rebuild fills it from the rows" (machines_by_kb_idx (aof mem) "user") 3)
+        (check "and finds nothing for a kb never stored" (machines_by_kb_idx (aof mem) "nope") 0)
+        (commit_transaction (aof mem))
+        (begin_transaction (aof mem))
+        (sync_disk (aof mem))
+        (cast void 0)))
+
+    ;; and a third opening: the rebuilt index is durable, and the store
+    ;; now knows it
+    (letin* ((hexmap (Zigurat::filestream (std::string "/tmp/mvccs-schema-hexmap.bin")
+                                 (bitor std::ios::in std::ios::out)))
+             (data (Zigurat::filestream (std::string "/tmp/mvccs-schema-data.bin")
+                               (bitor std::ios::in std::ios::out))))
+      (let ((Memory mem))
+        (memory_open (aof mem) (cast (binarystream *) (aof hexmap))
+                     (cast (binarystream *) (aof data)) 8192)
+        (IDX_COCOLOG_MACHINES_ID_attach (aof mem))
+        (IDX_COCOLOG_MACHINES_NAME_attach (aof mem))
+        (check "the rebuilt index is known on the next open"
+               (IDX_COCOLOG_MACHINES_KB_attach (aof mem)) 0)
+        (COCOLOG_MACHINES_SEQ_attach (aof mem))
+        (check "and it survived the restart" (machines_by_kb_idx (aof mem) "user") 3)
         (cast void 0)))
 
     (if (== failures 0)

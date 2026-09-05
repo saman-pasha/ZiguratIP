@@ -61,6 +61,21 @@ namespace
 
       connector.commit();
 
+    } else if (verb == "callret") {
+      // `call', and the Long it returned said out loud -- for a script that
+      // compares the number rather than the fact of an answer. Its own verb,
+      // so the scripts that compare `call' against a bare OK keep their line.
+      connector.call(argument);
+
+      Long returned(0);
+      for (ResultType r = connector.result(); r != ResultType::SUCCESSFUL_DONE; r = connector.result()) {
+	if (r == ResultType::CURSOR_OPEN) connector.columns();
+	else if (r == ResultType::RETURN_VALUE) connector.fetch(returned);
+      }
+
+      connector.commit();
+      std::cout << "returned " << returned.value() << std::endl;
+
     } else if (verb == "tensor") {
       // A TENSOR OVER RPC, which is the case Vector's packing exists for and
       // the one that could not work: pack_size answered a size read off the

@@ -197,6 +197,48 @@ branching factor is a parameter (the original derives it from the key
 type's size), which is what lets a test force splits with a tree of
 branching 3.
 
+**Every column kind is an index key.** The tree's key is one int64 —
+`BTKey` packs it in a 56-byte record and every `bt_*` takes it as such —
+so each kind folds to one, by a rule the engine states beside
+`text_key64` and exports through `engine_text_key` / `engine_real_key`
+/ `engine_words_key`, which is how the Parsi compiler's generated C++
+derives the same key from the same value that a `defindex` expansion
+does. An **INT** key is the value. A **REAL** column (`(REAL c)`, a
+double, eight bytes as they are) folds order-preserving — the bit
+pattern as a signed int64 already orders the positives, the negatives
+get their low 63 bits flipped, and `-0.0` is `+0.0` first — so a range
+over a REAL index is a real range. A **TEXT** key is FNV-1a 64 of the
+bytes, masked positive, and a **VECTOR** key is FNV-1a over the REAL
+fold of each element: hashes, in hash order, so those two kinds get
+`_equal` and nothing else, and two values can collide — every consumer
+of a hashed index re-checks the column on each row it is handed, which
+makes a collision a wasted visit and never a wrong answer. A UNIQUE
+hashed key can falsely refuse a distinct value at 2^63 odds, loudly.
+`deftable` leaves the column kinds on the table symbol's plist and
+`defindex` reads them back, which is the one place two macro expansions
+in one image can meet; an index over a column the table does not have,
+or over a table not yet declared, is an error at expansion time. The
+wrappers are typed by kind: `_equal` over a TEXT column takes a
+`const std::string &`, over a REAL a `double`, over a VECTOR a
+`const dvec_t &`, and a composite takes one such parameter per level —
+and a composite also answers its leading column alone through
+`_equal_first` (equality on the first level, every dependent level
+walked whole, which is what the server's WHERE compiler emits for a
+predicate on the first column only; cocolog's embedded store walks a
+`(kb name)` index for one kb that way).
+
+`_attach` answers **1 the first time a store meets the index** — its
+catalogue row was just created, and whatever rows the table already
+holds are not in the tree — and `_rebuild` then fills the tree from
+them (storage dropped, one exclusive table walk, this index alone),
+answering how many rows the tree refused: 0 is a complete index, and
+anything else is a UNIQUE key the table already held twice, counted
+rather than thrown because the walk runs inside a cursor's callback
+window. `schema_test` proves the whole sequence on cocolog's generated
+`machines`: the TEXT name index finds and misses, its UNIQUE refuses a
+twin, the KB index is attached only at the reopen, answers 1, rebuilds
+to three rows, and is known and full on a third open.
+
 **The plumbing went C, deliberately.** Cicili lambdas are lifted and
 cannot capture, so `std::function` callbacks became context structs +
 function pointers; `std::multimap` became intrusive lists (every use was

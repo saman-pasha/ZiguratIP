@@ -1,0 +1,105 @@
+-- Every Parsi type is an index key, proved on the server path: a table whose
+-- keys are a Double, a String and a Vector<Double>, and one procedure that
+-- seeds it and asks each index the question only that index can answer.
+--
+-- A Double key folds order-preserving, so `<' and `>=' over it are real
+-- ranges and the two zeros are one key. A String key is a hash and a UNIQUE
+-- one refuses a twin. A Vector key is a hash over the whole vector: the same
+-- doubles in another order are another key, and a prefix is not a match.
+--
+-- The answer is one Long with each count in its own decimal place, so the
+-- script compares a single number:
+--
+--     1 * (rows below zero)              2
+--    10 * (rows at least 1.5)            2
+--   100 * (rows equal to zero)           2   -- -0.0 and 0.0
+--  1000 * (rows labelled 'b')            1
+--  1e4  * (rows tagged [1, 2])           3   -- rows 1, 3 and 5
+--  1e5  * (rows tagged [2, 1])           3   -- rows 2, 4 and 6: another key
+--  1e6  * (rows tagged [1])              0   -- a prefix is not a key
+--  1e7  * (the UNIQUE label refused)     1
+--                                 = 10331222
+
+TABLE demo::prices
+BEGIN
+    COLUMN id     AS Long           PRIMARY KEY;
+    COLUMN amount AS Double         INDEX KEY;
+    COLUMN label  AS String         UNIQUE KEY;
+    COLUMN tags   AS Vector<Double> INDEX KEY;
+END
+
+PROCEDURE demo::keys_check() RETURNS Long
+REQUIRES demo::prices
+-- Parsi has no Vector literal and no statement that is a method call, so a
+-- vector of one or two doubles is built by a block of C++ and reached
+-- through the backtick, as doc/cpp.md prescribes. The block sits between
+-- REQUIRES and the body, where the grammar takes it.
+BEGIN CPP
+#include "typevector.hpp"
+#include "typedouble.hpp"
+static Zigurat::Vector<Zigurat::Double> keys_vec(double a, double b, long n)
+{
+  std::vector<Zigurat::Double> v;
+  v.push_back(Zigurat::Double(a));
+  if (n > 1) v.push_back(Zigurat::Double(b));
+  return Zigurat::Vector<Zigurat::Double>(v);
+}
+END
+BEGIN
+    -- the table is the server's, and this may run more than once
+    DELETE FROM demo::prices;
+
+    DECLARE one AS Double = 1.0;
+    DECLARE two AS Double = 2.0;
+    DECLARE t12 AS Vector<Double> = `keys_vec(one.`value(), two.`value(), 2);
+    DECLARE t21 AS Vector<Double> = `keys_vec(two.`value(), one.`value(), 2);
+    DECLARE t1 AS Vector<Double> = `keys_vec(one.`value(), one.`value(), 1);
+
+    INSERT INTO demo::prices VALUES (1, -2.5, 'a', t12);
+    INSERT INTO demo::prices VALUES (2, -1.0, 'b', t21);
+    INSERT INTO demo::prices VALUES (3, -0.0, 'c', t12);
+    INSERT INTO demo::prices VALUES (4,  0.0, 'd', t21);
+    INSERT INTO demo::prices VALUES (5,  1.5, 'e', t12);
+    INSERT INTO demo::prices VALUES (6,  3.25, 'f', t21);
+
+    DECLARE zero AS Double = 0.0;
+    DECLARE one_and_half AS Double = 1.5;
+    DECLARE below AS Long = 0;
+    DECLARE at_least AS Long = 0;
+    DECLARE at_zero AS Long = 0;
+    SELECT below = below + 1 FROM demo::prices WHERE amount < zero;
+    SELECT at_least = at_least + 1 FROM demo::prices WHERE amount >= one_and_half;
+    SELECT at_zero = at_zero + 1 FROM demo::prices WHERE amount == zero;
+
+    DECLARE lb AS String = 'b';
+    DECLARE labelled AS Long = 0;
+    SELECT labelled = labelled + 1 FROM demo::prices WHERE label == lb;
+
+    DECLARE tagged12 AS Long = 0;
+    DECLARE tagged21 AS Long = 0;
+    DECLARE tagged1 AS Long = 0;
+    SELECT tagged12 = tagged12 + 1 FROM demo::prices WHERE tags == t12;
+    SELECT tagged21 = tagged21 + 1 FROM demo::prices WHERE tags == t21;
+    SELECT tagged1 = tagged1 + 1 FROM demo::prices WHERE tags == t1;
+
+    -- last, because a refused insert leaves the transaction to its caller
+    DECLARE refused AS Long = 0;
+    TRY BEGIN
+        INSERT INTO demo::prices VALUES (7, 9.0, 'b', t1);
+    END CATCH ex AS Exception BEGIN
+        SET refused = 1;
+    END
+
+    -- one decimal place per count, most significant first; the Long stays
+    -- on the left of every operator, which is the side Zigurat::Long has
+    DECLARE ten AS Long = 10;
+    DECLARE code AS Long = refused;
+    SET code = code * ten + tagged1;
+    SET code = code * ten + tagged21;
+    SET code = code * ten + tagged12;
+    SET code = code * ten + labelled;
+    SET code = code * ten + at_zero;
+    SET code = code * ten + at_least;
+    SET code = code * ten + below;
+    RETURN code;
+END
