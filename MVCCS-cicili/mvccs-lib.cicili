@@ -2491,12 +2491,43 @@
   ;; read one row's bytes into OBJ (which carries its Pointer), under a
   ;; guard of its own -- the cursor has handed the streams back by the
   ;; time anything calls this
+  ;; EXPERIMENT FOR ZiguratIP#33 -- not master. A READ TAKES THE GUARD FOR
+  ;; ITSELF.
+  ;;
+  ;; The seek and the unpack below are two operations on ONE stream with one
+  ;; position, and read_row held nothing while it made them. Inside a
+  ;; cursor's callback window that is a race: both cursors release the
+  ;; streams guard around the callback unconditionally, but only redirect
+  ;; the window's reads to the thread's private stream when
+  ;; reader_eligible -- which is 0 for a store with no reader paths AND 0
+  ;; at REPEATABLE READ or SERIALIZABLE. find_then_update is SERIALIZABLE
+  ;; over a store with no reader paths, so it is both: its callback reads
+  ;; ride the canonical stream with nothing held, while seven other threads
+  ;; seek the same stream.
+  ;;
+  ;; That fits #33's evidence exactly -- a row written back with an EMPTY
+  ;; STRING, which is what an unpack reads when another thread moved the
+  ;; position between the seek and the length byte; the row then never heals
+  ;; because the update copies KIND from what it read. It is also why only
+  ;; contention_test sees it: cocolog and the server both call
+  ;; memory_reader_paths, and their claim paths are not SERIALIZABLE.
+  ;;
+  ;; The guard is re-entrant per thread, so a caller that already holds it
+  ;; pays nothing, and it is taken SHARED wherever a shared one is possible
+  ;; -- which sends the read to the thread's private stream and keeps the
+  ;; parallel-read design exactly as concurrent as it was. Only the case
+  ;; that has no private stream to use takes the exclusive guard, and that
+  ;; case is the one racing today. If this is the fault, 80 runs come back
+  ;; clean.
   (func read_row ((Memory * m) (BaseTable * obj)) (out void)
     (dba_watch1 m "Read Row" ($ (-> obj pointer) address))
-    (let ((binarystream * dio . #'(data_in m)))
-      (if (not ((-> dio good))) ((-> dio clear)))
-      ((-> dio seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
-      ((-> obj unpack) (cof dio))))
+    (if (== 1 (reader_eligible m)) (set tl_want_shared 1))
+    (letin* ((streams (Streams m)))
+      (let ((binarystream * dio . #'(data_in m)))
+        (if (not ((-> dio good))) ((-> dio clear)))
+        ((-> dio seekg) (ptr_data (aof (-> obj pointer))) std::ios::beg)
+        ((-> obj unpack) (cof dio)))
+      (cast void 0)))
 
   ;; ==================================================================
   ;; ISUD -- the staged writes
