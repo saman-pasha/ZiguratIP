@@ -151,6 +151,12 @@
     (var const uint8_t MAX_CURSOR_COUNT . 16)
     (var int lock_wait_timeout_ms . 10000)
 
+    ;; How many chains the page list is split into, by hash key. Every
+    ;; cursor walks ONE key's pages; while the list was single, each walk
+    ;; read the WHOLE store's pages to find them -- see "The page list and
+    ;; the free list" below for what that cost.
+    (var const int64_t PAGE_BUCKET_COUNT . 251)
+
     ;; rowstate.hpp / rowlock.hpp / isolationlevel.hpp. Cicili's enum is a
     ;; plain C enum, so the members carry prefixes instead of scope.
     (enum RowState (ROW_NONE . 0) (ROW_INSERTED . 4) (ROW_UPDATED . 8) (ROW_DELETED . 12))
@@ -330,11 +336,33 @@
   ;; The page list and the free list -- std::multimap in the original,
   ;; intrusive singly-linked lists here. Only equal_range walks and
   ;; insert/erase were ever asked of them; a linear list answers both.
+  ;;
+  ;; EXCEPT THAT equal_range IS WHAT EVERY WALK ASKS, and a single list
+  ;; answers it by reading the whole store. A cursor walks ONE key's
+  ;; pages -- and a SEQUENCE DRAW is a cursor, over the sequence's own
+  ;; key, one page holding one row. So the i-th row a process wrote
+  ;; walked past the pages the first i-1 had made, twice a draw and
+  ;; with two arrays of that size allocated and zeroed each time, and
+  ;; a write came out QUADRATIC IN ITS OWN ROWS. Measured from cocolog
+  ;; 1.2.16 over a fresh --embed: 16 000 rows 0.53 s, 32 000 1.42,
+  ;; 64 000 5.77, 128 000 26.9, while the assert loop that fed them
+  ;; stayed flat at 3.8 us a clause. Splitting the rows over 128
+  ;; predicates did not help -- pages are one store's however the rows
+  ;; are named -- which is exactly what ruled out the guess that it was
+  ;; an index key's value chain.
+  ;;
+  ;; So every entry sits in a second chain, of the pages under ITS KEY
+  ;; (key_next, bucketed by a hash of the key's twenty bytes), and the
+  ;; cursor, dead_pointers and drop_key_pages walk that one. The
+  ;; whole-store list stays: startup walks every page whatever its key,
+  ;; and so does the DBA's page dump. A bucket may hold two keys, so
+  ;; every walk still checks the key it reads.
   ;; ==================================================================
   (struct PageEntry
     (member const uint8_t * key)
     (member int64_t address)
-    (member PageEntry * next))
+    (member PageEntry * next)
+    (member PageEntry * key_next))   ;; the next page under the same key
 
   (struct FreeEntry
     (member const uint8_t * key)
@@ -662,6 +690,8 @@
     (member int64_t page_count)
     (member bool initialized)
     (member PageEntry * pages)
+    ;; the same entries, chained by key: one bucket answers equal_range
+    (member PageEntry * page_heads [PAGE_BUCKET_COUNT])
     (member FreeEntry * frees)
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
@@ -1086,12 +1116,57 @@
       (set (-> e next) (-> m frees))
       (set (-> m frees) e)))
 
+  ;; Which chain a key's pages hang from: FNV-1a over the key's twenty
+  ;; bytes, taken down to a bucket. The key is interned, so a pointer
+  ;; would do -- but a cursor is handed the table's own array, which is
+  ;; not, and the bytes are what both agree on.
+  (func key_bucket ((const uint8_t * key)) (out int64_t)
+    (let ((uint64_t h . #'(fnv_basis64)))
+      (for ((int64_t i . 0)) (< i HASHKEY_SIZE) ((++ i))
+        (set h (xor h (cast uint64_t (nth i key))))
+        (set h (* h (cast uint64_t 1099511628211))))
+      (return (cast int64_t (% h (cast uint64_t PAGE_BUCKET_COUNT))))))
+
+  ;; the head of KEY's chain. Every caller holds page_list_access, which
+  ;; is what it held to walk the whole list.
+  (func page_chain ((Memory * m) (const uint8_t * key)) (out PageEntry *)
+    (return (nth (key_bucket key) (-> m page_heads))))
+
+  (func page_bucket_link ((Memory * m) (PageEntry * e)) (out void)
+    (let ((int64_t b . #'(key_bucket (-> e key))))
+      (set (-> e key_next) (nth b (-> m page_heads)))
+      (set (nth b (-> m page_heads)) e)))
+
+  (func page_bucket_unlink ((Memory * m) (PageEntry * e)) (out void)
+    (let ((int64_t b . #'(key_bucket (-> e key)))
+          (PageEntry * prev . nil)
+          (PageEntry * c . nil))
+      (set c (nth b (-> m page_heads)))
+      (while (!= c nil)
+        (if (== c e)
+            (block
+              (if (== prev nil)
+                  (set (nth b (-> m page_heads)) (-> c key_next))
+                (set (-> prev key_next) (-> c key_next)))
+              (set (-> e key_next) nil)
+              (return)))
+        (set prev c)
+        (set c (-> c key_next)))))
+
+  ;; a page changes hands -- out of its old key's chain and into the new
+  ;; one, the entry itself staying where it is in the whole-store list
+  (func page_rekey ((Memory * m) (PageEntry * e) (const uint8_t * key)) (out void)
+    (page_bucket_unlink m e)
+    (set (-> e key) (intern_key key))
+    (page_bucket_link m e))
+
   (func page_list_insert ((Memory * m) (const uint8_t * key) (int64_t address)) (out void)
     (let ((PageEntry * e . #'(new* PageEntry)))
       (set (-> e key) (intern_key key))
       (set (-> e address) address)
       (set (-> e next) (-> m pages))
-      (set (-> m pages) e)))
+      (set (-> m pages) e)
+      (page_bucket_link m e)))
 
   ;; writes a fresh page header: control chunks full, the rest free, the
   ;; hash key at the front, zeroes behind it
@@ -1112,14 +1187,14 @@
   ;; page list under a second entry and left the __FREE__ entry behind;
   ;; here the entry is rekeyed in place.
   (func allocate_new_page ((Memory * m) (const uint8_t * key)) (out int64_t)
-    (let ((PageEntry * e . #'(-> m pages)))
+    (let ((PageEntry * e . #'(page_chain m FREE_HASHKEY)))
       (while (!= e nil)
         (if (== (memcmp (-> e key) FREE_HASHKEY (cast size_t HASHKEY_SIZE)) 0)
             (block
               (allocate_page m key (-> e address))
-              (set (-> e key) (intern_key key))
+              (page_rekey m e key)
               (return (-> e address))))
-        (set e (-> e next))))
+        (set e (-> e key_next))))
     ;; a failed read poisons the stream and every write after it no-ops --
     ;; writes clear first, exactly as the read accessors do
     (if (not ((-> (-> m data_io) good)))
@@ -1289,13 +1364,14 @@
       (if (== (* full_count CHUNK_SIZE) (- (-> m page_size) PAGEFILE_CONTROL_SIZE))
           (let ((int64_t page_address . #'(- (* begin CHUNK_SIZE) PAGEFILE_CONTROL_SIZE)))
             (allocate_page m FREE_HASHKEY page_address)
-            (let ((PageEntry * e . #'(-> m pages)))
+            ;; the page is this pointer's key's, so its own chain holds it
+            (let ((PageEntry * e . #'(page_chain m (-> p hash_key))))
               (while (!= e nil)
                 (if (== (-> e address) page_address)
                     (block
-                      (set (-> e key) (intern_key FREE_HASHKEY))
+                      (page_rekey m e FREE_HASHKEY)
                       break))
-                (set e (-> e next)))))
+                (set e (-> e key_next)))))
         (free_list_insert m (-> p hash_key) (* begin CHUNK_SIZE) (* full_count CHUNK_SIZE)))
 
       (pthread_mutex_unlock (aof (-> m free_list_access)))
@@ -1965,6 +2041,18 @@
   ;; ==================================================================
   (thread-local) (var uint8_t tl_cursor_id . 0)
 
+  ;; PAGE ENTRIES THIS THREAD'S CURSORS HAVE STEPPED OVER, EVER. Monotonic
+  ;; and thread-local, so it costs one increment per entry a walk reads and
+  ;; no cursor ever waits on another to keep it. It exists because it is
+  ;; the one number that says whether a cursor is reading ITS KEY'S pages
+  ;; or the whole store's -- mvccs.cicili takes a difference across a
+  ;; single sequence draw and refuses a walk longer than the store has
+  ;; pages, where a stopwatch could only have said that a store got slower
+  ;; and never why.
+  (thread-local) (var int64_t tl_cursor_steps . 0)
+
+  (func mvccs_cursor_steps () (out int64_t) (return tl_cursor_steps))
+
   ;; One seek and one read bring a page's whole hexmap slice into BUF, and
   ;; the walk parses it from memory. What this replaces was the walk's cost:
   ;; an absolute seek and byte-at-a-time reads PER RECORD through a buffered
@@ -2038,14 +2126,18 @@
               (const uint8_t ** page_keys . nil)
               (int64_t * page_addrs . nil))
         (pthread_mutex_lock (aof (-> m page_list_access)))
-        (let ((PageEntry * e . #'(-> m pages)))
+        ;; THIS KEY'S CHAIN, not the store's list: the count and the
+        ;; snapshot are both the size of the table, not of everything
+        ;; ever written -- see "The page list and the free list"
+        (let ((PageEntry * e . #'(page_chain m hash_key)))
           (while (!= e nil)
             (set page_cap (+ page_cap 1))
-            (set e (-> e next))))
+            (set tl_cursor_steps (+ tl_cursor_steps 1))
+            (set e (-> e key_next))))
         (set page_keys (cast (const uint8_t **)
                              (calloc (cast size_t page_cap) (sizeof size_t))))   ;; a pointer's size: sizeof takes one token
         (set page_addrs (cast (int64_t *) (calloc (cast size_t page_cap) (sizeof int64_t))))
-        (let ((PageEntry * e . #'(-> m pages)))
+        (let ((PageEntry * e . #'(page_chain m hash_key)))
           (while (!= e nil)
             (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
                 (let ((int64_t pn . #'(/ (-> e address) (-> m page_size))))
@@ -2064,7 +2156,8 @@
                         (set (nth page_total page_keys) (-> e key))
                         (set (nth page_total page_addrs) (-> e address))
                         (set page_total (+ page_total 1))))))
-            (set e (-> e next))))
+            (set tl_cursor_steps (+ tl_cursor_steps 1))
+            (set e (-> e key_next))))
         (pthread_mutex_unlock (aof (-> m page_list_access)))
 
         (if (== page_total 0) (set walk_done 1))
@@ -2443,21 +2536,21 @@
           (int64_t * page_addrs . nil))
 
       (pthread_mutex_lock (aof (-> m page_list_access)))
-      (let ((PageEntry * e . #'(-> m pages)))
+      (let ((PageEntry * e . #'(page_chain m hash_key)))
         (while (!= e nil)
           (set page_cap (+ page_cap 1))
-          (set e (-> e next))))
+          (set e (-> e key_next))))
       (set page_keys (cast (const uint8_t **)
                            (calloc (cast size_t page_cap) (sizeof size_t))))   ;; a pointer's size: sizeof takes one token
       (set page_addrs (cast (int64_t *) (calloc (cast size_t page_cap) (sizeof int64_t))))
-      (let ((PageEntry * e . #'(-> m pages)))
+      (let ((PageEntry * e . #'(page_chain m hash_key)))
         (while (!= e nil)
           (if (== (memcmp (-> e key) hash_key (cast size_t HASHKEY_SIZE)) 0)
               (block
                 (set (nth page_total page_keys) (-> e key))
                 (set (nth page_total page_addrs) (-> e address))
                 (set page_total (+ page_total 1))))
-          (set e (-> e next))))
+          (set e (-> e key_next))))
       (pthread_mutex_unlock (aof (-> m page_list_access)))
 
       (let ((int64_t page_n . 0))
@@ -2707,6 +2800,10 @@
     (set (-> m page_count) 0)
     (set (-> m initialized) #f)
     (set (-> m pages) nil)
+    ;; every bucket empty before the first page: a Memory on the stack
+    ;; arrives with these indeterminate, exactly as bt_cache does
+    (for ((int64_t b . 0)) (< b PAGE_BUCKET_COUNT) ((++ b))
+      (set (nth b (-> m page_heads)) nil))
     (set (-> m frees) nil)
     (set (-> m watcher) nil)
     ;; a fresh cache per open, never the field's old value: a Memory on the
@@ -4501,13 +4598,17 @@
           (block
             (set prev e)
             (set e (-> e next))))))
-    (let ((PageEntry * e . #'(-> m pages)))
+    ;; the key's own chain, and the next link is taken BEFORE the rekey
+    ;; moves this entry out of it -- the two chains can be one bucket
+    (let ((PageEntry * e . #'(page_chain m key))
+          (PageEntry * nxt . nil))
       (while (!= e nil)
+        (set nxt (-> e key_next))
         (if (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)))
             (block
               (allocate_page m FREE_HASHKEY (-> e address))
-              (set (-> e key) (intern_key FREE_HASHKEY))))
-        (set e (-> e next))))
+              (page_rekey m e FREE_HASHKEY)))
+        (set e nxt)))
     (pthread_mutex_unlock (aof (-> m free_list_access)))
     (pthread_mutex_unlock (aof (-> m page_list_access))))
 

@@ -734,6 +734,66 @@ brought a live store from 170 000 visible rows to 263 000, and every
 base that had "lost" clauses answered whole again. Rows hidden by the
 bug were never gone; they were unlit.
 
+## The page list was one chain, and a write was quadratic in its own rows
+
+Reported from downstream, diagnosed here. cocolog 1.2.16 wrote rows into a
+fresh `--embed` store and the time went **16 000 rows 0.53 s, 32 000 1.42,
+64 000 5.77, 128 000 26.9** on Linux, while the assert loop that fed them
+stayed flat at 3.8 µs a clause -- so it was the store, not the interpreter.
+Two facts came with it, and both were load-bearing: **splitting the rows
+over 128 predicates did not help** (29.0 s against 24.9 s for one predicate
+of 128 000), which ruled out the obvious guess of one index key's value
+chain; and **no vacuum moved it**, which ruled out dead rows. It was
+recorded as undiagnosed rather than guessed at.
+
+Reproduced on macOS at 1.13 / 2.15 / 5.14 / 15.0 s for the same four
+sizes, and a sampling profile named it in one line: **57 % of the process
+inside `cursor_walk`, called from `seq_next` through `seq_with_current`.**
+
+Every row a consumer inserts draws a sequence value, and a draw is a
+CURSOR -- over the sequence's own key, which owns one page holding one
+row. But `cursor_walk` snapshots the page list under the lock, and the
+list was ONE chain for the whole store: it walked every entry to count
+them, allocated two arrays of that size, walked every entry again to
+filter, and did all of it twice, because a second round is what proves no
+page appeared during the first. So a draw cost O(pages in the store) --
+and the store's pages grow with the rows -- which is a write quadratic in
+its own rows, with the two arrays' allocation and zeroing as the constant.
+That also explains both of the facts above: pages are one store's however
+the rows are named, and the pages a walk steps over are LIVE, so a vacuum
+has nothing to take.
+
+The fix is a second chain. Every `PageEntry` now also sits in the chain of
+the pages under ITS KEY (`key_next`, bucketed by an FNV fold of the key's
+twenty bytes into 251 heads), and `cursor_walk`, `dead_pointers` and
+`drop_key_pages` walk that one; `allocate_new_page` takes the `__FREE__`
+chain instead of scanning everything for a free page, and `_free` finds
+the page it is emptying in its own key's chain. The whole-store list stays
+exactly as it was, because startup walks every page whatever its key, and
+so does the DBA's page dump. A bucket may hold two keys, so every walk
+still checks the key it reads. Nothing in the format changed.
+
+| rows one process writes | before | after |
+|---|---|---|
+| 16 000 | 1.13 s | 0.97 s |
+| 32 000 | 2.15 s | 1.82 s |
+| 64 000 | 5.14 s | **3.69 s** |
+| 128 000 | 15.0 s | **7.45 s** |
+
+-- each doubling now costs twice where it cost nearly three times before
+(macOS, the same machine and the same binary but for this change).
+`mvccs_test` guards it with a counter rather than a stopwatch:
+`mvccs_cursor_steps` is a thread-local tally of the page entries a cursor
+has stepped over, and the case takes a difference across one draw and
+refuses a walk longer than the store has pages. The single chain stepped
+over four times that.
+
+What is left is linear, and is a different question: on macOS about two
+thirds of the remaining time is `ftruncate`, because the mapped store
+grows the file by exactly the bytes written -- deliberately, since the
+engine finds its end by the file's length, which `mapbuf.hpp` says in
+full -- and a fresh page is several extending writes.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout

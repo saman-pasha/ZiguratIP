@@ -1099,7 +1099,28 @@
           (check "and still walks in order" (cast int64_t ($ oc ascending)) 1))
 
         (SEQ_ORDER_attach (aof mem))
-        (check "the sequence survives it too" (SEQ_ORDER_current) 999)
+
+        ;; ---- A WALK IS ITS KEY'S, NOT THE STORE'S -------------------
+        ;; The case that keeps the quadratic write from coming back. Every
+        ;; row a consumer inserts draws a sequence value, and a draw is a
+        ;; CURSOR -- over the sequence's own key, one page holding one
+        ;; row. While the page list was a single chain, that cursor read
+        ;; every page in the store, so the i-th row written walked past
+        ;; the pages the first i-1 had made: measured from cocolog 1.2.16,
+        ;; 16 000 rows 0.53 s, 32 000 1.42, 64 000 5.77, 128 000 26.9,
+        ;; while the loop feeding them stayed flat. The counter is exact
+        ;; where a stopwatch would only have said a store got slower: a
+        ;; draw may not step over more page entries than the store HAS,
+        ;; and the single chain stepped over four times that.
+        (let ((int64_t steps0 . #'(mvccs_cursor_steps)))
+          (check "the sequence survives it too" (SEQ_ORDER_current) 999)
+          (let ((int64_t stepped . #'(- (mvccs_cursor_steps) steps0)))
+            (printf "     a draw stepped over %ld page entries; the store holds %ld pages\n"
+                    (cast long stepped) (cast long ($ mem page_count)))
+            (check "the store is big enough to tell the two walks apart"
+                   (? (> ($ mem page_count) 16) 1 0) 1)
+            (check "and a draw walks its key's pages, not the store's"
+                   (? (<= stepped ($ mem page_count)) 1 0) 1)))
 
         ;; ---- unmap_key: the lowest ten keys leave the tree wholesale,
         ;; every deletion of the minimum walking the leftmost leaf, the
