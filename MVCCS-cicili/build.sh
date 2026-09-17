@@ -37,10 +37,16 @@ export LD_LIBRARY_PATH
 #                                   they repaired, every commit's stamp
 #   MVCCS_DEBUG=warn  sh build.sh   and the rare paths: a torn record
 #                                   salvaged, a keyless page refreed, a
-#                                   commit that had to wait for the clock
+#                                   commit that had to wait for the clock,
+#                                   a streams guard waited for or held
+#                                   longer than a millisecond
 #   MVCCS_DEBUG=debug sh build.sh   and every read with the stream and guard
 #                                   it used, every cursor window, every
-#                                   synthesised clock value. Loud by design.
+#                                   synthesised clock value, and every guard
+#                                   acquisition with its mode, wait and
+#                                   hold. Loud by design -- and loud enough
+#                                   that the times it reports are its own
+#                                   build's, not a shipped one's.
 #
 # Every line goes to stderr and carries its thread, because the questions
 # these answer are all "which thread, and in what order". See the tracing

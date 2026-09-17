@@ -937,16 +937,16 @@ question needs them:
 
 ```bash
 sh MVCCS-cicili/build.sh                       # nothing; 0 trace sites emitted
-MVCCS_DEBUG=info  sh MVCCS-cicili/build.sh     # 34 lines over a schema_test run
-MVCCS_DEBUG=warn  sh MVCCS-cicili/build.sh
-MVCCS_DEBUG=debug sh MVCCS-cicili/build.sh     # 161 over the same run
+MVCCS_DEBUG=info  sh MVCCS-cicili/build.sh     # 6 lines over one schema_test run
+MVCCS_DEBUG=warn  sh MVCCS-cicili/build.sh     # 11 over the same run
+MVCCS_DEBUG=debug sh MVCCS-cicili/build.sh     # 505, of which 369 are the guard
 ```
 
 | level | what it answers | what it prints |
 |---|---|---|
 | `info` | *what did this store do?* | every open with its page count and hexmap coverage, every commit with its transaction and stamp |
-| `warn` | *what was unusual?* | a torn record salvaged, a keyless page refreed, a commit that had to WAIT for the wall clock, the pages a short hexmap cost |
-| `debug` | *which thread, in what order?* | every read with the stream and the guard it used, every cursor callback window and its eligibility decision, every synthesised clock value |
+| `warn` | *what was unusual?* | a torn record salvaged, a keyless page refreed, a commit that had to WAIT for the wall clock, the pages a short hexmap cost, and any streams guard **waited for or held over a millisecond** |
+| `debug` | *which thread, in what order?* | every read with the stream and the guard it used, every cursor callback window and its eligibility decision, every synthesised clock value, and **every guard acquisition with its mode, its wait and its hold** |
 
 Everything goes to **stderr**, never stdout — a consumer's answers live there
 (cocolog prints its own on stdout and is parsed by scripts) — and every line
@@ -971,6 +971,36 @@ mvccs[t0a10] read 8240  held=0 shared=0 window=0 eligible=0
 — the guard released, no redirect to a private stream, and then a read on the
 stream every other thread is seeking. Eleven comments and four days of
 patched builds the first time; two lines the next.
+
+**And the tenth point was asked for by a third** — ZiguratIP#37, which
+measured that 99.9 % of a `begin_transaction` is spent *acquiring* the one
+streams guard and 0.1 % doing the writes under it, and had to patch a working
+copy to learn it. The guard now times itself:
+
+```
+mvccs[t1a04] guard taken exclusive waited 84 us
+mvccs[t1a04] guard held 14 us
+mvccs[t5c40] guard exclusive WAITED 13549 us
+mvccs[t5c40] guard HELD 259262 us
+```
+
+The lower-case pair is `debug`, one per acquisition, and the SHOUTED pair is
+`warn`, which carries only what crossed a millisecond. From one
+`contention_test` run at `debug` — 36 444 exclusive acquisitions, 82 952
+shared, 20 222 nested no-ops:
+
+| | median | p90 | p99 | max |
+|---|---|---|---|---|
+| wait, exclusive | 84 µs | 1 438 µs | 4 866 µs | 13 549 µs |
+| wait, shared | 0 µs | 170 µs | 1 576 µs | 8 821 µs |
+| held | 14 µs | 124 µs | 1 698 µs | 259 262 µs |
+
+**Read that table knowing what produced it.** At `debug` the point writes two
+lines per acquisition — 119 396 of them in that run — so those figures belong
+to a build busy writing to stderr, not to the build that ships. The shape is
+the finding; the absolute numbers are inflated. `warn` showed 7 386 waits and
+2 893 holds over a millisecond in the same suite, at two orders of magnitude
+fewer lines, and is what to ask when the numbers themselves matter.
 
 ## Build and run
 

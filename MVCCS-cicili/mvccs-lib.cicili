@@ -250,11 +250,22 @@
     ;;          A handful of lines a run.
     ;;   warn   the paths that should be rare: a torn record salvaged, a
     ;;          page refreed because it had no key, a commit that had to
-    ;;          WAIT for the wall clock, a bounded wait giving up.
+    ;;          WAIT for the wall clock, a bounded wait giving up, and any
+    ;;          streams guard waited for or held over a millisecond.
     ;;   debug  per-operation: every read with the stream it used and the
     ;;          guard it held, every callback window's release and its
-    ;;          eligibility decision, every synthesised clock value.
-    ;;          Loud, and the point: this is what a race looks like.
+    ;;          eligibility decision, every synthesised clock value, and
+    ;;          EVERY guard acquisition with its mode, its wait and its
+    ;;          hold. Loud, and the point: this is what a race looks like.
+    ;;
+    ;; THE GUARD POINT PAYS FOR ITS OWN MEASUREMENT, which is a limit and
+    ;; not a caveat. At debug it writes two lines per acquisition --
+    ;; 119 396 of them in one contention_test run -- so the DISTRIBUTION it
+    ;; reports is that of a build busy writing to stderr, not of the build
+    ;; that ships. The shape is trustworthy and the absolute figures are
+    ;; inflated; warn, which carries only the tail over a millisecond and
+    ;; two orders of magnitude fewer lines, is what to ask when the numbers
+    ;; themselves matter.
     ;;
     ;; EVERY LINE GOES TO stderr, never stdout: a consumer's answers live
     ;; there (cocolog prints its own on stdout and is parsed by scripts),
@@ -845,6 +856,15 @@
   ;; the next Streams constructed on this thread would LIKE to be shared;
   ;; the ctor consumes the flag and grants it only when it is safe to
   (thread-local) (var int tl_want_shared . 0)
+  ;; THE GUARD'S OWN STOPWATCH -- when this thread asked for the guard, and
+  ;; when it got it. Written ONLY inside warn!/debug!, so an ordinary build
+  ;; never reads the clock; the two words of TLS are declared
+  ;; unconditionally because an unused file-scope thread-local warns
+  ;; nowhere, and a conditional declaration would need a macro of its own.
+  ;; The clock is mvccs_wall_micros, the same one the version clock uses:
+  ;; one clock in this file is worth more than a more suitable second one.
+  (thread-local) (var int64_t tl_guard_want . 0)
+  (thread-local) (var int64_t tl_guard_since . 0)
 
   ;; a shared guard is granted only to a read whose isolation writes
   ;; nothing: REPEATABLE READ and SERIALIZABLE stamp shared row locks as
@@ -900,7 +920,15 @@
     (member bool shared_)
 
     (method lock () (out void)
-      (if (or (not ($ this mine_)) ($ this locked_)) (return))
+      ;; a nested guard takes nothing and waits for nothing, and saying so
+      ;; is what explains a thread that shows no acquisition at all
+      (if (not ($ this mine_))
+          (block
+            (debug! (fprintf stderr "mvccs[t%04zx] guard nested: no-op\n"
+                             (bitand (cast size_t (pthread_self)) 65535)))
+            (return)))
+      (if ($ this locked_) (return))
+      (warn! (set tl_guard_want (mvccs_wall_micros)))
       (if ($ this shared_)
           (block
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
@@ -912,7 +940,25 @@
               (throw* (MemoryException "an exclusive streams guard under a shared one")))
           (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
           (set tl_streams_held (cast (void *) this))))
-      (set ($ this locked_) #t))
+      (set ($ this locked_) #t)
+      ;; THE WAIT IS THE MEASUREMENT. ZiguratIP#37 timestamped the four
+      ;; regions of a begin from a patched working copy and found 99.9% of
+      ;; it here and 0.1% in the writes under it -- the number nothing in
+      ;; this file could answer. debug! carries every acquisition, so a
+      ;; distribution can be had from a grep; warn! carries only what took
+      ;; longer than a millisecond, which is what keeps `warn' the level of
+      ;; things that should be rare.
+      (warn! (set tl_guard_since (mvccs_wall_micros))
+             (let ((int64_t waited . #'(- tl_guard_since tl_guard_want)))
+               (debug! (fprintf stderr "mvccs[t%04zx] guard taken %s waited %lld us\n"
+                                (bitand (cast size_t (pthread_self)) 65535)
+                                (? ($ this shared_) "shared" "exclusive")
+                                (cast llong waited)))
+               (if (> waited 1000)
+                   (fprintf stderr "mvccs[t%04zx] guard %s WAITED %lld us\n"
+                            (bitand (cast size_t (pthread_self)) 65535)
+                            (? ($ this shared_) "shared" "exclusive")
+                            (cast llong waited))))))
 
     (method unlock () (out void)
       (if (or (not ($ this mine_)) (not ($ this locked_))) (return))
@@ -930,7 +976,19 @@
           ((-> (-> ($ this m) data_io) flush))
           (set tl_streams_held nil)
           (set ($ this locked_) #f)
-          (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw))))))
+          (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw)))))
+      ;; AFTER the release, because the flush above is PART OF THE HOLD --
+      ;; it is there so a private reader cannot miss bytes still in the
+      ;; canonical buffers -- and what the next thread waited for is the
+      ;; whole of it, flush included.
+      (warn! (let ((int64_t held . #'(- (mvccs_wall_micros) tl_guard_since)))
+               (debug! (fprintf stderr "mvccs[t%04zx] guard held %lld us\n"
+                                (bitand (cast size_t (pthread_self)) 65535)
+                                (cast llong held)))
+               (if (> held 1000)
+                   (fprintf stderr "mvccs[t%04zx] guard HELD %lld us\n"
+                            (bitand (cast size_t (pthread_self)) 65535)
+                            (cast llong held))))))
 
     (ctor ((Memory * mem))
       (init (m mem) (mine_ #f) (locked_ #f) (shared_ #f))
