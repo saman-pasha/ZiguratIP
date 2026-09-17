@@ -79,7 +79,8 @@ namespace Zigurat
 
   // Maps [0, capacity) with capacity at least RESERVE and at least n, page
   // rounded. Mapping past the file's end is allowed; touching past it is
-  // not, and nothing here does until extend() has moved the end.
+  // not, and nothing here does: a write past the end goes through
+  // grow_write, which moves the end by making the write.
   bool mapbuf::reserve(std::size_t n)
   {
     std::size_t capacity = page_round(n > RESERVE ? n : RESERVE);
@@ -111,13 +112,40 @@ namespace Zigurat
     return true;
   }
 
-  bool mapbuf::extend(std::streamsize length)
+  // THE WRITE THAT GROWS THE FILE IS THE GROWTH -- one pwrite, which
+  // appends and extends in the same call, where this used to ftruncate to
+  // the new length and then memcpy into the mapping.
+  //
+  // WHY, MEASURED. A mapped page may not be touched past the file's end, so
+  // every extending write needed the length moved first, and on APFS moving
+  // it is a metadata transaction: 115 us a call. A fresh page of the store
+  // is six extending writes -- four of the hexmap slice, two of the page --
+  // so a store grew at 688 us a page, and a process writing 128 000 rows
+  // spent two thirds of itself inside ftruncate. The same six writes as
+  // pwrites cost 31 us a page, and a megabyte-at-a-time ftruncate would
+  // cost 4 -- but that one keeps the file longer than what was written,
+  // which is the invariant this class is built on (the engine finds its end
+  // by seeking to it), so the exact one wins and keeps the contract.
+  //
+  // The bytes land in the same page cache the mapping reads through, so a
+  // reader -- this stream, another mapping, another process -- sees them
+  // exactly as it saw a memcpy. The mapping is never touched for them,
+  // which is also why a fill of a fresh page no longer faults a page in
+  // only to leave zeros in it.
+  bool mapbuf::grow_write(const char* s, std::streamsize n)
   {
     if (!this->_writable || this->_fd < 0) return false;
-    if (length <= this->_size) return true;
-    if ((std::size_t)length > this->_capacity && !this->reserve((std::size_t)length)) return false;
-    if (::ftruncate(this->_fd, (off_t)length) != 0) return false;
-    this->_size = length;
+    const std::streamsize end = this->_pos + n;
+    if ((std::size_t)end > this->_capacity && !this->reserve((std::size_t)end)) return false;
+    std::streamsize done = 0;
+    while (done < n) {
+      const ssize_t written = ::pwrite(this->_fd, s + done, (std::size_t)(n - done),
+                                       (off_t)(this->_pos + done));
+      if (written <= 0) return false;
+      done += (std::streamsize)written;
+    }
+    this->_pos = end;
+    if (end > this->_size) this->_size = end;
     return true;
   }
 
@@ -169,7 +197,8 @@ namespace Zigurat
   std::streamsize mapbuf::xsputn(const char* s, std::streamsize n)
   {
     if (this->_fd < 0 || !this->_writable || n <= 0) return 0;
-    if (this->_pos + n > this->_size && !this->extend(this->_pos + n)) return 0;
+    // past the end the write itself does the growing; inside it, a memcpy
+    if (this->_pos + n > this->_size) return this->grow_write(s, n) ? n : 0;
     std::memcpy(this->_base + this->_pos, s, (std::size_t)n);
     this->_pos += n;
     return n;
@@ -194,7 +223,10 @@ namespace Zigurat
   {
     if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
     if (this->_fd < 0 || !this->_writable) return traits_type::eof();
-    if (this->_pos + 1 > this->_size && !this->extend(this->_pos + 1)) return traits_type::eof();
+    if (this->_pos + 1 > this->_size) {
+      const char one = traits_type::to_char_type(c);
+      return this->grow_write(&one, 1) ? c : traits_type::eof();
+    }
     this->_base[this->_pos++] = traits_type::to_char_type(c);
     return c;
   }

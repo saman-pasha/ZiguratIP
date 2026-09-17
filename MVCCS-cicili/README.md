@@ -788,11 +788,48 @@ has stepped over, and the case takes a difference across one draw and
 refuses a walk longer than the store has pages. The single chain stepped
 over four times that.
 
-What is left is linear, and is a different question: on macOS about two
-thirds of the remaining time is `ftruncate`, because the mapped store
-grows the file by exactly the bytes written -- deliberately, since the
-engine finds its end by the file's length, which `mapbuf.hpp` says in
-full -- and a fresh page is several extending writes.
+What was left was linear, and it was `ftruncate`: two thirds of the
+remaining time, because the mapped store grows the file by exactly the
+bytes written and a fresh page is six extending writes. That is the next
+section.
+
+## And then the growing itself, which was six ftruncates a page
+
+A mapped page may not be touched past the file's end, so `mapbuf`
+ftruncated to the new length before every extending write and then
+memcpy'd into the mapping. On APFS moving a file's end is a metadata
+transaction -- **115 µs a call, measured** -- and a fresh store page is six
+of them: four for its hexmap slice, two for the page itself. So the store
+grew at 688 µs a page, and after the page-list fix above that was two
+thirds of what a writing process spent.
+
+`StreamIO/mapbuf.cpp` now makes the extending write a **`pwrite`**, which
+appends and extends in the same call; writes inside the file are the same
+memcpy they always were. The file is still exactly as long as what was
+written -- the invariant the class is built on, since the engine finds its
+end by seeking to it -- and the bytes land in the same page cache the
+mappings read through, so a reader sees them exactly as it saw a memcpy.
+Three ways were measured on the store's own write pattern --
+`bench/grow-bench.cpp`, 2 000 pages of six extending writes each plus the
+in-place hexmap rewrites a row allocation makes, which is the mix a bench
+that only appends would miss:
+
+| | a page costs |
+|---|---|
+| ftruncate per extending write | ~700 µs |
+| **pwrite, the same exact length** | **~45 µs** |
+| ftruncate a megabyte ahead, truncate back | ~6 µs |
+
+The third is faster still and is NOT done: it keeps the file longer than
+what was written, which is the one thing this class promises the engine.
+
+End to end, 128 000 rows into a fresh `--embed` store, three runs each on
+one machine: **9.22 s → 3.64 s**. What it costs is disk, not time and not
+correctness: a hexmap block that is appended by `pwrite` and later rewritten
+through the mapping is written by both paths, and APFS leaves the first copy
+allocated -- a 1.4 MB hexmap carried 2.1 MB of blocks. It is bounded (one
+stale block per hexmap block, never more than the hexmap's own size, ~6 % of
+a store) and any copy of the file gives it back.
 
 ## Build and run
 

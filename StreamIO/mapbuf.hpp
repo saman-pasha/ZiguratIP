@@ -26,10 +26,23 @@ namespace Zigurat
   // extended ahead of the writes would grow phantom pages. Address space
   // is reserved ahead instead -- RESERVE bytes mapped beyond the file's
   // end, which is legal and costs nothing until touched -- and a write
-  // past the end grows the FILE by exactly the bytes written (one
-  // ftruncate), with no remap until the reservation itself is outgrown.
-  // A fill_n of a page is one such write, not eight thousand: the stream
-  // above overrides fill_n to write a block.
+  // past the end grows the FILE by exactly the bytes written, with no
+  // remap until the reservation itself is outgrown. A fill_n of a page is
+  // one such write, not eight thousand: the stream above overrides fill_n
+  // to write a block.
+  //
+  // AND THAT WRITE IS A pwrite, NOT AN ftruncate AND A memcpy. A mapped
+  // page may not be touched past the file's end, so an extending write has
+  // to move the end first -- and on APFS moving it is a metadata
+  // transaction costing 115 us. A fresh store page is six extending writes
+  // (four of its hexmap slice, two of the page), so a store grew at 688 us
+  // a page and a process writing 128 000 rows spent two thirds of itself
+  // inside ftruncate. One pwrite appends and extends in the same call:
+  // 31 us a page, the same exact length, and nothing about the contract
+  // above changes. (Growing a megabyte at a time would cost 4 us a page
+  // and break it, which is why it is not done.) The bytes land in the page
+  // cache the mappings read through, so a reader sees them exactly as it
+  // saw a memcpy.
   //
   // ONE POSITION, shared by reads and writes, as a filebuf has: the engine
   // was written against that and it stays true here.
@@ -82,7 +95,7 @@ namespace Zigurat
   private:
     bool refresh();                    // learn the length another stream may have given the file
     bool reserve(std::size_t);         // map at least this many bytes from offset 0
-    bool extend(std::streamsize);      // grow the file to this length (a writer only)
+    bool grow_write(const char*, std::streamsize);  // the write past the end: it extends by being made
     void unmap();
 
     int _fd;

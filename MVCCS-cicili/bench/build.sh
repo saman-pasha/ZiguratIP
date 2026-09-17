@@ -30,3 +30,10 @@ for mode in equal equal2 equal3; do
   echo "== delete_bench $N $mode"
   "$HERE/delete_bench" "$N" "$mode" | grep -v ' done, '
 done
+
+# and the growth measurement, which links nothing at all: what it costs to
+# extend a mapped file, in the store's own write pattern. The table in
+# ../README.md's "six ftruncates a page" came from here.
+echo "== grow_bench"
+"$CXX" -O2 -std=gnu++17 "$HERE/grow-bench.cpp" -o "$HERE/grow_bench"
+"$HERE/grow_bench" "${TMPDIR:-/tmp}/zig-grow-bench"
