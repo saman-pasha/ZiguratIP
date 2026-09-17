@@ -2,6 +2,7 @@
 #include <csignal>
 #include <clocale>
 #include "utility.hpp"
+#include "version.hpp"
 #include "globals.hpp"
 #include "argument.hpp"
 #include "configuration.hpp"
@@ -64,10 +65,12 @@ namespace
       << "Usage: " << std::endl
       << "\tziguratip [--config=<file>]" << std::endl
       << "\tziguratip --help" << std::endl
+      << "\tziguratip --version" << std::endl
       << std::endl
       << "Arguments: " << std::endl
       << "\t--config           ::= \"configuration file\"" << std::endl
       << "\t--help | -h        ::= this" << std::endl
+      << "\t--version          ::= the version, alone, on stdout" << std::endl
       << std::endl
       << "Configuration: " << std::endl
       << "\tWithout --config, ziguratip.conf is looked for in this order:" << std::endl
@@ -137,6 +140,14 @@ int main(int argc, char** argv)
     // require a configuration file to be findable first.
     if (args.flag("--help") || args.flag("-h")) {
       help();
+      return 0;
+    }
+
+    // THE NUMBER ALONE, on stdout, before the first "Configuration path:"
+    // line -- so V=$(ziguratip --version) reads it with nothing to strip
+    // and needs no configuration file to answer.
+    if (args.flag("--version")) {
+      std::cout << Zigurat::version() << std::endl;
       return 0;
     }
 

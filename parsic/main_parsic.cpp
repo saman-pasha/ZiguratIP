@@ -22,6 +22,7 @@
 #include "connectorexception.hpp"
 #include "zexception.hpp"
 #include "utility.hpp"
+#include "version.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -42,6 +43,7 @@ namespace
       << "\tparsic <file.parsi> [<file.parsi> ...]" << std::endl
       << "\tparsic --config" << std::endl
       << "\tparsic --help" << std::endl
+      << "\tparsic --version" << std::endl
       << std::endl
       << "Arguments:" << std::endl
       << "\t<file.parsi>   ::= source to compile, in the order given" << std::endl
@@ -49,6 +51,7 @@ namespace
       << "\t                    and nothing else. Empty output and status 1" << std::endl
       << "\t                    mean there is none." << std::endl
       << "\t--help | -h    ::= this" << std::endl
+      << "\t--version      ::= the version, alone, on stdout" << std::endl
       << std::endl
       << "Where it connects:" << std::endl
       << "\tWhatever connector.conf says, looked for in this order:" << std::endl
@@ -86,6 +89,8 @@ int main(int argc, char** argv)
   for (int i = 1; i < argc; i++) {
     std::string arg(argv[i]);
     if (arg == "--help" || arg == "-h") { help(); return 0; }
+    // the number alone, so V=$(parsic --version) needs nothing stripped
+    if (arg == "--version") { std::cout << Zigurat::version() << std::endl; return 0; }
     if (arg == "--config") {
       // The path only. An editor opens what this prints, and prose on stdout
       // would be a file name it then failed to find.

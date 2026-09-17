@@ -6,6 +6,7 @@
 #include <clocale>
 #include "zexception.hpp"
 #include "utility.hpp"
+#include "version.hpp"
 #include "configuration.hpp"
 #include "argument.hpp"
 #include "tokenizer.hpp"
@@ -39,12 +40,14 @@ namespace
       << "Usage: " << std::endl
       << "\tparsi <file.parsi> [--config=<file>]" << std::endl
       << "\tparsi --help" << std::endl
+      << "\tparsi --version" << std::endl
       << std::endl
       << "Arguments: " << std::endl
       << "\t<file.parsi>       ::= the source to compile; one file, any number" << std::endl
       << "\t                       of objects, compiled in the order written" << std::endl
       << "\t--config           ::= \"configuration file\"" << std::endl
       << "\t--help | -h        ::= this" << std::endl
+      << "\t--version          ::= the version, alone, on stdout" << std::endl
       << std::endl
       << "What it produces, for each object in the file: " << std::endl
       << "\t$LD_PATH/lib_NAME_.so       the loadable object" << std::endl
@@ -102,6 +105,13 @@ static int run(int argc, char* argv[])
   // works in a tree that is not set up yet.
   if (args.flag("--help") || args.flag("-h") || argc == 1) {
     help();
+    return 0;
+  }
+
+  // THE NUMBER ALONE, on stdout, before the configuration path is printed:
+  // V=$(parsi --version) reads a bare number in a tree that is not set up.
+  if (args.flag("--version")) {
+    std::cout << Zigurat::version() << std::endl;
     return 0;
   }
 

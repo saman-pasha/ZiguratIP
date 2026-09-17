@@ -920,6 +920,36 @@ with a `Makefile` in that shape and a line in `PROJECTS`. `home/include` is what
 `-I$ZIGURATIP_HOME/include` gives a client, so a header that is not in `HEADERS`
 is private to its module.
 
+### The version, and when it moves
+
+Every binary answers `--version` with the number alone on stdout, so
+`V=$(ziguratip --version)` needs nothing stripped, and answers it before any
+configuration file has to be findable:
+
+```bash
+ziguratip --version     # 0.1.0
+parsi --version
+parsic --version
+ca --version
+```
+
+It is written in **one place**, `Core/version.cpp`, and read through
+`version.hpp`; Core is linked by every library and every binary here, so a
+second copy — a `-D` on a compile line, a string in a banner, a number in a
+document — would only be a second thing to forget, and the forgotten one is the
+one a reader believes.
+
+**The patch is the default**: bump it for an ordinary change, in the *same
+commit* as the change, and keep bumping it. The minor is for something new a
+caller can reach — a statement the compiler now takes, an option a binary now
+answers, an entry point a library now offers. The major is for something that
+worked and no longer does: a store an older build cannot open, a signature a
+generated object cannot link. Neither of those two is *taken*: it is proposed,
+with what changed observably, and the owner decides. A documentation-only commit
+does not bump at all, because there is no new binary for the number to describe.
+`Test/run-version.sh` pins the SHAPE and deliberately not the number — a test
+that named it would be a second place to edit, and the one somebody forgets.
+
 Tests are `ZTEST(Suite, name)` blocks in `Test/test_*.cpp`, registered at load
 time, so a new file needs nothing but a line in `Test/Makefile`. `Test <filter>`
 runs one suite or one case; `Test --help` lists what is there.

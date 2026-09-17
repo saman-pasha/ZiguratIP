@@ -11,12 +11,14 @@ OPTIMIZE := -O3 -funroll-loops
 
 HEADERS := zexception.hpp \
 	utility.hpp \
+	version.hpp \
 	array.hpp \
 	polynomial.hpp \
 	bigint.hpp
 
 SOURCES := zexception.cpp \
 	utility.cpp \
+	version.cpp \
 	array.cpp \
 	polynomial.cpp \
 	bigint.cpp

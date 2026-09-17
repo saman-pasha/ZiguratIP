@@ -6,6 +6,7 @@
 #include <limits>
 #include "certificateexception.hpp"
 #include "utility.hpp"
+#include "version.hpp"
 #include "argument.hpp"
 #include "configuration.hpp"
 #include "bigint.hpp"
@@ -215,6 +216,13 @@ int main(int argc, char* argv[])
   return 0;
   */
   
+  // THE NUMBER ALONE, before the banner above reaches stdout -- so
+  // V=$(ca --version) reads a bare number with nothing to strip.
+  if (argc > 1 && std::strcmp(argv[1], "--version") == 0) {
+    std::cout << Zigurat::version() << std::endl;
+    return 0;
+  }
+
   std::cout << "\tZiguratIP X.509 v3 Certification Authority (CA)" << std::endl;
   std::cout << std::endl;
 
@@ -286,6 +294,9 @@ void help()
   std::cout << "\t--users            ::= SECURITY/USERS_PATH, else ZIGURATIP_HOME/etc/users" << std::endl;
   std::cout << std::endl;
   std::cout << "Instructions: " << std::endl;
+  std::cout << "\t--! The version, alone, on stdout !--" << std::endl;
+  std::cout << "\t--version" << std::endl;
+  std::cout << std::endl;
   std::cout << "\t--! Generating a new Private and Public key pair !--" << std::endl;
   std::cout << "\tkeygen --signature=? --encryption=? --cipher=\"?\" --encoding=? --private=? --public=?" << std::endl;
   std::cout << std::endl;
