@@ -642,6 +642,76 @@ static void find_then_update ()
   reset_table();
 }
 
+// --- a write from INSIDE a lookup's callback --------------------------------
+
+// The idiom `find_then_update' above does NOT exercise: it captures the row
+// in the callback and updates after `cursor_equal' has returned. Updating
+// from inside the callback is a different thing, because the cursor holds
+// the streams guard across the walk and hands it back around the callback --
+// so the write runs in that window and takes a guard of its own. Nothing
+// tested that until ZiguratIP#37 proposed letting the lookup take the guard
+// SHARED, where an unreleased shared hold would meet the write's exclusive
+// one and `lock()' would refuse it by design ("an exclusive streams guard
+// under a shared one"). This case is that idiom, at the level whose reads
+// are eligible for a private stream.
+//
+// Each thread owns ONE row, so the arithmetic is exact and there is no
+// lost-update question to confuse a failure with: every row gains precisely
+// its rounds.
+static void update_inside_a_lookup ()
+{
+  const int64_t ROWS = 8;
+  const int THREADS = 8;
+  const int ROUNDS = 25;
+  load(ROWS);
+  commit_transaction(MEM);
+
+  Trouble trouble;
+  std::atomic<int> updated(0);
+
+  fan_out(THREADS, [&] (int t) {
+      const int64_t mine = (t % ROWS) + 1;
+      for (int n = 0; n < ROUNDS; n++) {
+        try {
+          session();                       // READ COMMITTED: reader-eligible
+          bool hit = false;
+          Part::IDX_PART_ID.cursor_equal(LONG(mine), [&] (Part& row) -> bool {
+              Part next(LONG(mine), STRING((row.*Part::KIND).to_std_string()),
+                        LONG((row.*Part::WEIGHT).value() + 1));
+              Globals::memory()->online_update(row, next);
+              hit = true;
+              return false;
+            });
+          if (hit) updated++;
+          commit_transaction(MEM);
+        } catch (std::exception& e) {
+          trouble.note(e.what());
+          try { rollback_transaction(MEM); } catch (...) { }
+        }
+      }
+    });
+
+  check_str("update in a lookup: no trouble", trouble.say(), "none");
+  check("update in a lookup: every round wrote", updated.load(), THREADS * ROUNDS);
+
+  long wrong = 0, seen = 0;
+  session();
+  for (int64_t id = 1; id <= ROWS; id++) {
+    int hits = 0;
+    Part::IDX_PART_ID.cursor_equal(LONG(id), [&] (Part& row) -> bool {
+        hits++;
+        seen++;
+        if ((row.*Part::WEIGHT).value() != id * 10 + ROUNDS) wrong++;
+        return true;
+      });
+    if (hits != 1) wrong++;
+  }
+  commit_transaction(MEM);
+  check("update in a lookup: each row answers once", seen, (long)ROWS);
+  check("update in a lookup: and gained exactly its rounds", wrong, 0);
+  reset_table();
+}
+
 // --- a row that is being rewritten ------------------------------------------
 
 static void rewrite_never_missing_from_index ()
@@ -1158,6 +1228,7 @@ int main ()
   composite_under_load();
   scan_and_walk_together();
   find_then_update();
+  update_inside_a_lookup();
   rewrite_never_missing_from_index();
   rewrite_never_missing_from_scan();
   scan_counts_exactly_once();

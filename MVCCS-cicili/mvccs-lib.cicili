@@ -844,6 +844,15 @@
   ;; C++ layer earning its keep: a ctor/dtor pair IS the discipline.
   ;; ==================================================================
   (thread-local) (var void * tl_streams_held . nil)
+  ;; AND THE SHARED TWIN OF IT. tl_streams_held names the guard only when it
+  ;; is EXCLUSIVE, because that is the hold whose reads own the canonical
+  ;; streams. A cursor's callback window found the guard to hand back through
+  ;; that name, and so handed back nothing when the hold was shared -- and a
+  ;; callback that wrote then constructed an exclusive guard under a shared
+  ;; one, which lock() refuses by design. A read holding the shared side has
+  ;; to be findable too, or no read can ever take that side around a
+  ;; callback. ZiguratIP#37.
+  (thread-local) (var void * tl_streams_shared . nil)
   ;; nonzero while this thread holds the guard SHARED: its reads go through
   ;; the thread's own read-only streams, and writers are excluded wholesale
   (thread-local) (var int tl_read_mode . 0)
@@ -932,7 +941,8 @@
       (if ($ this shared_)
           (block
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
-            (set tl_read_mode 1))
+            (set tl_read_mode 1)
+            (set tl_streams_shared (cast (void *) this)))
         (block
           ;; a write guard under a held shared one would deadlock on the
           ;; rwlock -- surface the bug instead of wedging on it
@@ -966,6 +976,7 @@
           (block
             ;; withdrawn BEFORE releasing: never claim a hold already given back
             (set tl_read_mode 0)
+            (set tl_streams_shared nil)
             (set ($ this locked_) #f)
             (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw))))
         (block
@@ -4481,7 +4492,16 @@
         (if (not (chain_resolves m (-> v value)))
             (return #t))
         (let ((Pointer row_ptr . #'(pointer_at m (-> (-> rc idx) table_key) (-> v value)))
-              (Streams * held . #'(cast (Streams *) tl_streams_held))
+              ;; WHICHEVER SIDE THIS THREAD HOLDS, not the exclusive one
+              ;; alone. A lookup holding the shared guard released nothing
+              ;; here while this read only the exclusive name, so its
+              ;; callback ran with the guard still held -- and a callback
+              ;; that WRITES then met an exclusive guard constructed under a
+              ;; shared one, the case lock() refuses. That was the whole
+              ;; blocker on the 98 % ZiguratIP#37 measured.
+              (Streams * held . #'(? (!= tl_streams_held nil)
+                                     (cast (Streams *) tl_streams_held)
+                                     (cast (Streams *) tl_streams_shared)))
               ;; THE UNLOCKED WINDOW READS PRIVATELY. The guard goes back
               ;; around the callback so it can nest engine work -- and any
               ;; read the callback itself does (read_row above all) must
@@ -4543,7 +4563,16 @@
           (bool cont . #t))
       (if (> (-> idx levels) 1)
           (block
-            ;; a key with no dependents yet is skipped, as the original does
+            ;; THE DEPENDENT CALLBACK HAS NO WINDOW -- the guard is held
+            ;; across it, unlike the row callback below, which hands it
+            ;; back through bt_output_vcb. That is why bt_cursor_dep and
+            ;; bt_cursor_equal_dep keep the EXCLUSIVE side while the seven
+            ;; row cursors ask for the shared one: a callback that writes
+            ;; rides an exclusive hold as a nested no-op, and would meet
+            ;; the "exclusive under shared" refusal on a shared one. A
+            ;; window here would let the dep pair go shared too; it would
+            ;; also be a new unlocked window in the machinery ZiguratIP#33
+            ;; was fixed in, and it is not free to add.
             (if (> (-> key dependents_address) -1)
                 (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
                   (set cont ((-> em dcb) (-> em user) (aof dep))))))
@@ -4563,6 +4592,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4632,6 +4663,14 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; A LOOKUP IS A READ. It took the guard EXCLUSIVELY -- not because it
+      ;; writes, but because it never asked otherwise -- and ZiguratIP#37
+      ;; measured the cost: two exclusive acquisitions per lookup, 98 % of a
+      ;; reading thread's occupancy of the one guard, against 0.7-1.2 us for
+      ;; a shared hold. reader_eligible is the same gate read_row passes in
+      ;; e8ada3f, and it answers 0 at REPEATABLE READ and SERIALIZABLE --
+      ;; where a read stamps row locks, and must keep the exclusive side.
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4689,6 +4728,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4735,6 +4776,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4750,6 +4793,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4809,6 +4854,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4824,6 +4871,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)

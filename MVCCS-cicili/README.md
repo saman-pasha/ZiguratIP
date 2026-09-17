@@ -927,6 +927,70 @@ limit applies to `golden/` — those are little-endian bytes, so the
 carry-over acceptance would be wrong on a big-endian box and would now
 refuse rather than mislead.
 
+## A lookup is a read, and now takes the guard as one
+
+The tenth trace point was added so ZiguratIP#37 could be answered without
+patching a working copy. It answered something nobody had asked: bracketing a
+reading thread's acquisitions showed **98 % of its exclusive guard time was
+the index lookup**, not the transaction around it — two exclusive acquisitions
+per `cursor_equal` at 223 µs each, against 3.2 µs for its `begin` and 5.7 µs
+for its `commit`.
+
+Not one of those two acquisitions is a write. `bt_cursor_equal` took the
+guard exclusively because **it never asked for anything else**, and the
+callback window at `bt_output_vcb` took it again after handing it back.
+`read_row` had been taught to ask in `e8ada3f`; its neighbours in the same
+path never were.
+
+**What stopped them was the window, not the walk.** A cursor releases the
+guard around its callback so the callback can do engine work, and it found
+the guard to hand back through `tl_streams_held` — which only an *exclusive*
+hold ever set. A lookup holding the shared side would therefore release
+nothing, and a callback that wrote would construct an exclusive guard under a
+held shared one, which `Streams::lock` refuses by design. So the window now
+knows both sides: `tl_streams_shared` names a shared hold exactly as
+`tl_streams_held` names an exclusive one, and the window hands back whichever
+this thread has.
+
+With that, **the seven row cursors ask for the shared side when
+`reader_eligible` allows it** — the same gate `read_row` passes, which
+answers 0 at REPEATABLE READ and SERIALIZABLE, where a read stamps row locks
+and must keep the exclusive guard.
+
+**The two DEPENDENT cursors deliberately do not.** `bt_cursor_dep` and
+`bt_cursor_equal_dep` invoke their callback with the guard *held* — there is
+no window there at all — so a callback that writes rides an exclusive hold as
+a nested no-op today, and would meet the same refusal on a shared one. That
+is not theoretical: the suite's `composite under load` threw exactly that on
+the first attempt, which is what a suite is for. A window for the dependent
+callback would let the pair go shared too, and would also be a new unlocked
+window in the machinery ZiguratIP#33 was fixed in. It is not free and it is
+not done.
+
+**Measured, one `contention_test` binary with only `libMVCCS.so` swapped,
+five runs an arm alternating:**
+
+| | before | after |
+|---|---|---|
+| exclusive acquisitions | 38 344 | **30 622** |
+| exclusive guard time | 10 248 ms | **7 624 ms** |
+| shared acquisitions | 77 652 | 176 459 |
+| nested no-ops | 21 894 | 21 894 |
+| **suite wall clock** | **10.61 s** | **8.04 s** |
+
+Exclusive holds serialise every thread and shared ones do not, so the middle
+row is the one that matters: a quarter of the serialised time is gone, and
+the wall clock agrees to within two points (24 % against 26 %). The
+acquisition figures come from a `debug` build and carry its overhead; the
+wall clock is an ordinary build, `10.44-10.87` against `7.96-8.18` with no
+overlap. The nested count is identical either side, which is the control.
+
+The new case `update in a lookup` is what holds this honest: a write from
+**inside** a lookup's callback at READ COMMITTED, eight threads on their own
+rows. `find_then_update` looks like that case and is not — it captures the
+row in the callback and writes after the cursor returns, which is the one
+path that never needed the window.
+
 ## Hard debugging, without changing a line
 
 Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —
