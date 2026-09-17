@@ -328,7 +328,17 @@ static void lookups_survive_a_writer ()
   std::atomic<int> wrong(0);
   std::atomic<int> reads(0);
 
+  // THE READERS ARE IN THEIR LOOP BEFORE THE WRITER STARTS. Nothing used to
+  // make them: the writer thread is constructed here and fan_out spawns the
+  // readers after it, so on a four-core box the writer's 120 commits could
+  // be over before one reader was scheduled, and `readers made progress'
+  // then failed on reads == 0 with the engine perfectly innocent. It was the
+  // commonest red in ZiguratIP#33 -- 7 and 9 of 80 across the two arms of an
+  // engine A/B, moving with neither, which is what said it was the harness.
+  std::atomic<int> ready(0);
+
   std::thread writer([&] () {
+      while (ready.load() < READERS) std::this_thread::yield();
       try {
         for (int64_t i = ROWS + 1; i <= ROWS + 120; i++) {
           session();
@@ -345,7 +355,10 @@ static void lookups_survive_a_writer ()
   fan_out(READERS, [&] (int t) {
       try {
         session();
-        while (writing.load()) {
+        ready++;
+        // and a do-while, so what this case claims is structural: every
+        // reader reads at least once, whatever the scheduler does with it
+        do {
           const int64_t want = ((int64_t)(reads.load() + t) % ROWS) + 1;
           Part::IDX_PART_ID.cursor_equal(LONG(want), [&] (Part& row) -> bool {
               if ((row.*Part::ID).value() != want) wrong++;
@@ -353,7 +366,7 @@ static void lookups_survive_a_writer ()
               return true;
             });
           reads++;
-        }
+        } while (writing.load());
         commit_transaction(MEM);
       } catch (std::exception& e) {
         trouble.note(std::string("reader: ") + e.what());
@@ -635,8 +648,12 @@ static void rewrite_never_missing_from_index ()
   std::atomic<int> looks(0);
   std::atomic<int> missing(0);
   std::atomic<int> doubled(0);
+  // the same latch as `writer under readers' above, for the same reason:
+  // four readers spawned after the writer can all arrive to find it done
+  std::atomic<int> ready(0);
 
   std::thread writer([&] () {
+      while (ready.load() < 4) std::this_thread::yield();
       try {
         for (int n = 0; n < 200; n++) {
           session();
@@ -660,7 +677,8 @@ static void rewrite_never_missing_from_index ()
 
   fan_out(4, [&] (int) {
       try {
-        while (writing.load()) {
+        ready++;
+        do {
           session();
           int hits = 0;
           Part::IDX_PART_ID.cursor_equal(LONG(1), [&] (Part& row) -> bool {
@@ -672,7 +690,7 @@ static void rewrite_never_missing_from_index ()
           if (hits > 1) doubled++;
           looks++;
           commit_transaction(MEM);
-        }
+        } while (writing.load());
       } catch (std::exception& e) {
         trouble.note(std::string("reader: ") + e.what());
         try { rollback_transaction(MEM); } catch (...) { }
