@@ -237,6 +237,57 @@
         (pthread_mutex_unlock (aof clock_access))
         (return (cast time_t next))))
 
+    ;; HOW FAR THIS PROCESS'S CLOCK HAS RUN AHEAD OF REAL TIME, in
+    ;; microseconds, and 0 or less when it has not. The synthesised
+    ;; clock_last + 1 above is what makes that possible: a burst of calls
+    ;; inside one microsecond each take the next integer, and clock_last
+    ;; only ratchets, so a fast enough writer stamps rows with a time that
+    ;; has not happened yet. Nothing outside this process can see where the
+    ;; count got to, which is what makes the lead matter -- see
+    ;; clock_settle, and the case in mvccs.cicili that measures both.
+    (func clock_ahead () (out int64_t)
+      (pthread_mutex_lock (aof clock_access))
+      (let ((int64_t ahead . #'(- clock_last (mvccs_wall_micros))))
+        (pthread_mutex_unlock (aof clock_access))
+        (return ahead)))
+
+    ;; WAIT UNTIL REAL TIME REACHES A STAMP THIS PROCESS HANDED OUT.
+    ;;
+    ;; WHY A COMMIT OWES THIS. A committed row carries the transaction's
+    ;; stamp as its create_time, and every reader judges it by "born after
+    ;; this read began" -- against ITS OWN clock, which in a fresh process
+    ;; starts at zero and is therefore the true wall clock. So a writer
+    ;; that exits before the time it stamped its rows with leaves them
+    ;; invisible to the next process for as long as the lead lasts: the
+    ;; rows are all there, the store is whole to the byte, and the reader
+    ;; simply cannot see any of them -- the catalogue row included, which
+    ;; is why it reads as a missing predicate rather than an empty answer,
+    ;; and why the same read a few milliseconds later is perfect.
+    ;;
+    ;; Diagnosed downstream on Linux/ext4 and measured there
+    ;; (saman-pasha/ZiguratIP#32): a 32 000-row flush led the wall clock by
+    ;; 25.6 ms and 0 of 8 first reads saw the rows; 20 ms of delay made it
+    ;; 8 of 8. The lead tracks how fast the flush is -- the same rows over
+    ;; the three growth strategies in StreamIO/mapbuf led by -16.5, +9.6
+    ;; and +26.3 ms -- which is how a pair of storage commits with no
+    ;; defect in them came to look like the cause.
+    ;;
+    ;; The wait is the lead and nothing more: microseconds for an ordinary
+    ;; commit, spun out rather than slept away because a sleep's own
+    ;; granularity would cost more than the wait; milliseconds for a flush
+    ;; that outran the clock, slept through in one call. It is paid outside
+    ;; the streams guard -- the rows are durable before it starts -- so a
+    ;; committer waiting here holds nothing that another thread needs.
+    (func clock_settle ((time_t stamp)) (out void)
+      (let ((int64_t target . #'(cast int64_t stamp))
+            (int64_t now . #'(mvccs_wall_micros)))
+        (while (< now target)
+          (let ((int64_t gap . #'(- target now)))
+            ;; a syscall is worth making only for a gap that dwarfs it
+            (if (> gap 200)
+                (usleep (cast unsigned (- gap 100)))))
+          (set now (mvccs_wall_micros)))))
+
     ;; ----------------------------------------------------------------
     ;; Layout arithmetic -- the _pointer_* helpers. Integer arithmetic
     ;; instead of floor/ceil over doubles: exact for every non-negative
@@ -1652,10 +1703,12 @@
             (return)))
       ;; scoped: reset() below can wait on the SERIALIZABLE gate and must
       ;; not hold the streams while it does
+      (let ((time_t settled . #'(cast time_t 0)))
       (block
         (letin* ((streams (Streams m)))
           ;; ONE stamp for the whole transaction
           (let ((time_t commit_time . #'(version_time)))
+            (set settled commit_time)
             ;; the intention, on disk before any control block moves
             (write_transaction m (-> t id) commit_time)
             (sync_disk m)
@@ -1679,6 +1732,14 @@
             ;; only then is the intention retired
             (write_transaction m (-> t id) (cast time_t 0))
             (sync_disk m))))
+      ;; AND THE COMMIT DOES NOT RETURN UNTIL REAL TIME HAS REACHED THE
+      ;; STAMP IT WROTE. Everything above is durable by now and the guard
+      ;; is back, so this waits holding nothing; what it waits for is the
+      ;; lead a fast flush builds up in the version clock, which is
+      ;; otherwise a window in which the next process to open the store
+      ;; cannot see a single row of this transaction. clock_settle carries
+      ;; the measurements; the ordinary commit does not wait at all.
+      (clock_settle settled))
       ;; THE RECORD POINTER IS SPENT WITH THE TRANSACTION -- only the
       ;; read-only path nulled it, so after a writing commit the next
       ;; begin CONTINUED a committed-out transaction: its stages carried

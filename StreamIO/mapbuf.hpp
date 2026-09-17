@@ -45,16 +45,25 @@ namespace Zigurat
   // written, so every reader of its length sees the exact one and a clean
   // exit leaves an exact file.
   //
-  // WHAT WAS TRIED IN BETWEEN, and why it is not here: making the extending
-  // write a pwrite (ZiguratIP c4a7e19). It was faster than one ftruncate a
-  // write and kept the length exact at all times, but it put CONTENT
-  // through a second path -- write(2) for the bytes past the end, the
-  // mapping for everything else -- and a store written that way was
-  // intermittently incomplete to the next process that opened it on
-  // Linux/ext4 (saman-pasha/ZiguratIP#32: ~30% of first reads, repaired by
-  // the open that failed). The mechanism was never established; the mixing
-  // was, and it is gone. One path writes the bytes. The kernel is only ever
-  // asked to move the end.
+  // WHAT WAS TRIED IN BETWEEN, AND WHAT IT WAS WRONGLY BLAMED FOR: making
+  // the extending write a pwrite (ZiguratIP c4a7e19). It was faster than
+  // one ftruncate a write and kept the length exact at every instant, and
+  // it was withdrawn because a store written that way came out
+  // intermittently unreadable to the next process on Linux/ext4. THAT
+  // CONCLUSION, WHICH THIS COMMENT USED TO STATE, WAS WRONG. The fault was
+  // the version clock (saman-pasha/ZiguratIP#32, diagnosed downstream): a
+  // flush fast enough stamps its rows with a time that has not happened
+  // yet, and a reader in a fresh process cannot see rows born after its own
+  // snapshot. It survived the withdrawal at the same rate, and the three
+  // growth strategies only moved the lead -- -16.5 ms, +9.6, +26.3 at
+  // 32 000 rows -- which is how a storage commit with no defect in it came
+  // to look like a cause. The engine settles the clock at commit now; see
+  // clock_settle in MVCCS-cicili/mvccs-lib.cicili.
+  //
+  // The chunked grow stays on its own merits: fastest of the three on both
+  // filesystems, and one path writing the bytes is a rule worth keeping
+  // whatever the bug turned out to be. It did not fix anything, and this
+  // comment is not going to say it did.
   //
   // ONE POSITION, shared by reads and writes, as a filebuf has: the engine
   // was written against that and it stays true here.

@@ -1129,6 +1129,45 @@
             (check "and a draw walks its key's pages, not the store's"
                    (? (<= stepped ($ mem page_count)) 1 0) 1)))
 
+        ;; ---- A COMMIT DOES NOT LEAVE ITS STAMP IN THE FUTURE ---------
+        ;; The version clock hands out clock_last + 1 when two calls land
+        ;; in one microsecond, and clock_last only ratchets -- so a flush
+        ;; fast enough stamps its rows with a time that has not happened,
+        ;; and the NEXT PROCESS, whose clock starts at zero, judges every
+        ;; one of those rows "born after this read began" and sees none of
+        ;; them. That is what ZiguratIP#32 was: 30% of first reads of a
+        ;; 32 000-row store on Linux, with the store whole to the byte.
+        ;;
+        ;; The symptom needs two processes and a machine fast enough to
+        ;; outrun a microsecond a row; the INVARIANT needs neither, and is
+        ;; the thing worth pinning. The lead is made here on purpose --
+        ;; version_time called in a burst until the clock is milliseconds
+        ;; ahead -- and then one commit has to put it back.
+        (let ((int64_t burned . 0))
+          (while (< (clock_ahead) 4000)
+            (version_time)
+            (set burned (+ burned 1)))
+          (printf "     %ld draws of the clock put it %ld us ahead of real time\n"
+                  (cast long burned) (cast long (clock_ahead)))
+          (check "a burst of stamps really does run the clock ahead"
+                 (? (> (clock_ahead) 0) 1 0) 1)
+          (let ((Book b))
+            (set ($ b id) 4242)
+            (set ($ b value) 4242)
+            (Book_insert (aof mem) (aof b)))
+          (commit_transaction (aof mem))
+          (begin_transaction (aof mem))
+          (check "and the commit does not return until real time catches up"
+                 (? (<= (clock_ahead) 0) 1 0) 1)
+          ;; and the row it wrote is there, which is the point of the wait
+          (let ((Book found))
+            (check "with the row it stamped readable behind it"
+                   (? (book_find (aof mem) 4242 (aof found)) 1 0) 1)
+            (if (book_find (aof mem) 4242 (aof found))
+                (Book_delete (aof mem) (aof found))))
+          (commit_transaction (aof mem))
+          (begin_transaction (aof mem)))
+
         ;; ---- unmap_key: the lowest ten keys leave the tree wholesale,
         ;; every deletion of the minimum walking the leftmost leaf, the
         ;; underflow merges and the root shrinks

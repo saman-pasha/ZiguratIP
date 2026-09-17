@@ -821,18 +821,19 @@ End to end, 128 000 rows into a fresh `--embed` store, three runs each on
 one machine: **9.22 s → 3.6 s** here, and 26.9 s → 2.2 s on the Linux box
 with the page-list fix above.
 
-**THE MIDDLE ROW WAS TRIED AND WITHDRAWN**, and that is the reason the
-chunked grow carries a cut-back rather than the file simply being left
-long. `pwrite` appends and extends in one call and keeps the length exact
-at every instant, which read as the principled choice -- but it puts
-CONTENT through a second path, and a store written that way was
-intermittently incomplete to the next process that opened it on Linux/ext4:
-about 30 % of first reads could not see the last thing written, and the
-open that failed repaired it (saman-pasha/ZiguratIP#32, found by an
-interleaved 20-run A/B that swapped only `libStreamIO.so`). The mechanism
-was never established. The mixing was, and the rule that replaces it is
-narrower and easier to keep: **one path writes the bytes, and the kernel is
-only ever asked to move the end.**
+**THE MIDDLE ROW WAS TRIED AND WITHDRAWN, AND THE REASON GIVEN FOR
+WITHDRAWING IT WAS WRONG.** `pwrite` appends and extends in one call and
+keeps the length exact at every instant; it went out because a store
+written that way came out intermittently unreadable to the next process on
+Linux/ext4 -- about 30 % of first reads -- and because it was the one thing
+that had changed (saman-pasha/ZiguratIP#32, found by an interleaved 20-run
+A/B swapping only `libStreamIO.so`). This file said the mixing of write
+paths was the variable. **It was not**, and "The stamp in the future" below
+is what it actually was: the fault survived the withdrawal at the same
+rate, and what the three growth strategies did was move a clock's lead
+across zero. The chunked grow stays because it is the fastest of the three
+and because one path writing the bytes is a good rule -- not because it
+fixed anything.
 
 What the chunked grow costs is a window: between one sync and the next the
 file is up to a megabyte longer than its writes, so a KILL can leave whole
@@ -842,6 +843,52 @@ all zeros -- growth nobody wrote, or a page header torn mid-write, which
 shadow paging says never happened either way. Measured: a writer killed
 mid-write leaves a 20 MiB store, the next open refrees the zeros, and 500
 rows written after it do not grow the file by a byte.
+
+## The stamp in the future, which the faster writes only exposed
+
+Diagnosed downstream, on the store the two sections above made faster, and
+it is the better finding of the three because it explains why they looked
+guilty. `version_time` answers the wall clock in microseconds -- or
+`clock_last + 1` when two calls land inside one, and `clock_last` is PER
+PROCESS and only ratchets. So a flush that makes more calls than it has
+microseconds pushes the clock past real time, where nothing outside that
+process can see where it got to. `commit_transaction` takes ONE such value
+for the whole transaction and `commit_pointer` writes it into every
+committed row's `create_time` — which are the only reader-visible stamps a
+commit sets.
+
+**So the writer exits before the clock it stamped its own rows with.** A
+reader is a new process: its `clock_last` is 0, its snapshot is the true
+wall clock, and `alive_at`'s "born after this read began" then hides every
+row of that commit — the catalogue row included, which is why the symptom
+is a missing predicate rather than an empty answer, why a second read
+milliseconds later is perfect, and why nothing is ever lost.
+
+Measured on Linux/ext4 over fresh `--embed` stores, the commit stamp against
+the wall clock at the writer's exit, with the first read at three delays:
+
+| rows | commit stamp leads by | d=0 | 5 ms | 20 ms |
+|---|---|---|---|---|
+| 500 | -3.0 ms | 8/8 | 8/8 | 8/8 |
+| 2 000 | +1.9 ms | 8/8 | 8/8 | 8/8 |
+| 8 000 | +10.4 ms | 7/8 | 8/8 | 8/8 |
+| 32 000 | **+25.6 ms** | **0/8** | 3/8 | 8/8 |
+
+-- the delay a store needs is the lead its own stamp carries. And with only
+`libStreamIO.so` swapped, at 32 000 rows: **-16.5 ms** on one ftruncate a
+write, **+9.6** on the pwrite, **+26.3** on the chunked grow. The lead
+crosses zero exactly at the two commits that were blamed, in the order their
+failure rates ran. Neither put a defect in; both made the flush fast enough
+for the same number of clock calls to outrun the microseconds available.
+
+`clock_settle` is the answer: **a commit does not return until real time has
+reached the stamp it wrote**, waited out after the rows are durable and the
+streams guard is back, so a committer waiting holds nothing. An ordinary
+commit leads by microseconds and spins them out; a flush that outran the
+clock sleeps the difference in one call. `mvccs_test` pins the invariant
+without needing two processes or a fast machine: it burns the clock
+milliseconds ahead on purpose, commits, and requires `clock_ahead()` to be
+back at or below zero with the row it stamped readable behind it.
 
 ## Build and run
 
