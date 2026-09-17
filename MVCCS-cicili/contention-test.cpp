@@ -353,9 +353,10 @@ static void lookups_survive_a_writer ()
     });
 
   fan_out(READERS, [&] (int t) {
+      bool counted = false;
       try {
         session();
-        ready++;
+        ready++; counted = true;
         // and a do-while, so what this case claims is structural: every
         // reader reads at least once, whatever the scheduler does with it
         do {
@@ -371,6 +372,11 @@ static void lookups_survive_a_writer ()
       } catch (std::exception& e) {
         trouble.note(std::string("reader: ") + e.what());
       }
+      // AND A READER THAT THREW INSIDE session() NEVER COUNTED ITSELF, which
+      // would leave the writer spinning on `ready' for ever. A hang is worse
+      // than a red -- the red is already in `trouble' -- so it counts itself
+      // on the way out and lets the writer go.
+      if (!counted) ready++;
     });
 
   writer.join();
@@ -717,8 +723,12 @@ static void rewrite_never_missing_from_scan ()
   std::atomic<int> scans(0);
   std::atomic<int> short_counts(0);
   std::atomic<int> long_counts(0);
+  // the same latch as `writer under readers', for the same reason: four
+  // scanners spawned after the writer can all arrive to find it finished
+  std::atomic<int> ready(0);
 
   std::thread writer([&] () {
+      while (ready.load() < 4) std::this_thread::yield();
       try {
         for (int n = 0; n < 200; n++) {
           const int64_t which = (n % ROWS) + 1;
@@ -744,7 +754,8 @@ static void rewrite_never_missing_from_scan ()
 
   fan_out(4, [&] (int) {
       try {
-        while (writing.load()) {
+        ready++;
+        do {
           session();
           std::set<int64_t> ids;
           Globals::memory()->cursor<Part>([&] (Part& row) -> bool {
@@ -755,7 +766,7 @@ static void rewrite_never_missing_from_scan ()
           if ((int64_t)ids.size() > ROWS) long_counts++;
           scans++;
           commit_transaction(MEM);
-        }
+        } while (writing.load());
       } catch (std::exception& e) {
         trouble.note(std::string("reader: ") + e.what());
         try { rollback_transaction(MEM); } catch (...) { }
@@ -782,8 +793,12 @@ static void scan_counts_exactly_once ()
   std::atomic<int> scans(0);
   std::atomic<int> missed(0);
   std::atomic<int> counted_twice(0);
+  // and the same latch again: three scanners, one writer, nothing else
+  // ordering them
+  std::atomic<int> ready(0);
 
   std::thread writer([&] () {
+      while (ready.load() < 3) std::this_thread::yield();
       try {
         for (int n = 0; n < 400; n++) {
           const int64_t which = (n % ROWS) + 1;
@@ -808,7 +823,8 @@ static void scan_counts_exactly_once ()
 
   fan_out(3, [&] (int) {
       try {
-        while (writing.load()) {
+        ready++;
+        do {
           session();
           std::vector<int> seen((size_t)ROWS + 1, 0);
           Globals::memory()->cursor<Part>([&] (Part& row) -> bool {
@@ -822,7 +838,7 @@ static void scan_counts_exactly_once ()
           }
           scans++;
           commit_transaction(MEM);
-        }
+        } while (writing.load());
       } catch (std::exception& e) {
         trouble.note(std::string("reader: ") + e.what());
         try { rollback_transaction(MEM); } catch (...) { }
