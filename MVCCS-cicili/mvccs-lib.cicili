@@ -1732,14 +1732,6 @@
             ;; only then is the intention retired
             (write_transaction m (-> t id) (cast time_t 0))
             (sync_disk m))))
-      ;; AND THE COMMIT DOES NOT RETURN UNTIL REAL TIME HAS REACHED THE
-      ;; STAMP IT WROTE. Everything above is durable by now and the guard
-      ;; is back, so this waits holding nothing; what it waits for is the
-      ;; lead a fast flush builds up in the version clock, which is
-      ;; otherwise a window in which the next process to open the store
-      ;; cannot see a single row of this transaction. clock_settle carries
-      ;; the measurements; the ordinary commit does not wait at all.
-      (clock_settle settled))
       ;; THE RECORD POINTER IS SPENT WITH THE TRANSACTION -- only the
       ;; read-only path nulled it, so after a writing commit the next
       ;; begin CONTINUED a committed-out transaction: its stages carried
@@ -1750,7 +1742,18 @@
       ;; already cleared: a waiter still seeing this id on a lock must
       ;; find it live, or it would break a commit mid-flight
       (transaction_retire (-> t id))
-      (transaction_reset t)))
+      (transaction_reset t)
+      ;; AND ONLY NOW DOES THE COMMIT WAIT FOR REAL TIME TO REACH THE STAMP
+      ;; IT WROTE. The wait belongs LAST, after everything this transaction
+      ;; was holding is given back: the streams went with the block above,
+      ;; the live id with transaction_retire, and the SERIALIZABLE slot with
+      ;; transaction_reset -- which is a semaphore of ONE whose waiters poll
+      ;; at ten milliseconds, so a committer sleeping while still holding it
+      ;; would put its whole wait, rounded up to a poll, on every other
+      ;; writer. It was placed before these three when it was written and
+      ;; that was wrong; a wait that holds anything is a wait somebody else
+      ;; pays for. What it waits for is in clock_settle.
+      (clock_settle settled))))
 
   (func rollback_transaction ((Memory * m)) (out void)
     (dba_watch0 m "Rollback Transaction")
