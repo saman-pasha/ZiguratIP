@@ -28,9 +28,38 @@ cd "$CICILI"
 LIB_ENV="$(cd "$HERE/.." && pwd)/home/lib"
 LD_LIBRARY_PATH="$LIB_ENV${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH
-sbcl --script cicili.lisp --release "$HERE/mvccs.cicili"
+# MVCCS_DEBUG TURNS THE ENGINE'S TRACING ON WITHOUT EDITING A LINE OF IT.
+# Cicili's info!/warn!/debug! macros compile away to NOTHING at level 0, so
+# an ordinary build carries no trace code at all and this is the only way to
+# get any:
+#
+#   MVCCS_DEBUG=info  sh build.sh   the store's lifecycle: opens and what
+#                                   they repaired, every commit's stamp
+#   MVCCS_DEBUG=warn  sh build.sh   and the rare paths: a torn record
+#                                   salvaged, a keyless page refreed, a
+#                                   commit that had to wait for the clock
+#   MVCCS_DEBUG=debug sh build.sh   and every read with the stream and guard
+#                                   it used, every cursor window, every
+#                                   synthesised clock value. Loud by design.
+#
+# Every line goes to stderr and carries its thread, because the questions
+# these answer are all "which thread, and in what order". See the tracing
+# note in mvccs-lib.cicili for which level answers which kind of question,
+# and ../README.md for the two bugs that chose these points.
+DEBUG_FLAG=""
+case "${MVCCS_DEBUG:-}" in
+  info)   DEBUG_FLAG="--info"   ;;
+  warn)   DEBUG_FLAG="--warn"   ;;
+  debug)  DEBUG_FLAG="--debug"  ;;
+  syslog) DEBUG_FLAG="--syslog" ;;
+  "")     ;;
+  *) echo "MVCCS_DEBUG must be one of: info warn debug syslog" >&2; exit 1 ;;
+esac
+[ -n "$DEBUG_FLAG" ] && echo "== tracing compiled in at $MVCCS_DEBUG, on stderr"
+
+sbcl --script cicili.lisp --release $DEBUG_FLAG "$HERE/mvccs.cicili"
 if [ -f "$HERE/schema-test.cicili" ]; then
-  sbcl --script cicili.lisp --release "$HERE/schema-test.cicili"
+  sbcl --script cicili.lisp --release $DEBUG_FLAG "$HERE/schema-test.cicili"
 fi
 
 # The headers this engine includes live in ../home/include, and every
@@ -58,7 +87,7 @@ cp "$HERE/engine.hpp" "$HERE/engine-compat.hpp" "$INCDIR/"
 # ---- the engine as ONE shared library: libMVCCS.so ------------------
 # engine.cicili expands the engine exactly once and adds the engine_*
 # wrappers; consumers compile with plain $CXX against engine.hpp.
-sbcl --script cicili.lisp --release "$HERE/engine.cicili"
+sbcl --script cicili.lisp --release $DEBUG_FLAG "$HERE/engine.cicili"
 "$CXX" -shared "$HERE/.libs/engine.o" -o "$LIBDIR/libMVCCS.so" \
   -L"$LIBDIR" -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 

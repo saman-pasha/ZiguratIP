@@ -228,6 +228,56 @@
     (var pthread_mutex_t clock_access . PTHREAD_MUTEX_INITIALIZER)
     (var int64_t clock_last . 0)
 
+    ;; ----------------------------------------------------------------
+    ;; TRACING, AND HOW TO TURN IT ON WITHOUT TOUCHING A LINE OF THIS
+    ;; FILE. Cicili's four logging macros compile away to nothing unless
+    ;; the transpiler is told otherwise, so what is written below costs a
+    ;; release build exactly zero: `info!' emits only under --info and
+    ;; above, `warn!' under --warn and above, `debug!' under --debug and
+    ;; above, and level 0 -- every ordinary build -- emits none of them.
+    ;;
+    ;;     MVCCS_DEBUG=info  sh MVCCS-cicili/build.sh      the lifecycle
+    ;;     MVCCS_DEBUG=warn  sh MVCCS-cicili/build.sh      and what is odd
+    ;;     MVCCS_DEBUG=debug sh MVCCS-cicili/build.sh      and every read
+    ;;
+    ;; WHAT EACH LEVEL IS FOR, chosen from what two hard bugs actually
+    ;; needed (#32, a commit stamp in the future; #33, a read with no
+    ;; guard inside a cursor's callback window -- both took days of
+    ;; patched builds downstream to see, and both are one line here):
+    ;;
+    ;;   info   the store's lifecycle -- open, what the startup walk
+    ;;          repaired, every commit's stamp and rows, every rollback.
+    ;;          A handful of lines a run.
+    ;;   warn   the paths that should be rare: a torn record salvaged, a
+    ;;          page refreed because it had no key, a commit that had to
+    ;;          WAIT for the wall clock, a bounded wait giving up.
+    ;;   debug  per-operation: every read with the stream it used and the
+    ;;          guard it held, every callback window's release and its
+    ;;          eligibility decision, every synthesised clock value.
+    ;;          Loud, and the point: this is what a race looks like.
+    ;;
+    ;; EVERY LINE GOES TO stderr, never stdout: a consumer's answers live
+    ;; there (cocolog prints its own on stdout and is parsed by scripts),
+    ;; and a trace that corrupts the thing being debugged is worse than
+    ;; none. Every line carries the thread, because the questions these
+    ;; answer are all "which thread, and in what order" -- as the LOW
+    ;; SIXTEEN BITS of pthread_self, which is what makes eight threads
+    ;; tellable apart at a glance in a file of ten thousand lines. It is a
+    ;; tag and not an identity: two threads could in principle wear the
+    ;; same one, so a trace that reads as though one thread were in two
+    ;; places at once is the first thing to doubt.
+    ;;
+    ;; What two lines together look like, at debug, on the store the
+    ;; contention suite races -- and this pair IS issue #33, which took
+    ;; four days and eleven comments to establish the first time:
+    ;;
+    ;;     mvccs[t0a10] cursor window: release=1 flip=0
+    ;;     mvccs[t0a10] read 8240  held=0 shared=0 window=0 eligible=0
+    ;;
+    ;; the guard released, no private redirect, and then a read holding
+    ;; nothing on the stream every other thread is seeking.
+    ;; ----------------------------------------------------------------
+
     (func version_time () (out time_t)
       (pthread_mutex_lock (aof clock_access))
       (let ((int64_t now . #'(mvccs_wall_micros))
@@ -235,6 +285,12 @@
         (set next (? (> now clock_last) now (+ clock_last 1)))
         (set clock_last next)
         (pthread_mutex_unlock (aof clock_access))
+        ;; a synthesised value is the clock running ahead of real time --
+        ;; the whole of #32 in one line, had it been printable then
+        (debug! (if (> next now)
+                    (fprintf stderr "mvccs[t%04zx] clock synth %lld, ahead by %lld us\n"
+                             (bitand (cast size_t (pthread_self)) 65535)
+                             (cast llong next) (cast llong (- next now)))))
         (return (cast time_t next))))
 
     ;; HOW FAR THIS PROCESS'S CLOCK HAS RUN AHEAD OF REAL TIME, in
@@ -281,6 +337,10 @@
     (func clock_settle ((time_t stamp)) (out void)
       (let ((int64_t target . #'(cast int64_t stamp))
             (int64_t now . #'(mvccs_wall_micros)))
+        (warn! (if (> (- target now) 1000)
+                   (fprintf stderr "mvccs[t%04zx] commit waits %lld us for the wall clock\n"
+                            (bitand (cast size_t (pthread_self)) 65535)
+                            (cast llong (- target now)))))
         (while (< now target)
           (let ((int64_t gap . #'(- target now)))
             ;; a syscall is worth making only for a gap that dwarfs it
@@ -1818,6 +1878,9 @@
       ;; find it live, or it would break a commit mid-flight
       (transaction_retire (-> t id))
       (transaction_reset t)
+      (info! (fprintf stderr "mvccs[t%04zx] commit: txn %zu stamped %lld\n"
+                      (bitand (cast size_t (pthread_self)) 65535)
+                      (cast size_t (-> t id)) (cast llong settled)))
       ;; AND ONLY NOW DOES THE COMMIT WAIT FOR REAL TIME TO REACH THE STAMP
       ;; IT WROTE. The wait belongs LAST, after everything this transaction
       ;; was holding is given back: the streams went with the block above,
@@ -2468,6 +2531,13 @@
                                                 (int flip . #'(? (and (!= streams nil)
                                                                       (== 1 (reader_eligible m)))
                                                                1 0)))
+                                            ;; the window, and whether its reads
+                                            ;; go private: flip 0 with the guard
+                                            ;; released is the state #33 raced in
+                                            (debug! (fprintf stderr
+                                                     "mvccs[t%04zx] cursor window: release=%d flip=%d\n"
+                                                     (bitand (cast size_t (pthread_self)) 65535)
+                                                     (? (!= streams nil) 1 0) flip))
                                             (if (!= streams nil) ((-> streams unlock)))
                                             (if (== flip 1) (set tl_window_reads 1))
                                             (if (not (callback ctx (aof pointer)))
@@ -2521,6 +2591,14 @@
   ;; clean.
   (func read_row ((Memory * m) (BaseTable * obj)) (out void)
     (dba_watch1 m "Read Row" ($ (-> obj pointer) address))
+    ;; WHICH STREAM, AND WHAT WAS HELD. #33 was a read on the canonical
+    ;; stream holding nothing, inside a window where another thread could
+    ;; move its position; this line says both, per read, for every thread.
+    (debug! (fprintf stderr "mvccs[t%04zx] read %lld  held=%d shared=%d window=%d eligible=%d\n"
+                     (bitand (cast size_t (pthread_self)) 65535)
+                     (cast llong ($ (-> obj pointer) address))
+                     (? (!= tl_streams_held nil) 1 0) tl_read_mode tl_window_reads
+                     (reader_eligible m)))
     (if (== 1 (reader_eligible m)) (set tl_want_shared 1))
     (letin* ((streams (Streams m)))
       (let ((binarystream * dio . #'(data_in m)))
@@ -2867,6 +2945,9 @@
               (if (!= (nth b key) 0) (set keyed 1)))
             (if (== keyed 0)
                 (block
+                  (warn! (fprintf stderr "mvccs[t%04zx] open: page %lld has no key, refreed\n"
+                                  (bitand (cast size_t (pthread_self)) 65535)
+                                  (cast llong begin_address)))
                   (allocate_page m FREE_HASHKEY begin_address)
                   (memcpy (cast (void *) key) (cast (const void *) FREE_HASHKEY)
                           (cast size_t HASHKEY_SIZE)))))
@@ -2950,6 +3031,9 @@
                 (cast void 0))
               (catch ((const ZiguratException & ex))
                 (cast void ex)
+                (warn! (fprintf stderr "mvccs[t%04zx] open: a torn record at %lld salvaged -- %s\n"
+                                (bitand (cast size_t (pthread_self)) 65535)
+                                (cast llong begin_address) (($ ex what))))
                 (if (< begin_address end_address)
                     (let ((int64_t remaining . #'(/ (- end_address begin_address) CHUNK_SIZE)))
                       ((-> (-> m hexmap_io) clear))
@@ -3087,8 +3171,17 @@
       ;; exactly. A file that was never padded loses nothing: its last byte
       ;; is non-zero, so the scan reads one block and stops.
       (let ((int64_t covered . #'(/ (hexmap_written_length hexmap_io hexlen) (-> m hbpp))))
+        (info! (fprintf stderr
+                "mvccs[t%04zx] open: page_size %lld, %lld pages, hexmap %lld bytes covering %lld\n"
+                (bitand (cast size_t (pthread_self)) 65535)
+                (cast llong page_size) (cast llong (-> m page_count))
+                (cast llong hexlen) (cast llong covered)))
         (if (< covered (-> m page_count))
             (let ((int64_t p . covered))
+              ;; growth a kill left behind, or a hexmap that never caught up
+              (warn! (fprintf stderr "mvccs[t%04zx] open: refreeing %lld page(s) the hexmap does not cover\n"
+                              (bitand (cast size_t (pthread_self)) 65535)
+                              (cast llong (- (-> m page_count) covered))))
               (while (< p (-> m page_count))
                 (allocate_page m FREE_HASHKEY (* p page_size))
                 (set p (+ p 1)))

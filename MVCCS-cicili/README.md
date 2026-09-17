@@ -927,6 +927,51 @@ limit applies to `golden/` — those are little-endian bytes, so the
 carry-over acceptance would be wrong on a big-endian box and would now
 refuse rather than mislead.
 
+## Hard debugging, without changing a line
+
+Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —
+that a **transpiler flag** decides the fate of: at the default level each one
+expands to nothing at all, so the code below costs a shipped build exactly
+zero and a `grep` of `engine.cpp` finds none of it. Turn them on when a
+question needs them:
+
+```bash
+sh MVCCS-cicili/build.sh                       # nothing; 0 trace sites emitted
+MVCCS_DEBUG=info  sh MVCCS-cicili/build.sh     # 34 lines over a schema_test run
+MVCCS_DEBUG=warn  sh MVCCS-cicili/build.sh
+MVCCS_DEBUG=debug sh MVCCS-cicili/build.sh     # 161 over the same run
+```
+
+| level | what it answers | what it prints |
+|---|---|---|
+| `info` | *what did this store do?* | every open with its page count and hexmap coverage, every commit with its transaction and stamp |
+| `warn` | *what was unusual?* | a torn record salvaged, a keyless page refreed, a commit that had to WAIT for the wall clock, the pages a short hexmap cost |
+| `debug` | *which thread, in what order?* | every read with the stream and the guard it used, every cursor callback window and its eligibility decision, every synthesised clock value |
+
+Everything goes to **stderr**, never stdout — a consumer's answers live there
+(cocolog prints its own on stdout and is parsed by scripts) — and every line
+carries the low sixteen bits of its thread, which is what makes eight threads
+tellable apart in a file of ten thousand lines.
+
+**The points were chosen by two bugs that took days without them.** #32 was a
+commit stamp in the future; at `debug` it is one line per call:
+
+```
+mvccs[t5c40] clock synth 1789680767950128, ahead by 1 us
+```
+
+and #33 was a read holding nothing inside a cursor's callback window, which
+is the pair of lines that sit next to each other:
+
+```
+mvccs[t0a10] cursor window: release=1 flip=0
+mvccs[t0a10] read 8240  held=0 shared=0 window=0 eligible=0
+```
+
+— the guard released, no redirect to a private stream, and then a read on the
+stream every other thread is seeking. Eleven comments and four days of
+patched builds the first time; two lines the next.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout
