@@ -2619,26 +2619,36 @@
   ;; read one row's bytes into OBJ (which carries its Pointer), under a
   ;; guard of its own -- the cursor has handed the streams back by the
   ;; time anything calls this
-  ;; EXPERIMENT FOR ZiguratIP#33 -- not master. A READ TAKES THE GUARD FOR
-  ;; ITSELF.
+  ;; A READ TAKES THE GUARD FOR ITSELF -- ZiguratIP#33, and in master
+  ;; since 55896d9. (This block said "EXPERIMENT -- not master" for two
+  ;; commits after it stopped being one.)
   ;;
   ;; The seek and the unpack below are two operations on ONE stream with one
   ;; position, and read_row held nothing while it made them. Inside a
   ;; cursor's callback window that is a race: both cursors release the
   ;; streams guard around the callback unconditionally, but only redirect
   ;; the window's reads to the thread's private stream when
-  ;; reader_eligible -- which is 0 for a store with no reader paths AND 0
-  ;; at REPEATABLE READ or SERIALIZABLE. find_then_update is SERIALIZABLE
-  ;; over a store with no reader paths, so it is both: its callback reads
-  ;; ride the canonical stream with nothing held, while seven other threads
-  ;; seek the same stream.
+  ;; reader_eligible, which answers 0 on ANY ONE of its conditions -- an
+  ;; uninitialised store, an unset reader path, no open transaction, or a
+  ;; level of REPEATABLE READ or SERIALIZABLE (four early returns, line
+  ;; 873). EITHER, NOT BOTH: contention_test calls memory_reader_paths in
+  ;; its own main like everybody else, so what made find_then_update
+  ;; ineligible was its SERIALIZABLE claim ALONE. Its callback reads ride
+  ;; the canonical stream with nothing held, while seven other threads
+  ;; seek that same stream.
   ;;
   ;; That fits #33's evidence exactly -- a row written back with an EMPTY
   ;; STRING, which is what an unpack reads when another thread moved the
   ;; position between the seek and the length byte; the row then never heals
   ;; because the update copies KIND from what it read. It is also why only
-  ;; contention_test sees it: cocolog and the server both call
-  ;; memory_reader_paths, and their claim paths are not SERIALIZABLE.
+  ;; contention_test sees it: cocolog and the server read at READ COMMITTED,
+  ;; and nothing they run claims at a level that forfeits a private stream.
+  ;;
+  ;; THIS COMMENT AND e8ada3f'S MESSAGE BOTH SAID THE FAULT NEEDED BOTH
+  ;; HALVES -- no reader paths AND the level. A downstream session checked
+  ;; the call rather than taking it on trust, and it is wrong. The fix and
+  ;; its mechanism are untouched; the true claim is narrower than the one
+  ;; it replaces.
   ;;
   ;; The guard is re-entrant per thread, so a caller that already holds it
   ;; pays nothing, and it is taken SHARED wherever a shared one is possible
