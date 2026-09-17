@@ -59,6 +59,14 @@ home/etc/users/*
 *.i*86
 *.x86_64
 
+# EXCEPT THE GOLDEN STORE, which is not a build output but an INPUT: the two
+# small files the carry-over acceptance opens, which have to travel with the
+# repository. `*.bin' above had been excluding them since the day they were
+# written, so MVCCS-cicili/build.sh printed "carry-over: SKIP (no golden
+# store in this checkout)" on every machine and nobody had the bytes. See
+# MVCCS-cicili/carryover-seed.cpp for what they are and how to remake them.
+!MVCCS-cicili/golden/*.bin
+
 # --- debug and profiling ----------------------------------------------------
 *.pdb
 *.ilk

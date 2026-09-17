@@ -927,11 +927,15 @@ Every binary answers `--version` with the number alone on stdout, so
 configuration file has to be findable:
 
 ```bash
-ziguratip --version     # 0.1.0
+ziguratip --version
 parsi --version
 parsic --version
 ca --version
 ```
+
+(The number is deliberately not written here. This section's own argument is
+that a second copy of it is a second thing to forget, and a README that
+quotes it is exactly that — it shipped one version stale within the hour.)
 
 It is written in **one place**, `Core/version.cpp`, and read through
 `version.hpp`; Core is linked by every library and every binary here, so a

@@ -1119,6 +1119,13 @@
                     (cast long stepped) (cast long ($ mem page_count)))
             (check "the store is big enough to tell the two walks apart"
                    (? (> ($ mem page_count) 16) 1 0) 1)
+            ;; WHAT A FAILURE HERE MEANS, in order of likelihood: the walk
+            ;; went back to reading the whole store (it stepped four times
+            ;; the page count when it did), or a table added to this file
+            ;; hashes into the sequence's bucket and brought its pages with
+            ;; it -- the counter measures entries WALKED, and a bucket is
+            ;; one of 251 shared by every key that folds to it. The printed
+            ;; pair above tells the two apart at a glance.
             (check "and a draw walks its key's pages, not the store's"
                    (? (<= stepped ($ mem page_count)) 1 0) 1)))
 

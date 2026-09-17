@@ -8,4 +8,6 @@ schema_test.cpp
 contention_test
 carryover_old
 carryover_new
+carryover_seed
 ageing_test
+bench/grow_bench

@@ -65,7 +65,12 @@ namespace Zigurat
 
   mapbuf* mapbuf::close()
   {
-    // the exact length is what a closed file owes every reader of it
+    // The exact length is what a closed file owes every reader of it. A
+    // close cannot report, so a shrink that fails here (EIO, a read-only
+    // remount) leaves the growth behind -- whole pages of zeros, which the
+    // engine's startup refrees and its coverage walk now trims past;
+    // sync_to_disk is the path that returns the failure to a caller who
+    // can do something with it.
     this->shrink();
     this->unmap();
     if (this->_fd >= 0) {
@@ -110,6 +115,11 @@ namespace Zigurat
     return true;
   }
 
+  // A READER'S LENGTH IS THE FILE'S, which between a writer's syncs may
+  // include growth nothing has written into yet (grow() below). Nothing
+  // reads there -- the engine only ever addresses records inside pages it
+  // was given -- so the difference reaches no caller; but it is why `_size'
+  // means "what was written" on the writing side only.
   bool mapbuf::refresh()
   {
     if (this->_fd < 0) return false;

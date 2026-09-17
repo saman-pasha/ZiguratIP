@@ -45,14 +45,23 @@ for binary in ziguratip parsi parsic ca; do
 
   check "$binary --version exits 0" "$status" "0"
 
-  if printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  # AND IT ALONE, which a grep cannot say: `grep -q' answers yes when ANY
+  # line matches, so a binary printing its banner above the number passed
+  # this case while V=$(... --version) came back three lines long. The shape
+  # is the WHOLE of stdout, so the whole of it is what is compared -- one
+  # line, and that line a bare MAJOR.MINOR.PATCH.
+  lines=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+  if [ "$lines" = "1" ] && expr "$out" : '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' >/dev/null; then
     check "$binary --version is a bare number, and it alone" "bare" "bare"
   else
-    check "$binary --version is a bare number, and it alone" "$out" "bare"
+    check "$binary --version is a bare number, and it alone" "$(printf '%s' "$out" | tr '\n' '|')" "bare"
   fi
 
-  if [ -z "$first" ]; then first="$out"
-  else check "$binary agrees with ziguratip" "$out" "$first"; fi
+  # the FIRST BUILT binary is the baseline, and the message says which it
+  # was: naming ziguratip when ziguratip is the one that is missing sends
+  # the reader to look at the wrong thing.
+  if [ -z "$first" ]; then first="$out"; first_name="$binary"
+  else check "$binary agrees with $first_name" "$out" "$first"; fi
 done
 
 echo

@@ -2807,6 +2807,37 @@
 
     (set (-> m initialized) #t))
 
+  ;; How much of the hexmap file was WRITTEN: its length with the trailing
+  ;; zeros trimmed. Read backwards a block at a time, so a file that carries
+  ;; no growth -- every one a clean writer leaves -- costs a single read and
+  ;; stops at its last byte. See its caller in memory_open for why the
+  ;; length alone stopped being the answer.
+  (func hexmap_written_length ((binarystream * hexmap_io) (int64_t hexlen)) (out int64_t)
+    (let ((int64_t content . hexlen)
+          (uint8_t buf [4096])
+          (int done . 0))
+      (while (and (== done 0) (> content 0))
+        (let ((int64_t take . #'(? (> content 4096) 4096 content))
+              (int64_t from . 0))
+          (set from (- content take))
+          ((-> hexmap_io seekg) from std::ios::beg)
+          ((-> hexmap_io read) (cast (char *) buf) take)
+          (if (not ((-> hexmap_io good)))
+              (block
+                ;; unreadable is not empty: keep the length the file claims
+                ((-> hexmap_io clear))
+                (set done 1))
+            (let ((int64_t i . take))
+              (while (and (== done 0) (> i 0))
+                (if (!= (nth (- i 1) buf) 0)
+                    (block
+                      (set content (+ from i))
+                      (set done 1))
+                  (set i (- i 1))))
+              (if (== done 0) (set content from))))))
+      ((-> hexmap_io clear))
+      (return content)))
+
   ;; the constructor's work -- Memory(hexmap, data, page_size)
   (func memory_open ((Memory * m) (binarystream * hexmap_io) (binarystream * data_io)
                      (int64_t page_size)) (out void)
@@ -2867,7 +2898,25 @@
       ((-> hexmap_io seekg) 0 std::ios::end)
       (set hexlen ((-> hexmap_io tellg)))
       ((-> hexmap_io clear))
-      (let ((int64_t covered . #'(/ hexlen (-> m hbpp))))
+      ;; COVERAGE IS WHAT THE HEXMAP HOLDS, NOT HOW LONG ITS FILE IS -- and
+      ;; those stopped being the same thing when the store began growing its
+      ;; files a chunk at a time (StreamIO/mapbuf.hpp). The file is cut back
+      ;; to its writes at every sync and at close, so only a KILL leaves the
+      ;; two apart; but that is exactly when this walk matters, and a kill
+      ;; can leave up to a chunk of ZEROS past the last slice. Zeros read as
+      ;; free chunks, so a length taken at face value would report pages
+      ;; covered that were never written -- and the repair below, which
+      ;; refrees pages the hexmap does not describe, would stop firing in
+      ;; the one case it exists for (a commit syncs the data file before the
+      ;; hexmap; a kill between the two leaves a page keyed on disk with no
+      ;; slice behind it).
+      ;;
+      ;; Every slice a page is given ENDS IN A STANDALONE BYTE -- 64 for a
+      ;; free run, 240 for a control chunk, never 0 -- so trailing zeros are
+      ;; growth nobody wrote, and trimming them gives the coverage back
+      ;; exactly. A file that was never padded loses nothing: its last byte
+      ;; is non-zero, so the scan reads one block and stops.
+      (let ((int64_t covered . #'(/ (hexmap_written_length hexmap_io hexlen) (-> m hbpp))))
         (if (< covered (-> m page_count))
             (let ((int64_t p . covered))
               (while (< p (-> m page_count))
