@@ -21,28 +21,40 @@ namespace Zigurat
   // file shares it, so a writer's bytes are visible to a reader's mapping
   // the moment they are written, with no flush between them.
   //
-  // THE FILE IS EXACTLY AS LONG AS WHAT WAS WRITTEN. The engine finds its
-  // end by seeking to it (page_count = length / page_size), so a file
-  // extended ahead of the writes would grow phantom pages. Address space
-  // is reserved ahead instead -- RESERVE bytes mapped beyond the file's
-  // end, which is legal and costs nothing until touched -- and a write
-  // past the end grows the FILE by exactly the bytes written, with no
-  // remap until the reservation itself is outgrown. A fill_n of a page is
-  // one such write, not eight thousand: the stream above overrides fill_n
-  // to write a block.
+  // EVERY BYTE OF CONTENT GOES THROUGH THE MAPPING, and only the FILE'S
+  // LENGTH is moved by a system call. That division is load-bearing and was
+  // learnt the expensive way; see "growing" below.
   //
-  // AND THAT WRITE IS A pwrite, NOT AN ftruncate AND A memcpy. A mapped
-  // page may not be touched past the file's end, so an extending write has
-  // to move the end first -- and on APFS moving it is a metadata
-  // transaction costing 115 us. A fresh store page is six extending writes
-  // (four of its hexmap slice, two of the page), so a store grew at 688 us
-  // a page and a process writing 128 000 rows spent two thirds of itself
-  // inside ftruncate. One pwrite appends and extends in the same call:
-  // 31 us a page, the same exact length, and nothing about the contract
-  // above changes. (Growing a megabyte at a time would cost 4 us a page
-  // and break it, which is why it is not done.) The bytes land in the page
-  // cache the mappings read through, so a reader sees them exactly as it
-  // saw a memcpy.
+  // THE FILE IS EXACTLY AS LONG AS WHAT WAS WRITTEN at every sync and at
+  // close. The engine finds its end by seeking to it (page_count = length /
+  // page_size), so a file left longer than its writes would grow phantom
+  // pages. Address space is reserved ahead -- RESERVE bytes mapped beyond
+  // the file's end, which is legal and costs nothing until touched -- and
+  // a fill_n of a page is one write, not eight thousand: the stream above
+  // overrides fill_n to write a block.
+  //
+  // GROWING IS A CHUNK AT A TIME, AND CUT BACK AT EVERY SYNC. A mapped page
+  // may not be touched past the file's end, so an extending write has to
+  // move the end first -- and moving it is a metadata transaction: 115 us a
+  // call on APFS, 4 on ext4. A fresh store page is six extending writes
+  // (four of its hexmap slice, two of the page), so at one call per write a
+  // store grew at ~700 us a page on APFS and a process writing 128 000 rows
+  // spent two thirds of itself inside ftruncate. The file is grown CHUNK
+  // bytes ahead instead -- one call per megabyte, ~5 us a page on both
+  // systems -- and `sync_to_disk' and `close' cut it back to what was
+  // written, so every reader of its length sees the exact one and a clean
+  // exit leaves an exact file.
+  //
+  // WHAT WAS TRIED IN BETWEEN, and why it is not here: making the extending
+  // write a pwrite (ZiguratIP c4a7e19). It was faster than one ftruncate a
+  // write and kept the length exact at all times, but it put CONTENT
+  // through a second path -- write(2) for the bytes past the end, the
+  // mapping for everything else -- and a store written that way was
+  // intermittently incomplete to the next process that opened it on
+  // Linux/ext4 (saman-pasha/ZiguratIP#32: ~30% of first reads, repaired by
+  // the open that failed). The mechanism was never established; the mixing
+  // was, and it is gone. One path writes the bytes. The kernel is only ever
+  // asked to move the end.
   //
   // ONE POSITION, shared by reads and writes, as a filebuf has: the engine
   // was written against that and it stays true here.
@@ -60,6 +72,8 @@ namespace Zigurat
   public:
     // bytes of address space mapped ahead of the file's end
     static const std::size_t RESERVE;
+    // bytes the FILE is grown by when a write runs past its end
+    static const std::size_t CHUNK;
 
     mapbuf();
     virtual ~mapbuf();
@@ -95,13 +109,15 @@ namespace Zigurat
   private:
     bool refresh();                    // learn the length another stream may have given the file
     bool reserve(std::size_t);         // map at least this many bytes from offset 0
-    bool grow_write(const char*, std::streamsize);  // the write past the end: it extends by being made
+    bool grow(std::streamsize);        // make the file long enough to write this far (a writer only)
+    bool shrink();                     // and cut it back to what was written
     void unmap();
 
     int _fd;
     char* _base;
     std::size_t _capacity;             // bytes mapped
-    std::streamsize _size;             // the file's length as last known
+    std::streamsize _size;             // what has been WRITTEN: the length the engine is promised
+    std::streamsize _file;             // what the file is on disk, which may be a chunk ahead
     std::streamsize _pos;              // the one position
     bool _writable;
   };

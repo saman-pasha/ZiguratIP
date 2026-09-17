@@ -2683,6 +2683,23 @@
               (uint8_t key [20]))
           ((-> (-> m data_io) seekg) begin_address std::ios::beg)
           ((-> (-> m data_io) read) (cast (char *) key) HASHKEY_SIZE)
+          ;; A PAGE WITH NO KEY AT ALL IS NOT A PAGE THIS STORE GAVE OUT.
+          ;; The file is grown a chunk at a time (StreamIO/mapbuf.hpp), so
+          ;; a kill can leave whole pages of zeros past the last one a
+          ;; table was handed; a torn page header reads the same way, and
+          ;; shadow paging says what was mid-write never happened. A real
+          ;; key is a twenty-byte fold of a name and __FREE__ is a
+          ;; constant, so all zeros is neither. Refreed here rather than
+          ;; listed under a key nothing can ask for, which is what left it
+          ;; dead space for the life of the store.
+          (let ((int keyed . 0))
+            (for ((int64_t b . 0)) (< b HASHKEY_SIZE) ((++ b))
+              (if (!= (nth b key) 0) (set keyed 1)))
+            (if (== keyed 0)
+                (block
+                  (allocate_page m FREE_HASHKEY begin_address)
+                  (memcpy (cast (void *) key) (cast (const void *) FREE_HASHKEY)
+                          (cast size_t HASHKEY_SIZE)))))
           (page_list_insert m key begin_address))
         (set i (+ i 1))))
 

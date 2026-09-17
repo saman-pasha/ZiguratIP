@@ -10,13 +10,16 @@
 // bench that only appends measures something the store never does.
 //
 //   A  ftruncate to the exact new length, then memcpy into the map
-//   B  pwrite, which appends and extends in one call            (what mapbuf does)
-//   C  ftruncate a megabyte ahead, memcpy, truncate back at the end
+//   B  pwrite, which appends and extends in one call
+//   C  ftruncate a megabyte ahead, memcpy, truncate back    (what mapbuf does)
 //
 // A is what mapbuf did until a writing process was found spending two
-// thirds of itself inside ftruncate. C is faster than B and is NOT what
-// mapbuf does: it leaves the file longer than what was written, and the
-// engine finds its end by seeking to it.
+// thirds of itself inside ftruncate. B replaced it and was WITHDRAWN: it
+// writes content through a second path, and a store written that way was
+// intermittently incomplete to the next process on Linux/ext4
+// (saman-pasha/ZiguratIP#32). C is what mapbuf does now -- every byte of
+// content through the mapping, the kernel asked only to move the end, and
+// the end cut back to what was written at every sync and at close.
 //
 //   sh bench/build.sh      # builds and runs this with the rest
 //   ./grow_bench /tmp/zig-grow-bench
@@ -144,7 +147,7 @@ int main(int argc, char **argv)
   const char *dir = (argc > 1) ? argv[1] : "/tmp/zig-grow-bench";
   std::printf("%d pages of %d bytes, six extending writes each\n\n", PAGES, PAGE_SIZE);
   run("A  ftruncate per extending write", write_a, dir, false);
-  run("B  pwrite extends (what mapbuf does)", write_b, dir, false);
-  run("C  ftruncate a megabyte ahead", write_c, dir, true);
+  run("B  pwrite extends (withdrawn, see #32)", write_b, dir, false);
+  run("C  chunked grow (what mapbuf does)", write_c, dir, true);
   return 0;
 }

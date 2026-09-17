@@ -12,6 +12,13 @@ namespace Zigurat
   // and a store past it remaps once to twice the size.
   const std::size_t mapbuf::RESERVE = (std::size_t)1 << 30;
 
+  // and a megabyte of FILE per ftruncate: one call where there were six a
+  // page. A store page divides it at every size a store is opened with, so
+  // a growth a kill leaves behind is a whole number of pages of zeros --
+  // which is the shape the engine's own startup already knows what to do
+  // with (pages the hexmap does not cover are refreed).
+  const std::size_t mapbuf::CHUNK = (std::size_t)1 << 20;
+
   static std::size_t page_round(std::size_t n)
   {
     static const std::size_t page = (std::size_t)::sysconf(_SC_PAGESIZE);
@@ -19,7 +26,7 @@ namespace Zigurat
   }
 
   mapbuf::mapbuf()
-    : _fd(-1), _base(nullptr), _capacity(0), _size(0), _pos(0), _writable(false)
+    : _fd(-1), _base(nullptr), _capacity(0), _size(0), _file(0), _pos(0), _writable(false)
   {
   }
 
@@ -45,6 +52,7 @@ namespace Zigurat
     this->_fd = fd;
     this->_writable = out;
     this->_size = (std::streamsize)st.st_size;
+    this->_file = this->_size;
     this->_pos = 0;
 
     if (!this->reserve((std::size_t)this->_size)) {
@@ -57,12 +65,15 @@ namespace Zigurat
 
   mapbuf* mapbuf::close()
   {
+    // the exact length is what a closed file owes every reader of it
+    this->shrink();
     this->unmap();
     if (this->_fd >= 0) {
       ::close(this->_fd);
       this->_fd = -1;
     }
     this->_size = 0;
+    this->_file = 0;
     this->_pos = 0;
     this->_writable = false;
     return this;
@@ -106,46 +117,45 @@ namespace Zigurat
     if (::fstat(this->_fd, &st) != 0) return false;
     if ((std::streamsize)st.st_size != this->_size) {
       this->_size = (std::streamsize)st.st_size;
+      this->_file = this->_size;
       if ((std::size_t)this->_size > this->_capacity)
         return this->reserve((std::size_t)this->_size);
     }
     return true;
   }
 
-  // THE WRITE THAT GROWS THE FILE IS THE GROWTH -- one pwrite, which
-  // appends and extends in the same call, where this used to ftruncate to
-  // the new length and then memcpy into the mapping.
-  //
-  // WHY, MEASURED. A mapped page may not be touched past the file's end, so
-  // every extending write needed the length moved first, and on APFS moving
-  // it is a metadata transaction: 115 us a call. A fresh page of the store
-  // is six extending writes -- four of the hexmap slice, two of the page --
-  // so a store grew at 688 us a page, and a process writing 128 000 rows
-  // spent two thirds of itself inside ftruncate. The same six writes as
-  // pwrites cost 31 us a page, and a megabyte-at-a-time ftruncate would
-  // cost 4 -- but that one keeps the file longer than what was written,
-  // which is the invariant this class is built on (the engine finds its end
-  // by seeking to it), so the exact one wins and keeps the contract.
-  //
-  // The bytes land in the same page cache the mapping reads through, so a
-  // reader -- this stream, another mapping, another process -- sees them
-  // exactly as it saw a memcpy. The mapping is never touched for them,
-  // which is also why a fill of a fresh page no longer faults a page in
-  // only to leave zeros in it.
-  bool mapbuf::grow_write(const char* s, std::streamsize n)
+  // THE FILE IS MADE LONG ENOUGH, A CHUNK AT A TIME, AND NOTHING ELSE HERE
+  // WRITES A BYTE. _size is what has been written -- the length the engine
+  // is promised and every seek to the end answers; _file is what the file
+  // is on disk, which runs up to CHUNK ahead so that six extending writes
+  // of a fresh store page cost one ftruncate between them instead of six.
+  // shrink() below puts the two back together.
+  bool mapbuf::grow(std::streamsize length)
   {
     if (!this->_writable || this->_fd < 0) return false;
-    const std::streamsize end = this->_pos + n;
-    if ((std::size_t)end > this->_capacity && !this->reserve((std::size_t)end)) return false;
-    std::streamsize done = 0;
-    while (done < n) {
-      const ssize_t written = ::pwrite(this->_fd, s + done, (std::size_t)(n - done),
-                                       (off_t)(this->_pos + done));
-      if (written <= 0) return false;
-      done += (std::streamsize)written;
+    if (length <= this->_size) return true;
+    if ((std::size_t)length > this->_capacity && !this->reserve((std::size_t)length)) return false;
+    if (length > this->_file) {
+      const std::streamsize want =
+        (std::streamsize)((((std::size_t)length + CHUNK - 1) / CHUNK) * CHUNK);
+      if (::ftruncate(this->_fd, (off_t)want) != 0) return false;
+      this->_file = want;
     }
-    this->_pos = end;
-    if (end > this->_size) this->_size = end;
+    this->_size = length;
+    return true;
+  }
+
+  // The file cut back to what was written. Called at every sync and at
+  // close, which is what makes "exactly as long as what was written" true
+  // wherever anybody can observe it: a reader of the length, a next
+  // process, a copy of the directory. The pages dropped here are the ones
+  // grow() made and nothing wrote, so nothing is lost with them.
+  bool mapbuf::shrink()
+  {
+    if (!this->_writable || this->_fd < 0) return true;
+    if (this->_file <= this->_size) return true;
+    if (::ftruncate(this->_fd, (off_t)this->_size) != 0) return false;
+    this->_file = this->_size;
     return true;
   }
 
@@ -159,6 +169,8 @@ namespace Zigurat
   {
     if (this->_fd < 0) return false;
     if (!this->_writable) return true;
+    // what is made durable is a file exactly as long as its writes
+    if (!this->shrink()) return false;
     bool ok = true;
     if (this->_base != nullptr && this->_size > 0)
       ok = (::msync(this->_base, page_round((std::size_t)this->_size), MS_SYNC) == 0);
@@ -197,8 +209,7 @@ namespace Zigurat
   std::streamsize mapbuf::xsputn(const char* s, std::streamsize n)
   {
     if (this->_fd < 0 || !this->_writable || n <= 0) return 0;
-    // past the end the write itself does the growing; inside it, a memcpy
-    if (this->_pos + n > this->_size) return this->grow_write(s, n) ? n : 0;
+    if (this->_pos + n > this->_size && !this->grow(this->_pos + n)) return 0;
     std::memcpy(this->_base + this->_pos, s, (std::size_t)n);
     this->_pos += n;
     return n;
@@ -223,10 +234,7 @@ namespace Zigurat
   {
     if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
     if (this->_fd < 0 || !this->_writable) return traits_type::eof();
-    if (this->_pos + 1 > this->_size) {
-      const char one = traits_type::to_char_type(c);
-      return this->grow_write(&one, 1) ? c : traits_type::eof();
-    }
+    if (this->_pos + 1 > this->_size && !this->grow(this->_pos + 1)) return traits_type::eof();
     this->_base[this->_pos++] = traits_type::to_char_type(c);
     return c;
   }

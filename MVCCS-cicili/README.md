@@ -803,33 +803,45 @@ of them: four for its hexmap slice, two for the page itself. So the store
 grew at 688 µs a page, and after the page-list fix above that was two
 thirds of what a writing process spent.
 
-`StreamIO/mapbuf.cpp` now makes the extending write a **`pwrite`**, which
-appends and extends in the same call; writes inside the file are the same
-memcpy they always were. The file is still exactly as long as what was
-written -- the invariant the class is built on, since the engine finds its
-end by seeking to it -- and the bytes land in the same page cache the
-mappings read through, so a reader sees them exactly as it saw a memcpy.
-Three ways were measured on the store's own write pattern --
-`bench/grow-bench.cpp`, 2 000 pages of six extending writes each plus the
-in-place hexmap rewrites a row allocation makes, which is the mix a bench
-that only appends would miss:
+`StreamIO/mapbuf.cpp` grows the file **a megabyte at a time** and cuts it
+back to what was written at every `sync_to_disk` and at `close`. Every byte
+of content still goes through the mapping, exactly as before; the kernel is
+asked only to move the end, and asked 1/128th as often. Three ways were
+measured on the store's own write pattern -- `bench/grow-bench.cpp`, 2 000
+pages of six extending writes each plus the in-place hexmap rewrites a row
+allocation makes, which is the mix a bench that only appends would miss:
 
-| | a page costs |
-|---|---|
-| ftruncate per extending write | ~700 µs |
-| **pwrite, the same exact length** | **~45 µs** |
-| ftruncate a megabyte ahead, truncate back | ~6 µs |
-
-The third is faster still and is NOT done: it keeps the file longer than
-what was written, which is the one thing this class promises the engine.
+| | a page, APFS | a page, ext4 |
+|---|---|---|
+| ftruncate per extending write | ~700 µs | 23 µs |
+| pwrite the extending write | ~45 µs | 4.9 µs |
+| **chunked grow, cut back at sync** | **~6 µs** | **5.2 µs** |
 
 End to end, 128 000 rows into a fresh `--embed` store, three runs each on
-one machine: **9.22 s → 3.64 s**. What it costs is disk, not time and not
-correctness: a hexmap block that is appended by `pwrite` and later rewritten
-through the mapping is written by both paths, and APFS leaves the first copy
-allocated -- a 1.4 MB hexmap carried 2.1 MB of blocks. It is bounded (one
-stale block per hexmap block, never more than the hexmap's own size, ~6 % of
-a store) and any copy of the file gives it back.
+one machine: **9.22 s → 3.6 s** here, and 26.9 s → 2.2 s on the Linux box
+with the page-list fix above.
+
+**THE MIDDLE ROW WAS TRIED AND WITHDRAWN**, and that is the reason the
+chunked grow carries a cut-back rather than the file simply being left
+long. `pwrite` appends and extends in one call and keeps the length exact
+at every instant, which read as the principled choice -- but it puts
+CONTENT through a second path, and a store written that way was
+intermittently incomplete to the next process that opened it on Linux/ext4:
+about 30 % of first reads could not see the last thing written, and the
+open that failed repaired it (saman-pasha/ZiguratIP#32, found by an
+interleaved 20-run A/B that swapped only `libStreamIO.so`). The mechanism
+was never established. The mixing was, and the rule that replaces it is
+narrower and easier to keep: **one path writes the bytes, and the kernel is
+only ever asked to move the end.**
+
+What the chunked grow costs is a window: between one sync and the next the
+file is up to a megabyte longer than its writes, so a KILL can leave whole
+pages of zeros past the last real one. A chunk is a whole number of store
+pages, and `memory_initialize` now refrees a page whose twenty-byte key is
+all zeros -- growth nobody wrote, or a page header torn mid-write, which
+shadow paging says never happened either way. Measured: a writer killed
+mid-write leaves a 20 MiB store, the next open refrees the zeros, and 500
+rows written after it do not grow the file by a byte.
 
 ## Build and run
 
