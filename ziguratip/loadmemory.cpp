@@ -129,6 +129,18 @@ void load_memory(const Configuration &conf)
   // that is what engine-compat.hpp's Globals::memory() forwards to --
   // and each table attaches its own indexes on first touch, so nothing
   // here wires a catalogue index the way the old engine did.
+  // AND THE STORE'S BYTE ORDER IS THIS MACHINE'S, checked before a byte of
+  // it is parsed. The store is written in host order (filestream and
+  // mapstream are hbostream; only the protocol is normalised), so one
+  // carried from a machine of the other kind would open on its byte-array
+  // page keys and then read every int64 reversed. Refused by name instead.
+  {
+    char order_err[512] = { 0 };
+    const std::string store_dir = home_path + "data";
+    if (!store_order_check(store_dir.c_str(), order_err, sizeof order_err))
+      throw ZiguratIPException(order_err);
+  }
+
   ::Memory* engine_memory = engine_memory_new();
   memory_open(engine_memory, memory_hexmap_stream, memory_data_stream, (int64_t)memory_page_size);
   globals_set_memory(engine_memory);

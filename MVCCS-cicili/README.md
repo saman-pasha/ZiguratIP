@@ -890,6 +890,43 @@ without needing two processes or a fast machine: it burns the clock
 milliseconds ahead on purpose, commits, and requires `clock_ahead()` to be
 back at or below zero with the row it stamped readable behind it.
 
+## The store is in the writing machine's byte order
+
+Asked as a question and worth an answer in the file, because the answer is
+asymmetric and was written down nowhere: `grep -ri endian` over this
+repository hit no document, no engine source and no header — only the
+anonymous namespace inside `StreamIO/nbostream.cpp`.
+
+| | base | an `int64_t` |
+|---|---|---|
+| `networkstream` | `nbostream` | `reorder()` — octets reversed on a little-endian host, so **the protocol is big-endian on the wire** |
+| `filestream`, `mapstream`, `bufferstream` | **`hbostream`** | a raw eight-byte read, **no swap** |
+
+That asymmetry is the right one: a connection crosses machines and a store
+does not. But nothing said so, and a store carried across the boundary
+anyway would **open** — the page list is built from twenty-byte hash keys,
+which are byte arrays and read the same everywhere — and only then start
+reading control blocks whose every int64 is reversed: transaction ids,
+stamps, reference addresses, B-tree keys. What comes out of that is not an
+error, it is nonsense, and the first thing it does is write more of it.
+
+So a store now keeps a mark beside it, `byteorder.bin`: a magic written in
+host order at the store's first open and read back at every later one.
+Equal is the same order; **reversed is refused by name**, saying what
+happened and why a store does not travel; anything else means the mark
+itself is damaged. `store_order_check` is called by the two consumers that
+know a store's directory — `ziguratip/loadmemory.cpp` and cocolog's
+embedded open — because the engine is handed two streams and never learns a
+path. The test binaries make their own stores in `/tmp` with no directory
+to mark, and are unaffected.
+
+**What it cannot know** is where bytes written before the mark existed came
+from: a store that predates it gets a mark stamped with the opening host's
+order, which is a guess. It is honest about everything after that. The same
+limit applies to `golden/` — those are little-endian bytes, so the
+carry-over acceptance would be wrong on a big-endian box and would now
+refuse rather than mislead.
+
 ## Build and run
 
     sh MVCCS-cicili/build.sh     # needs sbcl + the cicili checkout

@@ -199,6 +199,17 @@ void engine_retire_transaction (size_t transaction_id);
 // turns the shared-reader side on; called by whoever opened the store
 void memory_reader_paths (Memory * m, const char * hex, const char * data);
 
+// THE STORE IS IN THE WRITING MACHINE'S BYTE ORDER -- filestream, mapstream
+// and bufferstream are hbostream, where the protocol is nbostream and
+// normalised. A store carried across an endian boundary OPENS (its page
+// keys are byte arrays and read the same everywhere) and then answers every
+// int64 reversed. Call this with the store's DIRECTORY before memory_open:
+// 1 means this machine's order, and marks a store that carried no mark; 0
+// means refuse, ERR saying which way. What it cannot know is where bytes
+// written before the mark existed came from -- see store_order_check in
+// mvccs-lib.cicili.
+int store_order_check (const char * dir, char * err, size_t errcap);
+
 // the DBA plumbing behind the binary protocol
 void dba_pagefiles (Memory * m, Zigurat::binarystream * out);
 void dba_pointers (Memory * m, Zigurat::binarystream * out);

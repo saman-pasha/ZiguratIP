@@ -9,6 +9,22 @@
 namespace Zigurat
 {
 
+  // HOST byte order: every read and write below is the machine's own bytes,
+  // with no swap anywhere. filestream, mapstream and bufferstream are all
+  // hbostream, so ANYTHING WRITTEN TO A FILE THROUGH ONE IS IN THE WRITING
+  // MACHINE'S ORDER and does not cross an endian boundary -- an int64
+  // written on x86-64 reads reversed on s390x, and nothing in the file says
+  // which kind wrote it.
+  //
+  // That is deliberate, and it is the cheaper half of a pair: nbostream is
+  // the other, network order with the octets reversed on a little-endian
+  // host, and networkstream is built on it -- because a CONNECTION crosses
+  // machines and a store does not.
+  //
+  // The MVCCS store keeps a byteorder.bin beside its two files for exactly
+  // this reason and refuses a foreign one by name (store_order_check, in
+  // MVCCS-cicili). Anything else written through an hbostream carries the
+  // same rule and no such guard.
   class hbostream : public binarystream
   {
   public:

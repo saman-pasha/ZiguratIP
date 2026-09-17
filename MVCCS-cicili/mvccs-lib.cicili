@@ -898,6 +898,81 @@
     (snprintf (-> m rd_data_path) 512 "%s" data))
 
   ;; ==================================================================
+  ;; THE STORE IS IN THE WRITING MACHINE'S BYTE ORDER, and this is what
+  ;; says so out loud.
+  ;;
+  ;; filestream, mapstream and bufferstream are all hbostream -- HOST
+  ;; byte order, a raw eight-byte read with no swap -- while the protocol
+  ;; is networkstream over nbostream, which reverses the octets on a
+  ;; little-endian host. That asymmetry is the right one: a connection
+  ;; crosses machines and a store does not. But nothing said it, and a
+  ;; store carried across the boundary anyway would OPEN: the page list is
+  ;; built from twenty-byte hash keys, which are byte arrays and read the
+  ;; same everywhere, and only then does the startup walk begin reading
+  ;; control blocks whose every int64 is reversed -- transaction ids,
+  ;; stamps, reference addresses. What comes out of that is not an error,
+  ;; it is nonsense, and the first thing it does is write more of it.
+  ;;
+  ;; So a store keeps a mark beside it. The magic is written in host order
+  ;; at the store's first open and read back at every later one: equal
+  ;; means the same order, REVERSED means the store came from the other
+  ;; kind of machine and this is refused by name, and anything else means
+  ;; the mark itself is damaged. A store that predates the mark gets one
+  ;; stamped with the opening host's order -- which is a guess, and the
+  ;; honest limit of this: it cannot know where bytes written before it
+  ;; existed came from, only that everything after agrees.
+  ;;
+  ;; The caller passes the store's DIRECTORY because that is what a caller
+  ;; has -- the engine is handed two streams and never learns a path. Both
+  ;; real consumers call it before memory_open: ziguratip's loadmemory and
+  ;; cocolog's embedded open. The test binaries make their own stores in
+  ;; /tmp with no directory to mark, and are unaffected.
+  ;; ==================================================================
+  (var const int64_t STORE_ORDER_MAGIC . 81985529216486895)   ;; 0x0123456789ABCDEF
+
+  (func store_order_reversed ((int64_t seen)) (out int)
+    (let ((uint8_t a [8]) (uint8_t b [8]) (int64_t mine . STORE_ORDER_MAGIC))
+      (memcpy (cast (void *) a) (cast (const void *) (aof seen)) 8)
+      (memcpy (cast (void *) b) (cast (const void *) (aof mine)) 8)
+      (for ((int i . 0)) (< i 8) ((++ i))
+        (if (!= (nth i a) (nth (- 7 i) b)) (return 0)))
+      (return 1)))
+
+  ;; 1 the store's order is this machine's, 0 it is not and ERR says why
+  (func store_order_check ((const char * dir) (char * err) (size_t errcap)) (out int)
+    (let ((char path [640]) (FILE * f . nil) (int64_t seen . 0))
+      (snprintf path 640 "%s/byteorder.bin" dir)
+      (set f (fopen path "rb"))
+      (if (== f nil)
+          (block
+            ;; no mark yet: this open makes one, in this machine's order
+            (set f (fopen path "wb"))
+            (if (== f nil) (return 1))   ;; unmarkable is not unreadable
+            (let ((int64_t mine . STORE_ORDER_MAGIC))
+              (fwrite (cast (const void *) (aof mine)) 8 1 f))
+            (fclose f)
+            (return 1)))
+      (let ((size_t got . #'(fread (cast (void *) (aof seen)) 8 1 f)))
+        (fclose f)
+        (if (!= got 1)
+            (block
+              (if (and (!= err nil) (> errcap 0))
+                  (snprintf err errcap
+                            "the store's byte-order mark in %s is short: the store cannot be judged either way"
+                            path))
+              (return 0))))
+      (if (== seen STORE_ORDER_MAGIC) (return 1))
+      (if (and (!= err nil) (> errcap 0))
+          (if (== 1 (store_order_reversed seen))
+              (snprintf err errcap
+                        "the store in %s was written on a machine of the OTHER byte order: every int64 in it -- stamps, ids, addresses, keys -- would read reversed here. A store does not cross that boundary; the protocol does (ZiguratIP, StreamIO/nbostream)."
+                        dir)
+            (snprintf err errcap
+                      "the store's byte-order mark in %s is neither this machine's nor its reverse, so the file is damaged"
+                      path)))
+      (return 0)))
+
+  ;; ==================================================================
   ;; Statement -- where a reader's single point in time is fixed. The
   ;; outermost one starts the statement; inner ones nest silently.
   ;; ==================================================================
