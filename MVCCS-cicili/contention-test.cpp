@@ -563,10 +563,33 @@ static void find_then_update ()
   check_str("claims: no thread met trouble", trouble.say(), "none");
   check("claims: every round claimed", done.load(), THREADS * ROUNDS);
 
+  // INSTRUMENTATION FOR ZiguratIP#33, and the one question it answers.
+  //
+  // This sum came back as 0xFFFF000000000226 there: the right value in the
+  // low bits with the top SIXTEEN set, twice in a row, to the bit. That is a
+  // fingerprint and not a shortfall -- on a little-endian host it is what an
+  // eight-byte slot looks like when its two most significant bytes keep an
+  // 0xFF fill and the low six are written -- so the sum alone cannot say
+  // whether the STORE holds such a value or the READ invented it. Every
+  // weight's raw bits are kept here with the row's address, and when the sum
+  // does not match the increments the same rows are read again through a
+  // FRESH statement: a value that reads clean the second time was made by
+  // the read, and one that reads 0xFFFF... twice is on disk. One run decides
+  // it, which is why this exists.
+  //
+  // Not for master: it prints nothing when the case passes, but it keeps two
+  // vectors per pass and the whole point is the failing run's detail.
   session();
   long total = 0, rows = 0;
+  std::vector<std::pair<long, unsigned long long> > weights;
+  std::vector<long long> addresses;
   Globals::memory()->cursor<Part>([&] (Part& row) -> bool {
-      total += (row.*Part::WEIGHT).value();
+      const int64_t w = (row.*Part::WEIGHT).value();
+      unsigned long long bits = 0;
+      std::memcpy(&bits, &w, sizeof bits);
+      weights.push_back(std::make_pair((long)(row.*Part::ID).value(), bits));
+      addresses.push_back((long long)row.pointer.address);
+      total += w;
       rows++;
       return true;
     });
@@ -574,6 +597,26 @@ static void find_then_update ()
 
   long opening = 0;
   for (int64_t i = 1; i <= ROWS; i++) opening += i * 10;
+
+  if (total != opening + done.load()) {
+    printf("     #33: the sum was 0x%016llx over %ld rows, wanted %ld\n",
+           (unsigned long long)total, rows, opening + done.load());
+    for (size_t i = 0; i < weights.size(); i++)
+      printf("     #33:   id %ld  weight 0x%016llx  at %lld\n",
+             weights[i].first, weights[i].second, addresses[i]);
+    printf("     #33: the same rows through a fresh statement --");
+    session();
+    Globals::memory()->cursor<Part>([&] (Part& row) -> bool {
+        const int64_t w = (row.*Part::WEIGHT).value();
+        unsigned long long bits = 0;
+        std::memcpy(&bits, &w, sizeof bits);
+        printf(" %ld:0x%016llx", (long)(row.*Part::ID).value(), bits);
+        return true;
+      });
+    printf("\n");
+    commit_transaction(MEM);
+    fflush(stdout);
+  }
 
   check("claims: the rows all stand", rows, (long)ROWS);
   check("claims: not one increment lost", total, opening + done.load());
