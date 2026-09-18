@@ -836,6 +836,23 @@
     ;; empty means "no private readers": every guard is exclusive, as before
     (member char rd_hex_path [512])
     (member char rd_data_path [512])
+    ;; A POOL OF PRIVATE MAPPINGS, capped -- the ladder ZiguratIP#39 asked
+    ;; for. Unset (cap 0) is today's engine: one private pair per thread,
+    ;; lazily, never returned. Capped, a thread takes a free pair or waits
+    ;; for one, and returns it when its outermost shared hold is released;
+    ;; between, the pair is that thread's alone, so a position is as
+    ;; private as ever. What varies with the cap is how many MAPPINGS of
+    ;; one file are reading at once, which is the cost cocolog#18 measured
+    ;; and this cannot otherwise vary. Up to 64; a wait counts itself.
+    (member pthread_mutex_t rpool_access)
+    (member pthread_cond_t rpool_free)
+    (member int rpool_cap)
+    (member int rpool_made)
+    (member int rpool_top)
+    (member binarystream * rpool_hex [64])
+    (member binarystream * rpool_data [64])
+    (member int64_t rpool_waits)
+    (member int64_t rpool_checkouts)
     (member pthread_mutex_t page_list_access)
     (member pthread_mutex_t free_list_access)
     ;; the DBA watcher: one line per engine operation goes through this
@@ -929,12 +946,52 @@
   ;; refreshes its length by fstat -- it is what a private reader is.
   (func reader_ensure ((Memory * m)) (out void)
     (if (!= tl_rd_hex nil) (return))
-    (set tl_rd_hex (cast (binarystream *)
-                         (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
-                               std::ios::in)))
-    (set tl_rd_data (cast (binarystream *)
-                          (new* Zigurat::mapstream (std::string (-> m rd_data_path))
-                                std::ios::in))))
+    (if (== (-> m rpool_cap) 0)
+        (block
+          ;; today's path: one pair per thread, for the life of the thread
+          (set tl_rd_hex (cast (binarystream *)
+                               (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
+                                     std::ios::in)))
+          (set tl_rd_data (cast (binarystream *)
+                                (new* Zigurat::mapstream (std::string (-> m rd_data_path))
+                                      std::ios::in)))
+          (return)))
+    ;; the pool: a free pair, a new one while the cap allows, or a wait
+    (pthread_mutex_lock (aof (-> m rpool_access)))
+    (while (and (== (-> m rpool_top) 0) (>= (-> m rpool_made) (-> m rpool_cap)))
+      (set (-> m rpool_waits) (+ (-> m rpool_waits) 1))
+      (pthread_cond_wait (aof (-> m rpool_free)) (aof (-> m rpool_access))))
+    (if (> (-> m rpool_top) 0)
+        (block
+          (set (-> m rpool_top) (- (-> m rpool_top) 1))
+          (set tl_rd_hex (nth (-> m rpool_top) (-> m rpool_hex)))
+          (set tl_rd_data (nth (-> m rpool_top) (-> m rpool_data))))
+      (block
+        (set (-> m rpool_made) (+ (-> m rpool_made) 1))
+        (set tl_rd_hex (cast (binarystream *)
+                             (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
+                                   std::ios::in)))
+        (set tl_rd_data (cast (binarystream *)
+                              (new* Zigurat::mapstream (std::string (-> m rd_data_path))
+                                    std::ios::in)))))
+    (set (-> m rpool_checkouts) (+ (-> m rpool_checkouts) 1))
+    (pthread_mutex_unlock (aof (-> m rpool_access))))
+
+  ;; the pair goes back when the thread's outermost shared hold is released.
+  ;; A window read between holds takes a pair again, and returns it at the
+  ;; next release: churn, but the same churn at every cap, which is what a
+  ;; ladder needs.
+  (func reader_return ((Memory * m)) (out void)
+    (if (== (-> m rpool_cap) 0) (return))
+    (if (== tl_rd_hex nil) (return))
+    (pthread_mutex_lock (aof (-> m rpool_access)))
+    (set (nth (-> m rpool_top) (-> m rpool_hex)) tl_rd_hex)
+    (set (nth (-> m rpool_top) (-> m rpool_data)) tl_rd_data)
+    (set (-> m rpool_top) (+ (-> m rpool_top) 1))
+    (set tl_rd_hex nil)
+    (set tl_rd_data nil)
+    (pthread_cond_signal (aof (-> m rpool_free)))
+    (pthread_mutex_unlock (aof (-> m rpool_access))))
 
   ;; which stream a READ goes through: the thread's private one under a
   ;; shared guard, the canonical one everywhere else -- above all under a
@@ -1098,7 +1155,8 @@
             (set tl_read_mode 0)
             (set tl_streams_shared nil)
             (set ($ this locked_) #f)
-            (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw))))
+            (pthread_rwlock_unlock (aof (-> ($ this m) streams_rw)))
+            (reader_return ($ this m)))
         (block
           ;; every write is in the FILE before the guard is released, or a
           ;; private reader taken the next instant would miss the bytes
@@ -1156,9 +1214,21 @@
 
   ;; called once, by whoever opened the store and knows where its two
   ;; files live -- this is what turns the shared side ON
+  ;; the pool's cap: 0 is off (a pair per thread), otherwise 1..64
+  (func memory_reader_pool ((Memory * m) (int cap)) (out void)
+    (if (< cap 0) (set cap 0))
+    (if (> cap 64) (set cap 64))
+    (set (-> m rpool_cap) cap))
+
   (func memory_reader_paths ((Memory * m) (const char * hex) (const char * data)) (out void)
     (snprintf (-> m rd_hex_path) 512 "%s" hex)
-    (snprintf (-> m rd_data_path) 512 "%s" data))
+    (snprintf (-> m rd_data_path) 512 "%s" data)
+    ;; ZIGURATIP_READER_POOL=P caps the private mappings for every consumer
+    ;; that sets reader paths -- the server, contention_test, cocolog's
+    ;; embed -- with no code change on their side
+    (let ((const char * knob . #'(getenv "ZIGURATIP_READER_POOL")))
+      (if (!= knob nil)
+          (memory_reader_pool m (atoi knob)))))
 
   ;; ==================================================================
   ;; THE STORE IS IN THE WRITING MACHINE'S BYTE ORDER, and this is what
@@ -3392,6 +3462,13 @@
     (code "  pthread_rwlock_init(&m->streams_rw, &rwa); pthread_rwlockattr_destroy(&rwa); }")
     (pthread_mutex_init (aof (-> m writers_access)) nil)
     (pthread_cond_init (aof (-> m writers_clear)) nil)
+    (pthread_mutex_init (aof (-> m rpool_access)) nil)
+    (pthread_cond_init (aof (-> m rpool_free)) nil)
+    (set (-> m rpool_cap) 0)
+    (set (-> m rpool_made) 0)
+    (set (-> m rpool_top) 0)
+    (set (-> m rpool_waits) 0)
+    (set (-> m rpool_checkouts) 0)
     (set (-> m writers_waiting) 0)
 
     ((-> data_io seekg) 0 std::ios::end)

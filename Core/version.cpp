@@ -23,6 +23,6 @@ namespace Zigurat
   // Test/run-version.sh pins the SHAPE and deliberately not the number --
   // a test that named it would be a second place to edit, and the one
   // somebody forgets.
-  const char* version() { return "0.1.24"; }
+  const char* version() { return "0.1.25"; }
 
 }

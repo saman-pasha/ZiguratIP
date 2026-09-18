@@ -137,6 +137,14 @@
     (set (cof nested) tl_guard_nested_n)
     (set (cof lifted) tl_guard_lifted_n))
 
+  ;; the reader pool's own two numbers, process-wide: how many times a
+  ;; thread waited for a pair, and how many pairs were checked out
+  (func engine_reader_pool_counts ((Memory * m) (int64_t * waits) (int64_t * checkouts)) (out void)
+    (pthread_mutex_lock (aof (-> m rpool_access)))
+    (set (cof waits) (-> m rpool_waits))
+    (set (cof checkouts) (-> m rpool_checkouts))
+    (pthread_mutex_unlock (aof (-> m rpool_access))))
+
   (func engine_isolate ((Memory * m) (IsolationLevel level)) (out void)
     (stage_needs_transaction m)
     (if (!= tl_txn nil)

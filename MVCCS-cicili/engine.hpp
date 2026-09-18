@@ -205,6 +205,11 @@ void engine_retire_transaction (size_t transaction_id);
 
 // turns the shared-reader side on; called by whoever opened the store
 void memory_reader_paths (Memory * m, const char * hex, const char * data);
+// the private-mapping pool's cap (0 = a pair per thread, the default) and its
+// two counters; ZIGURATIP_READER_POOL=P sets the cap for any consumer that
+// calls memory_reader_paths
+void memory_reader_pool (Memory * m, int cap);
+void engine_reader_pool_counts (Memory * m, int64_t * waits, int64_t * checkouts);
 
 // THE STORE IS IN THE WRITING MACHINE'S BYTE ORDER -- filestream, mapstream
 // and bufferstream are hbostream, where the protocol is nbostream and
