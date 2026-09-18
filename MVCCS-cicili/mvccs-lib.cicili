@@ -4705,6 +4705,10 @@
   (func bt_no_deps ((void * c) (BTreeIndex * d)) (out bool)
     (cast void c) (cast void d) (return #t))
 
+  ;; the engine's own chain callback -- the next level of a multi-level
+  ;; descent -- declared ahead so bt_emit_key can tell it from a user's
+  (decl) (func bt_eqchain_dcb ((void * c) (BTreeIndex * dep)) (out bool))
+
   (func bt_emit_key ((BTEmit * em) (BTKey * key)) (out bool)
     (let ((BTreeIndex * idx . #'(-> em idx))
           (bool cont . #t))
@@ -4725,21 +4729,34 @@
             ;; The exposure is the row window's: `dep' was read under the
             ;; guard and the callback runs without it.
             (if (> (-> key dependents_address) -1)
-                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address)))
-                      (Memory * m . #'(-> idx m))
-                      (Streams * held . #'(? (!= tl_streams_held nil)
-                                             (cast (Streams *) tl_streams_held)
-                                             (cast (Streams *) tl_streams_shared)))
-                      (int old_rm . tl_window_reads))
-                  (let ((int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0)))
-                    (debug! (fprintf stderr "mvccs[t%04zx] dep window: release=%d flip=%d\n"
-                                     (bitand (cast size_t (pthread_self)) 65535)
-                                     (? (!= held nil) 1 0) flip))
-                    (if (!= held nil) ((-> held unlock)))
-                    (if (== flip 1) (set tl_window_reads 1))
-                    (set cont ((-> em dcb) (-> em user) (aof dep)))
-                    (if (== flip 1) (set tl_window_reads old_rm))
-                    (if (!= held nil) ((-> held lock)))))))
+                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
+                  (if (== (-> em dcb) bt_eqchain_dcb)
+                      ;; THE ENGINE'S OWN CHAIN -- the next level of this same
+                      ;; descent. It asks for the shared side itself and nests
+                      ;; as a no-op under the hold already taken, so there is
+                      ;; nothing to hand back: a triple returns the guard
+                      ;; ONCE, around its rows in bt_output_vcb, not once per
+                      ;; level. cocolog#18 measured the per-level window at
+                      ;; three shared acquisitions a fetch where there had
+                      ;; been one exclusive, and 13-14% off throughput at 8
+                      ;; and 12 workers on a single pass.
+                      (set cont ((-> em dcb) (-> em user) (aof dep)))
+                    ;; A USER'S DEPENDENT CALLBACK: released around it, as the
+                    ;; row callback is, because it may nest a cursor or write
+                    (let ((Memory * m . #'(-> idx m))
+                          (Streams * held . #'(? (!= tl_streams_held nil)
+                                                 (cast (Streams *) tl_streams_held)
+                                                 (cast (Streams *) tl_streams_shared)))
+                          (int old_rm . tl_window_reads))
+                      (let ((int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0)))
+                        (debug! (fprintf stderr "mvccs[t%04zx] dep window: release=%d flip=%d\n"
+                                         (bitand (cast size_t (pthread_self)) 65535)
+                                         (? (!= held nil) 1 0) flip))
+                        (if (!= held nil) ((-> held unlock)))
+                        (if (== flip 1) (set tl_window_reads 1))
+                        (set cont ((-> em dcb) (-> em user) (aof dep)))
+                        (if (== flip 1) (set tl_window_reads old_rm))
+                        (if (!= held nil) ((-> held lock)))))))))
         (set cont (bt_cursor_output idx key (-> em user) (-> em rcb))))
       (set (-> em cont) (? cont 1 0))
       (return cont)))
