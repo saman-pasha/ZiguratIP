@@ -1196,6 +1196,17 @@
   ;; Statement -- where a reader's single point in time is fixed. The
   ;; outermost one starts the statement; inner ones nest silently.
   ;; ==================================================================
+  ;; CONSTRUCTED BEFORE THE STREAMS GUARD, NOT INSIDE IT. Every cursor used
+  ;; to take the guard first and build its Statement second, so the entropy
+  ;; draw below -- one read() of eight bytes -- ran inside the hold. A
+  ;; syscall is a scheduling point, and cocolog#16 measured what that costs
+  ;; on four cores: a hold of 22 779us with 103us on CPU, of which the draw
+  ;; was 22 729us wall and 56us CPU. The thread was descheduled at the
+  ;; read(), holding the guard, and no other connection could take it for
+  ;; the better part of a scheduler quantum. Nothing here needs the guard:
+  ;; the constructor touches only thread-local fields. Moving it out does
+  ;; not stop the deschedule -- it stops the deschedule being inside a
+  ;; global lock, which is the whole of what it buys and is worth having.
   (struct Statement
     (member bool mine_)
 
@@ -4730,8 +4741,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_walk_keys_rec idx (-> idx root_address)
                                      (cast (void *) (aof em)) bt_emit_kcb)
@@ -4749,8 +4760,8 @@
       (set ($ em rcb) bt_no_rows)
       (set ($ em dcb) dcb)
       (set ($ em cont) 1)
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_walk_keys_rec idx (-> idx root_address)
                                      (cast (void *) (aof em)) bt_emit_kcb)
@@ -4813,8 +4824,8 @@
       ;; e8ada3f, 0 at REPEATABLE READ and SERIALIZABLE where a read stamps
       ;; row locks.
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_equal_rec idx (-> idx root_address) k (aof em))
                    (cast void 0)))
@@ -4829,8 +4840,8 @@
       (set ($ em rcb) bt_no_rows)
       (set ($ em dcb) dcb)
       (set ($ em cont) 1)
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_equal_rec idx (-> idx root_address) k (aof em))
                    (cast void 0)))
@@ -4872,8 +4883,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_not_equal_rec idx (-> idx root_address) k (aof em))
                    (cast void 0)))
@@ -4920,8 +4931,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_less_rec idx (-> idx root_address) k 0 (aof em))
                    (cast void 0)))
@@ -4937,8 +4948,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_less_rec idx (-> idx root_address) k 1 (aof em))
                    (cast void 0)))
@@ -4998,8 +5009,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_greater_rec idx (-> idx root_address) k 0 (aof em))
                    (cast void 0)))
@@ -5015,8 +5026,8 @@
       (set ($ em cont) 1)
       ;; a read, so it asks for the shared side -- see bt_cursor_equal
       (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
-      (letin* ((streams (Streams (-> idx m)))
-               (statement (Statement (-> idx m))))
+      (letin* ((statement (Statement (-> idx m)))
+               (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
             (block (bt_greater_rec idx (-> idx root_address) k 1 (aof em))
                    (cast void 0)))
