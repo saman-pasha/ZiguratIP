@@ -927,69 +927,75 @@ limit applies to `golden/` — those are little-endian bytes, so the
 carry-over acceptance would be wrong on a big-endian box and would now
 refuse rather than mislead.
 
-## A lookup is a read, and now takes the guard as one
+## A lookup that went shared, and the four-core box that would not run it
+
+**This section records a change that was made, measured, pushed, and
+withdrawn two hours later.** It is here because the measurement was real and
+the failure was too, and the next person to have the idea should meet both.
 
 The tenth trace point was added so ZiguratIP#37 could be answered without
 patching a working copy. It answered something nobody had asked: bracketing a
 reading thread's acquisitions showed **98 % of its exclusive guard time was
-the index lookup**, not the transaction around it — two exclusive acquisitions
-per `cursor_equal` at 223 µs each, against 3.2 µs for its `begin` and 5.7 µs
-for its `commit`.
+the index lookup** -- two exclusive acquisitions per `cursor_equal` at 223 µs
+each, against 3.2 µs for its `begin` and 5.7 µs for its `commit`. Neither
+acquisition is a write. `bt_cursor_equal` took the exclusive side because it
+never asked for anything else, exactly as `read_row` did before `e8ada3f`.
 
-Not one of those two acquisitions is a write. `bt_cursor_equal` took the
-guard exclusively because **it never asked for anything else**, and the
-callback window at `bt_output_vcb` took it again after handing it back.
-`read_row` had been taught to ask in `e8ada3f`; its neighbours in the same
-path never were.
+**The window was what stopped it, and that part stands.** A cursor releases
+the guard around its callback, and found what to hand back through
+`tl_streams_held` -- a name only an *exclusive* hold ever set. A lookup
+holding the shared side would release nothing, and a callback that wrote
+would construct an exclusive guard under a held shared one, which
+`Streams::lock` refuses by design. `tl_streams_shared` now names a shared
+hold the same way and the window hands back whichever side the thread has.
+That mechanism is in and is what any future shared lookup needs.
 
-**What stopped them was the window, not the walk.** A cursor releases the
-guard around its callback so the callback can do engine work, and it found
-the guard to hand back through `tl_streams_held` — which only an *exclusive*
-hold ever set. A lookup holding the shared side would therefore release
-nothing, and a callback that wrote would construct an exclusive guard under a
-held shared one, which `Streams::lock` refuses by design. So the window now
-knows both sides: `tl_streams_shared` names a shared hold exactly as
-`tl_streams_held` names an exclusive one, and the window hands back whichever
-this thread has.
+**The asking is not.** `0dd8b2a` had the seven row cursors ask for the shared
+side when `reader_eligible` allowed, and on sixteen threads it did what the
+measurement promised:
 
-With that, **the seven row cursors ask for the shared side when
-`reader_eligible` allows it** — the same gate `read_row` passes, which
-answers 0 at REPEATABLE READ and SERIALIZABLE, where a read stamps row locks
-and must keep the exclusive guard.
+| | exclusive | before | after |
+|---|---|---|---|
+| acquisitions | | 38 344 | 30 622 |
+| guard time | | 10 248 ms | 7 624 ms |
+| suite wall clock | | 10.61 s | **8.04 s** |
 
-**The two DEPENDENT cursors deliberately do not.** `bt_cursor_dep` and
-`bt_cursor_equal_dep` invoke their callback with the guard *held* — there is
-no window there at all — so a callback that writes rides an exclusive hold as
-a nested no-op today, and would meet the same refusal on a shared one. That
-is not theoretical: the suite's `composite under load` threw exactly that on
-the first attempt, which is what a suite is for. A window for the dependent
-callback would let the pair go shared too, and would also be a new unlocked
-window in the machinery ZiguratIP#33 was fixed in. It is not free and it is
-not done.
+On **four cores it livelocks, deterministically, 4 runs of 4**. The scenario
+is `lookups_survive_a_writer`, whose six readers run a tight
+`do { cursor_equal } while (writing.load())` and whose `writing` clears only
+when the writer finishes 120 inserts. With the lookups exclusive, readers and
+writer queue on one lock and the writer gets its turns. With them shared, six
+readers on four cores overlap continuously and the writer never sees a gap --
+so the readers wait on the writer and the writer waits on the lock. gdb five
+seconds apart: the writer byte-identical in `___pthread_rwlock_wrlock`, all
+six readers moved, ~3.6 CPU-seconds burned per wall-second. Nothing is
+deadlocked; nothing finishes.
 
-**Measured, one `contention_test` binary with only `libMVCCS.so` swapped,
-five runs an arm alternating:**
+Two things are worth carrying forward from it.
 
-| | before | after |
-|---|---|---|
-| exclusive acquisitions | 38 344 | **30 622** |
-| exclusive guard time | 10 248 ms | **7 624 ms** |
-| shared acquisitions | 77 652 | 176 459 |
-| nested no-ops | 21 894 | 21 894 |
-| **suite wall clock** | **10.61 s** | **8.04 s** |
+* **`streams_rw` is already `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`
+  and it did not save the scenario.** Whatever the mechanism, writer
+  preference is not a reason to widen the shared side.
+* **A sixteen-thread box cannot find this and a four-core box cannot miss
+  it.** The suite ran green here twenty times over; the machine that broke
+  could not complete a single run -- and could not BUILD `0.1.11` at all,
+  because the gauntlet runs inside `build.sh` and hung rather than failed.
 
-Exclusive holds serialise every thread and shared ones do not, so the middle
-row is the one that matters: a quarter of the serialised time is gone, and
-the wall clock agrees to within two points (24 % against 26 %). The
-acquisition figures come from a `debug` build and carry its overhead; the
-wall clock is an ordinary build, `10.44-10.87` against `7.96-8.18` with no
-overlap. The nested count is identical either side, which is the control.
+What would make it safe is a gap a queued writer is guaranteed to get, not a
+stronger opinion about how many cores are around. The ask does not come back
+without a case that starves a writer on purpose and proves it does not.
 
-The new case `update in a lookup` is what holds this honest: a write from
-**inside** a lookup's callback at READ COMMITTED, eight threads on their own
-rows. `find_then_update` looks like that case and is not — it captures the
-row in the callback and writes after the cursor returns, which is the one
-path that never needed the window.
+**The table cursor has always taken the shared side** (the generated `icur`
+sets `tl_want_shared` before `cursor_walk`), and that has never starved
+anything -- its holds are per row emitted, not a tight loop of whole
+lookups. The difference is the shape of the loop, not the mode.
+
+**One thing the episode left that is worth keeping:** the case
+`update in a lookup`, a write from **inside** a lookup's callback at READ
+COMMITTED. Nothing in the suite did that before -- `find_then_update` looks
+like it and is not, capturing the row in the callback and writing after the
+cursor returns. It passes either side of the change; it is coverage the
+window machinery should always have had.
 
 ## Hard debugging, without changing a line
 

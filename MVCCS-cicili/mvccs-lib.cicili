@@ -4592,8 +4592,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4663,14 +4661,25 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; A LOOKUP IS A READ. It took the guard EXCLUSIVELY -- not because it
-      ;; writes, but because it never asked otherwise -- and ZiguratIP#37
-      ;; measured the cost: two exclusive acquisitions per lookup, 98 % of a
-      ;; reading thread's occupancy of the one guard, against 0.7-1.2 us for
-      ;; a shared hold. reader_eligible is the same gate read_row passes in
-      ;; e8ada3f, and it answers 0 at REPEATABLE READ and SERIALIZABLE --
-      ;; where a read stamps row locks, and must keep the exclusive side.
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
+      ;; THIS CURSOR TAKES THE EXCLUSIVE GUARD, AND THE OBVIOUS ONE-LINE
+      ;; CHANGE IS A TRAP. 0dd8b2a asked for the shared side here, on
+      ;; ZiguratIP#37's measurement that the lookup is 98 % of a reading
+      ;; thread's occupancy of the guard. It cut a quarter off the suite on
+      ;; sixteen threads -- and LIVELOCKED on four, deterministically:
+      ;; `lookups_survive_a_writer' runs six readers in a tight
+      ;; `do { cursor_equal } while (writing)' loop, and once their shared
+      ;; holds overlap continuously the writer they are waiting on never
+      ;; gets the exclusive side. The readers wait on the writer, the writer
+      ;; waits on the lock, and neither can yield. Withdrawn in 0.1.12; the
+      ;; box that found it could not even BUILD 0.1.11, because the gauntlet
+      ;; runs inside build.sh. streams_rw is already
+      ;; PREFER_WRITER_NONRECURSIVE_NP and it did not save it.
+      ;;
+      ;; What would make it safe is a gap a queued writer is guaranteed to
+      ;; get -- not a stronger opinion about how many cores are around. The
+      ;; window machinery below (tl_streams_shared) is what a shared lookup
+      ;; needs and it stays; the asking does not come back without a test
+      ;; that starves a writer on purpose and proves it does not.
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4728,8 +4737,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4776,8 +4783,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4793,8 +4798,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4854,8 +4857,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4871,8 +4872,6 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; a read, so it asks for the shared side -- see bt_cursor_equal
-      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
