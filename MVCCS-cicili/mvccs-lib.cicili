@@ -2038,7 +2038,10 @@
 
   (func rollback_transaction ((Memory * m)) (out void)
     (dba_watch0 m "Rollback Transaction")
-    (let ((Transaction * t . #'(txn)))
+    (let ((Transaction * t . #'(txn))
+          (int staged . 0))
+      ;; read BEFORE the context is cleared below
+      (if (!= (-> t ctx_head) nil) (set staged 1))
       (block
         (letin* ((streams (Streams m)))
           ;; backwards, and the record freed exactly once
@@ -2050,7 +2053,29 @@
           (if (!= ($ (-> t pointer) hash_key) nil)
               (free_pointer m (aof (-> t pointer))))
           (set (-> t pointer) (pointer_null))
-          (sync_disk m)))
+          ;; A ROLLBACK THAT UNDID NOTHING HAS NOTHING TO MAKE DURABLE, and
+          ;; this sync was unconditional where commit_transaction's is not.
+          ;; The argument is commit's own, written there: a crash resurrects
+          ;; an open record that licenses nothing, "which startup treats as
+          ;; the no-op it is". The only difference here is that the record is
+          ;; being freed rather than kept, and a crash before the free is
+          ;; durable leaves exactly that -- an allocated record nobody will
+          ;; ever license.
+          ;;
+          ;; IT IS NOT A NICETY. ziguratip's ConnectionScope rolls back on
+          ;; every connection teardown, and its own comment calls that "a
+          ;; no-op on the clean path" -- a no-op in WORK, and two fsyncs in
+          ;; COST, on every connection of the binary protocol.
+          ;; ZiguratIP#37 measured the result from the outside: half to four
+          ;; fifths of requests carrying an exclusive hold over a
+          ;; millisecond, median ~1.2ms, and the hold surviving every other
+          ;; explanation either of us offered.
+          ;;
+          ;; A rollback that DID undo staged rows still syncs: those control
+          ;; blocks moved, and what a crash owes them is a longer argument
+          ;; than this one.
+          (if (== staged 1)
+              (sync_disk m))))
       ;; a rolled back transaction is as over as a committed one, and
       ;; retired the same way, after its locks are gone
       (transaction_retire (-> t id))
