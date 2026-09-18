@@ -192,6 +192,10 @@ size_t engine_transaction_id (Memory * m);
 // the id this thread's transaction has or last had, 0 if never -- and it
 // NEVER stages, where engine_transaction_id opens one to have an id to give
 size_t engine_transaction_peek (Memory * m);
+// the calling thread's guard counters: outermost shared, outermost exclusive,
+// nested no-ops, and lifts (a write that gave a shared hold back to take the
+// exclusive side). Read before and after a stretch of work and subtract.
+void engine_guard_counts (int64_t * shared, int64_t * exclusive, int64_t * nested, int64_t * lifted);
 void engine_isolate (Memory * m, IsolationLevel level);
 void engine_set_autocommit (Memory * m, int64_t v);
 int64_t engine_autocommit ();

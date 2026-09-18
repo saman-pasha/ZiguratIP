@@ -126,6 +126,17 @@
     (cast void m)
     (return (? (!= tl_txn nil) (-> tl_txn id) (cast size_t 0))))
 
+  ;; the guard's own counters for THIS thread: outermost shared, outermost
+  ;; exclusive, nested no-ops, and lifts -- a write that gave a shared hold
+  ;; back to take the exclusive side. Deltas across a stretch of work are
+  ;; what a test asserts and what a probe used to patch in.
+  (func engine_guard_counts ((int64_t * shared) (int64_t * exclusive)
+                             (int64_t * nested) (int64_t * lifted)) (out void)
+    (set (cof shared) tl_guard_shared_n)
+    (set (cof exclusive) tl_guard_exclusive_n)
+    (set (cof nested) tl_guard_nested_n)
+    (set (cof lifted) tl_guard_lifted_n))
+
   (func engine_isolate ((Memory * m) (IsolationLevel level)) (out void)
     (stage_needs_transaction m)
     (if (!= tl_txn nil)

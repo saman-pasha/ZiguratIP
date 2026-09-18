@@ -894,6 +894,16 @@
   ;; a scheduling point, and this says whether the thread ran through it
   (thread-local) (var int64_t tl_draw_wall . 0)
   (thread-local) (var int64_t tl_draw_cpu . 0)
+  ;; FOUR COUNTERS THE GUARD KEEPS ABOUT ITSELF, always on: one increment
+  ;; each, no clock, no trace level, thread-local so they cost no
+  ;; coordination. They exist because a test that checks rows alone cannot
+  ;; tell a nested no-op from an outermost acquisition, and because
+  ;; cocolog#18 had been patching exactly these in by hand since
+  ;; ZiguratIP#37. engine_guard_counts reads them on the calling thread.
+  (thread-local) (var int64_t tl_guard_shared_n . 0)
+  (thread-local) (var int64_t tl_guard_exclusive_n . 0)
+  (thread-local) (var int64_t tl_guard_nested_n . 0)
+  (thread-local) (var int64_t tl_guard_lifted_n . 0)
 
   ;; a shared guard is granted only to a read whose isolation writes
   ;; nothing: REPEATABLE READ and SERIALIZABLE stamp shared row locks as
@@ -1025,6 +1035,7 @@
             ;; at most GATE_STANDDOWNS times
             (writers_stand_down ($ this m))
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
+            (set tl_guard_shared_n (+ tl_guard_shared_n 1))
             (set tl_read_mode 1)
             (set tl_streams_shared (cast (void *) this)))
         (block
@@ -1047,6 +1058,7 @@
           (if (== tl_read_mode 1)
               (block
                 (set ($ this lifted_) (cast (Streams *) tl_streams_shared))
+                (set tl_guard_lifted_n (+ tl_guard_lifted_n 1))
                 (debug! (fprintf stderr "mvccs[t%04zx] guard lifted: a write under a shared hold\n"
                                  (bitand (cast size_t (pthread_self)) 65535)))
                 ((-> ($ this lifted_) unlock))))
@@ -1055,6 +1067,7 @@
           (writers_enqueue ($ this m))
           (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
           (writers_granted ($ this m))
+          (set tl_guard_exclusive_n (+ tl_guard_exclusive_n 1))
           (set tl_streams_held (cast (void *) this))))
       (set ($ this locked_) #t)
       ;; THE WAIT IS THE MEASUREMENT. ZiguratIP#37 timestamped the four
@@ -1134,6 +1147,8 @@
               (set ($ this mine_) #t)
               (if (and (== want 1) (== 1 (reader_eligible mem)))
                   (set ($ this shared_) #t))))))
+      (if (not ($ this mine_))
+          (set tl_guard_nested_n (+ tl_guard_nested_n 1)))
       (($ this lock)))
 
     (dtor ()

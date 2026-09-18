@@ -780,17 +780,24 @@ static void update_inside_a_dependent_lookup ()
   reset_table();
 }
 
-// --- a write DIRECTLY in a dependent callback: the lift ---------------------
+// --- a write DIRECTLY in a dependent callback, from a NESTED frame: the lift -
 
 // `update in a dependent lookup' writes from a ROW callback nested inside a
 // dependent one, and the row window handles that. This one writes with only
-// a LEVEL in hand -- an insert from inside the dependent callback itself,
-// no row cursor between -- which is the shape that used to be refused as
-// "an exclusive streams guard under a shared one" and is now lifted: the
-// write gives the shared hold back, takes the exclusive side, and hands the
-// shared side back after. Eight threads insert distinct ids from inside
-// lookups on the same index; every id lands exactly once, or the lift lost
-// a row or wedged.
+// a LEVEL in hand -- an insert from inside a dependent callback, no row
+// cursor between -- which used to be refused as "an exclusive streams guard
+// under a shared one" and is now lifted. And it lifts from TWO frames down:
+// the write happens inside a second dependent lookup nested in the first
+// one's callback, so the inner cursor is a nested no-op under the outer's
+// shared hold and the lift has to give back the OUTERMOST holder from
+// underneath it -- the frame cocolog's three-level CLAUSES_OF would write
+// from. The suite's index has two levels, so nesting a second lookup is
+// how the third frame is reached.
+//
+// AND THE PATH IS ASSERTED, not inferred from the rows: the guard's own
+// counters say each round lifted exactly once and the inner lookup nested
+// rather than acquired. A case that checked rows alone could not tell those
+// apart, which is the blindness that let a wrong branch pass this gauntlet.
 static void insert_inside_a_dependent_lookup ()
 {
   const int64_t ROWS = 8;
@@ -802,19 +809,29 @@ static void insert_inside_a_dependent_lookup ()
 
   Trouble trouble;
   std::atomic<int> inserted(0);
+  std::atomic<long> lifts(0), nested(0);
 
   fan_out(THREADS, [&] (int t) {
-      const std::string kind(KINDS[t % KIND_COUNT]);
+      const std::string outer(KINDS[t % KIND_COUNT]);
+      const std::string inner(KINDS[(t + 1) % KIND_COUNT]);
+      int64_t s0, x0, n0, l0, s1, x1, n1, l1;
+      engine_guard_counts(&s0, &x0, &n0, &l0);
       for (int n = 0; n < ROUNDS; n++) {
         try {
           session();                        // READ COMMITTED: reader-eligible
           const int64_t id = BASE + (int64_t)t * ROUNDS + n;
-          Part::IDX_PART_KIND_WEIGHT.cursor_equal(STRING(kind),
+          Part::IDX_PART_KIND_WEIGHT.cursor_equal(STRING(outer),
             [&] (Zigurat::BTreeIndex<Part, LONG>& level) -> bool {
               (void)level;
-              Part row = make_part(id);      // a write with the shared hold in hand
-              Globals::memory()->online_insert(row);
-              inserted++;
+              // a second lookup, nested under the first one's shared hold
+              Part::IDX_PART_KIND_WEIGHT.cursor_equal(STRING(inner),
+                [&] (Zigurat::BTreeIndex<Part, LONG>& deeper) -> bool {
+                  (void)deeper;
+                  Part row = make_part(id);  // the write, two frames down
+                  Globals::memory()->online_insert(row);
+                  inserted++;
+                  return false;
+                });
               return false;
             });
           commit_transaction(MEM);
@@ -823,10 +840,16 @@ static void insert_inside_a_dependent_lookup ()
           try { rollback_transaction(MEM); } catch (...) { }
         }
       }
+      engine_guard_counts(&s1, &x1, &n1, &l1);
+      lifts += (l1 - l0);
+      nested += (n1 - n0);
     });
 
   check_str("insert in a dependent lookup: no trouble", trouble.say(), "none");
   check("insert in a dependent lookup: every round inserted", inserted.load(), THREADS * ROUNDS);
+  check("insert in a dependent lookup: every round LIFTED, once", lifts.load(), (long)THREADS * ROUNDS);
+  check("insert in a dependent lookup: the inner lookup nested, not acquired",
+        nested.load() >= (long)THREADS * ROUNDS ? 1 : 0, 1);
 
   long total = 0, missing = 0, doubled = 0;
   session();
