@@ -48,6 +48,11 @@
   ;; binding for struct timespec and does not need one for a single call site.
   (code "int64_t mvccs_wall_micros() { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000; }")
   (decl) (func mvccs_wall_micros () (out int64_t))
+  ;; the thread's own CPU clock, for the guard trace: a hold whose wall
+  ;; time is milliseconds and whose CPU time is microseconds was not
+  ;; running -- it was descheduled with the guard in hand
+  (code "int64_t mvccs_cpu_micros() { struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000; }")
+  (decl) (func mvccs_cpu_micros () (out int64_t))
 
   ;; The VECTOR column kind's member type: what the real engine's
   ;; Vector<Double> column is here, per doc/lib-std-c.md's `@define'
@@ -883,6 +888,12 @@
   ;; one clock in this file is worth more than a more suitable second one.
   (thread-local) (var int64_t tl_guard_want . 0)
   (thread-local) (var int64_t tl_guard_since . 0)
+  (thread-local) (var int64_t tl_guard_cpu_since . 0)
+  ;; and the same pair around the entropy draw in Statement's constructor,
+  ;; which cocolog#16 timed at 12 603us of a 12 613us hold -- a syscall is
+  ;; a scheduling point, and this says whether the thread ran through it
+  (thread-local) (var int64_t tl_draw_wall . 0)
+  (thread-local) (var int64_t tl_draw_cpu . 0)
 
   ;; a shared guard is granted only to a read whose isolation writes
   ;; nothing: REPEATABLE READ and SERIALIZABLE stamp shared row locks as
@@ -1033,6 +1044,7 @@
       ;; longer than a millisecond, which is what keeps `warn' the level of
       ;; things that should be rare.
       (warn! (set tl_guard_since (mvccs_wall_micros))
+             (set tl_guard_cpu_since (mvccs_cpu_micros))
              (let ((int64_t waited . #'(- tl_guard_since tl_guard_want)))
                (debug! (fprintf stderr "mvccs[t%04zx] guard taken %s waited %lld us\n"
                                 (bitand (cast size_t (pthread_self)) 65535)
@@ -1066,14 +1078,19 @@
       ;; it is there so a private reader cannot miss bytes still in the
       ;; canonical buffers -- and what the next thread waited for is the
       ;; whole of it, flush included.
-      (warn! (let ((int64_t held . #'(- (mvccs_wall_micros) tl_guard_since)))
-               (debug! (fprintf stderr "mvccs[t%04zx] guard held %lld us\n"
+      ;; WALL BESIDE CPU, because a hold can be long without running: cocolog#16
+      ;; chased a 9-17ms hold through the callback, cold reads and the walk
+      ;; and found one key, no misses and 5us of code. The suffixes are
+      ;; suffixes so a `grep -o "guard HELD [0-9]* us"' keeps matching.
+      (warn! (let ((int64_t held . #'(- (mvccs_wall_micros) tl_guard_since))
+                   (int64_t cpu . #'(- (mvccs_cpu_micros) tl_guard_cpu_since)))
+               (debug! (fprintf stderr "mvccs[t%04zx] guard held %lld us, cpu %lld us\n"
                                 (bitand (cast size_t (pthread_self)) 65535)
-                                (cast llong held)))
+                                (cast llong held) (cast llong cpu)))
                (if (> held 1000)
-                   (fprintf stderr "mvccs[t%04zx] guard HELD %lld us\n"
+                   (fprintf stderr "mvccs[t%04zx] guard HELD %lld us, on cpu %lld us\n"
                             (bitand (cast size_t (pthread_self)) 65535)
-                            (cast llong held))))))
+                            (cast llong held) (cast llong cpu))))))
 
     (ctor ((Memory * mem))
       (init (m mem) (mine_ #f) (locked_ #f) (shared_ #f))
@@ -1191,7 +1208,24 @@
                 ;; a random positive query id, so an update cursor can tell
                 ;; its own freshly inserted rows from the rows it is walking
                 (let ((uint64_t drawn . 0))
+                  ;; THE DRAW, TIMED WALL BESIDE CPU. One read() of eight
+                  ;; bytes from a kept-open /dev/urandom -- a mean of 1.5us
+                  ;; on cocolog#16's box, and once 12 603us, inside a hold
+                  ;; of 12 613us. Whether that is the read blocking or the
+                  ;; thread being descheduled at the syscall is exactly what
+                  ;; a wall clock cannot say and a CPU clock can.
+                  (warn! (set tl_draw_wall (mvccs_wall_micros))
+                         (set tl_draw_cpu (mvccs_cpu_micros)))
                   (Utility::random_bytes (cast (uint8_t *) (aof drawn)) (sizeof uint64_t))
+                  (warn! (let ((int64_t w . #'(- (mvccs_wall_micros) tl_draw_wall))
+                               (int64_t c . #'(- (mvccs_cpu_micros) tl_draw_cpu)))
+                           (debug! (fprintf stderr "mvccs[t%04zx] draw %lld us, cpu %lld us\n"
+                                            (bitand (cast size_t (pthread_self)) 65535)
+                                            (cast llong w) (cast llong c)))
+                           (if (> w 1000)
+                               (fprintf stderr "mvccs[t%04zx] draw STALLED %lld us, on cpu %lld us\n"
+                                        (bitand (cast size_t (pthread_self)) 65535)
+                                        (cast llong w) (cast llong c)))))
                   (set (-> tl_txn query_id) (cast int64_t (>> drawn 1))))
                 (set (-> tl_txn query_time) (version_time))))))
 
