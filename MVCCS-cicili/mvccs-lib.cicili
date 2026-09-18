@@ -3558,10 +3558,25 @@
 
   (struct BTNodeSlot (member int64_t addr) (member BTNode node))
   (struct BTKeySlot (member int64_t addr) (member BTKey key))
+  ;; THE CACHE LOCK IS STRIPED, 64 ways by slot. It was one mutex for the
+  ;; whole cache, taken on every node and key read -- ~6 per three-level
+  ;; lookup, ~312 per request on cocolog#18's page -- which was free while
+  ;; lookups were exclusive, because the write lock had already serialised
+  ;; every reader before it reached here, and became twelve readers
+  ;; colliding on one word the moment lookups went shared. ZiguratIP#39's
+  ;; ladder showed the cost is not the mappings (flat from twelve to one)
+  ;; and grows with the reader count; this is the largest shared touch by
+  ;; operation count. A slot-scoped operation takes its slot's stripe;
+  ;; reset takes all 64 in order; forget takes the one its address maps to.
+  ;; Node and key slots share their low six bits (both are address >> 6),
+  ;; so one address is one stripe.
   (struct BTCache
-    (member pthread_mutex_t access)
+    (member pthread_mutex_t stripes [64])
     (member BTNodeSlot nodes [4096])
     (member BTKeySlot keys [16384]))
+
+  (func bt_cache_stripe ((int slot)) (out int)
+    (return (bitand slot 63)))
 
   (func bt_cache_clear_slots ((BTCache * c)) (out void)
     (let ((int i . 0))
@@ -3579,7 +3594,8 @@
     ;; is one run away from an answer
     (if (!= (getenv "MVCCS_NO_CACHE") nil) (return nil))
     (let ((BTCache * c . #'(new* BTCache)))
-      (pthread_mutex_init (aof (-> c access)) nil)
+      (for ((int i . 0)) (< i 64) ((++ i))
+        (pthread_mutex_init (aof (nth i (-> c stripes))) nil))
       (bt_cache_clear_slots c)
       (return (cast (void *) c))))
 
@@ -3592,9 +3608,13 @@
   (func bt_cache_reset ((Memory * m)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
-      (pthread_mutex_lock (aof (-> c access)))
+      ;; every stripe, ascending -- a slot-scoped caller holds at most one,
+      ;; so there is no order for this to cross
+      (for ((int i . 0)) (< i 64) ((++ i))
+        (pthread_mutex_lock (aof (nth i (-> c stripes)))))
       (bt_cache_clear_slots c)
-      (pthread_mutex_unlock (aof (-> c access)))))
+      (for ((int i . 0)) (< i 64) ((++ i))
+        (pthread_mutex_unlock (aof (nth i (-> c stripes)))))))
 
   ;; records sit at least a control block apart, so the address over 64
   ;; spreads neighbours across slots
@@ -3607,57 +3627,58 @@
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
           (int ns . #'(bt_cache_node_slot address))
-          (int ks . #'(bt_cache_key_slot address)))
-      (pthread_mutex_lock (aof (-> c access)))
+          (int ks . #'(bt_cache_key_slot address))
+          (int st . #'(bt_cache_stripe (bt_cache_node_slot address))))
+      (pthread_mutex_lock (aof (nth st (-> c stripes))))
       (if (== ($ (nth ns (-> c nodes)) addr) address)
           (set ($ (nth ns (-> c nodes)) addr) -1))
       (if (== ($ (nth ks (-> c keys)) addr) address)
           (set ($ (nth ks (-> c keys)) addr) -1))
-      (pthread_mutex_unlock (aof (-> c access)))))
+      (pthread_mutex_unlock (aof (nth st (-> c stripes))))))
 
   (func bt_cache_node_get ((Memory * m) (int64_t address) (BTNode * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
           (int ns . #'(bt_cache_node_slot address))
           (int hit . 0))
-      (pthread_mutex_lock (aof (-> c access)))
+      (pthread_mutex_lock (aof (nth (bt_cache_stripe ns) (-> c stripes))))
       (if (== ($ (nth ns (-> c nodes)) addr) address)
           (block
             (set (cof out) ($ (nth ns (-> c nodes)) node))
             (set hit 1)))
-      (pthread_mutex_unlock (aof (-> c access)))
+      (pthread_mutex_unlock (aof (nth (bt_cache_stripe ns) (-> c stripes))))
       (return hit)))
 
   (func bt_cache_node_put ((Memory * m) (const BTNode * node)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
           (int ns . #'(bt_cache_node_slot ($ (-> node pointer) address))))
-      (pthread_mutex_lock (aof (-> c access)))
+      (pthread_mutex_lock (aof (nth (bt_cache_stripe ns) (-> c stripes))))
       (set ($ (nth ns (-> c nodes)) node) (cof node))
       (set ($ (nth ns (-> c nodes)) addr) ($ (-> node pointer) address))
-      (pthread_mutex_unlock (aof (-> c access)))))
+      (pthread_mutex_unlock (aof (nth (bt_cache_stripe ns) (-> c stripes))))))
 
   (func bt_cache_key_get ((Memory * m) (int64_t address) (BTKey * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
           (int ks . #'(bt_cache_key_slot address))
           (int hit . 0))
-      (pthread_mutex_lock (aof (-> c access)))
+      (pthread_mutex_lock (aof (nth (bt_cache_stripe ks) (-> c stripes))))
       (if (== ($ (nth ks (-> c keys)) addr) address)
           (block
             (set (cof out) ($ (nth ks (-> c keys)) key))
             (set hit 1)))
-      (pthread_mutex_unlock (aof (-> c access)))
+      (pthread_mutex_unlock (aof (nth (bt_cache_stripe ks) (-> c stripes))))
       (return hit)))
 
   (func bt_cache_key_put ((Memory * m) (const BTKey * key)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
           (int ks . #'(bt_cache_key_slot ($ (-> key pointer) address))))
-      (pthread_mutex_lock (aof (-> c access)))
+      (pthread_mutex_lock (aof (nth (bt_cache_stripe ks) (-> c stripes))))
       (set ($ (nth ks (-> c keys)) key) (cof key))
       (set ($ (nth ks (-> c keys)) addr) ($ (-> key pointer) address))
-      (pthread_mutex_unlock (aof (-> c access)))))
+      (pthread_mutex_unlock (aof (nth (bt_cache_stripe ks) (-> c stripes))))))
 
   (struct BTValue (inherits BaseTable)
     (member int64_t value)
