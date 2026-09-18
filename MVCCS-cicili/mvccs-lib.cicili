@@ -825,6 +825,7 @@
     ;; guard ZERO times in 120 rounds. Writer preference has to be the
     ;; engine's own, because it cannot be the platform's.
     (member pthread_mutex_t writers_access)
+    (member pthread_cond_t writers_clear)
     (member int writers_waiting)
     ;; where a thread may open its own read-only view of the two files --
     ;; empty means "no private readers": every guard is exclusive, as before
@@ -935,34 +936,58 @@
   ;; for the exclusive side, which is what makes the guard
   ;; writer-preferring on a platform whose rwlock is not.
   ;;
-  ;; It is a COUNT and not a lock: a writer announces itself before it
-  ;; blocks and withdraws once granted, and readers consult the count
-  ;; rather than each other. A stale answer is not unsafe in either
-  ;; direction -- one more shared grant slips past a writer, or one
-  ;; reader waits 20us it need not have -- but the count is taken under
-  ;; its own mutex anyway, because the alternative is a data race that
-  ;; happens to work.
+  ;; IT WAS A POLL AND IT COST TOO MUCH. The first build stood a reader
+  ;; down with `usleep 20' in a loop, and ZiguratIP#37 measured what that
+  ;; buys on four cores: the writer passed 120/120 rounds at every reader
+  ;; count, and the LOOKUPS COLLAPSED 14x to 57x, ranges not overlapping
+  ;; at any count. 15 688 sleeps to serve 142 lookups -- 110 sleeps each
+  ;; -- because a 20us sleep among thirteen runnable threads on four
+  ;; cores is a timer, a context switch and a queue, and measured ~137us.
+  ;; A reader was standing down for 137us to let through a begin that
+  ;; holds the guard for 3.2us.
+  ;;
+  ;; So the reader SLEEPS instead of polling: a condition variable the
+  ;; writer broadcasts on every grant, which is why the count needs a
+  ;; mutex rather than an atomic -- the mutex is what makes the wait and
+  ;; the wake race-free, not what protects an integer.
   ;;
   ;; Nested guards never reach lock(), so they neither announce nor wait:
   ;; a thread that already holds the guard cannot be made to queue behind
   ;; itself.
   ;; ==================================================================
+  ;; HOW MANY TIMES A READER WILL STAND DOWN before it takes the shared
+  ;; side anyway. Strict preference is unbounded by construction -- a
+  ;; reader defers while ANY writer is queued, and a workload whose
+  ;; writers never stop arriving is one where readers never run. That is
+  ;; the fault this gate exists to fix, mirrored, and cocolog's httpd pool
+  ;; is exactly such a workload: every request is a short exclusive
+  ;; acquisition through run_isolated/2. So the preference is bounded, and
+  ;; two is the bound ZiguratIP#37 proposed from the box that has the
+  ;; numbers.
+  (var const int GATE_STANDDOWNS . 2)
+
   (func writers_enqueue ((Memory * m)) (out void)
     (pthread_mutex_lock (aof (-> m writers_access)))
     (set (-> m writers_waiting) (+ (-> m writers_waiting) 1))
     (pthread_mutex_unlock (aof (-> m writers_access))))
 
-  (func writers_dequeue ((Memory * m)) (out void)
+  (func writers_granted ((Memory * m)) (out void)
     (pthread_mutex_lock (aof (-> m writers_access)))
     (set (-> m writers_waiting) (- (-> m writers_waiting) 1))
+    ;; EVERY grant wakes the standing-down readers, not only the one that
+    ;; empties the queue. A reader that slept until the count reached zero
+    ;; would sleep through a continuous stream of writers, and never
+    ;; reaching zero is precisely what a busy store looks like.
+    (pthread_cond_broadcast (aof (-> m writers_clear)))
     (pthread_mutex_unlock (aof (-> m writers_access))))
 
-  (func writers_queued ((Memory * m)) (out int)
-    (let ((int n . 0))
+  (func writers_stand_down ((Memory * m)) (out void)
+    (let ((int rounds . 0))
       (pthread_mutex_lock (aof (-> m writers_access)))
-      (set n (-> m writers_waiting))
-      (pthread_mutex_unlock (aof (-> m writers_access)))
-      (return n)))
+      (while (and (> (-> m writers_waiting) 0) (< rounds GATE_STANDDOWNS))
+        (pthread_cond_wait (aof (-> m writers_clear)) (aof (-> m writers_access)))
+        (set rounds (+ rounds 1)))
+      (pthread_mutex_unlock (aof (-> m writers_access)))))
 
   (struct Streams
     (member Memory * m)
@@ -982,9 +1007,9 @@
       (warn! (set tl_guard_want (mvccs_wall_micros)))
       (if ($ this shared_)
           (block
-            ;; stand down: a queued writer goes first, every time
-            (while (> (writers_queued ($ this m)) 0)
-              (usleep 20))
+            ;; stand down for a queued writer -- asleep, not polling, and
+            ;; at most GATE_STANDDOWNS times
+            (writers_stand_down ($ this m))
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
             (set tl_read_mode 1)
             (set tl_streams_shared (cast (void *) this)))
@@ -997,7 +1022,7 @@
           ;; count covers exactly the interval a reader must respect
           (writers_enqueue ($ this m))
           (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
-          (writers_dequeue ($ this m))
+          (writers_granted ($ this m))
           (set tl_streams_held (cast (void *) this))))
       (set ($ this locked_) #t)
       ;; THE WAIT IS THE MEASUREMENT. ZiguratIP#37 timestamped the four
@@ -3253,6 +3278,7 @@
     (code "#endif")
     (code "  pthread_rwlock_init(&m->streams_rw, &rwa); pthread_rwlockattr_destroy(&rwa); }")
     (pthread_mutex_init (aof (-> m writers_access)) nil)
+    (pthread_cond_init (aof (-> m writers_clear)) nil)
     (set (-> m writers_waiting) 0)
 
     ((-> data_io seekg) 0 std::ios::end)
