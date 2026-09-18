@@ -818,6 +818,15 @@
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
     (member pthread_rwlock_t streams_rw)
+    ;; HOW MANY THREADS ARE QUEUED FOR THE EXCLUSIVE SIDE. The rwlock is
+    ;; created PREFER_WRITER_NONRECURSIVE_NP and on glibc that defers
+    ;; nothing: ZiguratIP#37 counted 36 729 941 of 36 731 243 shared grants
+    ;; made while a writer was already queued, and a writer granted the
+    ;; guard ZERO times in 120 rounds. Writer preference has to be the
+    ;; engine's own, because it cannot be the platform's.
+    (member pthread_mutex_t writers_access)
+    (member pthread_cond_t writers_clear)
+    (member int writers_waiting)
     ;; where a thread may open its own read-only view of the two files --
     ;; empty means "no private readers": every guard is exclusive, as before
     (member char rd_hex_path [512])
@@ -922,6 +931,64 @@
     (reader_ensure m)
     (return tl_rd_data))
 
+  ;; ==================================================================
+  ;; THE GATE. A shared acquirer stands down while any thread is queued
+  ;; for the exclusive side, which is what makes the guard
+  ;; writer-preferring on a platform whose rwlock is not.
+  ;;
+  ;; IT WAS A POLL AND IT COST TOO MUCH. The first build stood a reader
+  ;; down with `usleep 20' in a loop, and ZiguratIP#37 measured what that
+  ;; buys on four cores: the writer passed 120/120 rounds at every reader
+  ;; count, and the LOOKUPS COLLAPSED 14x to 57x, ranges not overlapping
+  ;; at any count. 15 688 sleeps to serve 142 lookups -- 110 sleeps each
+  ;; -- because a 20us sleep among thirteen runnable threads on four
+  ;; cores is a timer, a context switch and a queue, and measured ~137us.
+  ;; A reader was standing down for 137us to let through a begin that
+  ;; holds the guard for 3.2us.
+  ;;
+  ;; So the reader SLEEPS instead of polling: a condition variable the
+  ;; writer broadcasts on every grant, which is why the count needs a
+  ;; mutex rather than an atomic -- the mutex is what makes the wait and
+  ;; the wake race-free, not what protects an integer.
+  ;;
+  ;; Nested guards never reach lock(), so they neither announce nor wait:
+  ;; a thread that already holds the guard cannot be made to queue behind
+  ;; itself.
+  ;; ==================================================================
+  ;; HOW MANY TIMES A READER WILL STAND DOWN before it takes the shared
+  ;; side anyway. Strict preference is unbounded by construction -- a
+  ;; reader defers while ANY writer is queued, and a workload whose
+  ;; writers never stop arriving is one where readers never run. That is
+  ;; the fault this gate exists to fix, mirrored, and cocolog's httpd pool
+  ;; is exactly such a workload: every request is a short exclusive
+  ;; acquisition through run_isolated/2. So the preference is bounded, and
+  ;; two is the bound ZiguratIP#37 proposed from the box that has the
+  ;; numbers.
+  (var const int GATE_STANDDOWNS . 2)
+
+  (func writers_enqueue ((Memory * m)) (out void)
+    (pthread_mutex_lock (aof (-> m writers_access)))
+    (set (-> m writers_waiting) (+ (-> m writers_waiting) 1))
+    (pthread_mutex_unlock (aof (-> m writers_access))))
+
+  (func writers_granted ((Memory * m)) (out void)
+    (pthread_mutex_lock (aof (-> m writers_access)))
+    (set (-> m writers_waiting) (- (-> m writers_waiting) 1))
+    ;; EVERY grant wakes the standing-down readers, not only the one that
+    ;; empties the queue. A reader that slept until the count reached zero
+    ;; would sleep through a continuous stream of writers, and never
+    ;; reaching zero is precisely what a busy store looks like.
+    (pthread_cond_broadcast (aof (-> m writers_clear)))
+    (pthread_mutex_unlock (aof (-> m writers_access))))
+
+  (func writers_stand_down ((Memory * m)) (out void)
+    (let ((int rounds . 0))
+      (pthread_mutex_lock (aof (-> m writers_access)))
+      (while (and (> (-> m writers_waiting) 0) (< rounds GATE_STANDDOWNS))
+        (pthread_cond_wait (aof (-> m writers_clear)) (aof (-> m writers_access)))
+        (set rounds (+ rounds 1)))
+      (pthread_mutex_unlock (aof (-> m writers_access)))))
+
   (struct Streams
     (member Memory * m)
     (member bool mine_)
@@ -940,6 +1007,9 @@
       (warn! (set tl_guard_want (mvccs_wall_micros)))
       (if ($ this shared_)
           (block
+            ;; stand down for a queued writer -- asleep, not polling, and
+            ;; at most GATE_STANDDOWNS times
+            (writers_stand_down ($ this m))
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
             (set tl_read_mode 1)
             (set tl_streams_shared (cast (void *) this)))
@@ -948,7 +1018,11 @@
           ;; rwlock -- surface the bug instead of wedging on it
           (if (== tl_read_mode 1)
               (throw* (MemoryException "an exclusive streams guard under a shared one")))
+          ;; announced BEFORE blocking and withdrawn once granted, so the
+          ;; count covers exactly the interval a reader must respect
+          (writers_enqueue ($ this m))
           (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
+          (writers_granted ($ this m))
           (set tl_streams_held (cast (void *) this))))
       (set ($ this locked_) #t)
       ;; THE WAIT IS THE MEASUREMENT. ZiguratIP#37 timestamped the four
@@ -3203,6 +3277,9 @@
     (code "  pthread_rwlockattr_setkind_np(&rwa, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);")
     (code "#endif")
     (code "  pthread_rwlock_init(&m->streams_rw, &rwa); pthread_rwlockattr_destroy(&rwa); }")
+    (pthread_mutex_init (aof (-> m writers_access)) nil)
+    (pthread_cond_init (aof (-> m writers_clear)) nil)
+    (set (-> m writers_waiting) 0)
 
     ((-> data_io seekg) 0 std::ios::end)
     (set (-> m page_count) (/ ((-> data_io tellg)) page_size))
@@ -4592,6 +4669,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4661,25 +4740,20 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
-      ;; THIS CURSOR TAKES THE EXCLUSIVE GUARD, AND THE OBVIOUS ONE-LINE
-      ;; CHANGE IS A TRAP. 0dd8b2a asked for the shared side here, on
-      ;; ZiguratIP#37's measurement that the lookup is 98 % of a reading
-      ;; thread's occupancy of the guard. It cut a quarter off the suite on
-      ;; sixteen threads -- and LIVELOCKED on four, deterministically:
-      ;; `lookups_survive_a_writer' runs six readers in a tight
-      ;; `do { cursor_equal } while (writing)' loop, and once their shared
-      ;; holds overlap continuously the writer they are waiting on never
-      ;; gets the exclusive side. The readers wait on the writer, the writer
-      ;; waits on the lock, and neither can yield. Withdrawn in 0.1.12; the
-      ;; box that found it could not even BUILD 0.1.11, because the gauntlet
-      ;; runs inside build.sh. streams_rw is already
-      ;; PREFER_WRITER_NONRECURSIVE_NP and it did not save it.
-      ;;
-      ;; What would make it safe is a gap a queued writer is guaranteed to
-      ;; get -- not a stronger opinion about how many cores are around. The
-      ;; window machinery below (tl_streams_shared) is what a shared lookup
-      ;; needs and it stays; the asking does not come back without a test
-      ;; that starves a writer on purpose and proves it does not.
+      ;; THE SHARED ASK, SECOND ATTEMPT -- and it is only safe because of
+      ;; the gate in Streams::lock above. 0dd8b2a asked for the shared side
+      ;; here without one and LIVELOCKED on four cores: six readers in a
+      ;; tight `do { cursor_equal } while (writing)' loop overlapped
+      ;; continuously and the writer they were waiting on was granted the
+      ;; guard zero times in 120 rounds, because glibc let every one of
+      ;; 36.7 million shared acquisitions barge a queued writer. With the
+      ;; gate a queued writer is respected by the engine rather than by the
+      ;; platform, and this becomes what the measurement always said it
+      ;; was: 98 % of a reading thread's occupancy of the one guard, given
+      ;; back. reader_eligible is the same gate read_row passes in
+      ;; e8ada3f, 0 at REPEATABLE READ and SERIALIZABLE where a read stamps
+      ;; row locks.
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4737,6 +4811,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4783,6 +4859,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4798,6 +4876,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4857,6 +4937,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4872,6 +4954,8 @@
       (set ($ em rcb) rcb)
       (set ($ em dcb) bt_no_deps)
       (set ($ em cont) 1)
+      ;; a read, so it asks for the shared side -- see bt_cursor_equal
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((streams (Streams (-> idx m)))
                (statement (Statement (-> idx m))))
         (if (> (-> idx root_address) -1)

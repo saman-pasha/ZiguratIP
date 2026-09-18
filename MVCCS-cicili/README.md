@@ -927,75 +927,139 @@ limit applies to `golden/` — those are little-endian bytes, so the
 carry-over acceptance would be wrong on a big-endian box and would now
 refuse rather than mislead.
 
-## A lookup that went shared, and the four-core box that would not run it
+## A lookup is a read, and the guard now prefers writers itself
 
-**This section records a change that was made, measured, pushed, and
-withdrawn two hours later.** It is here because the measurement was real and
-the failure was too, and the next person to have the idea should meet both.
+This one took four measured rounds, a livelock, a withdrawal and a machine
+this repository is not developed on. It is written out at length because the
+shape of the mistake is more useful than the fix.
 
-The tenth trace point was added so ZiguratIP#37 could be answered without
-patching a working copy. It answered something nobody had asked: bracketing a
-reading thread's acquisitions showed **98 % of its exclusive guard time was
-the index lookup** -- two exclusive acquisitions per `cursor_equal` at 223 µs
-each, against 3.2 µs for its `begin` and 5.7 µs for its `commit`. Neither
-acquisition is a write. `bt_cursor_equal` took the exclusive side because it
-never asked for anything else, exactly as `read_row` did before `e8ada3f`.
+**What started it.** The tenth trace point was added so ZiguratIP#37 could be
+answered without patching a working copy. Bracketing a reading thread's
+acquisitions showed **98 % of its exclusive guard time was the index lookup**
+-- two exclusive acquisitions per `cursor_equal` at 223 µs each, against
+3.2 µs for its `begin` and 5.7 µs for its `commit`. Neither acquisition is a
+write. `bt_cursor_equal` took the exclusive side because it never asked for
+anything else, exactly as `read_row` did before `e8ada3f`.
 
-**The window was what stopped it, and that part stands.** A cursor releases
-the guard around its callback, and found what to hand back through
-`tl_streams_held` -- a name only an *exclusive* hold ever set. A lookup
-holding the shared side would release nothing, and a callback that wrote
-would construct an exclusive guard under a held shared one, which
-`Streams::lock` refuses by design. `tl_streams_shared` now names a shared
-hold the same way and the window hands back whichever side the thread has.
-That mechanism is in and is what any future shared lookup needs.
+**The window was the blocker.** A cursor releases the guard around its
+callback, and found what to hand back through `tl_streams_held` -- a name
+only an *exclusive* hold ever set. A lookup holding the shared side would
+release nothing, and a callback that wrote would construct an exclusive guard
+under a held shared one, which `Streams::lock` refuses by design.
+`tl_streams_shared` names a shared hold the same way, and the window hands
+back whichever side the thread has.
 
-**The asking is not.** `0dd8b2a` had the seven row cursors ask for the shared
-side when `reader_eligible` allowed, and on sixteen threads it did what the
-measurement promised:
+**Then it livelocked a four-core box, deterministically.** Shipped as
+`0dd8b2a` on the strength of a sixteen-thread measurement -- exclusive guard
+time 10 248 ms to 7 624 ms, the suite 10.61 s to 8.04 s -- and on four cores
+`lookups_survive_a_writer` never finished, four runs of four. Six readers in
+a tight `do { cursor_equal } while (writing)` loop overlapped continuously
+and the writer they were waiting on was granted the guard **zero times in
+120 rounds**. Not a red case: a **hang inside `build.sh`**, so the box could
+not build the release at all. Withdrawn in `3e2ce4e` the same evening.
 
-| | exclusive | before | after |
+**The cause was not the ratio of readers to cores.** 32 readers on 16 cores
+is 2x oversubscribed and finishes in 0.21 s; 6 on 4 is 1.5x and never
+finishes. Instrumented on the box that had it: **36 729 941 of 36 731 243
+shared grants were made while a writer was already queued.** `streams_rw` is
+created `PREFER_WRITER_NONRECURSIVE_NP` and on glibc that defers nothing.
+The same barging is in the grants `read_row` has taken since `e8ada3f` (98 of
+99, 163 of 163, 7 108 of 7 109): it was always there, and only the volume of
+a shared cursor made it load-bearing.
+
+### So the guard prefers writers itself
+
+`Memory` carries `writers_waiting` under a mutex and a condition variable.
+The exclusive path announces itself before `pthread_rwlock_wrlock` and
+broadcasts once granted; a shared acquirer **sleeps** while the count is
+above zero. Three decisions in that sentence were each bought with a
+measurement:
+
+* **It sleeps rather than polls.** The first build stood a reader down with
+  `usleep 20` in a loop. The writer passed 120/120 rounds at every reader
+  count -- and the **lookups collapsed 14x to 57x**, ranges not overlapping
+  at any count. 15 688 sleeps to serve 142 lookups, 110 sleeps each, because
+  a nominal 20 µs sleep among thirteen runnable threads on four cores
+  measures ~137 µs. A reader was standing down 137 µs to let through a
+  `begin` that holds the guard for 3.2 µs. The gate's *decision* was never
+  the cost; its *granularity* was.
+* **The preference is bounded** -- `GATE_STANDDOWNS = 2`, then the reader
+  takes the shared side regardless. Strict preference is unbounded by
+  construction: a reader defers while *any* writer is queued, so a workload
+  whose writers never stop arriving is one where readers never run. That is
+  this fault mirrored, and cocolog's `library(httpd)` pool -- every request a
+  short exclusive acquisition through `run_isolated/2` -- is exactly that
+  shape. The bound removed **98 %** of stand-down time and is the change that
+  mattered most; a `pthread_cond_wait` is only 56-88 µs against the poll's
+  86-99 µs, so the win was the bound and not the sleep.
+* **The broadcast fires on every grant**, not when the queue empties. A
+  reader waiting for zero would sleep through a continuous stream of writers,
+  and never reaching zero is what a busy store looks like.
+
+The mutex stays because a condition variable needs one: it is what makes the
+wait and the wake race-free, not what protects an integer.
+
+### And why the two halves landed as one commit
+
+**Neither is an improvement alone.** The gate by itself is a *regression* on
+a tree whose lookups are exclusive -- 0.02 to 0.18x of ungated lookups at
+every reader count -- because `writers_enqueue` cannot know its caller, so
+**every reader's own lookup enqueues as a writer**. At twelve readers about
+90 % of the queued "writers" are readers, all deferring to each other. The
+shared lookup by itself livelocks. Only the pair is better than master, so
+they are one commit and there is nothing to bisect into.
+
+**Measured on the four-core box, five repeats an arm at every reader count,
+100 runs with no `STARVED` anywhere:**
+
+| readers | ungated lookups | gate alone | **both** |
 |---|---|---|---|
-| acquisitions | | 38 344 | 30 622 |
-| guard time | | 10 248 ms | 7 624 ms |
-| suite wall clock | | 10.61 s | **8.04 s** |
+| 2 | 149 | 4 | **279** |
+| 4 | 352 | 62 | **1 727** |
+| 6 | 1 449 | 119 | **2 192** |
+| 8 | 931 | 63 | **2 414** |
+| 12 | 4 167 | 79 | **3 638** |
 
-On **four cores it livelocks, deterministically, 4 runs of 4**. The scenario
-is `lookups_survive_a_writer`, whose six readers run a tight
-`do { cursor_equal } while (writing.load())` and whose `writing` clears only
-when the writer finishes 120 inserts. With the lookups exclusive, readers and
-writer queue on one lock and the writer gets its turns. With them shared, six
-readers on four cores overlap continuously and the writer never sees a gap --
-so the readers wait on the writer and the writer waits on the lock. gdb five
-seconds apart: the writer byte-identical in `___pthread_rwlock_wrlock`, all
-six readers moved, ~3.6 CPU-seconds burned per wall-second. Nothing is
-deadlocked; nothing finishes.
+Five range separations out of five against the gate alone; against ungated
+the ranges overlap everywhere except N = 4, so the honest claim is *at least
+as good as ungated at every count and clearly better at four readers*. The
+writer pays **1.13-1.37x** against a ceiling of 3x -- the gate alone makes it
+*faster* than ungated and the shared lookup gives that back, which is the
+same trade seen from both ends.
 
-Two things are worth carrying forward from it.
+**The number worth keeping** is the exclusive acquisition count, which is
+flat in N: **364 at two readers, 384 at twelve**, against ungated's 662 and
+8 718. The difference of 20 is exactly the 20 extra `begin`/`commit` calls
+ten more readers make. The lookups have left the exclusive side entirely.
+Shared grants made while a writer was queued fall to **17-26 %**, from the
+99.996 % that opened the issue, and the stand-down fires 0.8-1.9 times a
+lookup -- under the bound, and rarely reaching it.
 
-* **`streams_rw` is already `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`
-  and it did not save the scenario.** Whatever the mechanism, writer
-  preference is not a reason to widen the shared side.
-* **A sixteen-thread box cannot find this and a four-core box cannot miss
-  it.** The suite ran green here twenty times over; the machine that broke
-  could not complete a single run -- and could not BUILD `0.1.11` at all,
-  because the gauntlet runs inside `build.sh` and hung rather than failed.
+### What is still exclusive, and deliberately
 
-What would make it safe is a gap a queued writer is guaranteed to get, not a
-stronger opinion about how many cores are around. The ask does not come back
-without a case that starves a writer on purpose and proves it does not.
+`bt_cursor_dep` and `bt_cursor_equal_dep` invoke their callback with the
+guard **held** -- `bt_emit_key` calls `dcb` directly, there is no window
+there -- so a write inside a dependent callback rides an exclusive hold as a
+nested no-op and would meet the refusal on a shared one. The first attempt
+gave them the ask too and `composite under load` threw
+`an exclusive streams guard under a shared one` on the first run. A window
+for the dependent callback would let the pair go shared as well, and would
+also be a new unlocked window in the machinery ZiguratIP#33 was fixed in.
 
-**The table cursor has always taken the shared side** (the generated `icur`
-sets `tl_want_shared` before `cursor_walk`), and that has never starved
-anything -- its holds are per row emitted, not a tight loop of whole
-lookups. The difference is the shape of the loop, not the mode.
+The case `update in a lookup` is what holds all of this honest: a write from
+**inside** a lookup's callback at READ COMMITTED, eight threads on their own
+rows. Nothing in the suite did that before -- `find_then_update` looks like
+it and is not, capturing the row in the callback and writing after the cursor
+returns.
 
-**One thing the episode left that is worth keeping:** the case
-`update in a lookup`, a write from **inside** a lookup's callback at READ
-COMMITTED. Nothing in the suite did that before -- `find_then_update` looks
-like it and is not, capturing the row in the callback and writing after the
-cursor returns. It passes either side of the change; it is coverage the
-window machinery should always have had.
+### The lesson that is not about locks
+
+A sixteen-thread box cannot find this and a four-core box cannot miss it.
+The suite ran green here twenty times over while the machine that mattered
+could not complete a single run. **Anything that changes the guard's mode
+goes to four cores before it gets a version number**, and the measurements in
+this section are not ours -- they are ZiguratIP#37's, on the only box that
+has ever seen either fault.
 
 ## Hard debugging, without changing a line
 
