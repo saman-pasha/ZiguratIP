@@ -818,6 +818,14 @@
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
     (member pthread_rwlock_t streams_rw)
+    ;; HOW MANY THREADS ARE QUEUED FOR THE EXCLUSIVE SIDE. The rwlock is
+    ;; created PREFER_WRITER_NONRECURSIVE_NP and on glibc that defers
+    ;; nothing: ZiguratIP#37 counted 36 729 941 of 36 731 243 shared grants
+    ;; made while a writer was already queued, and a writer granted the
+    ;; guard ZERO times in 120 rounds. Writer preference has to be the
+    ;; engine's own, because it cannot be the platform's.
+    (member pthread_mutex_t writers_access)
+    (member int writers_waiting)
     ;; where a thread may open its own read-only view of the two files --
     ;; empty means "no private readers": every guard is exclusive, as before
     (member char rd_hex_path [512])
@@ -922,6 +930,40 @@
     (reader_ensure m)
     (return tl_rd_data))
 
+  ;; ==================================================================
+  ;; THE GATE. A shared acquirer stands down while any thread is queued
+  ;; for the exclusive side, which is what makes the guard
+  ;; writer-preferring on a platform whose rwlock is not.
+  ;;
+  ;; It is a COUNT and not a lock: a writer announces itself before it
+  ;; blocks and withdraws once granted, and readers consult the count
+  ;; rather than each other. A stale answer is not unsafe in either
+  ;; direction -- one more shared grant slips past a writer, or one
+  ;; reader waits 20us it need not have -- but the count is taken under
+  ;; its own mutex anyway, because the alternative is a data race that
+  ;; happens to work.
+  ;;
+  ;; Nested guards never reach lock(), so they neither announce nor wait:
+  ;; a thread that already holds the guard cannot be made to queue behind
+  ;; itself.
+  ;; ==================================================================
+  (func writers_enqueue ((Memory * m)) (out void)
+    (pthread_mutex_lock (aof (-> m writers_access)))
+    (set (-> m writers_waiting) (+ (-> m writers_waiting) 1))
+    (pthread_mutex_unlock (aof (-> m writers_access))))
+
+  (func writers_dequeue ((Memory * m)) (out void)
+    (pthread_mutex_lock (aof (-> m writers_access)))
+    (set (-> m writers_waiting) (- (-> m writers_waiting) 1))
+    (pthread_mutex_unlock (aof (-> m writers_access))))
+
+  (func writers_queued ((Memory * m)) (out int)
+    (let ((int n . 0))
+      (pthread_mutex_lock (aof (-> m writers_access)))
+      (set n (-> m writers_waiting))
+      (pthread_mutex_unlock (aof (-> m writers_access)))
+      (return n)))
+
   (struct Streams
     (member Memory * m)
     (member bool mine_)
@@ -940,6 +982,9 @@
       (warn! (set tl_guard_want (mvccs_wall_micros)))
       (if ($ this shared_)
           (block
+            ;; stand down: a queued writer goes first, every time
+            (while (> (writers_queued ($ this m)) 0)
+              (usleep 20))
             (pthread_rwlock_rdlock (aof (-> ($ this m) streams_rw)))
             (set tl_read_mode 1)
             (set tl_streams_shared (cast (void *) this)))
@@ -948,7 +993,11 @@
           ;; rwlock -- surface the bug instead of wedging on it
           (if (== tl_read_mode 1)
               (throw* (MemoryException "an exclusive streams guard under a shared one")))
+          ;; announced BEFORE blocking and withdrawn once granted, so the
+          ;; count covers exactly the interval a reader must respect
+          (writers_enqueue ($ this m))
           (pthread_rwlock_wrlock (aof (-> ($ this m) streams_rw)))
+          (writers_dequeue ($ this m))
           (set tl_streams_held (cast (void *) this))))
       (set ($ this locked_) #t)
       ;; THE WAIT IS THE MEASUREMENT. ZiguratIP#37 timestamped the four
@@ -3203,6 +3252,8 @@
     (code "  pthread_rwlockattr_setkind_np(&rwa, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);")
     (code "#endif")
     (code "  pthread_rwlock_init(&m->streams_rw, &rwa); pthread_rwlockattr_destroy(&rwa); }")
+    (pthread_mutex_init (aof (-> m writers_access)) nil)
+    (set (-> m writers_waiting) 0)
 
     ((-> data_io seekg) 0 std::ios::end)
     (set (-> m page_count) (/ ((-> data_io tellg)) page_size))
