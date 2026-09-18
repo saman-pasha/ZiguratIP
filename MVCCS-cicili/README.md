@@ -1133,6 +1133,66 @@ And the log line got the accessor it should have had: `engine_transaction_peek`
 answers the id a thread's transaction has or last had and never stages,
 where `engine_transaction_id` opens one to have an id to give.
 
+## The dependent lookup stays exclusive, and the reason is mappings, not locks
+
+cocolog#18 counted **104 dependent-cursor lookups per request** on a page that
+reads one row -- 52 predicates fetched by a fresh per-request store, at two
+`equal_dep` descents each on the three-level `(kb, name, arity)` index -- and
+every one exclusive, because the dependent pair was left on the exclusive side
+above. Two branches took them shared. Both were measured on the four-core box,
+three alternating repeats, and both are closed as the record:
+
+| | exclusive / req | shared / req | W=12 vs master |
+|---|---|---|---|
+| master `0.1.20` | 57 | 1 | 1.00 |
+| `archive/dependent-window` -- eager window in `bt_emit_key` | 3 | 160 | 0.92x |
+| `archive/lazy-window` -- no window; a write under a shared hold is *lifted* | 3 | 54 | **0.88x** |
+
+**Fewer acquisitions, worse.** Every count landed exactly where the arithmetic
+put it, and the throughput went the other way -- so the acquisitions were
+never the cost. Nor was the guard: all guard waiting is 19-50 us a request on
+every arm, and the arm that waits the most (master) is the fastest. Store CPU
+per request is the inverse of throughput at every width, including a sign
+flip at two workers where the shared path is *cheaper*. And the closing
+measurement needed no build: **`ZIGURATIP_PARALLEL_READS=0` on the same
+`lazy-window` binary lands on master's profile exactly** -- 4 376 requests
+against master's 4 308-4 349, 57 exclusive, 1.78 ms of store CPU against 1.84.
+The whole 3.3 ms a request is the shared read path.
+
+**The shared read path is twelve mappings of one file.** `reader_ensure` opens
+a private read-only `mapstream` per thread, once, and reads under a shared
+hold go through it -- a private *position*, which is all #33's race ever
+needed, bought with a private *mapping*. Twelve `MAP_SHARED` VMAs share
+page-cache pages and nothing else: each thread walks its own translations,
+and four cores hosting twelve mappings hold three mappings' worth per core
+where the exclusive path held one. Minor faults are flat (0.026 a request),
+so the mappings are stable and it is not first-touch; the box has no `perf`,
+so the TLB figure is unrefuted rather than confirmed. Two mappings are
+cheaper than serialising fifty-six exclusive holds; twelve are not.
+
+So the sentence beside the 24 % above: **the shared lookup is a win on
+sixteen threads where the readers have cores of their own, and a loss on four
+cores with twelve workers until readers share a mapping.** Both measured,
+different machines. The seven row cursors stay shared as landed -- this page
+reads four rows a request through that path and it costs nothing measurable;
+the dependent pair stays exclusive, and the 104 lookups a request are
+cocolog's number (its fresh store per request) before they are this engine's.
+
+**The fix is one mapping, many positions** -- a per-thread reader aliasing
+the canonical `mapbuf` with its own cursor -- and it is blocked on one fact:
+`mapbuf::reserve` unmaps and remaps when a store exceeds its reservation, and
+base moves. A remap is a writer's act under the exclusive guard, so a shared
+holder is safe; a callback-window reader is not, since it reads with the
+guard released. It needs a base that never moves or an epoch that keeps the
+old mapping alive until the last window reader is done. Its own issue.
+
+What the two branches leave behind is worth keeping when that day comes: the
+*lift* -- an exclusive guard taken under a held shared one gives the shared
+hold back, takes the write side, and hands the shared side back after,
+proved from a nested frame -- and four always-on guard counters behind
+`engine_guard_counts`, which are what let a test assert the path it took
+rather than infer it from the rows.
+
 ## Hard debugging, without changing a line
 
 Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —
