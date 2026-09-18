@@ -111,6 +111,21 @@
     (stage_needs_transaction m)
     (return (? (!= tl_txn nil) (-> tl_txn id) (cast size_t 0))))
 
+  ;; THE ONE THAT ONLY LOOKS. engine_transaction_id is not an accessor: it
+  ;; stages, so asking for the id OPENS a transaction when none is open.
+  ;; ziguratip printed "Transaction Closed <id>" through it at the end of
+  ;; every connection, and so opened a second transaction per connection
+  ;; in order to report on the first -- ZiguratIP#37 watched the ids step
+  ;; by 2, and by 1 once the call was taken out. A log line that wants to
+  ;; say what is there must not conjure something to report.
+  ;;
+  ;; This answers the id this thread's transaction has or last had -- the
+  ;; id survives a commit, which nulls the record pointer and keeps it --
+  ;; and 0 if the thread never had one. It never stages.
+  (func engine_transaction_peek ((Memory * m)) (out size_t)
+    (cast void m)
+    (return (? (!= tl_txn nil) (-> tl_txn id) (cast size_t 0))))
+
   (func engine_isolate ((Memory * m) (IsolationLevel level)) (out void)
     (stage_needs_transaction m)
     (if (!= tl_txn nil)

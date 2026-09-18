@@ -215,7 +215,12 @@ void handle_client()
   // which is SUCCESSFUL_DONE. A failed compile looked like a successful one.
   Globals::client_stream()->flush();
 
-  std::cout << "Transaction Closed " << engine_transaction_id(globals_memory()) << std::endl;
+  // PEEK, NOT ID: engine_transaction_id stages, and at this point the client's
+  // close has committed, so asking it for an id to print OPENED A SECOND
+  // TRANSACTION on every connection -- which ConnectionScope then rolled
+  // back, fsyncs and all. ZiguratIP#37 watched the ids step by 2. The peek
+  // reports the one that just closed and opens nothing.
+  std::cout << "Transaction Closed " << engine_transaction_peek(globals_memory()) << std::endl;
 }
 
 namespace

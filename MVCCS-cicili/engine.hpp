@@ -189,6 +189,9 @@ int  globals_identified ();
 // each stages a transaction first: a begin on an open transaction
 // continues it, so a pooled thread's first touch opens its own
 size_t engine_transaction_id (Memory * m);
+// the id this thread's transaction has or last had, 0 if never -- and it
+// NEVER stages, where engine_transaction_id opens one to have an id to give
+size_t engine_transaction_peek (Memory * m);
 void engine_isolate (Memory * m, IsolationLevel level);
 void engine_set_autocommit (Memory * m, int64_t v);
 int64_t engine_autocommit ();
