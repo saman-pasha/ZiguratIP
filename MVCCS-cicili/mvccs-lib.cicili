@@ -48,6 +48,9 @@
   ;; binding for struct timespec and does not need one for a single call site.
   (code "int64_t mvccs_wall_micros() { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000 + (int64_t)ts.tv_nsec / 1000; }")
   (decl) (func mvccs_wall_micros () (out int64_t))
+  ;; for the cache's hugepage advice (ZiguratIP#40); every target that
+  ;; expands this engine gets the header the same way it gets the clock
+  (code "#include <sys/mman.h>")
   ;; the thread's own CPU clock, for the guard trace: a hold whose wall
   ;; time is milliseconds and whose CPU time is microseconds was not
   ;; running -- it was descheduled with the guard in hand
@@ -3517,6 +3520,9 @@
   (struct BTKeySlot (member int64_t addr) (member BTKey key))
   (struct BTCache
     (member pthread_mutex_t access)
+    ;; 1 when the table was placed by aligned_alloc for a hugepage, so
+    ;; bt_cache_free knows to free() rather than delete
+    (member int huge)
     (member BTNodeSlot nodes [4096])
     (member BTKeySlot keys [16384]))
 
@@ -3535,15 +3541,41 @@
     ;; accessor answers nothing for a nil cache -- so a suspicion about it
     ;; is one run away from an answer
     (if (!= (getenv "MVCCS_NO_CACHE") nil) (return nil))
-    (let ((BTCache * c . #'(new* BTCache)))
+    ;; MVCCS_CACHE_HUGEPAGE=1 PLACES THE TABLE IN ONE PAGE. ZiguratIP#40
+    ;; measured this cache -- 1.84 MB, 100% hits -- costing ~3.6us a probe
+    ;; of user-space CPU on a four-core Firecracker guest where it costs
+    ;; nothing on bare metal, with the mutex never reaching the kernel.
+    ;; The one mechanism with that shape is TLB misses on the table under
+    ;; nested paging: 460 four-kilobyte pages walked in hash order, each
+    ;; miss a two-dimensional page walk. A 2 MB-aligned allocation with
+    ;; MADV_HUGEPAGE is one page instead. Advisory -- the kernel may
+    ;; decline, and /proc/<pid>/smaps_rollup's AnonHugePages says whether
+    ;; it took. Unset, this is today's `new', byte for byte: one binary,
+    ;; one variable, two arms.
+    (let ((BTCache * c . nil))
+      (if (!= (getenv "MVCCS_CACHE_HUGEPAGE") nil)
+          (let ((size_t want . #'(sizeof BTCache))
+                (size_t size . 0))
+            (set size (* (/ (+ want 2097151) 2097152) 2097152))
+            (set c (cast (BTCache *) (aligned_alloc 2097152 size)))
+            (code "#ifdef MADV_HUGEPAGE")
+            (if (!= c nil) (madvise (cast (void *) c) size 14))
+            (code "#endif")
+            (if (!= c nil) (set (-> c huge) 1)))
+        (block
+          (set c (new* BTCache))
+          (set (-> c huge) 0)))
+      (if (== c nil) (return nil))
       (pthread_mutex_init (aof (-> c access)) nil)
       (bt_cache_clear_slots c)
       (return (cast (void *) c))))
 
   (func bt_cache_free ((Memory * m)) (out void)
     (if (!= (-> m bt_cache) nil)
-        (block
-          (delete* (cast (BTCache *) (-> m bt_cache)))
+        (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
+          (if (== (-> c huge) 1)
+              (free (cast (void *) c))
+            (delete* c))
           (set (-> m bt_cache) nil))))
 
   (func bt_cache_reset ((Memory * m)) (out void)
