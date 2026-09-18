@@ -780,6 +780,75 @@ static void update_inside_a_dependent_lookup ()
   reset_table();
 }
 
+// --- a write DIRECTLY in a dependent callback: the lift ---------------------
+
+// `update in a dependent lookup' writes from a ROW callback nested inside a
+// dependent one, and the row window handles that. This one writes with only
+// a LEVEL in hand -- an insert from inside the dependent callback itself,
+// no row cursor between -- which is the shape that used to be refused as
+// "an exclusive streams guard under a shared one" and is now lifted: the
+// write gives the shared hold back, takes the exclusive side, and hands the
+// shared side back after. Eight threads insert distinct ids from inside
+// lookups on the same index; every id lands exactly once, or the lift lost
+// a row or wedged.
+static void insert_inside_a_dependent_lookup ()
+{
+  const int64_t ROWS = 8;
+  const int THREADS = 8;
+  const int ROUNDS = 25;
+  const int64_t BASE = 1000;
+  load(ROWS);
+  commit_transaction(MEM);
+
+  Trouble trouble;
+  std::atomic<int> inserted(0);
+
+  fan_out(THREADS, [&] (int t) {
+      const std::string kind(KINDS[t % KIND_COUNT]);
+      for (int n = 0; n < ROUNDS; n++) {
+        try {
+          session();                        // READ COMMITTED: reader-eligible
+          const int64_t id = BASE + (int64_t)t * ROUNDS + n;
+          Part::IDX_PART_KIND_WEIGHT.cursor_equal(STRING(kind),
+            [&] (Zigurat::BTreeIndex<Part, LONG>& level) -> bool {
+              (void)level;
+              Part row = make_part(id);      // a write with the shared hold in hand
+              Globals::memory()->online_insert(row);
+              inserted++;
+              return false;
+            });
+          commit_transaction(MEM);
+        } catch (std::exception& e) {
+          trouble.note(e.what());
+          try { rollback_transaction(MEM); } catch (...) { }
+        }
+      }
+    });
+
+  check_str("insert in a dependent lookup: no trouble", trouble.say(), "none");
+  check("insert in a dependent lookup: every round inserted", inserted.load(), THREADS * ROUNDS);
+
+  long total = 0, missing = 0, doubled = 0;
+  session();
+  Globals::memory()->cursor<Part>([&] (Part& r) -> bool { (void)r; total++; return true; });
+  for (int t = 0; t < THREADS; t++)
+    for (int n = 0; n < ROUNDS; n++) {
+      const int64_t id = BASE + (int64_t)t * ROUNDS + n;
+      int hits = 0;
+      Part::IDX_PART_ID.cursor_equal(LONG(id), [&] (Part& row) -> bool {
+          if ((row.*Part::ID).value() == id) hits++;
+          return true;
+        });
+      if (hits == 0) missing++;
+      if (hits > 1) doubled++;
+    }
+  commit_transaction(MEM);
+  check("insert in a dependent lookup: the table holds them all", total, ROWS + THREADS * ROUNDS);
+  check("insert in a dependent lookup: none missing", missing, 0);
+  check("insert in a dependent lookup: none doubled", doubled, 0);
+  reset_table();
+}
+
 // --- a row that is being rewritten ------------------------------------------
 
 static void rewrite_never_missing_from_index ()
@@ -1298,6 +1367,7 @@ int main ()
   find_then_update();
   update_inside_a_lookup();
   update_inside_a_dependent_lookup();
+  insert_inside_a_dependent_lookup();
   rewrite_never_missing_from_index();
   rewrite_never_missing_from_scan();
   scan_counts_exactly_once();

@@ -1005,6 +1005,9 @@
     (member bool mine_)
     (member bool locked_)
     (member bool shared_)
+    ;; the shared hold this exclusive guard LIFTED to get in -- released
+    ;; before wrlock, retaken after unlock -- or nil
+    (member Streams * lifted_)
 
     (method lock () (out void)
       ;; a nested guard takes nothing and waits for nothing, and saying so
@@ -1025,10 +1028,28 @@
             (set tl_read_mode 1)
             (set tl_streams_shared (cast (void *) this)))
         (block
-          ;; a write guard under a held shared one would deadlock on the
-          ;; rwlock -- surface the bug instead of wedging on it
+          ;; A WRITE UNDER A HELD SHARED GUARD IS LIFTED, NOT REFUSED. It
+          ;; used to throw here -- "an exclusive streams guard under a
+          ;; shared one" -- because taking the write side while holding the
+          ;; read side deadlocks the rwlock, and surfacing that beat wedging
+          ;; on it. Since the lookups went shared (f1ff4d5, cocolog#18) a
+          ;; write inside a dependent callback is not a bug but the one
+          ;; thing a callback window exists for; and an EAGER window at
+          ;; every dependent callback cost three acquisitions a fetch
+          ;; (cocolog#18: 160 shared a request, 0.92x at twelve workers) to
+          ;; serve a write that arrives in well under 2% of them. So the
+          ;; window opens when the write arrives: this guard gives the
+          ;; shared hold back, takes the exclusive side, and hands the
+          ;; shared side back on unlock. Nothing is held while it waits, so
+          ;; there is no upgrade and no upgrade deadlock. The exposure --
+          ;; the enclosing cursor's state may move underneath -- is the
+          ;; eager window's exactly, taken only when it is paid for.
           (if (== tl_read_mode 1)
-              (throw* (MemoryException "an exclusive streams guard under a shared one")))
+              (block
+                (set ($ this lifted_) (cast (Streams *) tl_streams_shared))
+                (debug! (fprintf stderr "mvccs[t%04zx] guard lifted: a write under a shared hold\n"
+                                 (bitand (cast size_t (pthread_self)) 65535)))
+                ((-> ($ this lifted_) unlock))))
           ;; announced BEFORE blocking and withdrawn once granted, so the
           ;; count covers exactly the interval a reader must respect
           (writers_enqueue ($ this m))
@@ -1090,10 +1111,17 @@
                (if (> held 1000)
                    (fprintf stderr "mvccs[t%04zx] guard HELD %lld us, on cpu %lld us\n"
                             (bitand (cast size_t (pthread_self)) 65535)
-                            (cast llong held) (cast llong cpu))))))
+                            (cast llong held) (cast llong cpu)))))
+      ;; and the shared hold this write lifted comes back, through the gate
+      ;; like any other shared acquisition -- AFTER the accounting above,
+      ;; which reads the stopwatch this relock resets
+      (if (!= ($ this lifted_) nil)
+          (block
+            ((-> ($ this lifted_) lock))
+            (set ($ this lifted_) nil))))
 
     (ctor ((Memory * mem))
-      (init (m mem) (mine_ #f) (locked_ #f) (shared_ #f))
+      (init (m mem) (mine_ #f) (locked_ #f) (shared_ #f) (lifted_ nil))
       (let ((int want . tl_want_shared))
         (set tl_want_shared 0)
         (if (!= tl_streams_held nil)
@@ -1101,7 +1129,7 @@
           (if (== tl_read_mode 1)
               (if (== want 1)
                   (set ($ this mine_) #f)     ;; nested under a shared hold: no-op
-                (set ($ this mine_) #t))      ;; write wanted under shared: trap in lock()
+                (set ($ this mine_) #t))      ;; write wanted under shared: LIFTED in lock()
             (block                            ;; outermost
               (set ($ this mine_) #t)
               (if (and (== want 1) (== 1 (reader_eligible mem)))
@@ -4710,36 +4738,20 @@
           (bool cont . #t))
       (if (> (-> idx levels) 1)
           (block
-            ;; THE DEPENDENT CALLBACK HAS A WINDOW NOW, the same one the row
-            ;; callback has had in bt_output_vcb: whichever side this thread
-            ;; holds is handed back around the callback and retaken after,
-            ;; and the window's reads go to the private stream when
-            ;; reader_eligible. Without it the dependent pair had to keep
-            ;; the exclusive side -- a callback that wrote, or nested a
-            ;; cursor, met "an exclusive streams guard under a shared one"
-            ;; (composite under load, on the first attempt). cocolog#18
-            ;; counted what that cost: 104 dependent lookups per request,
-            ;; every one an exclusive acquisition, on a read-only page.
-            ;; With the guard released here, a nested cursor is outermost
-            ;; and asks for its own; a write takes its own exclusive one.
-            ;; The exposure is the row window's: `dep' was read under the
-            ;; guard and the callback runs without it.
+            ;; NO EAGER WINDOW HERE, on purpose. The dependent callback runs
+            ;; with the guard held: a nested read cursor asks for the shared
+            ;; side itself and nests as a no-op, so a triple is ONE shared
+            ;; acquisition and two no-ops. A write inside the callback is
+            ;; handled where it happens -- Streams::lock lifts the shared
+            ;; hold for it and hands it back after (see the guard) -- so
+            ;; the window opens when a write arrives, not when one might.
+            ;; The eager version (dependent-window, 6298244) opened one at
+            ;; every level: 160 shared acquisitions a request and 0.92x at
+            ;; twelve workers on cocolog#18's box, for writes that arrive
+            ;; in under 2% of these callbacks.
             (if (> (-> key dependents_address) -1)
-                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address)))
-                      (Memory * m . #'(-> idx m))
-                      (Streams * held . #'(? (!= tl_streams_held nil)
-                                             (cast (Streams *) tl_streams_held)
-                                             (cast (Streams *) tl_streams_shared)))
-                      (int old_rm . tl_window_reads))
-                  (let ((int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0)))
-                    (debug! (fprintf stderr "mvccs[t%04zx] dep window: release=%d flip=%d\n"
-                                     (bitand (cast size_t (pthread_self)) 65535)
-                                     (? (!= held nil) 1 0) flip))
-                    (if (!= held nil) ((-> held unlock)))
-                    (if (== flip 1) (set tl_window_reads 1))
-                    (set cont ((-> em dcb) (-> em user) (aof dep)))
-                    (if (== flip 1) (set tl_window_reads old_rm))
-                    (if (!= held nil) ((-> held lock)))))))
+                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
+                  (set cont ((-> em dcb) (-> em user) (aof dep))))))
         (set cont (bt_cursor_output idx key (-> em user) (-> em rcb))))
       (set (-> em cont) (? cont 1 0))
       (return cont)))
