@@ -1101,9 +1101,33 @@ what waited was every *other* connection, because the guard was held across
 them -- which is the same finding as the rest of this file, one level down:
 the cost of a hold is never paid by the thread that takes it.
 
-The survivor is a **~9-21 ms hold once in twenty requests**, present across
-four arms and three engines. It is not the teardown and not the `cout`, it
-predates everything above, and it is unexplained.
+**The survivor was the scheduler.** A ~9-22 ms hold, about one request in
+166 (first read as one in twenty, off three samples of twenty), present
+across four arms and three engines and predating everything above. cocolog#16
+chased it through the dependent callback (92 µs), cold reads (zero misses in
+72 000 key reads) and the walk (one key) -- every counter aimed at code came
+back empty -- until the guard trace carried the thread's CPU time beside its
+wall time: **22 779 µs held, 103 µs on CPU**, and inside it
+`Utility::random_bytes` at 22 729 µs wall and 56 µs CPU. One `read()` of eight
+bytes from a kept-open `/dev/urandom`, which cannot block; a syscall is a
+scheduling point, and the thread was preempted there with the guard in hand.
+Nothing ran. Nothing else could take the guard.
+
+So every cursor now builds its `Statement` **before** it takes the guard, not
+inside it (`1abfea6`): the constructor touches only thread-local fields and
+never needed one. It does not stop the deschedule -- their run on the fix
+shows `draw STALLED 18841 us, on cpu 66 us`, the same as ever -- it stops the
+deschedule being inside a global lock: **zero `guard HELD` lines in 400
+requests, and the stall that did occur had no hold beside it.** Stand-downs
+per request stayed under 0.07 at every width. The cost of a hold is never paid
+by the thread that takes it, one more time.
+
+What is left on that path is 1.73 cached keys of descent per lookup, and
+**105 such lookups per request** -- cocolog's number (cocolog#18), from a
+fresh store per request re-fetching every predicate it touches. Fewer
+acquisitions is the lever on a scheduler tail, not shorter ones; the other
+lever is the dependent-callback window above, which would make those
+acquisitions shared.
 
 And the log line got the accessor it should have had: `engine_transaction_peek`
 answers the id a thread's transaction has or last had and never stages,
