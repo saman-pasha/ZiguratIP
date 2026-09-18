@@ -929,12 +929,36 @@
   ;; refreshes its length by fstat -- it is what a private reader is.
   (func reader_ensure ((Memory * m)) (out void)
     (if (!= tl_rd_hex nil) (return))
-    (set tl_rd_hex (cast (binarystream *)
-                         (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
-                               std::ios::in)))
-    (set tl_rd_data (cast (binarystream *)
-                          (new* Zigurat::mapstream (std::string (-> m rd_data_path))
-                                std::ios::in))))
+    ;; A MEASUREMENT ARM, NOT A DESIGN. ZiguratIP#39 has refuted the mapping
+    ;; count, the cache mutex and the acquisition count as the shared read
+    ;; path's cost on four cores, and what its two results jointly
+    ;; constrain is a cost per STREAM READ that grows with concurrent
+    ;; readers. The one variable no arm has moved is the stream object
+    ;; itself: a private read-only mapstream against the canonical one.
+    ;; ZIGURATIP_READER_STREAM=file hands out a private filestream instead
+    ;; -- same guard mode, same acquisitions, same mapping count, a
+    ;; different streambuf. It is not safe as a design: a filebuf caches a
+    ;; get area and a seek inside it does not reload, so a reader whose
+    ;; block was cached against a fresh page's zero-fill answers zeros
+    ;; (the reason the reader is a mapstream at all). On a read-only page
+    ;; that hazard is visible rather than silent, which is what makes it
+    ;; usable as an arm.
+    (let ((const char * kind . #'(getenv "ZIGURATIP_READER_STREAM")))
+      (if (and (!= kind nil) (== 0 (strcmp kind "file")))
+          (block
+            (set tl_rd_hex (cast (binarystream *)
+                                 (new* Zigurat::filestream (std::string (-> m rd_hex_path))
+                                       std::ios::in)))
+            (set tl_rd_data (cast (binarystream *)
+                                  (new* Zigurat::filestream (std::string (-> m rd_data_path))
+                                        std::ios::in))))
+        (block
+          (set tl_rd_hex (cast (binarystream *)
+                               (new* Zigurat::mapstream (std::string (-> m rd_hex_path))
+                                     std::ios::in)))
+          (set tl_rd_data (cast (binarystream *)
+                                (new* Zigurat::mapstream (std::string (-> m rd_data_path))
+                                      std::ios::in)))))))
 
   ;; which stream a READ goes through: the thread's private one under a
   ;; shared guard, the canonical one everywhere else -- above all under a
