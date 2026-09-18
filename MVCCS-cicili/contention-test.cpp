@@ -712,6 +712,74 @@ static void update_inside_a_lookup ()
   reset_table();
 }
 
+// --- a write from INSIDE a dependent callback --------------------------------
+
+// The shape that kept the two dependent cursors on the exclusive side: their
+// callback ran with the guard HELD -- no window in bt_emit_key -- so a write
+// inside one rode the hold as a nested no-op, and would have met the
+// "exclusive under shared" refusal the moment the pair asked for the shared
+// side. The window is there now; this is the case that says a write in that
+// callback still lands, with the level being walked by other threads at the
+// same time. Each thread owns one row and finds it through its kind's
+// dependent level, so the arithmetic is exact.
+static void update_inside_a_dependent_lookup ()
+{
+  const int64_t ROWS = 8;
+  const int THREADS = 8;
+  const int ROUNDS = 25;
+  load(ROWS);
+  commit_transaction(MEM);
+
+  Trouble trouble;
+  std::atomic<int> updated(0);
+
+  fan_out(THREADS, [&] (int t) {
+      const int64_t mine = (t % ROWS) + 1;
+      const std::string kind(KINDS[mine % KIND_COUNT]);
+      for (int n = 0; n < ROUNDS; n++) {
+        try {
+          session();                        // READ COMMITTED: reader-eligible
+          bool hit = false;
+          Part::IDX_PART_KIND_WEIGHT.cursor_equal(STRING(kind),
+            [&] (Zigurat::BTreeIndex<Part, LONG>& level) -> bool {
+              level.cursor([&] (Part& row) -> bool {
+                  if ((row.*Part::ID).value() != mine) return true;
+                  Part next(LONG(mine), STRING(kind), LONG((row.*Part::WEIGHT).value() + 1));
+                  Globals::memory()->online_update(row, next);
+                  hit = true;
+                  return false;               // the key just moved: stop walking it
+                });
+              return false;
+            });
+          if (hit) updated++;
+          commit_transaction(MEM);
+        } catch (std::exception& e) {
+          trouble.note(e.what());
+          try { rollback_transaction(MEM); } catch (...) { }
+        }
+      }
+    });
+
+  check_str("update in a dependent lookup: no trouble", trouble.say(), "none");
+  check("update in a dependent lookup: every round wrote", updated.load(), THREADS * ROUNDS);
+
+  long wrong = 0, seen = 0;
+  session();
+  for (int64_t id = 1; id <= ROWS; id++) {
+    int hits = 0;
+    Part::IDX_PART_ID.cursor_equal(LONG(id), [&] (Part& row) -> bool {
+        hits++; seen++;
+        if ((row.*Part::WEIGHT).value() != id * 10 + ROUNDS) wrong++;
+        return true;
+      });
+    if (hits != 1) wrong++;
+  }
+  commit_transaction(MEM);
+  check("update in a dependent lookup: each row answers once", seen, (long)ROWS);
+  check("update in a dependent lookup: and gained exactly its rounds", wrong, 0);
+  reset_table();
+}
+
 // --- a row that is being rewritten ------------------------------------------
 
 static void rewrite_never_missing_from_index ()
@@ -1229,6 +1297,7 @@ int main ()
   scan_and_walk_together();
   find_then_update();
   update_inside_a_lookup();
+  update_inside_a_dependent_lookup();
   rewrite_never_missing_from_index();
   rewrite_never_missing_from_scan();
   scan_counts_exactly_once();

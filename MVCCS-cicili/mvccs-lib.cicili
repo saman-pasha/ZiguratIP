@@ -4710,19 +4710,36 @@
           (bool cont . #t))
       (if (> (-> idx levels) 1)
           (block
-            ;; THE DEPENDENT CALLBACK HAS NO WINDOW -- the guard is held
-            ;; across it, unlike the row callback below, which hands it
-            ;; back through bt_output_vcb. That is why bt_cursor_dep and
-            ;; bt_cursor_equal_dep keep the EXCLUSIVE side while the seven
-            ;; row cursors ask for the shared one: a callback that writes
-            ;; rides an exclusive hold as a nested no-op, and would meet
-            ;; the "exclusive under shared" refusal on a shared one. A
-            ;; window here would let the dep pair go shared too; it would
-            ;; also be a new unlocked window in the machinery ZiguratIP#33
-            ;; was fixed in, and it is not free to add.
+            ;; THE DEPENDENT CALLBACK HAS A WINDOW NOW, the same one the row
+            ;; callback has had in bt_output_vcb: whichever side this thread
+            ;; holds is handed back around the callback and retaken after,
+            ;; and the window's reads go to the private stream when
+            ;; reader_eligible. Without it the dependent pair had to keep
+            ;; the exclusive side -- a callback that wrote, or nested a
+            ;; cursor, met "an exclusive streams guard under a shared one"
+            ;; (composite under load, on the first attempt). cocolog#18
+            ;; counted what that cost: 104 dependent lookups per request,
+            ;; every one an exclusive acquisition, on a read-only page.
+            ;; With the guard released here, a nested cursor is outermost
+            ;; and asks for its own; a write takes its own exclusive one.
+            ;; The exposure is the row window's: `dep' was read under the
+            ;; guard and the callback runs without it.
             (if (> (-> key dependents_address) -1)
-                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address))))
-                  (set cont ((-> em dcb) (-> em user) (aof dep))))))
+                (let ((BTreeIndex dep . #'(bt_dependent idx (-> key dependents_address)))
+                      (Memory * m . #'(-> idx m))
+                      (Streams * held . #'(? (!= tl_streams_held nil)
+                                             (cast (Streams *) tl_streams_held)
+                                             (cast (Streams *) tl_streams_shared)))
+                      (int old_rm . tl_window_reads))
+                  (let ((int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0)))
+                    (debug! (fprintf stderr "mvccs[t%04zx] dep window: release=%d flip=%d\n"
+                                     (bitand (cast size_t (pthread_self)) 65535)
+                                     (? (!= held nil) 1 0) flip))
+                    (if (!= held nil) ((-> held unlock)))
+                    (if (== flip 1) (set tl_window_reads 1))
+                    (set cont ((-> em dcb) (-> em user) (aof dep)))
+                    (if (== flip 1) (set tl_window_reads old_rm))
+                    (if (!= held nil) ((-> held lock)))))))
         (set cont (bt_cursor_output idx key (-> em user) (-> em rcb))))
       (set (-> em cont) (? cont 1 0))
       (return cont)))
@@ -4760,6 +4777,8 @@
       (set ($ em rcb) bt_no_rows)
       (set ($ em dcb) dcb)
       (set ($ em cont) 1)
+      ;; a read, and its callback has a window now -- see bt_emit_key
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((statement (Statement (-> idx m)))
                (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
@@ -4840,6 +4859,8 @@
       (set ($ em rcb) bt_no_rows)
       (set ($ em dcb) dcb)
       (set ($ em cont) 1)
+      ;; a read, and its callback has a window now -- see bt_emit_key
+      (if (== 1 (reader_eligible (-> idx m))) (set tl_want_shared 1))
       (letin* ((statement (Statement (-> idx m)))
                (streams (Streams (-> idx m))))
         (if (> (-> idx root_address) -1)
