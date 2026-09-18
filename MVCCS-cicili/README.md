@@ -1061,6 +1061,54 @@ goes to four cores before it gets a version number**, and the measurements in
 this section are not ours -- they are ZiguratIP#37's, on the only box that
 has ever seen either fault.
 
+## A rollback that undid nothing was syncing anyway
+
+Found by chasing a millisecond-scale exclusive hold at the end of every
+request over the binary protocol -- 10 of 20 requests on `f1ff4d5`, median
+1 194 µs -- and ruling out two explanations first, the second of which was
+proved right as a *mechanism* and wrong as a *cause* by its own control:
+`loadzigurat.cpp` asked `engine_transaction_id` for an id to print in
+`Transaction Closed`, and that call stages, so it opened a second
+transaction on every connection (the ids stepped by 2; by 1 with the call
+removed) -- and the hold did not move.
+
+What was left was the one thing that control could not touch, because a
+destructor runs either way: `ConnectionScope` rolls back on every connection
+teardown, and **`rollback_transaction`'s `sync_disk` was unconditional**.
+`commit_transaction` has had the short-circuit for as long as its comment has
+-- *a transaction that wrote nothing has nothing to make durable* -- and
+rollback never got it. A teardown the server's own comment calls "a no-op on
+the clean path" was a no-op in **work** and two fsyncs in **cost**.
+
+Now a rollback syncs only when it undid staged rows. The safety argument is
+commit's, already written there: a crash resurrects an open record that
+licenses nothing, which startup treats as the no-op it is; the only
+difference is that this record is being freed rather than kept.
+
+**Measured on the four-core box, `ee08330` against `f1ff4d5`:**
+
+| | before | after |
+|---|---|---|
+| holds over 1 ms, 20 sequential requests | 10 / 20 | **1 / 20** |
+| stand-downs per request, 4 / 8 / 12 workers | 0.220 / 0.439 / 0.427 | **0.046 / 0.072 / 0.073** |
+| shared grants that barged, 4 / 8 / 12 workers | 4.7 % / 15.7 % / 15.6 % | **0.37 % / 1.07 % / 1.16 %** |
+| throughput, 2 / 4 / 8 / 12 workers | | **no consistent direction** (+13, −10, −3, +10 %) |
+
+**It is a correctness fix that also removes five- to sixfold of the guard
+contention, and it is not a throughput improvement on that workload.** The
+fsyncs ran after the reply had gone, so the client never waited on them;
+what waited was every *other* connection, because the guard was held across
+them -- which is the same finding as the rest of this file, one level down:
+the cost of a hold is never paid by the thread that takes it.
+
+The survivor is a **~9-21 ms hold once in twenty requests**, present across
+four arms and three engines. It is not the teardown and not the `cout`, it
+predates everything above, and it is unexplained.
+
+And the log line got the accessor it should have had: `engine_transaction_peek`
+answers the id a thread's transaction has or last had and never stages,
+where `engine_transaction_id` opens one to have an id to give.
+
 ## Hard debugging, without changing a line
 
 Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —
