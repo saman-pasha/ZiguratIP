@@ -1133,65 +1133,68 @@ And the log line got the accessor it should have had: `engine_transaction_peek`
 answers the id a thread's transaction has or last had and never stages,
 where `engine_transaction_id` opens one to have an id to give.
 
-## The dependent lookup stays exclusive, and the reason is mappings, not locks
+## The dependent lookup stays exclusive, the cache stays on, and the reason was never in the engine
 
-cocolog#18 counted **104 dependent-cursor lookups per request** on a page that
-reads one row -- 52 predicates fetched by a fresh per-request store, at two
-`equal_dep` descents each on the three-level `(kb, name, arity)` index -- and
-every one exclusive, because the dependent pair was left on the exclusive side
-above. Two branches took them shared. Both were measured on the four-core box,
-three alternating repeats, and both are closed as the record:
+Two issues, ZiguratIP#39 and #40, chased two costs that turned out to be one
+thing, and the record of how is worth more than the answer.
 
-| | exclusive / req | shared / req | W=12 vs master |
-|---|---|---|---|
-| master `0.1.20` | 57 | 1 | 1.00 |
-| `archive/dependent-window` -- eager window in `bt_emit_key` | 3 | 160 | 0.92x |
-| `archive/lazy-window` -- no window; a write under a shared hold is *lifted* | 3 | 54 | **0.88x** |
+**The two costs.** On a four-core Firecracker guest with twelve pool workers
+and a read-only page, taking the dependent pair's lookups shared cost 12 %
+of throughput (`archive/dependent-window`, `archive/lazy-window`), and the
+B-tree cache -- 1.84 MB, a 100 % hit rate -- cost 15-24 %: removing it made
+the lookup-heavy page faster. On this sixteen-thread box the same two
+changes are wins: the shared lookup 24 % on the contention suite, the cache
+2.6x at one reader and 1.3x at sixteen on a mapped store, 7x on a filebuf.
+Same code, opposite signs.
 
-**Fewer acquisitions, worse.** Every count landed exactly where the arithmetic
-put it, and the throughput went the other way -- so the acquisitions were
-never the cost. Nor was the guard: all guard waiting is 19-50 us a request on
-every arm, and the arm that waits the most (master) is the fastest. Store CPU
-per request is the inverse of throughput at every width, including a sign
-flip at two workers where the shared path is *cheaper*. And the closing
-measurement needed no build: **`ZIGURATIP_PARALLEL_READS=0` on the same
-`lazy-window` binary lands on master's profile exactly** -- 4 376 requests
-against master's 4 308-4 349, 57 exclusive, 1.78 ms of store CPU against 1.84.
-The whole 3.3 ms a request is the shared read path.
+**What was refuted, each by an arm on one binary with one variable:** the
+number of private mappings (a capped pool, flat from twelve to one --
+`archive/reader-pool`); the cache mutex (64 stripes, flat to four figures --
+`archive/cache-stripes`); the stream object (a private filestream in place
+of the mapstream, 12 % of the gap with overlapping ranges --
+`archive/reader-file`); the cache table's pages (one 2 MB page, 6.5 % --
+`archive/cache-hugepage`); the acquisition count (160 and 54 within a
+point); the guard wait (0.06 % of a request, sign inverted); the mutex
+reaching the kernel (fewer futex calls with the cache than without); false
+sharing on `Memory` (killed by the struct layout). Every one was named from
+source with the right shape. Every one was wrong.
 
-**The shared read path is twelve mappings of one file.** `reader_ensure` opens
-a private read-only `mapstream` per thread, once, and reads under a shared
-hold go through it -- a private *position*, which is all #33's race ever
-needed, bought with a private *mapping*. Twelve `MAP_SHARED` VMAs share
-page-cache pages and nothing else: each thread walks its own translations,
-and four cores hosting twelve mappings hold three mappings' worth per core
-where the exclusive path held one. Minor faults are flat (0.026 a request),
-so the mappings are stable and it is not first-touch; the box has no `perf`,
-so the TLB figure is unrefuted rather than confirmed. Two mappings are
-cheaper than serialising fifty-six exclusive holds; twelve are not.
+**What it was:** `/proc/interrupts`. Every difference in every pair is
+**system time** -- user time identical to three decimals -- and each pair's
+extra system time divides by its extra reschedule IPIs to the same price:
+**17-19 us per cross-vCPU wakeup, a VM exit.** `RES` 44 a request against 5;
+TLB and timer flat. Neither the cache nor the shared lookup is a cause; each
+makes more threads runnable at once, and on that guest every wakeup that
+lands on a halted vCPU is an exit. At one worker the cache is 0.24 ms a
+request *cheaper*: nobody to wake. The chain of refutations was innocent for
+one reason -- none of it was ever the thing being paid for.
 
-So the sentence beside the 24 % above: **the shared lookup is a win on
-sixteen threads where the readers have cores of their own, and a loss on four
-cores with twelve workers until readers share a mapping.** Both measured,
-different machines. The seven row cursors stay shared as landed -- this page
-reads four rows a request through that path and it costs nothing measurable;
-the dependent pair stays exclusive, and the 104 lookups a request are
-cocolog's number (its fresh store per request) before they are this engine's.
+**So nothing here changes.** The dependent pair stays exclusive and the cache
+stays on, because those are the defaults that measured fastest on the box
+that pays the exits, and the per-machine knobs that already exist --
+`ZIGURATIP_PARALLEL_READS=0`, `MVCCS_NO_CACHE` -- are the right shape for a
+decision that belongs to the host, not the workload. The archived branches
+are what to rebase if a guest's idle path is fixed and the measurement flips:
+`archive/lazy-window` carries the lift, the guard counters and the
+dependent-callback cases, all correct, over a read path that was never the
+problem.
 
-**The fix is one mapping, many positions** -- a per-thread reader aliasing
-the canonical `mapbuf` with its own cursor -- and it is blocked on one fact:
-`mapbuf::reserve` unmaps and remaps when a store exceeds its reservation, and
-base moves. A remap is a writer's act under the exclusive guard, so a shared
-holder is safe; a callback-window reader is not, since it reads with the
-guard released. It needs a base that never moves or an epoch that keeps the
-old mapping alive until the last window reader is done. Its own issue.
+**And in the shipped configuration neither cost exists.** cocolog's
+`prewarm/1` (1.2.17) took its own lever -- 52 predicate fetches a request to
+1, 104 dependent lookups to 2 -- and with it the shared-path penalty fell
+from 11.5 % to 0.9 % with overlapping ranges, and the cache from 1.24x to a
+wash. Fewer threads handing off is the only lever on a wakeup cost, and it
+was downstream's.
 
-What the two branches leave behind is worth keeping when that day comes: the
-*lift* -- an exclusive guard taken under a held shared one gives the shared
-hold back, takes the write side, and hands the shared side back after,
-proved from a nested frame -- and four always-on guard counters behind
-`engine_guard_counts`, which are what let a test assert the path it took
-rather than infer it from the rows.
+**Two things the chain leaves behind that are true everywhere.** A
+per-request total divided by an estimated count is not a per-operation cost
+-- four numbers in these issues were built that way and all four were wrong.
+And an instrument that yields a plausible value instead of an error is the
+failure to fear: an empty environment variable that reads as set, `env`
+options after an assignment, a `grep` for a filename that does not exist,
+a build that measured the previous library with exit 0 -- eight of those
+between two sessions, every one caught by checking an artefact rather than
+a number.
 
 ## Hard debugging, without changing a line
 
