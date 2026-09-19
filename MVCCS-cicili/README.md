@@ -1169,6 +1169,20 @@ lands on a halted vCPU is an exit. At one worker the cache is 0.24 ms a
 request *cheaper*: nobody to wake. The chain of refutations was innocent for
 one reason -- none of it was ever the thing being paid for.
 
+**Confirmed on a second instrument, with no reboot.** The guest has no
+cpuidle driver: an idle vCPU halts at once, so there is no polling window
+and the tunable that would widen one is inert. The check that needed no
+reboot was placement. Pinned to one vCPU with `taskset`, so that the store
+cannot wake another vCPU, the cache's cost fell from +0.809 ms of system
+time a request to +0.006 ms and its extra reschedule IPIs from 43.5 to
+2.6, with nothing else changed -- one binary, one library behind an md5
+gate, one affinity mask. And with the wakeups gone the cache is a cache
+again: 0.224 ms of user time a request saved and 2.3 % more throughput at
+twelve workers, ranges separated -- the one-worker result reproduced at
+twelve by removing only the cross-vCPU path. Only the within-arm
+differences are measurements: pinning itself costs a fifth of the
+throughput, and `RES` is system-wide.
+
 **So nothing here changes.** The dependent pair stays exclusive and the cache
 stays on, because those are the defaults that measured fastest on the box
 that pays the exits, and the per-machine knobs that already exist --
