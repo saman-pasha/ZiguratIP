@@ -47,5 +47,5 @@ now says which one rather than leaving it commented out.
 
 GOING BACK TO GCC: `make COMPILER=g++', or CICILI_CC=gcc CICILI_CXX=g++
 for the scripts. Nothing here is load-bearing on clang. What is
-load-bearing is that all of it agrees -- cocolog links libCore into its
-own binary, so this is not a per-repository choice.
+load-bearing is that all of it agrees -- a program downstream links
+libCore into its own binary, so this is not a per-repository choice.

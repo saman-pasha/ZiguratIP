@@ -7,7 +7,7 @@ Two scripts, one per operating system, and the part they share:
 | `install-linux.sh` | Debian and Ubuntu through `apt-get`, Fedora and the Red Hat family through `dnf`: the packages, a clang 16+ (Fedora's own; on Ubuntu clang 18 from apt.llvm.org, because apt's is 14), then the common part |
 | `install-macos.sh` | macOS: the Xcode command line tools for clang, Homebrew for `sbcl`, `libtool` and `openssl@3`, then the common part |
 | `common.sh` | sourced by both: the Cicili checkout (found or cloned beside this one), the four Lisp systems Cicili is built from, `make MODE=Release`, and a check of the **artifacts** — fourteen libraries and three programs — because the top-level make steps over a failed project and its exit code proves nothing |
-| `lisp/` | `sha1` and `base64`, the two Lisp systems Cicili depends on that are published nowhere; mirrors of cocolog's copies, see the README there |
+| `lisp/` | `sha1` and `base64`, the two Lisp systems Cicili depends on that are published nowhere; see the README there |
 
 ```sh
 sh install/install-linux.sh        # or install-macos.sh

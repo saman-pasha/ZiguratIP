@@ -162,12 +162,12 @@ them per operation; real `try`/`throw*`/`catch` against the real
 Here `deftable`:
 
     (deftable Book "smoke::Book" id value)
-    (deftable COCOLOG::MACHINES ID NAME KB STATUS CHUNKS NOTE)
+    (deftable APP::MACHINES ID NAME KB STATUS CHUNKS NOTE)
 
 The second spelling is the one the generated files use: Cicili's `::`
 is a name, so a schema-qualified object needs no string beside it —
 the SQL name is the spelling itself, and the identifiers fold the
-`::` to `_` (`COCOLOG_MACHINES_insert`, and so on). A string after
+`::` to `_` (`APP_MACHINES_insert`, and so on). A string after
 the name still overrides, which is what the unqualified test tables
 use.
 
@@ -190,8 +190,8 @@ table's own row shim — all seven for a single column; for a composite,
 with the engine's `*_dep` cursors there for hand-rolled composition.
 Several indexes share one table by **chaining**: each attach keeps the
 hooks it found and calls them ahead of its own work, registered once
-per process so a re-attach cannot loop the chain — cocolog's
-`machines`, with three indexes, is the test. What a template instantiates invisibly, the
+per process so a re-attach cannot loop the chain — the generated
+`machines` table, with three indexes, is the test. What a template instantiates invisibly, the
 macro emits greppably. The
 branching factor is a parameter (the original derives it from the key
 type's size), which is what lets a test force splits with a tree of
@@ -224,7 +224,7 @@ wrappers are typed by kind: `_equal` over a TEXT column takes a
 and a composite also answers its leading column alone through
 `_equal_first` (equality on the first level, every dependent level
 walked whole, which is what the server's WHERE compiler emits for a
-predicate on the first column only; cocolog's embedded store walks a
+predicate on the first column only; an embedding client walks a
 `(kb name)` index for one kb that way).
 
 **A composite may be any depth, and the WHERE compiler descends it.** A
@@ -234,8 +234,8 @@ every dependent level whole down to the rows; the compiler wrote those
 lower walks as SIBLINGS — each middle level's lambda returning at once,
 the row walk then called on the OUTER handle — which compiled for two
 levels, where there is no middle, and failed for three with `no matching
-function for call to object of type lambda`. cocolog's `predicates_of`
-over its `(kb, name, arity)` index was the first to meet it. Each middle
+function for call to object of type lambda`. A downstream `predicates_of`
+over a `(kb, name, arity)` index was the first to meet it. Each middle
 level now opens a lambda that stays open until the innermost row walk is
 written, and they close in reverse; `Test/run-keys-e2e.sh` proves it on
 `demo::triple` — four rows under `a == 'x'`, two under `(a, b)`, one under
@@ -248,7 +248,7 @@ them (storage dropped, one exclusive table walk, this index alone),
 answering how many rows the tree refused: 0 is a complete index, and
 anything else is a UNIQUE key the table already held twice, counted
 rather than thrown because the walk runs inside a cursor's callback
-window. `schema_test` proves the whole sequence on cocolog's generated
+window. `schema_test` proves the whole sequence on the generated
 `machines`: the TEXT name index finds and misses, its UNIQUE refuses a
 twin, the KB index is attached only at the reopen, answers 1, rebuilds
 to three rows, and is known and full on a third open.
@@ -360,15 +360,15 @@ pair, **one `.cicili` per TABLE and SEQUENCE** — a macro file
 (`define-<NAME>`) whose expansion is the `deftable`/`defindex`/
 `defsequence` forms for the same object, columns and index shapes and
 bounds carried over (a `LONG::MAX` bound becomes the literal). The
-files under `generated/` are byte-for-byte what it wrote for cocolog's
-whole schema — `clauses`, `props`, `machines`, `machine_state` and
+files under `generated/` are byte-for-byte what it wrote for one
+downstream application's whole schema — `clauses`, `props`, `machines`, `machine_state` and
 their four sequences; `schema-test.cicili` imports the machines pair
 untouched and runs twelve checks green — three machines through the
 generated table, ids drawn from the generated sequence, the PRIMARY
 ID index refusing a duplicate, and rows, index and sequence coming
 back through the catalogue after a restart. The generated forms carry
 the object's schema-qualified name bare —
-`(deftable COCOLOG::MACHINES ID …)` — because Cicili's `::` is a name;
+`(deftable APP::MACHINES ID …)` — because Cicili's `::` is a name;
 no string rides beside it.
 
 Two mappings make a real schema fit. A Parsi STRING/TEXT column emits
@@ -376,12 +376,11 @@ as `(TEXT col)`: a `std::string` member, packed as a 2-byte length and
 the bytes, the row's pack size folded from what each string actually
 holds. And an index over such a column emits **commented out** — the
 Cicili B-tree keys int64 and nothing else — so a consumer scans for
-by-name lookups, which is what cocolog's embedded backend
-(`cocolog/embed/embed.cicili`) does: it imports these very files, runs
-the eighteen `cocolog::*` procedures over them in-process, and passes
-the same twelve-worker group test the server passes. A Parsi schema
-now compiles to either engine from one source, and cocolog runs on
-both.
+by-name lookups, which is what an embedding backend downstream does:
+it imports these very files, runs its eighteen procedures over them
+in-process, and passes the same twelve-worker group test the server
+passes. A Parsi schema now compiles to either engine from one source,
+and the same application runs on both.
 
 ## The server runs on this engine now
 
@@ -392,7 +391,7 @@ plain g++ against `engine.hpp`, nothing RAII crossing the boundary.
 through `engine-compat.hpp`, which keeps every spelling the DML
 emitters use — `Globals::memory()->cursor<T>`, `T::IDX.cursor_equal`,
 the ALL-CAPS type family, the keyword macros — and changes the engine
-under them; the whole cocolog application (schema, procedures, pages)
+under them; a whole downstream application (schema, procedures, pages)
 compiles and dlopens against it. String index keys ride as a 64-bit
 FNV-1a fold; every indexed lookup re-applies its full WHERE predicate,
 so a collision costs a row visit and never a wrong answer, and the
@@ -443,7 +442,8 @@ root back whenever it changed; `_unmap_key` deletes internal keys by
 leftmost-leaf successor replacement, combines on the live separator
 with the boundary children adopted, and shrinks only the actual root;
 `dba_pointers` runs under the Streams pair. Verified: ZiguratIP's own
-suite 303 cases / 0 failed, and cocolog's ten suites `red: 0` against
+suite 303 cases / 0 failed, and a downstream application's ten suites
+`red: 0` against
 the rebuilt server with every Parsi object recompiled.
 
 The findings, as the port originally recorded them:
@@ -533,7 +533,7 @@ None of these blocked the port; every one had an in-language answer.
 
 The question was "7000 inserts take ~70 seconds; why?" -- asked of this
 engine, and answered by measuring it from three heights: the engine
-alone (`bench/`), the server over the wire (a cocolog `consult`), and a
+alone (`bench/`), the server over the wire (a client's `consult`), and a
 `sample` of the live server mid-statement. Every number below is from
 one Mac (APFS, Apple clang), and the benchmark that produced it ships
 in `bench/` so the next machine can disagree with a number rather than
@@ -551,7 +551,7 @@ a sentence.
 **Over the wire, a fresh knowledge base loads at 1.8 ms a clause**,
 linearly (1000 / 3500 / 7000 clauses: 1.8 / 6.5 / 12.7 s), in ONE
 transaction, the client at 3% CPU. So 70 seconds is not a fresh load.
-It is a REWRITE: cocolog writes a predicate back as `forget_clauses`
+It is a REWRITE: the client writes a predicate back as `forget_clauses`
 plus every clause again, and the second consult of the same 7000 into
 the same base took 51.6 s, the third 94.3 s; a `retractall` of 7000
 clauses whose chain carried 14000 dead links took 116.6 s -- 16.7 ms a
@@ -592,7 +592,7 @@ every "after" number in it was inflated by that; the engine-level rows,
 timed inside the benchmark, were never affected. These are the
 re-measured numbers, three configurations run back to back on one
 server: the mark fix alone; the mark fix and the record cache; both plus
-cocolog's pipelined client.)
+a pipelined client.)
 
 | measurement | before | mark fix | + record cache | + pipelined client |
 |---|---|---|---|---|
@@ -610,9 +610,9 @@ Three things the columns say. The mark fix is the delete side only, as
 it should be: the fresh load barely moves, the rewrites and the
 retractall fall by two to five times. The record cache is everything
 that descends a tree, so it takes the fresh load from 11.4 s to 3.1 and
-the rewrites down again. The pipelined client (cocolog's, not this
-repository's: `zg_call_send` / `zg_call_wait` in `client/zigurat.c`,
-up to 128 calls in flight) is worth 0.6 s on a fresh load and nothing
+the rewrites down again. The pipelined client (downstream's, not this
+repository's: `zg_call_send` / `zg_call_wait`, up to 128 calls in
+flight) is worth 0.6 s on a fresh load and nothing
 on a rewrite, because what a rewrite pays now is the statements and the
 commit, not the waits: a `sample` of the server during a consult puts
 the remaining time in `commit_transaction` -- 28000 control blocks
@@ -671,8 +671,8 @@ the mapped store (`STORE_MAP=1 ./consumer_test`), contention over it
 fails at the same macOS `rewrite vs index` line it fails at over a
 filebuf and nowhere before it, and the two Cicili suites, which open
 filestreams, pass as before -- which is the point of the engine not
-knowing. cocolog's store cases and its 7000-clause sequence above ran
-against the mapped server. The record cache still stands in front of
+knowing. A downstream client's store cases and the 7000-clause sequence
+above ran against the mapped server. The record cache still stands in front of
 the mapping, and
 still earns its place: a cached descent is lookups, a mapped one is
 memcpys with a `pointer_at` walk of the hexmap in front of each.
@@ -736,8 +736,8 @@ bug were never gone; they were unlit.
 
 ## The page list was one chain, and a write was quadratic in its own rows
 
-Reported from downstream, diagnosed here. cocolog 1.2.16 wrote rows into a
-fresh `--embed` store and the time went **16 000 rows 0.53 s, 32 000 1.42,
+Reported from downstream, diagnosed here. An embedding client wrote rows
+into a fresh store and the time went **16 000 rows 0.53 s, 32 000 1.42,
 64 000 5.77, 128 000 26.9** on Linux, while the assert loop that fed them
 stayed flat at 3.8 µs a clause -- so it was the store, not the interpreter.
 Two facts came with it, and both were load-bearing: **splitting the rows
@@ -914,9 +914,9 @@ So a store now keeps a mark beside it, `byteorder.bin`: a magic written in
 host order at the store's first open and read back at every later one.
 Equal is the same order; **reversed is refused by name**, saying what
 happened and why a store does not travel; anything else means the mark
-itself is damaged. `store_order_check` is called by the two consumers that
-know a store's directory — `ziguratip/loadmemory.cpp` and cocolog's
-embedded open — because the engine is handed two streams and never learns a
+itself is damaged. `store_order_check` is called by the consumers that
+know a store's directory — `ziguratip/loadmemory.cpp`, and an embedding
+application's own open — because the engine is handed two streams and never learns a
 path. The test binaries make their own stores in `/tmp` with no directory
 to mark, and are unaffected.
 
@@ -987,9 +987,8 @@ measurement:
   takes the shared side regardless. Strict preference is unbounded by
   construction: a reader defers while *any* writer is queued, so a workload
   whose writers never stop arriving is one where readers never run. That is
-  this fault mirrored, and cocolog's `library(httpd)` pool -- every request a
-  short exclusive acquisition through `run_isolated/2` -- is exactly that
-  shape. The bound removed **98 %** of stand-down time and is the change that
+  this fault mirrored, and a downstream HTTP worker pool -- every request a
+  short exclusive acquisition -- is exactly that shape. The bound removed **98 %** of stand-down time and is the change that
   mattered most; a `pthread_cond_wait` is only 56-88 µs against the poll's
   86-99 µs, so the win was the bound and not the sleep.
 * **The broadcast fires on every grant**, not when the queue empties. A
@@ -1103,8 +1102,8 @@ the cost of a hold is never paid by the thread that takes it.
 
 **The survivor was the scheduler.** A ~9-22 ms hold, about one request in
 166 (first read as one in twenty, off three samples of twenty), present
-across four arms and three engines and predating everything above. cocolog#16
-chased it through the dependent callback (92 µs), cold reads (zero misses in
+across four arms and three engines and predating everything above. A
+downstream investigation chased it through the dependent callback (92 µs), cold reads (zero misses in
 72 000 key reads) and the walk (one key) -- every counter aimed at code came
 back empty -- until the guard trace carried the thread's CPU time beside its
 wall time: **22 779 µs held, 103 µs on CPU**, and inside it
@@ -1123,7 +1122,7 @@ per request stayed under 0.07 at every width. The cost of a hold is never paid
 by the thread that takes it, one more time.
 
 What is left on that path is 1.73 cached keys of descent per lookup, and
-**105 such lookups per request** -- cocolog's number (cocolog#18), from a
+**105 such lookups per request** -- a downstream client's number, from a
 fresh store per request re-fetching every predicate it touches. Fewer
 acquisitions is the lever on a scheduler tail, not shorter ones; the other
 lever is the dependent-callback window above, which would make those
@@ -1193,9 +1192,9 @@ are what to rebase if a guest's idle path is fixed and the measurement flips:
 dependent-callback cases, all correct, over a read path that was never the
 problem.
 
-**And in the shipped configuration neither cost exists.** cocolog's
-`prewarm/1` (1.2.17) took its own lever -- 52 predicate fetches a request to
-1, 104 dependent lookups to 2 -- and with it the shared-path penalty fell
+**And in the shipped configuration neither cost exists.** The client
+took its own lever, prewarming -- 52 predicate fetches a request to 1,
+104 dependent lookups to 2 -- and with it the shared-path penalty fell
 from 11.5 % to 0.9 % with overlapping ranges, and the cache from 1.24x to a
 wash. Fewer threads handing off is the only lever on a wakeup cost, and it
 was downstream's.
@@ -1232,7 +1231,8 @@ MVCCS_DEBUG=debug sh MVCCS-cicili/build.sh     # 505, of which 369 are the guard
 | `debug` | *which thread, in what order?* | every read with the stream and the guard it used, every cursor callback window and its eligibility decision, every synthesised clock value, and **every guard acquisition with its mode, its wait and its hold** |
 
 Everything goes to **stderr**, never stdout — a consumer's answers live there
-(cocolog prints its own on stdout and is parsed by scripts) — and every line
+(an interpreter embedding the engine prints its own on stdout, and scripts
+parse it) — and every line
 carries the low sixteen bits of its thread, which is what makes eight threads
 tellable apart in a file of ten thousand lines.
 

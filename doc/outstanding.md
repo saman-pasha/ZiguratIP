@@ -482,8 +482,8 @@ format both engines would have to agree on.
 The two store streams were `std::filebuf`s, and a filebuf discards its
 buffer on every seek. `StreamIO/mapstream` maps the files instead
 (`MEMORY/STORE_IO: MAP`, the default); the engine is untouched. What is
-left of the item: cocolog's EMBEDDED store still opens filestreams
-(`embed/embed.cicili`), and a platform without `mmap` runs `FILE`.
+left of the item: a store an embedding application opens as filestreams
+still pays it, and a platform without `mmap` runs `FILE`.
 
 ### A sequence's keys always go right
 
@@ -501,16 +501,16 @@ unlink it, as vacuum does, and chains would stop growing between vacuums.
 
 ### One clause, one round trip -- pipelined now
 
-cocolog's `assert_clause` is called once per clause, and a call was three
-waits on the wire (the verb's acknowledgement, the name's, the answer).
-cocolog's client now sends up to 128 calls ahead of the answers
+A client's `assert_clause` procedure is called once per clause, and a call
+was three waits on the wire (the verb's acknowledgement, the name's, the
+answer). That client now sends up to 128 calls ahead of the answers
 (`zg_call_send` / `zg_call_wait`), which was worth 0.6 s of a 3.1 s fresh
 load and nothing on a rewrite. What a load pays now, per a `sample` of the
 server: the statement's own work, and `commit_transaction` -- one
 `load_control` and one `dump_control` per staged pointer, 28000 of them for
 7000 rows with three indexes, each pair a seek that drops the filebuf's
 buffer. A bulk procedure carrying N clauses per call would still cut the
-statements' framing; and on cocolog's side the rewrite-whole-predicate
+statements' framing; and on the client's side the rewrite-whole-predicate
 sync is what multiplies the delete cost in the first place (an incremental
 assert would insert one row at the next ordinal).
 

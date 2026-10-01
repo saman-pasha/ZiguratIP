@@ -183,7 +183,7 @@ Nothing is wrong, nothing errors, nothing times out — and every exchange costs
 before handing it to the handler, best effort: a socket that will not take the
 option still works, it is merely slow.
 
-**What it cost before that line existed.** One turn of a cocolog worker is a few
+**What it cost before that line existed.** One turn of a client's worker is a few
 dozen exchanges. Twelve of them took a minute to do a second's work, and the
 test that runs twelve at once failed on its own timeout with no error anywhere
 to say why. A client that speaks this protocol should set `TCP_NODELAY` at its
@@ -202,7 +202,7 @@ row behind every time it does so, and a workload that rewrites the same row
 thirty times leaves twenty-nine. The table's live contents never grow; what
 grows is everything an index entry has to walk past to reach them.
 
-**Measured, in cocolog:** twelve interpreters over four machine states took
+**Measured, downstream:** twelve interpreters over four machine states took
 **14 seconds on one run and 32 on the fifth**, identical work each time, while
 the store file grew 72KB. Not more data to find — more dead data to walk past.
 
@@ -302,7 +302,7 @@ home/bin/Test Concurrency
 
 ## A private reader's buffer is not the file
 
-Found by cocolog's twelve-worker group case as a transient `no suspended
+Found by a downstream twelve-worker test as a transient `no suspended
 machine' -- a claim-holder's own `machine_find' answering zero rows for a
 header that was there before the statement and there again one statement
 later, 7-69 times a run -- and pinned by this suite's `rewrite vs index'
@@ -346,8 +346,8 @@ Three changes close it, all in `MVCCS-cicili/mvccs-lib.cicili':
   in the window.
 
 Measured: `contention_test' zero failures over twenty rc-checked runs,
-filestream and mapstream stores both; cocolog's `test/groups.sh' three
-runs at totals exactly 34/24/60/59 with zero `no suspended machine', zero
+filestream and mapstream stores both; that downstream twelve-worker test,
+three runs at totals exactly 34/24/60/59 with zero `no suspended machine', zero
 `missing chunk', zero lost connections; its embedded twin the same. The
 open staged-row note above predates this finding and its suite is retired;
 whether it was another face of the same stale read is not established

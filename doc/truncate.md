@@ -94,7 +94,7 @@ replacement leaves a dead row behind every time it runs. The table's live
 contents stay the same size; what grows is the number of dead versions every
 index entry has to walk past to reach them, and so every read gets slower.
 
-**Measured.** cocolog keeps a suspended interpreter's state in a table and
+**Measured.** A client that keeps a suspended interpreter's state in a table
 rewrites it once per turn. Twelve interpreters over four such states took
 **12 seconds against an empty store and 60 against one a few hundred test runs
 had been through** — identical work, identical live data, five times the wall
