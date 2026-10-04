@@ -162,3 +162,16 @@ fi
   -I"$HERE" -I"$INCDIR" \
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"
+
+# DEFERRED INDEX MAINTENANCE, pinned both ways. A transaction's entries in
+# its non-unique indexes queue during its inserts and are mapped in bulk,
+# sorted, at its commit (mvccs-lib.cicili, "Deferred index maintenance");
+# every answer here -- own rows before the commit, nothing for another
+# transaction until it, unique refusals at the insert, deletes and updates
+# of rows still queued, rollbacks that leave nothing -- must be the same
+# with the queue on and with MVCCS_DEFER_INDEX=0.
+"$CXX" -O3 -std=c++17 "$HERE/defer-check.cpp" -o "$HERE/defer_check" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"
+MVCCS_DEFER_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"

@@ -1209,6 +1209,112 @@ a build that measured the previous library with exit 0 -- eight of those
 between two sessions, every one caught by checking an artefact rather than
 a number.
 
+## A hashed index, a growing table -- and the index mapped in bulk at the commit
+
+The question (2026-10-04): a downstream table keeps a Bitcoin block's
+transactions as rows -- an id from a sequence, a composite `(kb, height)`,
+a `txid` String index -- and a block of 2,000 transactions took 0.12 s on
+an empty table and ~1 s at two million rows. Insertion should not grow
+with the table. `bench/table-bench.cpp` puts that table in the engine
+alone: 2,001-row blocks, one transaction a block, mapped store, 64 KiB
+pages, 1,000 blocks; `p` the id, `h` the composite, `t` the hashed txid.
+
+**Only the hashed index grows** (before any change):
+
+| indexes | block 1 | block 1,000 | inserts, block 1,000 | commit, block 1,000 |
+|---|---|---|---|---|
+| none | 0.012 s | 0.044 s | 0.033 s | 0.011 s |
+| `p` | 0.022 s | 0.075 s | 0.062 s | 0.013 s |
+| `ph` | 0.031 s | 0.094 s | 0.078 s | 0.016 s |
+| `pt` | 0.064 s | 0.956 s | 0.432 s | 0.523 s |
+| `pht` | 0.043 s | 0.994 s | 0.458 s | 0.536 s |
+
+A String key folds to a 64-bit hash (`doc/table.md`), so every row lands
+in a random leaf of a tree that grows. **Where its time goes**, from 60
+gdb samples of the `pt` run near block 350 and an strace of its syncs:
+half in `msync` -- the commit's first `sync_disk` writing back the pages
+the block dirtied, 0.27 s for the data file and 0.05 s for the hexmap,
+the two later syncs a few milliseconds -- a third walking key records
+(`bt_key_read`: a node's keys are a linked list read from its head, a
+record cache miss a `pointer_at`, a seek and seven reads through the
+stream), and 8 % in `allocate`'s first-fit walk. Each random insert
+rewrites three records in place where they happen to live -- the leaf
+node (its degree), the key before and the key after (their links) -- so a
+block of 2,001 random keys dirties up to ~6,000 pages scattered through
+the file, and the commit waits for every one.
+
+**The record cache is now sized by the store, not a constant**: 65 536
+node slots and 262 144 key slots by default (~30 MB), `MVCCS_CACHE_NODES`
+and `MVCCS_CACHE_KEYS` to change them. Measured on `pt`, 1,000 blocks, one
+sitting: the old 4 096 / 16 384 averaged 0.276 s of inserts a block, the
+new default 0.241, a million key slots 0.218; the commit, 0.335 s, did
+not move. Bigger helps a little; the walk, not the misses, is the cost.
+
+**Deferred index maintenance: the bulk insertion.** A row's entries in
+every NON-UNIQUE index now queue during its insert (`bt_map` /
+`bt_map_multi` reached from `online_insert` / `online_update`) and the
+transaction's commit maps them all at once, sorted by index and key,
+before it records its intention -- so the values are staged under the
+transaction and flip with its rows exactly as before. A unique index
+still maps at the insert and refuses a duplicate there. The inserting
+transaction sees its own rows: every cursor entry, every unmap, a
+truncate and a drop map the queue first. Each entry carries its row's
+query id (a statement still does not see the rows it inserted itself) and
+staging time (a partial rollback treats a row and its values alike); a
+rollback drops the queue, a partial one the entries of the rows it undoes.
+No other transaction needs the queue: a value is its row's transactional
+twin, so the values of rows nobody else can see are invisible to everyone
+else anyway. `MVCCS_DEFER_INDEX=0` maps every entry at its insert, as
+before. `defer-check.cpp` pins all of it, both ways, in `build.sh`; armed
+-- the cursor drains and the rollback discard taken out -- six of its
+checks go red. Measured, `pht`, 1,000 blocks, one build, one sitting:
+
+| | queue off | queue on |
+|---|---|---|
+| inserts, average | 0.248 s | 0.042 s |
+| commit, average | 0.334 s | 0.369 s |
+| a block, average | 0.582 s | **0.411 s** (-29 %) |
+| block 1,000 | 0.950 s | **0.676 s** (-29 %) |
+
+The index work left the inserts (0.248 s to 0.042) and came back to the
+commit as 0.035 s: mapped sorted and together it is a fraction of what it
+cost one row at a time. **Through the server** -- the downstream case
+itself, a client process a block, sixteen rows a procedure call, five
+tables that differ only in their keys, 500 blocks each, the server
+restarted with and without `MVCCS_DEFER_INDEX=0` in one sitting:
+
+| a block, average | queue off | queue on |
+|---|---|---|
+| id, (kb, height), txid | 0.802 s | **0.626 s** (-22 %) |
+| id, txid | 0.768 s | **0.606 s** (-21 %) |
+| (kb, height, idx, seq) primary, txid | 0.796 s | **0.625 s** (-21 %) |
+| id, (kb, height) | 0.369 s | 0.361 s |
+| id only | 0.344 s | 0.341 s |
+
+The two tables with no hashed index are the control and did not move;
+the queue-off run went second, onto pages the first run's TRUNCATE had
+freed, which if anything favours it. **What is left is the writeback**: near block
+500 with the queue on, `msync` was 58 % of the wall clock, ~0.26 s of
+each commit, and it still grows with the tree.
+
+**Why an indexing thread would not finish the job here.** The method
+reviewed was a second thread applying the queue while the inserting
+thread goes on. In this engine two things defeat it. One `Streams` guard
+is exclusive for every write to the store, so the indexer's tree writes
+and the rows' writes take turns; and every commit's `sync_disk` is an
+`msync` of the whole mapping and an `fsync` of the one data file, so
+whichever thread commits pays the writeback of the index pages the other
+dirtied. It becomes worth building together with the change that makes
+insertion constant: index records in a store of their own (their own
+file, guard and sync schedule), the queue made durable as a journal
+record in the main store at each commit, the indexer applying it in large
+sorted batches and syncing the index store on its own clock, a lookup
+consulting the not-yet-applied entries in memory, and recovery replaying
+the journal. The other half of the bill -- three records rewritten in
+place per random insert -- is the key-list layout; a node stored as one
+record would rewrite one. Both change the store's layout, so both are a
+decision, not a fix.
+
 ## Hard debugging, without changing a line
 
 Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —

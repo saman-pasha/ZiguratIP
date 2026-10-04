@@ -1754,12 +1754,47 @@
   ;; ==================================================================
   ;; Transaction plumbing
   ;; ==================================================================
+  ;; THE STAGING TIME A DEFERRED INDEX ENTRY CARRIES. An entry the
+  ;; transaction applies late (see "Deferred index maintenance" with the
+  ;; tree) is pushed with the time its ROW was staged, not the time it was
+  ;; applied, so rollback_transaction_to treats a row and its index values
+  ;; as one: both before the boundary, or both after it. Zero means now.
+  (thread-local) (var time_t tl_push_at . 0)
+
+  ;; set by online_insert / online_update around a row's map(): an index
+  ;; entry made under it queues for the commit instead of mapping now
+  (thread-local) (var int tl_defer_maps . 0)
+  ;; -1 until the environment has been read; then 0 off, 1 on
+  (var int g_defer_index . -1)
+
+  (func idx_defer_enabled () (out int)
+    (if (< g_defer_index 0)
+        (let ((const char * s . #'(getenv "MVCCS_DEFER_INDEX")))
+          (set g_defer_index (? (and (!= s nil) (== (nth 0 s) (cast char 48))) 0 1))))
+    (return g_defer_index))
+
+  ;; the flag around a row's map(), put back however map() leaves --
+  ;; a unique key refusing the row throws through here
+  (struct DeferScope
+    (member int saved_)
+    (ctor ((int on))
+      (init (saved_ 0))
+      (set ($ this saved_) tl_defer_maps)
+      (set tl_defer_maps on))
+    (dtor ()
+      (set tl_defer_maps ($ this saved_))))
+
+  ;; the queue's three verbs, defined with the tree they map into
+  (decl) (func idx_pending_apply () (out void))
+  (decl) (func idx_pending_discard () (out void))
+  (decl) (func idx_pending_drop_from ((time_t at)) (out void))
+
   (func transaction_push ((Memory * m) (const Pointer * p)) (out void)
     (dba_watch1 m "Transaction Push" (-> p address))
     (let ((Transaction * t . #'(txn))
           (TxnEntry * e . #'(new* TxnEntry)))
       ;; same clock as query_time: rollback_transaction_to compares the two
-      (set (-> e at) (version_time))
+      (set (-> e at) (? (!= tl_push_at (cast time_t 0)) tl_push_at (version_time)))
       (set (-> e ptr) (cof p))
       (set (-> e next) nil)
       (set (-> e prev) (-> t ctx_tail))
@@ -1997,6 +2032,10 @@
 
   (func commit_transaction ((Memory * m)) (out void)
     (dba_watch0 m "Commit Transaction")
+    ;; THE BULK MAP: every index entry this transaction's inserts queued,
+    ;; sorted and mapped now -- before the intention, so the values are
+    ;; staged under this transaction and flip with its rows below
+    (idx_pending_apply)
     (let ((Transaction * t . #'(txn)))
       ;; A transaction that wrote nothing has nothing to make durable: no
       ;; control block moved, so there is no intention to record and no
@@ -2083,6 +2122,8 @@
 
   (func rollback_transaction ((Memory * m)) (out void)
     (dba_watch0 m "Rollback Transaction")
+    ;; the rows are going; their queued index entries never reach the tree
+    (idx_pending_discard)
     (let ((Transaction * t . #'(txn))
           (int staged . 0))
       ;; read BEFORE the context is cleared below
@@ -2129,6 +2170,8 @@
   ;; the partial rollback the repeatable-read retry uses
   (func rollback_transaction_to ((Memory * m) (time_t at)) (out void)
     (dba_watch0 m "Rollback Transaction to")
+    ;; the queued entries of the rows this undoes go with them
+    (idx_pending_drop_from at)
     (letin* ((streams (Streams m)))
       (let ((Transaction * t . #'(txn))
             (TxnEntry * e . #'(-> t ctx_tail)))
@@ -2902,7 +2945,10 @@
           ((-> (-> m data_io) clear)))
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> obj pointer))) std::ios::beg)
       ((-> obj pack) (cof (-> m data_io)))
-      ((-> obj map) (cast (void *) m))
+      ;; the row's index entries queue for the commit's bulk map
+      (letin* ((defer (DeferScope (idx_defer_enabled))))
+        ((-> obj map) (cast (void *) m))
+        (cast void 0))
       ((-> (-> m hexmap_io) flush))
       ((-> (-> m data_io) flush))
       (cast void 0)))
@@ -2924,7 +2970,9 @@
       ((-> (-> m data_io) seekp) (ptr_data (aof (-> new_obj pointer))) std::ios::beg)
       ((-> new_obj pack) (cof (-> m data_io)))
       ((-> old_obj unmap) (cast (void *) m))
-      ((-> new_obj map) (cast (void *) m))
+      (letin* ((defer (DeferScope (idx_defer_enabled))))
+        ((-> new_obj map) (cast (void *) m))
+        (cast void 0))
       ((-> (-> m hexmap_io) flush))
       ((-> (-> m data_io) flush))
       (cast void 0)))
@@ -3510,33 +3558,64 @@
   ;; streams guard fill it concurrently. The on-disk format is untouched
   ;; -- a store written by the C++ engine reads the same.
   ;; ==================================================================
-  ;; 4096 node slots and 16384 key slots, the numbers written out: a
-  ;; #define of one's own is invisible to Cicili (CLAUDE.md)
+  ;; THE SIZE IS THE TREE'S, NOT A CONSTANT. It was 4096 node slots and
+  ;; 16384 key slots, and a table indexed by a hashed column outgrows that
+  ;; at once: two million rows under a random 64-bit key are ~60 000
+  ;; leaves of up to 128 keys, so nearly every key a descent read missed
+  ;; and was unpacked from the store again -- a third of the insert's
+  ;; time at that size (bench/table-bench.cpp, a gdb sample of the "pt"
+  ;; run). Now 65536 node slots and 262144 key slots by default, ~32 MB
+  ;; a store, and MVCCS_CACHE_NODES / MVCCS_CACHE_KEYS set either, rounded
+  ;; down to a power of two (at least 1024) so the slot is a mask. The
+  ;; slots live in vectors because a slot holds a record with a vtable,
+  ;; which a malloc would leave unconstructed.
 
   (struct BTNodeSlot (member int64_t addr) (member BTNode node))
   (struct BTKeySlot (member int64_t addr) (member BTKey key))
+  (@define (code "btnodeslots_t std::vector<BTNodeSlot>"))
+  (@define (code "btkeyslots_t std::vector<BTKeySlot>"))
   (struct BTCache
     (member pthread_mutex_t access)
-    (member BTNodeSlot nodes [4096])
-    (member BTKeySlot keys [16384]))
+    (member int64_t node_mask)
+    (member int64_t key_mask)
+    (member btnodeslots_t nodes)
+    (member btkeyslots_t keys))
 
   (func bt_cache_clear_slots ((BTCache * c)) (out void)
-    (let ((int i . 0))
-      (while (< i 4096)
+    (let ((int64_t i . 0))
+      (while (<= i (-> c node_mask))
         (set ($ (nth i (-> c nodes)) addr) -1)
         (set i (+ i 1))))
-    (let ((int i . 0))
-      (while (< i 16384)
+    (let ((int64_t i . 0))
+      (while (<= i (-> c key_mask))
         (set ($ (nth i (-> c keys)) addr) -1)
         (set i (+ i 1)))))
+
+  ;; an environment count rounded down to a power of two, at least 1024
+  (func bt_cache_slots ((const char * name) (int64_t fallback)) (out int64_t)
+    (let ((const char * s . #'(getenv name))
+          (int64_t want . fallback)
+          (int64_t n . 1024))
+      (if (!= s nil)
+          (let ((int64_t v . #'(cast int64_t (atoll s))))
+            (if (> v 0) (set want v))))
+      (while (<= (* n 2) want)
+        (set n (* n 2)))
+      (return n)))
 
   (func bt_cache_new () (out void *)
     ;; MVCCS_NO_CACHE in the environment runs without the cache -- every
     ;; accessor answers nothing for a nil cache -- so a suspicion about it
     ;; is one run away from an answer
     (if (!= (getenv "MVCCS_NO_CACHE") nil) (return nil))
-    (let ((BTCache * c . #'(new* BTCache)))
+    (let ((BTCache * c . #'(new* BTCache))
+          (int64_t nn . #'(bt_cache_slots "MVCCS_CACHE_NODES" 65536))
+          (int64_t nk . #'(bt_cache_slots "MVCCS_CACHE_KEYS" 262144)))
       (pthread_mutex_init (aof (-> c access)) nil)
+      (set (-> c node_mask) (- nn 1))
+      (set (-> c key_mask) (- nk 1))
+      (($ (-> c nodes) resize) (cast size_t nn))
+      (($ (-> c keys) resize) (cast size_t nk))
       (bt_cache_clear_slots c)
       (return (cast (void *) c))))
 
@@ -3555,16 +3634,16 @@
 
   ;; records sit at least a control block apart, so the address over 64
   ;; spreads neighbours across slots
-  (func bt_cache_node_slot ((int64_t address)) (out int)
-    (return (cast int (bitand (>> address 6) 4095))))
-  (func bt_cache_key_slot ((int64_t address)) (out int)
-    (return (cast int (bitand (>> address 6) 16383))))
+  (func bt_cache_node_slot ((BTCache * c) (int64_t address)) (out int64_t)
+    (return (bitand (>> address 6) (-> c node_mask))))
+  (func bt_cache_key_slot ((BTCache * c) (int64_t address)) (out int64_t)
+    (return (bitand (>> address 6) (-> c key_mask))))
 
   (func bt_cache_forget ((Memory * m) (int64_t address)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int ns . #'(bt_cache_node_slot address))
-          (int ks . #'(bt_cache_key_slot address)))
+          (int64_t ns . #'(bt_cache_node_slot c address))
+          (int64_t ks . #'(bt_cache_key_slot c address)))
       (pthread_mutex_lock (aof (-> c access)))
       (if (== ($ (nth ns (-> c nodes)) addr) address)
           (set ($ (nth ns (-> c nodes)) addr) -1))
@@ -3575,7 +3654,7 @@
   (func bt_cache_node_get ((Memory * m) (int64_t address) (BTNode * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int ns . #'(bt_cache_node_slot address))
+          (int64_t ns . #'(bt_cache_node_slot c address))
           (int hit . 0))
       (pthread_mutex_lock (aof (-> c access)))
       (if (== ($ (nth ns (-> c nodes)) addr) address)
@@ -3588,7 +3667,7 @@
   (func bt_cache_node_put ((Memory * m) (const BTNode * node)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int ns . #'(bt_cache_node_slot ($ (-> node pointer) address))))
+          (int64_t ns . #'(bt_cache_node_slot c ($ (-> node pointer) address))))
       (pthread_mutex_lock (aof (-> c access)))
       (set ($ (nth ns (-> c nodes)) node) (cof node))
       (set ($ (nth ns (-> c nodes)) addr) ($ (-> node pointer) address))
@@ -3597,7 +3676,7 @@
   (func bt_cache_key_get ((Memory * m) (int64_t address) (BTKey * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int ks . #'(bt_cache_key_slot address))
+          (int64_t ks . #'(bt_cache_key_slot c address))
           (int hit . 0))
       (pthread_mutex_lock (aof (-> c access)))
       (if (== ($ (nth ks (-> c keys)) addr) address)
@@ -3610,7 +3689,7 @@
   (func bt_cache_key_put ((Memory * m) (const BTKey * key)) (out void)
     (if (== (-> m bt_cache) nil) (return))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int ks . #'(bt_cache_key_slot ($ (-> key pointer) address))))
+          (int64_t ks . #'(bt_cache_key_slot c ($ (-> key pointer) address))))
       (pthread_mutex_lock (aof (-> c access)))
       (set ($ (nth ks (-> c keys)) key) (cof key))
       (set ($ (nth ks (-> c keys)) addr) ($ (-> key pointer) address))
@@ -3871,6 +3950,78 @@
       (set (-> uc found) 1)
       (return #f)))
 
+  ;; ==================================================================
+  ;; Deferred index maintenance: a transaction's index entries, held back
+  ;; from its inserts and mapped in bulk, sorted, when it commits.
+  ;;
+  ;; WHY. A table indexed on a hashed column -- a transaction id, any
+  ;; String key -- maps every row into a random leaf of a growing tree, and
+  ;; measured (bench/table-bench.cpp, 2 001-row blocks, 2 million rows) it
+  ;; was all of the growth: the row and a sequence's primary key stayed
+  ;; near 0.04 s a block while the hashed index took the block to ~1 s,
+  ;; half of it walking key records and half the commit writing back the
+  ;; pages the walk dirtied. Mapping a whole transaction's entries at once,
+  ;; in key order, is the bulk insertion: the descents of neighbouring keys
+  ;; share their path, and the entries of one block reach the tree in one
+  ;; pass instead of interleaved with the rows.
+  ;;
+  ;; WHAT IS DEFERRED. bt_map and bt_map_multi, reached from a row's map()
+  ;; inside online_insert / online_update (tl_defer_maps), on an index that
+  ;; is not UNIQUE -- a unique index still refuses the duplicate at the
+  ;; insert that makes it, exactly as before -- and not a dependent level
+  ;; (bt_map_multi defers the whole tuple at the top). MVCCS_DEFER_INDEX=0
+  ;; in the environment turns it off.
+  ;;
+  ;; WHY NO OTHER TRANSACTION NEEDS THEM. An index value is its row's
+  ;; transactional twin (bt_insert_value stages it; a cursor trusts the
+  ;; value's visibility and reads the row plainly), so the values of rows
+  ;; nobody else can see yet are invisible to everybody else anyway. The
+  ;; commit maps them BEFORE it records its intention, so they are staged
+  ;; under this transaction and flipped with its rows, as they always were.
+  ;;
+  ;; THIS TRANSACTION DOES NEED THEM, and gets them first: every cursor on
+  ;; any index, every unmap, a truncate and a drop map the pending entries
+  ;; before they walk (idx_pending_apply is a no-op when there are none).
+  ;; Each entry carries its row's query id, so a statement still does not
+  ;; see the rows it inserted itself, and its row's staging time, so a
+  ;; partial rollback treats the row and its values alike; entries of rows
+  ;; a rollback undoes are dropped, never mapped.
+  ;; ==================================================================
+  (struct IdxPending
+    (member BTreeIndex * idx)
+    (member int64_t ks [8])
+    (member int64_t value)
+    (member int64_t seq)
+    (member int64_t query_id)
+    (member time_t at))
+  (@define (code "idxpending_t std::vector<IdxPending>"))
+  (thread-local) (var idxpending_t * tl_pending . nil)
+  (thread-local) (var int64_t tl_pending_seq . 0)
+
+  (func idx_pending_count () (out int64_t)
+    (if (== tl_pending nil) (return 0))
+    (return (cast int64_t ((-> tl_pending size)))))
+
+  (func idx_pending_push ((BTreeIndex * idx) (const int64_t * ks) (int64_t value)) (out void)
+    (if (== tl_pending nil) (set tl_pending (new* idxpending_t)))
+    (let ((IdxPending e))
+      (set ($ e idx) idx)
+      (for ((int64_t i . 0)) (< i 8) ((++ i))
+        (set (nth i ($ e ks)) (? (< i (-> idx levels)) (nth i ks) 0)))
+      (set ($ e value) value)
+      (set tl_pending_seq (+ tl_pending_seq 1))
+      (set ($ e seq) tl_pending_seq)
+      (set ($ e query_id) (? (!= tl_txn nil) (-> tl_txn query_id) 0))
+      (set ($ e at) (version_time))
+      ((-> tl_pending push_back) e)))
+
+  ;; whether bt_map / bt_map_multi on IDX should queue rather than map
+  (func idx_defer_here ((BTreeIndex * idx)) (out int)
+    (if (!= tl_defer_maps 1) (return 0))
+    (if (!= (-> idx is_dependent) 0) (return 0))
+    (if (!= (-> idx is_unique) 0) (return 0))
+    (return 1))
+
   ;; _split_node: the lower half keeps the node, the upper half moves to
   ;; a fresh node of the SAME kind, and the median key is promoted into
   ;; the parent -- or into a brand new root when there is none.
@@ -4115,6 +4266,12 @@
 
   (func bt_map ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
     (dba_watch2 (-> idx m) "BTreeIndex map" k value)
+    ;; a row's insert queues its entry; the commit maps the queue in bulk
+    (if (== 1 (idx_defer_here idx))
+        (let ((int64_t ks [1]))
+          (set (nth 0 ks) k)
+          (idx_pending_push idx ks value)
+          (return)))
     (let ((Memory * m . #'(-> idx m)))
       ;; reached from online_insert, which is already holding these; the
       ;; guard nests and does nothing. Reached bare, it locks for real.
@@ -4146,6 +4303,11 @@
         (block
           (bt_map idx (nth 0 ks) value)
           (return)))
+    ;; the whole tuple queues at the top level, never a dependent's tail
+    (if (== 1 (idx_defer_here idx))
+        (block
+          (idx_pending_push idx ks value)
+          (return)))
     (let ((Memory * m . #'(-> idx m)))
       (letin* ((streams (Streams m)))
         (if (== (-> idx root_address) -1)
@@ -4173,6 +4335,80 @@
                     (set ($ fresh dependents_address) ($ dep root_address))
                     (offline_update m (cast (BaseTable *) (aof fresh))))))))
         (cast void 0))))
+
+  ;; ---- the deferred entries, mapped in bulk -------------------------
+  ;; index, then key tuple, then arrival: one index's entries in key order,
+  ;; and one key's in the order its rows came, so its value chain ends up
+  ;; exactly as immediate mapping would have built it
+  (func idx_pending_cmp ((const void * a) (const void * b)) (out int)
+    (let ((const IdxPending * x . #'(cast (const IdxPending *) a))
+          (const IdxPending * y . #'(cast (const IdxPending *) b)))
+      (if (< (cast uintptr_t (-> x idx)) (cast uintptr_t (-> y idx))) (return -1))
+      (if (> (cast uintptr_t (-> x idx)) (cast uintptr_t (-> y idx))) (return 1))
+      (for ((int i . 0)) (< i 8) ((++ i))
+        (if (< (nth i (-> x ks)) (nth i (-> y ks))) (return -1))
+        (if (> (nth i (-> x ks)) (nth i (-> y ks))) (return 1)))
+      (if (< (-> x seq) (-> y seq)) (return -1))
+      (if (> (-> x seq) (-> y seq)) (return 1))
+      (return 0)))
+
+  ;; what the bulk map borrows -- the defer flag, the shared ask, the
+  ;; staging time, the query id -- handed back however the map leaves
+  (struct ApplyScope
+    (member int defer_)
+    (member int want_)
+    (member time_t at_)
+    (member int64_t query_)
+    (ctor ()
+      (init (defer_ 0) (want_ 0) (at_ 0) (query_ 0))
+      (set ($ this defer_) tl_defer_maps)
+      (set ($ this want_) tl_want_shared)
+      (set ($ this at_) tl_push_at)
+      (if (!= tl_txn nil) (set ($ this query_) (-> tl_txn query_id)))
+      (set tl_defer_maps 0)
+      ;; the maps write: an exclusive guard, never a shared one a read
+      ;; above us asked for and has not constructed yet
+      (set tl_want_shared 0))
+    (dtor ()
+      (set tl_defer_maps ($ this defer_))
+      (set tl_want_shared ($ this want_))
+      (set tl_push_at ($ this at_))
+      (if (!= tl_txn nil) (set (-> tl_txn query_id) ($ this query_)))))
+
+  ;; Every queued entry of this thread's transaction, mapped now. The queue
+  ;; is taken whole before the first map, so an entry is mapped once even
+  ;; if a map throws.
+  (func idx_pending_apply () (out void)
+    (if (or (== tl_pending nil) ((-> tl_pending empty))) (return))
+    (let ((idxpending_t batch))
+      (($ batch swap) (cof tl_pending))
+      (qsort (cast (void *) (($ batch data))) (($ batch size)) (sizeof IdxPending) idx_pending_cmp)
+      (letin* ((scope (ApplyScope)))
+        (for ((size_t i . 0)) (< i (($ batch size))) ((++ i))
+          (let ((IdxPending * e . #'(aof (nth i batch))))
+            (set tl_push_at (-> e at))
+            (if (!= tl_txn nil) (set (-> tl_txn query_id) (-> e query_id)))
+            (if (> (-> (-> e idx) levels) 1)
+                (bt_map_multi (-> e idx) (-> e ks) (-> e value))
+              (bt_map (-> e idx) (nth 0 (-> e ks)) (-> e value)))))
+        (cast void 0))))
+
+  ;; a full rollback: the rows are gone, so are their entries
+  (func idx_pending_discard () (out void)
+    (if (!= tl_pending nil) ((-> tl_pending clear))))
+
+  ;; a partial rollback to AT: the entries of the rows staged at or after
+  ;; it go with them (an entry is queued in its row's own insert, so its
+  ;; time and its row's fall on the same side of any statement's start)
+  (func idx_pending_drop_from ((time_t at)) (out void)
+    (if (== tl_pending nil) (return))
+    (let ((size_t kept . 0))
+      (for ((size_t i . 0)) (< i ((-> tl_pending size))) ((++ i))
+        (if (< ($ (nth i (cof tl_pending)) at) at)
+            (block
+              (set (nth kept (cof tl_pending)) (nth i (cof tl_pending)))
+              (set kept (+ kept 1)))))
+      ((-> tl_pending resize) kept)))
 
   ;; ---- unmap: one row's entry, never the key's whole chain ----------
   ;;
@@ -4284,6 +4520,8 @@
 
   (func bt_unmap ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
     (dba_watch2 (-> idx m) "BTreeIndex unmap" k value)
+    ;; the value to mark may still be queued
+    (idx_pending_apply)
     (letin* ((streams (Streams (-> idx m))))
       (if (!= (-> idx root_address) -1)
           (let ((BTNode root_node))
@@ -4333,6 +4571,7 @@
         (block
           (bt_unmap idx (nth 0 ks) value)
           (return)))
+    (if (== (-> idx is_dependent) 0) (idx_pending_apply))
     (letin* ((streams (Streams (-> idx m))))
       (if (> (-> idx root_address) -1)
           (let ((BTKey keyrec))
@@ -4733,6 +4972,8 @@
   ;; ---- the seven cursors ---------------------------------------------
   (func bt_cursor ((BTreeIndex * idx) (void * user)
                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4754,6 +4995,8 @@
   ;; composite counterpart of bt_cursor, as the variadic class shapes it
   (func bt_cursor_dep ((BTreeIndex * idx) (void * user)
                        (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4804,6 +5047,8 @@
 
   (func bt_cursor_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                          (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4834,6 +5079,8 @@
 
   (func bt_cursor_equal_dep ((BTreeIndex * idx) (int64_t k) (void * user)
                              (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4875,6 +5122,8 @@
 
   (func bt_cursor_not_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4923,6 +5172,8 @@
 
   (func bt_cursor_less_than ((BTreeIndex * idx) (int64_t k) (void * user)
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4940,6 +5191,8 @@
 
   (func bt_cursor_less_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5001,6 +5254,8 @@
 
   (func bt_cursor_greater_than ((BTreeIndex * idx) (int64_t k) (void * user)
                                 (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5018,6 +5273,8 @@
 
   (func bt_cursor_greater_than_equal ((BTreeIndex * idx) (int64_t k) (void * user)
                                       (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5051,6 +5308,8 @@
 
   (func bt_cursor_rows_deep ((BTreeIndex * idx) (void * user)
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (if (== (-> idx levels) 1)
         (return (bt_cursor idx user rcb)))
     (let ((BTDeepCtx dc))
@@ -5078,6 +5337,8 @@
 
   (func bt_cursor_equal_multi ((BTreeIndex * idx) (int64_t * ks) (void * user)
                                (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (if (== (-> idx levels) 1)
         (return (bt_cursor_equal idx (nth 0 ks) user rcb)))
     (let ((BTEqChainCtx ec))
@@ -5159,6 +5420,8 @@
   ;; two hash keys to sweep for a composite, not one: every dependent
   ;; level shares dep_hash_key, which is not the top level's own
   (func bt_truncate ((BTreeIndex * idx) (Memory * m)) (out size_t)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (block
       (letin* ((streams (Streams (-> idx m))))
         (bt_unlink_dead idx)
@@ -5212,6 +5475,8 @@
     (pthread_mutex_unlock (aof (-> m page_list_access))))
 
   (func bt_drop_storage ((BTreeIndex * idx) (Memory * m)) (out void)
+    ;; this transaction's own queued entries reach the tree first
+    (idx_pending_apply)
     (block
       (letin* ((streams (Streams m)))
         (drop_key_pages m (-> idx hash_key))

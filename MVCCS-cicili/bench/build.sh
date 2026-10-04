@@ -16,7 +16,7 @@ LIBDIR="$ROOT/home/lib"
 INCDIR="$ROOT/home/include"
 N=${1:-7000}
 set -e
-for b in insert delete composite; do
+for b in insert delete composite table; do
   "$CXX" -O3 -std=gnu++17 -Wno-deprecated-declarations "$HERE/$b-$( [ $b = composite ] && echo check || echo bench ).cpp" \
     -o "$HERE/${b}_$( [ $b = composite ] && echo check || echo bench )" -I"$HERE/.." -I"$INCDIR" \
     -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
@@ -30,6 +30,14 @@ for mode in equal equal2 equal3; do
   echo "== delete_bench $N $mode"
   "$HERE/delete_bench" "$N" "$mode" | grep -v ' done, '
 done
+
+# a real table as it grows: blocks of 2,001 rows under a sequence's id, a
+# composite (kb, height) and a hashed txid, a transaction a block -- the
+# table in ../README.md's "Deferred index maintenance". Twenty blocks here;
+# `table_bench 1000 pht' (STORE_MAP=1, ~10 minutes) is the measurement,
+# and MVCCS_DEFER_INDEX=0 the same with every entry mapped at its insert.
+echo "== table_bench 20 pht"
+"$HERE/table_bench" 20 pht
 
 # and the growth measurement, which links nothing at all: what it costs to
 # extend a mapped file, in the store's own write pattern. The table in

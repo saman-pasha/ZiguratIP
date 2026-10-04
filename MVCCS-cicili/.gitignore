@@ -11,3 +11,5 @@ carryover_new
 carryover_seed
 ageing_test
 bench/grow_bench
+defer_check
+bench/table_bench
