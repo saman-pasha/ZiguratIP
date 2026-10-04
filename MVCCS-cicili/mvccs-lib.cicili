@@ -3646,11 +3646,25 @@
   ;; leaves of up to 128 keys, so nearly every key a descent read missed
   ;; and was unpacked from the store again -- a third of the insert's
   ;; time at that size (bench/table-bench.cpp, a gdb sample of the "pt"
-  ;; run). Now 65536 node slots and 262144 key slots by default, ~32 MB
-  ;; a store, and MVCCS_CACHE_NODES / MVCCS_CACHE_KEYS set either, rounded
-  ;; down to a power of two (at least 1024) so the slot is a mask. The
-  ;; slots live in vectors because a slot holds a record with a vtable,
-  ;; which a malloc would leave unconstructed.
+  ;; run). Now up to 65536 node slots and 262144 key slots by default,
+  ;; ~32 MB a store, and MVCCS_CACHE_NODES / MVCCS_CACHE_KEYS set either
+  ;; cap, rounded down to a power of two (at least 1024) so the slot is a
+  ;; mask. The slots live in vectors because a slot holds a record with a
+  ;; vtable, which a malloc would leave unconstructed.
+  ;;
+  ;; AND IT GROWS TO THAT SIZE; IT DOES NOT START THERE. Built whole at
+  ;; the open, the 32 MB cost every process that opened a store ~55 ms
+  ;; and 27 MB before its first read: an embedded store's start-up went
+  ;; from 17 to 75 ms, the whole of a short program's time. An array
+  ;; starts at a sixteenth of its cap (at least 1024) -- 4096 node and
+  ;; 16384 key slots by default, the sizes before the caps -- and grows
+  ;; four-fold, up to its cap, once it has missed as many times as it has
+  ;; slots since it last grew: a small tree never pays for the big cache,
+  ;; a big one reaches it after ~20 000 misses. A growth keeps every
+  ;; record held: under the wider mask, the record in old slot i goes to i
+  ;; or to i plus a multiple of the old size -- a slot in the new part,
+  ;; which nothing else moves to -- and the slot it leaves is emptied, or
+  ;; the next growth would carry its stale copy over the fresh one.
 
   (struct BTNodeSlot (member int64_t addr) (member BTNode node))
   (struct BTKeySlot (member int64_t addr) (member BTKey key))
@@ -3677,6 +3691,11 @@
     (member pthread_mutex_t access)
     (member int64_t node_mask)
     (member int64_t key_mask)
+    ;; what each array may grow to, and its misses since it last grew
+    (member int64_t node_cap)
+    (member int64_t key_cap)
+    (member int64_t node_misses)
+    (member int64_t key_misses)
     (member btnodeslots_t nodes)
     (member btkeyslots_t keys)
     (member bttails_t tails))
@@ -3713,12 +3732,21 @@
     (if (!= (getenv "MVCCS_NO_CACHE") nil) (return nil))
     (let ((BTCache * c . #'(new* BTCache))
           (int64_t nn . #'(bt_cache_slots "MVCCS_CACHE_NODES" 65536))
-          (int64_t nk . #'(bt_cache_slots "MVCCS_CACHE_KEYS" 262144)))
+          (int64_t nk . #'(bt_cache_slots "MVCCS_CACHE_KEYS" 262144))
+          (int64_t sn . #'(/ nn 16))
+          (int64_t sk . #'(/ nk 16)))
+      ;; a cap is at least 1024 (bt_cache_slots), so this never passes it
+      (if (< sn 1024) (set sn 1024))
+      (if (< sk 1024) (set sk 1024))
       (pthread_mutex_init (aof (-> c access)) nil)
-      (set (-> c node_mask) (- nn 1))
-      (set (-> c key_mask) (- nk 1))
-      (($ (-> c nodes) resize) (cast size_t nn))
-      (($ (-> c keys) resize) (cast size_t nk))
+      (set (-> c node_cap) nn)
+      (set (-> c key_cap) nk)
+      (set (-> c node_misses) 0)
+      (set (-> c key_misses) 0)
+      (set (-> c node_mask) (- sn 1))
+      (set (-> c key_mask) (- sk 1))
+      (($ (-> c nodes) resize) (cast size_t sn))
+      (($ (-> c keys) resize) (cast size_t sk))
       (bt_cache_clear_slots c)
       (return (cast (void *) c))))
 
@@ -3736,66 +3764,135 @@
       (pthread_mutex_unlock (aof (-> c access)))))
 
   ;; records sit at least a control block apart, so the address over 64
-  ;; spreads neighbours across slots
+  ;; spreads neighbours across slots. A slot is taken UNDER the mutex,
+  ;; never before it: a growth changes the mask, and a slot from the old
+  ;; one would put a record where no lookup goes -- for the next growth to
+  ;; carry over a fresh copy -- or forget a slot the record has left.
   (func bt_cache_node_slot ((BTCache * c) (int64_t address)) (out int64_t)
     (return (bitand (>> address 6) (-> c node_mask))))
   (func bt_cache_key_slot ((BTCache * c) (int64_t address)) (out int64_t)
     (return (bitand (>> address 6) (-> c key_mask))))
 
+  ;; with the mutex held, after a miss: count it, and once the array has
+  ;; missed as many times as it has slots since it last grew, widen it
+  ;; four-fold up to its cap, every record held moved to its slot under the
+  ;; new mask and the slot it left emptied
+  (func bt_cache_node_missed ((BTCache * c)) (out void)
+    (let ((int64_t n . #'(+ (-> c node_mask) 1))
+          (int64_t w . #'(* n 4)))
+      (set (-> c node_misses) (+ (-> c node_misses) 1))
+      (if (or (<= (-> c node_misses) n) (>= n (-> c node_cap))) (return))
+      (if (> w (-> c node_cap)) (set w (-> c node_cap)))
+      (($ (-> c nodes) resize) (cast size_t w))
+      (set (-> c node_mask) (- w 1))
+      (let ((int64_t i . n))
+        (while (< i w)
+          (set ($ (nth i (-> c nodes)) addr) -1)
+          (set i (+ i 1))))
+      (let ((int64_t i . 0))
+        (while (< i n)
+          (let ((int64_t a . #'($ (nth i (-> c nodes)) addr)))
+            (if (!= a -1)
+                (let ((int64_t j . #'(bt_cache_node_slot c a)))
+                  (if (!= j i)
+                      (block
+                        (set (nth j (-> c nodes)) (nth i (-> c nodes)))
+                        (set ($ (nth i (-> c nodes)) addr) -1))))))
+          (set i (+ i 1))))
+      (set (-> c node_misses) 0)))
+
+  (func bt_cache_key_missed ((BTCache * c)) (out void)
+    (let ((int64_t n . #'(+ (-> c key_mask) 1))
+          (int64_t w . #'(* n 4)))
+      (set (-> c key_misses) (+ (-> c key_misses) 1))
+      (if (or (<= (-> c key_misses) n) (>= n (-> c key_cap))) (return))
+      (if (> w (-> c key_cap)) (set w (-> c key_cap)))
+      (($ (-> c keys) resize) (cast size_t w))
+      (set (-> c key_mask) (- w 1))
+      (let ((int64_t i . n))
+        (while (< i w)
+          (set ($ (nth i (-> c keys)) addr) -1)
+          (set i (+ i 1))))
+      (let ((int64_t i . 0))
+        (while (< i n)
+          (let ((int64_t a . #'($ (nth i (-> c keys)) addr)))
+            (if (!= a -1)
+                (let ((int64_t j . #'(bt_cache_key_slot c a)))
+                  (if (!= j i)
+                      (block
+                        (set (nth j (-> c keys)) (nth i (-> c keys)))
+                        (set ($ (nth i (-> c keys)) addr) -1))))))
+          (set i (+ i 1))))
+      (set (-> c key_misses) 0)))
+
   (func bt_cache_forget ((Memory * m) (int64_t address)) (out void)
     (if (== (-> m bt_cache) nil) (return))
-    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int64_t ns . #'(bt_cache_node_slot c address))
-          (int64_t ks . #'(bt_cache_key_slot c address)))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
       (pthread_mutex_lock (aof (-> c access)))
-      (if (== ($ (nth ns (-> c nodes)) addr) address)
-          (set ($ (nth ns (-> c nodes)) addr) -1))
-      (if (== ($ (nth ks (-> c keys)) addr) address)
-          (set ($ (nth ks (-> c keys)) addr) -1))
+      (let ((int64_t ns . #'(bt_cache_node_slot c address))
+            (int64_t ks . #'(bt_cache_key_slot c address)))
+        (if (== ($ (nth ns (-> c nodes)) addr) address)
+            (set ($ (nth ns (-> c nodes)) addr) -1))
+        (if (== ($ (nth ks (-> c keys)) addr) address)
+            (set ($ (nth ks (-> c keys)) addr) -1)))
       (pthread_mutex_unlock (aof (-> c access)))))
 
   (func bt_cache_node_get ((Memory * m) (int64_t address) (BTNode * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int64_t ns . #'(bt_cache_node_slot c address))
           (int hit . 0))
       (pthread_mutex_lock (aof (-> c access)))
-      (if (== ($ (nth ns (-> c nodes)) addr) address)
-          (block
-            (set (cof out) ($ (nth ns (-> c nodes)) node))
-            (set hit 1)))
+      (let ((int64_t ns . #'(bt_cache_node_slot c address)))
+        (if (== ($ (nth ns (-> c nodes)) addr) address)
+            (block
+              (set (cof out) ($ (nth ns (-> c nodes)) node))
+              (set hit 1))
+            (bt_cache_node_missed c)))
       (pthread_mutex_unlock (aof (-> c access)))
       (return hit)))
 
   (func bt_cache_node_put ((Memory * m) (const BTNode * node)) (out void)
     (if (== (-> m bt_cache) nil) (return))
-    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int64_t ns . #'(bt_cache_node_slot c ($ (-> node pointer) address))))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
       (pthread_mutex_lock (aof (-> c access)))
-      (set ($ (nth ns (-> c nodes)) node) (cof node))
-      (set ($ (nth ns (-> c nodes)) addr) ($ (-> node pointer) address))
+      (let ((int64_t ns . #'(bt_cache_node_slot c ($ (-> node pointer) address))))
+        (set ($ (nth ns (-> c nodes)) node) (cof node))
+        (set ($ (nth ns (-> c nodes)) addr) ($ (-> node pointer) address)))
       (pthread_mutex_unlock (aof (-> c access)))))
 
   (func bt_cache_key_get ((Memory * m) (int64_t address) (BTKey * out)) (out int)
     (if (== (-> m bt_cache) nil) (return 0))
     (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int64_t ks . #'(bt_cache_key_slot c address))
           (int hit . 0))
       (pthread_mutex_lock (aof (-> c access)))
-      (if (== ($ (nth ks (-> c keys)) addr) address)
-          (block
-            (set (cof out) ($ (nth ks (-> c keys)) key))
-            (set hit 1)))
+      (let ((int64_t ks . #'(bt_cache_key_slot c address)))
+        (if (== ($ (nth ks (-> c keys)) addr) address)
+            (block
+              (set (cof out) ($ (nth ks (-> c keys)) key))
+              (set hit 1))
+            (bt_cache_key_missed c)))
       (pthread_mutex_unlock (aof (-> c access)))
       (return hit)))
 
   (func bt_cache_key_put ((Memory * m) (const BTKey * key)) (out void)
     (if (== (-> m bt_cache) nil) (return))
-    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache)))
-          (int64_t ks . #'(bt_cache_key_slot c ($ (-> key pointer) address))))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
       (pthread_mutex_lock (aof (-> c access)))
-      (set ($ (nth ks (-> c keys)) key) (cof key))
-      (set ($ (nth ks (-> c keys)) addr) ($ (-> key pointer) address))
+      (let ((int64_t ks . #'(bt_cache_key_slot c ($ (-> key pointer) address))))
+        (set ($ (nth ks (-> c keys)) key) (cof key))
+        (set ($ (nth ks (-> c keys)) addr) ($ (-> key pointer) address)))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
+  ;; the cache's size now, for a check: its node and key slots, or 0 and 0
+  ;; without one (MVCCS_NO_CACHE)
+  (func mvccs_cache_slots ((Memory * m) (int64_t * nodes) (int64_t * keys)) (out void)
+    (set (cof nodes) 0)
+    (set (cof keys) 0)
+    (if (== (-> m bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> m bt_cache))))
+      (pthread_mutex_lock (aof (-> c access)))
+      (set (cof nodes) (+ (-> c node_mask) 1))
+      (set (cof keys) (+ (-> c key_mask) 1))
       (pthread_mutex_unlock (aof (-> c access)))))
 
   (struct BTValue (inherits BaseTable)

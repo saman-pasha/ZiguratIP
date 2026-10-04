@@ -1245,7 +1245,8 @@ the file, and the commit waits for every one.
 
 **The record cache is now sized by the store, not a constant**: 65 536
 node slots and 262 144 key slots by default (~30 MB), `MVCCS_CACHE_NODES`
-and `MVCCS_CACHE_KEYS` to change them. Measured on `pt`, 1,000 blocks, one
+and `MVCCS_CACHE_KEYS` to change them -- caps since, which it grows to
+rather than starts at ("The record cache grows to its size", below). Measured on `pt`, 1,000 blocks, one
 sitting: the old 4 096 / 16 384 averaged 0.276 s of inserts a block, the
 new default 0.241, a million key slots 0.218; the commit, 0.335 s, did
 not move. Bigger helps a little; the walk, not the misses, is the cost.
@@ -1581,6 +1582,70 @@ A store that ran `unmap_key` on a tree index before this fix can hold
 such nodes; rebuilding the index -- the vacuum's drop and remap -- writes
 it afresh. (A plain index kept as a log has its own `unmap_key` and never
 reached this.)
+
+## The record cache grows to its size -- it no longer starts there
+
+Sizing the record cache for big trees ("A hashed index, a growing table")
+built it whole when a store opened: 65 536 node and 262 144 key slots,
+~32 MB, every slot a constructed record and then emptied. A process that
+opens an embedded store to run one short program paid that before its
+first read, and nothing else it did cost as much: a fresh store's process
+took 69-93 ms to start where the build before the caps took 15-19 ms
+(seven alternating pairs of whole processes), reached 36 MB resident
+against 9, and took 8 131 minor faults against 1 393. With
+`MVCCS_CACHE_NODES=1024 MVCCS_CACHE_KEYS=1024`, or `MVCCS_NO_CACHE=1`, it
+started in 14-17 ms again. A server pays it once; a short-lived process
+pays it every time.
+
+**An array now starts at a sixteenth of its cap** (at least 1 024) --
+4 096 node and 16 384 key slots by default, the sizes before the caps --
+and grows four-fold, up to its cap, once it has missed as many times as it
+has slots since it last grew. A small tree never pays for the big cache; a
+big one reaches it after some 20 000 misses, a moment in a table of
+millions of rows. A growth keeps every record it holds: under the wider
+mask, the record in old slot `i` belongs at `i` or at `i` plus a multiple
+of the old size -- a slot in the new part, which no other record moves to
+-- and the slot it leaves is emptied. That last step is the one that
+matters: a slot left holding its copy is unreachable under the new mask,
+but the NEXT growth carries it to the record's slot again, and where the
+fresh copy already sits there, the stale one lands on it.
+
+**And the slot is now taken under the cache's mutex.** `get`, `put` and
+`forget` computed it from the mask before locking, harmless while the
+mask never changed. With growth, a reader filling the cache under the
+shared guard can widen it between another reader's slot and its lock, and
+that reader then writes its record where no lookup goes -- the stale copy
+of the paragraph above, by another road. Every slot is computed inside the
+lock now. (Argued, not tested: `tail-check` is one thread.)
+
+`tail-check.cpp` pins it, reading the size through `mvccs_cache_slots`
+(new): `main` caps both arrays at 16 384, so they start at 1 024 and must
+grow four-fold twice; 25 000 shuffled ids (section 5d)
+grow them to the cap with every id found after, and the reopened store's
+reads alone grow its fresh cache to the cap with every id found. Armed --
+the moved-from slot left as it was -- the first section already loses 621
+of its 2 000 ids.
+
+**What it costs a big tree: nothing a pair can see.** `table_bench 1000
+pt` with the txid index a tree (`MVCCS_LOG_INDEX=0`) -- the run the caps
+were sized on, two million rows under a random key -- mapped, the two
+engines in ABBA order in one sitting:
+
+| a block, average | built whole | grown | grown / whole |
+|---|---:|---:|---:|
+| first pair | 0.376 s (inserts 0.019, commit 0.357) | 0.371 s (0.016, 0.356) | 0.988 |
+| second pair | 0.364 s (0.014, 0.350) | 0.371 s (0.016, 0.356) | 1.020 |
+| the whole run | 375 s, 367 s | 374 s, 373 s | |
+
+Each pair within 2 %, in opposite directions: the box's drift, not the
+cache.
+
+**And the start-up is back.** The same seven alternating pairs of whole
+processes, the build before this change against this one: a fresh store
+72-87 ms against 16-22, a reopened one 40-51 against 15-21, a process
+that opens no store 11-16 in both; the fresh store's process 35-36 MB
+resident against 9, and 8 132 minor faults against 1 410 (the build before
+the caps: 1 393).
 
 ## Hard debugging, without changing a line
 

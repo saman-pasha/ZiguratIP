@@ -26,11 +26,19 @@
 // answers come from sets kept beside the store, not from counts written
 // by hand. STORE_MAP=1 for the mapped store; TAIL_CHECK_VERBOSE=1 lists
 // every id a check found missing or extra (the first five otherwise).
+//
+// The hint lives beside the B-tree record cache, and this check also pins
+// the cache's growth ("AND IT GROWS TO THAT SIZE"): main caps each array at
+// 16384 slots (MVCCS_CACHE_NODES / _KEYS), so it starts at 1024 and must
+// grow four-fold twice -- under 25,000 shuffled inserts, and in the reopened
+// store under reads alone -- with every id found after each.
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <map>
 #include <set>
+#include <vector>
 #include <thread>
 #include "engine.hpp"
 #include "filestream.hpp"
@@ -38,6 +46,12 @@
 
 // the hint's own counter, exported beside mvccs_cursor_steps
 int64_t mvccs_tail_appends ();
+// the record cache's node and key slots now (0 and 0 with MVCCS_NO_CACHE)
+void mvccs_cache_slots (Memory* m, int64_t* nodes, int64_t* keys);
+
+// the caps main sets, and so the start: a sixteenth, at least 1024
+static const int64_t CACHE_CAP = 16384, CACHE_START = 1024;
+static bool have_cache () { return getenv("MVCCS_NO_CACHE") == nullptr; }
 
 static const char* HEX = "/tmp/mvccs-tail-hexmap.bin";
 static const char* DAT = "/tmp/mvccs-tail-data.bin";
@@ -158,10 +172,14 @@ static void check_all (const char* label) {
   snprintf(buf, sizeof buf, "%s: and no other", label); check(buf, extra, 0);
   snprintf(buf, sizeof buf, "%s: the walk as long as the set", label); check(buf, all_p(), (long)mapped.size());
   snprintf(buf, sizeof buf, "%s: and in id order", label); check(buf, walk_in_order(), 1);
+  // each group's rows counted in one pass: a pass per group is quadratic
+  // once 5d has put tens of thousands of rows in
+  std::map<int64_t, long> per;
+  for (int64_t id : rows) per[id / 10]++;
   long g_bad = 0;
   for (int64_t g = 0; g <= top / 10 + 1; g++) {
-    long want = 0;
-    for (int64_t id : rows) if (id / 10 == g) want++;
+    auto it = per.find(g);
+    long want = it == per.end() ? 0 : it->second;
     if (eq_g(g) != want) g_bad++;
   }
   snprintf(buf, sizeof buf, "%s: G's every group as the rows say", label); check(buf, g_bad, 0);
@@ -178,9 +196,24 @@ static long reclaim () {
   return gone;
 }
 
+// the cache's two arrays both at SLOTS, or no cache at all
+static void check_cache (const char* what, int64_t slots) {
+  int64_t n = 0, k = 0;
+  mvccs_cache_slots(g_m, &n, &k);
+  char buf[160];
+  if (!have_cache()) {
+    snprintf(buf, sizeof buf, "%s: no cache (MVCCS_NO_CACHE)", what);
+    check(buf, (long)(n + k), 0);
+    return;
+  }
+  snprintf(buf, sizeof buf, "%s: node slots", what); check(buf, (long)n, (long)slots);
+  snprintf(buf, sizeof buf, "%s: key slots", what); check(buf, (long)k, (long)slots);
+}
+
 static int main_run () {
   remove(HEX); remove(DAT);
   open_all(true);
+  check_cache("the record cache at the open, a sixteenth of its cap", CACHE_START);
 
   // 1. ascending ids: the common insert
   int64_t before = mvccs_tail_appends();
@@ -308,6 +341,34 @@ static int main_run () {
   check_all("after 3000 mixed steps at the top");
   commit_transaction(g_m);
 
+  // 5d. the record cache grows: 25,000 ids in a shuffled order, from one
+  // seed, past every id so far (5c's rolled back ones too), so every insert
+  // descends a tree of two-to-four-key nodes and reads more records than
+  // the cache holds. Both arrays grow from 1024 to their cap of 16384, four-
+  // fold twice, carrying every record they hold; a slot left holding its
+  // stale copy would be carried over the fresh one at the second growth.
+  {
+    std::vector<int64_t> ids;
+    const int64_t lo = *rows.rbegin() + 1000;
+    for (int64_t i = 0; i < 25000; i++) ids.push_back(lo + i);
+    uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    for (size_t i = ids.size() - 1; i > 0; i--) {
+      seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+      std::swap(ids[i], ids[seed % (i + 1)]);
+    }
+    int n = 0;
+    begin_transaction(g_m);
+    for (int64_t id : ids) {
+      insert(id); rows.insert(id); mapped.insert(id);
+      if (++n % 100 == 0) { commit_transaction(g_m); begin_transaction(g_m); }
+    }
+    commit_transaction(g_m);
+  }
+  check_cache("after 25,000 shuffled inserts, grown to its cap", CACHE_CAP);
+  begin_transaction(g_m);
+  check_all("after the record cache grew");
+  commit_transaction(g_m);
+
   // 6. the vacuum's shape: the rolled back rows reclaimed, the storage
   // dropped, every row mapped again -- those unmap_key hid among them --
   // and appends after it
@@ -338,9 +399,12 @@ static int phase_reopen () {
   if (f) fclose(f);
   check("the rows main_run left, read back", rows.empty() ? 0 : 1, 1);
   open_all(false);
+  check_cache("the reopened store's cache, at the open", CACHE_START);
   begin_transaction(g_m);
   check_all("reopened");
   commit_transaction(g_m);
+  // every id read back through a cache that started small: reads alone grow it
+  check_cache("and grown to its cap by the reads alone", CACHE_CAP);
   int64_t before = mvccs_tail_appends();
   const int64_t base = *rows.rbegin();
   insert_run(base + 1, base + 200, 1, 25);
@@ -355,6 +419,9 @@ static int phase_reopen () {
 
 int main (int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  // read when a store opens: both arrays capped, so they start at 1024
+  setenv("MVCCS_CACHE_NODES", "16384", 1);
+  setenv("MVCCS_CACHE_KEYS", "16384", 1);
   const char* phase = argc > 1 ? argv[1] : "main";
   printf("tail_check %s: the hint %s\n", phase, hint_on() ? "on" : "OFF");
   int rc = 0;
