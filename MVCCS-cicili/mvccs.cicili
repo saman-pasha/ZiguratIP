@@ -86,6 +86,7 @@
   (defindex IDX_PAIR_AB Pair (a b) 1 3)
 
   (defsequence SEQ_ORDER "smoke::OrderSeq" 100 999 1)
+  (defsequence SEQ_KEPT "smoke::KeptSeq" 1 999 1)
 
   (deftable Memo "smoke::Memo" id (TEXT body))
   ;; a UNIQUE index over the text itself: the key is the text's hash,
@@ -752,6 +753,34 @@
                  (cast void e)
                  (set refused 1)))
           (check "maximum exceeds refused" refused 1))
+
+        ;; ---- a sequence keeps its row's address -----------------------
+        ;; The first draw walks for the row; every later one reads it where
+        ;; it was found (seq_with_current) and walks no page at all -- and
+        ;; a row that is not there any more is walked for again, never read
+        ;; where it stood: freed underneath, the draw refuses as it did
+        ;; when every draw walked.
+        (SEQ_KEPT_attach (aof mem))
+        (check "a kept sequence draws FROM first" (SEQ_KEPT_next) 1)
+        (let ((int64_t steps0 . #'(mvccs_cursor_steps))
+              (int64_t last . 0))
+          (for ((int i . 0)) (< i 10) ((++ i))
+            (set last (SEQ_KEPT_next)))
+          (check "ten draws after the first" last 11)
+          (check "and they walked no page" (- (mvccs_cursor_steps) steps0) 0))
+        (let ((SeqRow row)
+              (int64_t refused . 0))
+          (seq_with_current (aof SEQ_KEPT) (aof row))
+          (letin* ((streams (Streams (aof mem))))
+            (free_pointer (aof mem) (aof ($ row pointer)))
+            (cast void 0))
+          (try (block
+                 (let ((int64_t v . #'(SEQ_KEPT_next)))
+                   (cast void v)))
+               (catch ((const SequenceException & e))
+                 (cast void e)
+                 (set refused 1)))
+          (check "a draw whose row was freed refuses, not reads where it stood" refused 1))
 
         ;; ---- Globals: switches, the registry, who may reach what ------
         (globals_set_trace_mode 1)

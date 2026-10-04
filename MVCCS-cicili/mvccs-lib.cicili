@@ -161,6 +161,10 @@
     ;; read the WHOLE store's pages to find them -- see "The page list and
     ;; the free list" below for what that cost.
     (var const int64_t PAGE_BUCKET_COUNT . 251)
+    ;; the free list's size classes, a power of two each, and its slots:
+    ;; one chain per (key bucket, class) -- 251 x 24
+    (var const int64_t FREE_CLASSES . 24)
+    (var const int64_t FREE_SLOT_COUNT . 6024)
 
     ;; rowstate.hpp / rowlock.hpp / isolationlevel.hpp. Cicili's enum is a
     ;; plain C enum, so the members carry prefixes instead of scope.
@@ -819,7 +823,9 @@
     (member PageEntry * pages)
     ;; the same entries, chained by key: one bucket answers equal_range
     (member PageEntry * page_heads [PAGE_BUCKET_COUNT])
-    (member FreeEntry * frees)
+    ;; the free spans, chained by key bucket AND size class -- see "The
+    ;; free list, segregated" with allocate
+    (member FreeEntry * free_heads [6024])
     (member pthread_mutex_t hexmap_access)
     (member pthread_mutex_t data_access)
     (member pthread_rwlock_t streams_rw)
@@ -1481,15 +1487,6 @@
   ;; ==================================================================
   ;; Allocation
   ;; ==================================================================
-  (func free_list_insert ((Memory * m) (const uint8_t * key)
-                          (int64_t address) (int64_t size)) (out void)
-    (let ((FreeEntry * e . #'(new* FreeEntry)))
-      (set (-> e key) (intern_key key))
-      (set (-> e address) address)
-      (set (-> e size) size)
-      (set (-> e next) (-> m frees))
-      (set (-> m frees) e)))
-
   ;; Which chain a key's pages hang from: FNV-1a over the key's twenty
   ;; bytes, taken down to a bucket. The key is interned, so a pointer
   ;; would do -- but a cursor is handed the table's own array, which is
@@ -1500,6 +1497,41 @@
         (set h (xor h (cast uint64_t (nth i key))))
         (set h (* h (cast uint64_t 1099511628211))))
       (return (cast int64_t (% h (cast uint64_t PAGE_BUCKET_COUNT))))))
+
+;; ==================================================================
+  ;; THE FREE LIST, SEGREGATED. It was one list of every key's free spans,
+  ;; and a fresh page leaves a tail too short for the next row of its key
+  ;; behind it for good: measured on bench/table-bench.cpp, the list held
+  ;; 27 434 entries at its block 1 000, 21 001 of them the rows' -- one a
+  ;; page -- and every allocation that met no fit near the head walked
+  ;; them all, a cache miss a link, until a row's insert took 45 us
+  ;; instead of 6 (a quarter of a gdb sample of the run in `allocate').
+  ;; Now a span is chained by its key's bucket AND its size class, a
+  ;; power of two: an allocation looks in its own class -- a bounded walk,
+  ;; since that class holds the spans just too short for it -- and then
+  ;; takes the first span of its key in any larger class, which fits by
+  ;; construction. A short tail sits in a class nothing of its size asks.
+  ;; ==================================================================
+  (func free_class ((int64_t size)) (out int64_t)
+    (let ((int64_t c . 0)
+          (int64_t s . size))
+      (while (and (> s 1) (< c (- FREE_CLASSES 1)))
+        (set s (>> s 1))
+        (set c (+ c 1)))
+      (return c)))
+
+  (func free_slot ((const uint8_t * key) (int64_t size)) (out int64_t)
+    (return (+ (* (key_bucket key) FREE_CLASSES) (free_class size))))
+
+  (func free_list_insert ((Memory * m) (const uint8_t * key)
+                          (int64_t address) (int64_t size)) (out void)
+    (let ((FreeEntry * e . #'(new* FreeEntry))
+          (int64_t slot . #'(free_slot key size)))
+      (set (-> e key) (intern_key key))
+      (set (-> e address) address)
+      (set (-> e size) size)
+      (set (-> e next) (nth slot (-> m free_heads)))
+      (set (nth slot (-> m free_heads)) e)))
 
   ;; the head of KEY's chain. Every caller holds page_list_access, which
   ;; is what it held to walk the whole list.
@@ -1588,33 +1620,50 @@
       (pthread_mutex_lock (aof (-> m page_list_access)))
       (pthread_mutex_lock (aof (-> m free_list_access)))
 
-      ;; first fit from the free list. A free entry measures the WHOLE
-      ;; span; the Pointer handed out measures the DATA -- see _allocate
-      ;; in memory.cpp for the corruption confusing the two caused.
-      (let ((FreeEntry * prev . nil)
-            (FreeEntry * e . #'(-> m frees)))
-        (while (!= e nil)
-          (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
-              (block
-                (if (== actual_size (-> e size))
-                    (let ((Pointer p . #'(pointer_make (-> e key) (-> e address) size)))
-                      (if (== prev nil)
-                          (set (-> m frees) (-> e next))
-                        (set (-> prev next) (-> e next)))
-                      (delete* e)
-                      (pthread_mutex_unlock (aof (-> m free_list_access)))
-                      (pthread_mutex_unlock (aof (-> m page_list_access)))
-                      (return p)))
-                (if (< actual_size (-> e size))
-                    (let ((Pointer p . #'(pointer_make (-> e key) (-> e address) size)))
-                      ;; split: the tail keeps its place in the list
-                      (set (-> e address) (+ (-> e address) actual_size))
-                      (set (-> e size) (- (-> e size) actual_size))
-                      (pthread_mutex_unlock (aof (-> m free_list_access)))
-                      (pthread_mutex_unlock (aof (-> m page_list_access)))
-                      (return p)))))
-          (set prev e)
-          (set e (-> e next))))
+      ;; a fit from the free list: the span's own class, a bounded walk,
+      ;; then the first of this key's spans in any larger class. A free
+      ;; entry measures the WHOLE span; the Pointer handed out measures the
+      ;; DATA -- see _allocate in memory.cpp for the corruption confusing
+      ;; the two caused.
+      (let ((int64_t base . #'(* (key_bucket key) FREE_CLASSES))
+            (int64_t c . #'(free_class actual_size))
+            (FreeEntry * got . nil)
+            (FreeEntry * got_prev . nil)
+            (int64_t got_slot . -1))
+        (while (and (< c FREE_CLASSES) (== got nil))
+          (let ((FreeEntry * prev . nil)
+                (FreeEntry * e . #'(nth (+ base c) (-> m free_heads)))
+                (int64_t looked . 0))
+            (while (and (!= e nil) (and (== got nil) (< looked 16)))
+              (if (and (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+                       (<= actual_size (-> e size)))
+                  (block
+                    (set got e)
+                    (set got_prev prev)
+                    (set got_slot (+ base c)))
+                (block
+                  (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+                      (set looked (+ looked 1)))
+                  (set prev e)
+                  (set e (-> e next))))))
+          (set c (+ c 1)))
+        (if (!= got nil)
+            (let ((Pointer p . #'(pointer_make (-> got key) (-> got address) size)))
+              ;; out of its chain; a split's tail goes back in its own class
+              (if (== got_prev nil)
+                  (set (nth got_slot (-> m free_heads)) (-> got next))
+                (set (-> got_prev next) (-> got next)))
+              (if (== actual_size (-> got size))
+                  (delete* got)
+                (let ((int64_t slot . 0))
+                  (set (-> got address) (+ (-> got address) actual_size))
+                  (set (-> got size) (- (-> got size) actual_size))
+                  (set slot (free_slot (-> got key) (-> got size)))
+                  (set (-> got next) (nth slot (-> m free_heads)))
+                  (set (nth slot (-> m free_heads)) got)))
+              (pthread_mutex_unlock (aof (-> m free_list_access)))
+              (pthread_mutex_unlock (aof (-> m page_list_access)))
+              (return p))))
 
       ;; nothing fits: a new page, its tail registered free
       (let ((const uint8_t * key_interned . #'(intern_key key))
@@ -1673,20 +1722,29 @@
           (return 0)))
       (return 0)))
 
-  (func free_list_erase_at ((Memory * m) (const uint8_t * key) (int64_t address)) (out void)
+  ;; the span of KEY at ADDRESS out of the list: SIZE names its class, and
+  ;; a span registered otherwise is found by the bucket's every class
+  (func free_slot_erase ((Memory * m) (int64_t slot) (const uint8_t * key) (int64_t address)) (out bool)
     (let ((FreeEntry * prev . nil)
-          (FreeEntry * e . #'(-> m frees)))
+          (FreeEntry * e . #'(nth slot (-> m free_heads))))
       (while (!= e nil)
         (if (and (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
                  (== (-> e address) address))
             (block
               (if (== prev nil)
-                  (set (-> m frees) (-> e next))
+                  (set (nth slot (-> m free_heads)) (-> e next))
                 (set (-> prev next) (-> e next)))
               (delete* e)
-              (return)))
+              (return #t)))
         (set prev e)
-        (set e (-> e next)))))
+        (set e (-> e next)))
+      (return #f)))
+
+  (func free_list_erase_at ((Memory * m) (const uint8_t * key) (int64_t address) (int64_t size)) (out void)
+    (if (free_slot_erase m (free_slot key size) key address) (return))
+    (let ((int64_t base . #'(* (key_bucket key) FREE_CLASSES)))
+      (for ((int64_t c . 0)) (< c FREE_CLASSES) ((++ c))
+        (if (free_slot_erase m (+ base c) key address) (return)))))
 
   (func free_pointer ((Memory * m) (const Pointer * p)) (out void)
     (dba_watch2 m "Free" (-> p address) (-> p size))
@@ -1712,14 +1770,16 @@
             (block
               (set full_count (+ full_count prev_count))
               (set begin (- begin prev_count))
-              (free_list_erase_at m (-> p hash_key) (* (- from prev_count) CHUNK_SIZE)))))
+              (free_list_erase_at m (-> p hash_key) (* (- from prev_count) CHUNK_SIZE)
+                                  (* prev_count CHUNK_SIZE)))))
 
       ((-> (-> m hexmap_io) seekg) (+ from count) std::ios::beg)
       (let ((int64_t next_count . #'(free_next_count m)))
         (if (> next_count 0)
             (block
               (set full_count (+ full_count next_count))
-              (free_list_erase_at m (-> p hash_key) (* (+ from count) CHUNK_SIZE)))))
+              (free_list_erase_at m (-> p hash_key) (* (+ from count) CHUNK_SIZE)
+                                  (* next_count CHUNK_SIZE)))))
 
       (free_hexmap m begin full_count)
 
@@ -1788,6 +1848,14 @@
   (decl) (func idx_pending_apply () (out void))
   (decl) (func idx_pending_discard () (out void))
   (decl) (func idx_pending_drop_from ((time_t at)) (out void))
+
+  ;; the log index's hooks into the store's life, defined with it (see
+  ;; "THE LOG INDEX" beside the tree): a commit's first sync frees what it
+  ;; made safe to free, a table's TRUNCATE drops its log indexes before a
+  ;; row is freed, and a store opened afresh forgets the last one's logs
+  (decl) (func log_after_sync ((Memory * m)) (out void))
+  (decl) (func log_table_truncated ((Memory * m) (const uint8_t * table_key)) (out int))
+  (decl) (func log_forget_memory ((Memory * m)) (out void))
 
   (func transaction_push ((Memory * m) (const Pointer * p)) (out void)
     (dba_watch1 m "Transaction Push" (-> p address))
@@ -2074,6 +2142,9 @@
             ;; the intention, on disk before any control block moves
             (write_transaction m (-> t id) commit_time)
             (sync_disk m)
+            ;; that sync made every log run written so far durable, the
+            ;; merges' outputs among them: the runs they replace may go
+            (log_after_sync m)
             ;; then the control blocks it licenses
             (let ((TxnEntry * e . #'(-> t ctx_head)))
               (while (!= e nil)
@@ -3147,6 +3218,13 @@
       ;; the hexmap and moves entries the walk stands on
       (let ((DeadList * dead . #'(dead_pointers m hash_key))
             (size_t rows . 0))
+        ;; A FREED ROW'S ADDRESS CAN BE A NEW ROW'S, and a log index's
+        ;; entries name rows by address: the table's log indexes go first,
+        ;; durably, so no entry can outlive the row it named. The caller
+        ;; rebuilds them over the survivors, as it rebuilds a tree.
+        (if (!= dead nil)
+            (if (== 1 (log_table_truncated m hash_key))
+                (sync_disk m)))
         (while (!= dead nil)
           (free_pointer m (aof (-> dead ptr)))
           (set rows (+ rows 1))
@@ -3366,6 +3444,9 @@
   ;; the constructor's work -- Memory(hexmap, data, page_size)
   (func memory_open ((Memory * m) (binarystream * hexmap_io) (binarystream * data_io)
                      (int64_t page_size)) (out void)
+    ;; a Memory opened again -- or a new one at a freed one's address --
+    ;; owes nothing to the log indexes of the store it held before
+    (log_forget_memory m)
     (set (-> m hexmap_io) hexmap_io)
     (set (-> m data_io) data_io)
     (set (-> m page_size) page_size)
@@ -3377,7 +3458,8 @@
     ;; arrives with these indeterminate, exactly as bt_cache does
     (for ((int64_t b . 0)) (< b PAGE_BUCKET_COUNT) ((++ b))
       (set (nth b (-> m page_heads)) nil))
-    (set (-> m frees) nil)
+    (for ((int64_t f . 0)) (< f FREE_SLOT_COUNT) ((++ f))
+      (set (nth f (-> m free_heads)) nil))
     (set (-> m watcher) nil)
     ;; a fresh cache per open, never the field's old value: a Memory on the
     ;; stack or from a bare `new' arrives with that pointer indeterminate
@@ -3822,8 +3904,12 @@
   ;; answers 1 when the store met this index for the first time -- its
   ;; catalogue row was just created, and a table with rows already in it
   ;; has none of them in the tree until the consumer rebuilds it
+  ;; which structure the store keeps an index as -- see "THE LOG INDEX"
+  (decl) (func log_select ((BTreeIndex * idx)) (out void))
+
   (func bt_select_record ((BTreeIndex * idx)) (out int)
-    (let ((BTSelCtx sc))
+    (let ((BTSelCtx sc)
+          (int fresh . 0))
       (set ($ sc idx) idx)
       (set ($ sc found) 0)
       (letin* ((streams (Streams (-> idx m))))
@@ -3835,8 +3921,11 @@
       (if (== ($ sc found) 0)
           (block
             (bt_insert_record idx)
-            (return 1)))
-      (return 0)))
+            (set fresh 1)))
+      ;; a tree or a log, and the entries moved across when the store
+      ;; kept it as the other
+      (log_select idx)
+      (return fresh)))
 
   (func bt_update_record ((BTreeIndex * idx)) (out void)
     (let ((BTRecord rec))
@@ -3850,6 +3939,12 @@
   ;; ---- value chains (_insert_btreevalue / _delete_btreevalue) -------
   ;; Linked at the head -- the cheap end -- and the key written back
   ;; here, because every caller has just written the key anyway.
+  ;;
+  ;; nonzero while a log index's entries move back into a tree: each value
+  ;; is then COMMITTED as it is written, born when its row was, because
+  ;; the row it names was committed long before (log_to_tree)
+  (thread-local) (var int64_t tl_offline_values . 0)
+
   (func bt_insert_value ((BTreeIndex * idx) (BTKey * key) (int64_t value)) (out void)
     (let ((Memory * m . #'(-> idx m))
           (BTValue v))
@@ -3859,8 +3954,15 @@
 
       ;; transactional, unlike the nodes and keys: the entry must roll
       ;; back with the row it indexes
-      (transaction_push m (aof ($ v pointer)))
-      (control_insert m (cast (BaseTable *) (aof v)))
+      (if (!= tl_offline_values 0)
+          (let ((Control control))
+            (control_clear (aof control))
+            (set ($ control offline_state) ROW_INSERTED)
+            (set ($ control create_time) (cast time_t tl_offline_values))
+            (dump_control m (aof ($ v pointer)) (aof control)))
+        (block
+          (transaction_push m (aof ($ v pointer)))
+          (control_insert m (cast (BaseTable *) (aof v)))))
 
       (full_hexmap m (aof ($ v pointer)))
       ;; a failed read poisons the stream and every write after it no-ops --
@@ -4021,6 +4123,174 @@
     (if (!= (-> idx is_dependent) 0) (return 0))
     (if (!= (-> idx is_unique) 0) (return 0))
     (return 1))
+
+  ;; ==================================================================
+  ;; THE LOG INDEX: an insertion that does not grow with the index.
+  ;;
+  ;; WHY. Mapped in bulk at the commit (above), a hashed index still
+  ;; rewrote a random leaf and its two neighbouring key records in place
+  ;; for every row -- a block of 2 001 transactions dirtied ~6 000 pages
+  ;; scattered through the store, and the commit's msync waited for every
+  ;; one: 58 % of the wall clock near two million rows, and growing with
+  ;; the tree. Indexes kept as sorted RUNS written once and never edited
+  ;; in place -- a log-structured merge tree's shape, what LevelDB keeps
+  ;; a node's transaction index in -- turn the commit's index work into
+  ;; one sequential append of the transaction's sorted entries, whatever
+  ;; the index already holds.
+  ;;
+  ;; WHICH INDEXES. A single-level, non-unique, non-dependent one -- a
+  ;; transaction id, any String key, a plain foreign key. A unique index
+  ;; must refuse a duplicate at the insert, which wants the tree's
+  ;; descent; a composite keeps its dependent trees. MVCCS_LOG_INDEX=0 in
+  ;; the environment keeps every index a tree. A store switches either
+  ;; way at an index's attach, moving the entries across (log_select).
+  ;;
+  ;; WHAT AN ENTRY MEANS: (key, row address), and nothing about whether
+  ;; the row is alive. The tree's values are the rows' transactional
+  ;; twins and say who may see them; a log entry is written once, at the
+  ;; commit or earlier, and the ROW answers the visibility question when
+  ;; a cursor reaches it (log_row_visible -- visible() itself, or at
+  ;; SNAPSHOT the version's own lifetime). That is sound because a row
+  ;; version never changes its columns (an update writes a new version at
+  ;; a new address) and is never reclaimed except by TRUNCATE (rollback
+  ;; flags it dead), and TRUNCATE drops a table's log indexes before it
+  ;; frees a row (log_table_truncated) and rebuilds them after. So an
+  ;; entry can be early -- a row not committed yet, or rolled back -- or
+  ;; late -- a row deleted or superseded -- but never wrong: a delete or
+  ;; an update's old version writes nothing to the log at all.
+  ;;
+  ;; ON DISK: records of the index's own LOG KEY (its hash key, every
+  ;; byte turned), all offline. One META says the store keeps this index
+  ;; as a log. A run is BLOCKS of sorted (key, value) pairs -- half a
+  ;; page each -- and then its HEAD, written last, so a run whose head is
+  ;; on disk is whole; a merged run's head names the runs it replaces.
+  ;; The load (log_load) keeps every whole run nothing replaces and frees
+  ;; the rest, which is all a crash can leave behind.
+  ;;
+  ;; THE MERGE. A run's tier is its size, LOG_BASE entries and every
+  ;; LOG_FANOUT-fold after (log_tier_of); LOG_FANOUT runs of one tier
+  ;; merge into one. An entry is rewritten once per tier it climbs --
+  ;; sequentially -- and a lookup reads at most a few runs per tier. A
+  ;; merge is PACED: each commit that adds a run carries every merge under
+  ;; way a bounded step further, so no commit pays a whole one (see "THE
+  ;; MERGE, PACED"). The merged-away runs' records are freed only after
+  ;; the next commit's first sync has made their replacement durable
+  ;; (log_after_sync), and only once no cursor still holds them (LogSnap).
+  ;; ==================================================================
+  (var const int64_t LOG_ROOT . -2)
+  (var const int64_t LOG_KIND_META . 1)
+  (var const int64_t LOG_KIND_HEAD . 2)
+  (var const int64_t LOG_KIND_BLOCK . 3)
+  (var const int64_t LOG_BASE . 4096)
+  (var const int64_t LOG_FANOUT . 4)
+  ;; a block record: six header words, the entry count, the entries,
+  ;; and an empty list's count -- the first entry sits 56 bytes in
+  (var const int64_t LOG_ENTS_AT . 56)
+
+  (var const int LOG_ALL . 0)
+  (var const int LOG_EQ . 1)
+  (var const int LOG_NE . 2)
+  (var const int LOG_LT . 3)
+  (var const int LOG_LE . 4)
+  (var const int LOG_GT . 5)
+  (var const int LOG_GE . 6)
+
+  (struct LogEnt
+    (member int64_t key)
+    (member int64_t value))
+  (@define (code "logents_t std::vector<LogEnt>"))
+  (@define (code "logaddrs_t std::vector<int64_t>"))
+
+  ;; a block of a run, as the directory remembers it
+  (struct LogBlockRef
+    (member int64_t first)
+    (member int64_t last)
+    (member int64_t address)
+    (member int64_t count))
+  (@define (code "logblocks_t std::vector<LogBlockRef>"))
+
+  ;; one run in memory: refs counts the directory's hold and every
+  ;; cursor's; dropped says its pages went back wholesale, so nothing of
+  ;; it is to be freed record by record
+  (struct LogRun
+    (member int64_t id)
+    (member int64_t tier)
+    (member int64_t count)
+    (member int64_t head)
+    (member int refs)
+    (member int dropped)
+    (member logblocks_t blocks))
+  (@define (code "logruns_t std::vector<LogRun *>"))
+
+  ;; a merge under way across commits, one a tier at most (see "THE MERGE,
+  ;; PACED" with the cursors)
+  (decl) (struct LogPend)
+  (var const int64_t LOG_TIERS . 64)
+
+  ;; an index kept as a log: its runs oldest first, the records of
+  ;; released runs waiting for a sync before they may be freed, and the
+  ;; merges under way, by the tier they merge
+  (struct LogIndex
+    (member BTreeIndex * idx)
+    (member Memory * m)
+    (member const uint8_t * key)
+    (member int64_t next_id)
+    (member pthread_mutex_t access)
+    (member logruns_t runs)
+    (member logaddrs_t doomed)
+    (member LogPend * pending [64]))
+  (@define (code "logindexes_t std::vector<LogIndex *>"))
+
+  ;; every log index of the process, found by its BTreeIndex: the tree's
+  ;; own struct is laid out in every compiled object that holds one, so
+  ;; the log's state lives here and the index carries only LOG_ROOT in
+  ;; its root_address -- one compare on a tree's every path
+  (var pthread_mutex_t log_registry_access . PTHREAD_MUTEX_INITIALIZER)
+  (var logindexes_t * log_registry . nil)
+  ;; -1 until the environment has been read; then 0 off, 1 on
+  (var int g_log_index . -1)
+
+  (func log_index_enabled () (out int)
+    (if (< g_log_index 0)
+        (let ((const char * s . #'(getenv "MVCCS_LOG_INDEX")))
+          (set g_log_index (? (and (!= s nil) (== (nth 0 s) (cast char 48))) 0 1))))
+    (return g_log_index))
+
+  (func log_eligible ((BTreeIndex * idx)) (out int)
+    (if (== (log_index_enabled) 0) (return 0))
+    (if (!= (-> idx is_unique) 0) (return 0))
+    (if (!= (-> idx levels) 1) (return 0))
+    (if (!= (-> idx is_dependent) 0) (return 0))
+    (return 1))
+
+  ;; the index's log, or nil for a tree
+  (func log_of ((BTreeIndex * idx)) (out LogIndex *)
+    (if (!= (-> idx root_address) LOG_ROOT) (return nil))
+    (let ((LogIndex * found . nil))
+      (pthread_mutex_lock (aof log_registry_access))
+      (if (!= log_registry nil)
+          (for ((size_t i . 0)) (< i ((-> log_registry size))) ((++ i))
+            (let ((LogIndex * cand . #'(nth i (cof log_registry))))
+              (if (== (-> cand idx) idx)
+                  (block
+                    (set found cand)
+                    break)))))
+      (pthread_mutex_unlock (aof log_registry_access))
+      ;; a root that says log with no log behind it is an index used
+      ;; across a store's reopen without its attach: say so, rather than
+      ;; let a tree walk read address -2
+      (if (== found nil)
+          (throw* (IndexException "a log index used before its store attached it")))
+      (return found)))
+
+  ;; defined with the cursors, after the tree they stand beside
+  (decl) (func log_push ((LogIndex * li) (int64_t k) (int64_t value)) (out void))
+  (decl) (func log_add_run ((LogIndex * li) (logents_t * ents)) (out void))
+  (decl) (func log_cursor ((LogIndex * li) (int mode) (int64_t k) (void * user)
+                           (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool))
+  (decl) (func log_drop ((LogIndex * li)) (out void))
+  (decl) (func log_truncate ((LogIndex * li)) (out size_t))
+  (decl) (func log_unmap_key ((LogIndex * li) (int64_t k)) (out void))
 
   ;; _split_node: the lower half keeps the node, the upper half moves to
   ;; a fresh node of the SAME kind, and the median key is promoted into
@@ -4266,6 +4536,12 @@
 
   (func bt_map ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
     (dba_watch2 (-> idx m) "BTreeIndex map" k value)
+    ;; a log index queues every entry, inside an insert or not: the queue
+    ;; is how its entries reach a run
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_push (log_of idx) k value)
+          (return)))
     ;; a row's insert queues its entry; the commit maps the queue in bulk
     (if (== 1 (idx_defer_here idx))
         (let ((int64_t ks [1]))
@@ -4384,13 +4660,29 @@
       (($ batch swap) (cof tl_pending))
       (qsort (cast (void *) (($ batch data))) (($ batch size)) (sizeof IdxPending) idx_pending_cmp)
       (letin* ((scope (ApplyScope)))
-        (for ((size_t i . 0)) (< i (($ batch size))) ((++ i))
-          (let ((IdxPending * e . #'(aof (nth i batch))))
-            (set tl_push_at (-> e at))
-            (if (!= tl_txn nil) (set (-> tl_txn query_id) (-> e query_id)))
-            (if (> (-> (-> e idx) levels) 1)
-                (bt_map_multi (-> e idx) (-> e ks) (-> e value))
-              (bt_map (-> e idx) (nth 0 (-> e ks)) (-> e value)))))
+        (let ((size_t i . 0)
+              (size_t n . #'(($ batch size))))
+          (while (< i n)
+            (let ((IdxPending * e . #'(aof (nth i batch))))
+              (if (== (-> (-> e idx) root_address) LOG_ROOT)
+                  ;; a log index's entries are together and in key order:
+                  ;; they become one run
+                  (let ((BTreeIndex * idx . #'(-> e idx))
+                        (logents_t ents))
+                    (while (and (< i n) (== ($ (nth i batch) idx) idx))
+                      (let ((LogEnt le))
+                        (set ($ le key) (nth 0 ($ (nth i batch) ks)))
+                        (set ($ le value) ($ (nth i batch) value))
+                        (($ ents push_back) le))
+                      (set i (+ i 1)))
+                    (log_add_run (log_of idx) (aof ents)))
+                (block
+                  (set tl_push_at (-> e at))
+                  (if (!= tl_txn nil) (set (-> tl_txn query_id) (-> e query_id)))
+                  (if (> (-> (-> e idx) levels) 1)
+                      (bt_map_multi (-> e idx) (-> e ks) (-> e value))
+                    (bt_map (-> e idx) (nth 0 (-> e ks)) (-> e value)))
+                  (set i (+ i 1)))))))
         (cast void 0))))
 
   ;; a full rollback: the rows are gone, so are their entries
@@ -4520,6 +4812,8 @@
 
   (func bt_unmap ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out void)
     (dba_watch2 (-> idx m) "BTreeIndex unmap" k value)
+    ;; a log keeps the entry: the row it names says it is dead
+    (if (== (-> idx root_address) LOG_ROOT) (return))
     ;; the value to mark may still be queued
     (idx_pending_apply)
     (letin* ((streams (Streams (-> idx m))))
@@ -4804,6 +5098,10 @@
     (dba_watch1 (-> idx m) "BTreeIndex unmap_key" k)
     (if (> (-> idx levels) 1)
         (throw* (IndexException "unmap_key is single-level only")))
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_unmap_key (log_of idx) k)
+          (return)))
     (letin* ((streams (Streams (-> idx m))))
       (if (> (-> idx root_address) -1)
           (let ((BTNode root))
@@ -4974,6 +5272,8 @@
                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (return (log_cursor (log_of idx) LOG_ALL 0 user rcb)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -4997,6 +5297,8 @@
                        (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    ;; a log index is single-level: it has no dependents to hand over
+    (if (== (-> idx root_address) LOG_ROOT) (return #t))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5049,6 +5351,8 @@
                          (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (return (log_cursor (log_of idx) LOG_EQ k user rcb)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5081,6 +5385,7 @@
                              (func dcb ((void * c) (BTreeIndex * dep)) (out bool))) (out bool)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT) (return #t))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5124,6 +5429,10 @@
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_cursor (log_of idx) LOG_NE k user rcb)
+          (return)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5174,6 +5483,10 @@
                              (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_cursor (log_of idx) LOG_LT k user rcb)
+          (return)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5193,6 +5506,10 @@
                                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_cursor (log_of idx) LOG_LE k user rcb)
+          (return)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5256,6 +5573,10 @@
                                 (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_cursor (log_of idx) LOG_GT k user rcb)
+          (return)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5275,6 +5596,10 @@
                                       (func rcb ((void * c) (Pointer * p)) (out bool))) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_cursor (log_of idx) LOG_GE k user rcb)
+          (return)))
     (let ((BTEmit em))
       (set ($ em idx) idx)
       (set ($ em user) user)
@@ -5422,6 +5747,8 @@
   (func bt_truncate ((BTreeIndex * idx) (Memory * m)) (out size_t)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (return (log_truncate (log_of idx))))
     (block
       (letin* ((streams (Streams (-> idx m))))
         (bt_unlink_dead idx)
@@ -5449,17 +5776,19 @@
     (pthread_mutex_lock (aof (-> m free_list_access)))
     ;; the key's free entries first: their space is about to sit inside
     ;; __FREE__ pages and must not be handed out under the old key
-    (let ((FreeEntry * prev . nil)
-          (FreeEntry * e . #'(-> m frees)))
-      (while (!= e nil)
-        (if (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)))
-            (let ((FreeEntry * dead . e))
-              (set e (-> e next))
-              (if (== prev nil) (set (-> m frees) e) (set (-> prev next) e))
-              (delete* dead))
-          (block
-            (set prev e)
-            (set e (-> e next))))))
+    (let ((int64_t base . #'(* (key_bucket key) FREE_CLASSES)))
+      (for ((int64_t c . 0)) (< c FREE_CLASSES) ((++ c))
+        (let ((FreeEntry * prev . nil)
+              (FreeEntry * e . #'(nth (+ base c) (-> m free_heads))))
+          (while (!= e nil)
+            (if (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)))
+                (let ((FreeEntry * dead . e))
+                  (set e (-> e next))
+                  (if (== prev nil) (set (nth (+ base c) (-> m free_heads)) e) (set (-> prev next) e))
+                  (delete* dead))
+              (block
+                (set prev e)
+                (set e (-> e next))))))))
     ;; the key's own chain, and the next link is taken BEFORE the rekey
     ;; moves this entry out of it -- the two chains can be one bucket
     (let ((PageEntry * e . #'(page_chain m key))
@@ -5477,6 +5806,10 @@
   (func bt_drop_storage ((BTreeIndex * idx) (Memory * m)) (out void)
     ;; this transaction's own queued entries reach the tree first
     (idx_pending_apply)
+    (if (== (-> idx root_address) LOG_ROOT)
+        (block
+          (log_drop (log_of idx))
+          (return)))
     (block
       (letin* ((streams (Streams m)))
         (drop_key_pages m (-> idx hash_key))
@@ -5491,6 +5824,1344 @@
     (if (and (== (-> idx is_dependent) 0)
              (!= ($ (-> idx record_pointer) hash_key) nil))
         (bt_update_record idx)))
+
+  ;; ==================================================================
+  ;; THE LOG INDEX, built (the design is with the tree's deferred
+  ;; maintenance, above bt_split_node)
+  ;; ==================================================================
+  (func log_ent_cmp ((const void * a) (const void * b)) (out int)
+    (let ((const LogEnt * x . #'(cast (const LogEnt *) a))
+          (const LogEnt * y . #'(cast (const LogEnt *) b)))
+      (if (< (-> x key) (-> y key)) (return -1))
+      (if (> (-> x key) (-> y key)) (return 1))
+      (if (< (-> x value) (-> y value)) (return -1))
+      (if (> (-> x value) (-> y value)) (return 1))
+      (return 0)))
+
+  (func log_addr_cmp ((const void * a) (const void * b)) (out int)
+    (let ((int64_t x . #'(cof (cast (const int64_t *) a)))
+          (int64_t y . #'(cof (cast (const int64_t *) b))))
+      (if (< x y) (return -1))
+      (if (> x y) (return 1))
+      (return 0)))
+
+  (func log_ent_before ((const LogEnt * x) (const LogEnt * y)) (out bool)
+    (if (< (-> x key) (-> y key)) (return #t))
+    (if (> (-> x key) (-> y key)) (return #f))
+    (return (< (-> x value) (-> y value))))
+
+  ;; the one record a log key holds: six header words, the entry count
+  ;; and the entries, the list's count and the list. A META is its kind
+  ;; alone; a run's HEAD is (a id, b tier, c entries, d blocks) with the
+  ;; ids of the runs it replaces as its list; a run's BLOCK is (a id, b
+  ;; sequence, c entries) with the entries. Host order, as every record.
+  (struct LogRecord (inherits BaseTable)
+    (member int64_t kind)
+    (member int64_t a)
+    (member int64_t b)
+    (member int64_t c)
+    (member int64_t d)
+    (member int64_t e)
+    (member logents_t ents)
+    (member logaddrs_t list)
+    (override) (method pack_size () (out int64_t)
+      (return (+ 64 (+ (* 16 (cast int64_t (($ ($ this ents) size))))
+                       (* 8 (cast int64_t (($ ($ this list) size))))))))
+    (override) (method pack ((binarystream & io)) (out void)
+      (($ io write_std_long) (cast int64_t ($ this kind)))
+      (($ io write_std_long) (cast int64_t ($ this a)))
+      (($ io write_std_long) (cast int64_t ($ this b)))
+      (($ io write_std_long) (cast int64_t ($ this c)))
+      (($ io write_std_long) (cast int64_t ($ this d)))
+      (($ io write_std_long) (cast int64_t ($ this e)))
+      (($ io write_std_long) (cast int64_t (($ ($ this ents) size))))
+      (if (> (($ ($ this ents) size)) 0)
+          (($ io write) (cast (const char *) (($ ($ this ents) data)))
+                        (cast int64_t (* 16 (($ ($ this ents) size))))))
+      (($ io write_std_long) (cast int64_t (($ ($ this list) size))))
+      (if (> (($ ($ this list) size)) 0)
+          (($ io write) (cast (const char *) (($ ($ this list) data)))
+                        (cast int64_t (* 8 (($ ($ this list) size)))))))
+    (override) (method unpack ((binarystream & io)) (out void)
+      (($ io read_std_long) ($ this kind))
+      (($ io read_std_long) ($ this a))
+      (($ io read_std_long) ($ this b))
+      (($ io read_std_long) ($ this c))
+      (($ io read_std_long) ($ this d))
+      (($ io read_std_long) ($ this e))
+      (let ((int64_t n . 0))
+        (($ io read_std_long) n)
+        (if (or (< n 0) (> n 1048576)) (set n 0))
+        (($ ($ this ents) resize) (cast size_t n))
+        (if (> n 0)
+            (($ io read) (cast (char *) (($ ($ this ents) data))) (* 16 n))))
+      (let ((int64_t n . 0))
+        (($ io read_std_long) n)
+        (if (or (< n 0) (> n 1048576)) (set n 0))
+        (($ ($ this list) resize) (cast size_t n))
+        (if (> n 0)
+            (($ io read) (cast (char *) (($ ($ this list) data))) (* 8 n))))))
+
+  (func log_record_clear ((LogRecord * r) (int64_t kind)) (out void)
+    (set (-> r kind) kind)
+    (set (-> r a) 0)
+    (set (-> r b) 0)
+    (set (-> r c) 0)
+    (set (-> r d) 0)
+    (set (-> r e) 0)
+    (($ (-> r ents) clear))
+    (($ (-> r list) clear))
+    (set (-> r pointer) (pointer_null)))
+
+  ;; half a page of entries a block: two share a page, and a block never
+  ;; meets allocate's ceiling
+  (func log_block_cap ((Memory * m)) (out int64_t)
+    (let ((int64_t cap . #'(/ (- (/ (-> m page_size) 2) 128) 16)))
+      (if (< cap 16) (set cap 16))
+      (return cap)))
+
+  (func log_tier_of ((int64_t n)) (out int64_t)
+    (let ((int64_t tier . 0)
+          (int64_t size . LOG_BASE))
+      (while (> n size)
+        (set size (* size LOG_FANOUT))
+        (set tier (+ tier 1)))
+      (return tier)))
+
+  ;; the log's own key: the index's, every byte turned
+  (func log_key_of ((BTreeIndex * idx)) (out const uint8_t *)
+    (let ((uint8_t key [20]))
+      (for ((int64_t i . 0)) (< i HASHKEY_SIZE) ((++ i))
+        (set (nth i key) (cast uint8_t (bitand (xor (nth i (-> idx hash_key)) 255) 255))))
+      (return (intern_key key))))
+
+  ;; whether ADDRESS names an allocated record in a page keyed KEY -- the
+  ;; question every address the log holds is asked before it is read, and
+  ;; a sequence's kept row too
+  (func key_record_holds ((Memory * m) (const uint8_t * key) (int64_t address)) (out bool)
+    (if (<= address 0) (return #f))
+    (if (not (chain_resolves m address)) (return #f))
+    (let ((uint8_t page_key [20])
+          (int64_t page_size . #'(-> m page_size))
+          (binarystream * dio . #'(data_in m)))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (* (/ address page_size) page_size) std::ios::beg)
+      ((-> dio read) (cast (char *) page_key) HASHKEY_SIZE)
+      (if (not ((-> dio good)))
+          (block
+            ((-> dio clear))
+            (return #f)))
+      (return (== 0 (memcmp page_key key (cast size_t HASHKEY_SIZE))))))
+
+  ;; THE RAW WALK: every allocated record of KEY that is committed in the
+  ;; offline sense, handed to CB, judged by nobody. A cursor walk would
+  ;; judge -- and at REPEATABLE READ stamp a lock on what it reads, which
+  ;; a log's own records must never carry. The hexmap reading is
+  ;; cursor_walk's own. Under the caller's exclusive guard.
+  (func key_records ((Memory * m) (const uint8_t * key) (void * ctx)
+                     (func cb ((void * c) (Pointer * p)) (out void))) (out void)
+    (let ((logaddrs_t pages))
+      (pthread_mutex_lock (aof (-> m page_list_access)))
+      (let ((PageEntry * e . #'(page_chain m key)))
+        (while (!= e nil)
+          (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+              (($ pages push_back) (-> e address)))
+          (set e (-> e key_next))))
+      (pthread_mutex_unlock (aof (-> m page_list_access)))
+      (for ((size_t pn . 0)) (< pn (($ pages size))) ((++ pn))
+        (let ((int64_t page_address . #'(nth pn pages))
+              (uint8_t hexbuf [4096])
+              (int64_t i . PAGEFILE_CONTROL_COUNT))
+          (cursor_page_hexmap m page_address hexbuf)
+          (while (< i (-> m hbpp))
+            (let ((uint8_t hb . #'(nth i hexbuf)))
+              (if (== (bitand hb 128) 0)
+                  (block
+                    (set i (+ i 1))
+                    continue))
+              (let ((int64_t start . #'(+ (addr_hexmap page_address) i))
+                    (RowState online_state . #'(cast RowState (bitand hb 12)))
+                    (RowState offline_state . #'(cast RowState (bitand (nth (+ i 1) hexbuf) 12)))
+                    (int64_t size . 0)
+                    (bool at_end . #f)
+                    (bool is_data . #f))
+                (set i (+ i CONTROL_COUNT))
+                (while (and (not at_end) (< i (-> m hbpp)))
+                  (let ((uint8_t b . #'(nth i hexbuf)))
+                    (set i (+ i 1))
+                    (if (and (!= b CONTROL_STANDALONE_CHUNK) (== (bitand b 64) 64))
+                        (block
+                          (set at_end #t)
+                          (if (and (!= b CONTROL_CHUNK) (== (bitand b 128) 128))
+                              (block
+                                (set is_data #t)
+                                (set size (+ size (size_remainder b))))))
+                      (set size (+ size CHUNK_SIZE)))))
+                (if (and is_data (and (== offline_state ROW_INSERTED) (== online_state ROW_NONE)))
+                    (let ((Pointer p . #'(pointer_make key (* start CHUNK_SIZE) size)))
+                      (cb ctx (aof p)))))))))))
+
+  ;; ---- the directory's runs ----------------------------------------
+  ;; R loses a hold -- caller holds li->access. The last hold gone, its
+  ;; records wait for a sync (log_after_sync), unless its pages already
+  ;; went back wholesale.
+  (func log_unref ((LogIndex * li) (LogRun * r)) (out void)
+    (set (-> r refs) (- (-> r refs) 1))
+    (if (> (-> r refs) 0) (return))
+    (if (== (-> r dropped) 0)
+        (block
+          (for ((size_t bi . 0)) (< bi (($ (-> r blocks) size))) ((++ bi))
+            (($ (-> li doomed) push_back) ($ (nth bi (-> r blocks)) address)))
+          (if (> (-> r head) 0)
+              (($ (-> li doomed) push_back) (-> r head)))))
+    (delete* r))
+
+  ;; R out of the directory -- caller holds li->access
+  (func log_unlist ((LogIndex * li) (LogRun * r)) (out void)
+    (let ((size_t n . #'(($ (-> li runs) size)))
+          (size_t w . 0))
+      (for ((size_t i . 0)) (< i n) ((++ i))
+        (if (!= (nth i (-> li runs)) r)
+            (block
+              (set (nth w (-> li runs)) (nth i (-> li runs)))
+              (set w (+ w 1)))))
+      (($ (-> li runs) resize) w))
+    (log_unref li r))
+
+  ;; defined with the paced merge -- caller holds li->access
+  (decl) (func log_pend_abandon ((LogIndex * li) (int doom)) (out void))
+
+  ;; every run let go WITHOUT a record freed one by one: the pages go
+  ;; back wholesale, or belong to a store this process no longer holds.
+  ;; A merge under way goes first, its blocks with the rest.
+  (func log_release_all ((LogIndex * li)) (out void)
+    (pthread_mutex_lock (aof (-> li access)))
+    (log_pend_abandon li 0)
+    (for ((size_t i . 0)) (< i (($ (-> li runs) size))) ((++ i))
+      (let ((LogRun * r . #'(nth i (-> li runs))))
+        (set (-> r dropped) 1)
+        (log_unref li r)))
+    (($ (-> li runs) clear))
+    (($ (-> li doomed) clear))
+    (pthread_mutex_unlock (aof (-> li access))))
+
+  ;; a cursor's hold on the runs it walks: a merge finished by another
+  ;; thread's commit -- which may run inside this cursor's callback window
+  ;; -- cannot free a block this walk has yet to read
+  (struct LogSnap
+    (member LogIndex * li)
+    (member logruns_t runs)
+    (ctor ((LogIndex * l))
+      (init (li l))
+      (pthread_mutex_lock (aof (-> l access)))
+      (set ($ this runs) (-> l runs))
+      (for ((size_t i . 0)) (< i (($ ($ this runs) size))) ((++ i))
+        (let ((LogRun * r . #'(nth i ($ this runs))))
+          (set (-> r refs) (+ (-> r refs) 1))))
+      (pthread_mutex_unlock (aof (-> l access))))
+    (dtor ()
+      (pthread_mutex_lock (aof (-> ($ this li) access)))
+      (for ((size_t i . 0)) (< i (($ ($ this runs) size))) ((++ i))
+        (log_unref ($ this li) (nth i ($ this runs))))
+      (pthread_mutex_unlock (aof (-> ($ this li) access)))))
+
+  ;; ---- writing a run -----------------------------------------------
+  ;; Entries go in in order, a block goes out each time one fills, and the
+  ;; head goes out last -- so a merge streams, holding a block of each
+  ;; input and one of output, however big the runs. Under the caller's
+  ;; exclusive guard.
+  (struct LogWriter
+    (member LogIndex * li)
+    (member LogRun * run)
+    (member int64_t cap)
+    (member int64_t seq)
+    (member logents_t buf))
+
+  (func log_writer_begin ((LogIndex * li) (LogWriter * w)) (out void)
+    (let ((LogRun * run . #'(new* LogRun)))
+      (set (-> run id) (-> li next_id))
+      (set (-> li next_id) (+ (-> li next_id) 1))
+      (set (-> run tier) 0)
+      (set (-> run count) 0)
+      (set (-> run head) -1)
+      (set (-> run refs) 1)
+      (set (-> run dropped) 0)
+      (set (-> w li) li)
+      (set (-> w run) run)
+      (set (-> w cap) (log_block_cap (-> li m)))
+      (set (-> w seq) 0)
+      (($ (-> w buf) clear))))
+
+  (func log_writer_flush ((LogWriter * w)) (out void)
+    (if (== (($ (-> w buf) size)) 0) (return))
+    (let ((LogRecord rec)
+          (LogRun * run . #'(-> w run))
+          (int64_t take . #'(cast int64_t (($ (-> w buf) size)))))
+      (log_record_clear (aof rec) LOG_KIND_BLOCK)
+      (set ($ rec a) (-> run id))
+      (set ($ rec b) (-> w seq))
+      (set ($ rec c) take)
+      (($ ($ rec ents) swap) (-> w buf))
+      (offline_insert (-> (-> w li) m) (-> (-> w li) key) (cast (BaseTable *) (aof rec)))
+      (let ((LogBlockRef br))
+        (set ($ br first) ($ (nth 0 ($ rec ents)) key))
+        (set ($ br last) ($ (nth (- take 1) ($ rec ents)) key))
+        (set ($ br address) ($ ($ rec pointer) address))
+        (set ($ br count) take)
+        (($ (-> run blocks) push_back) br))
+      (set (-> run count) (+ (-> run count) take))
+      (set (-> w seq) (+ (-> w seq) 1))
+      (($ (-> w buf) clear))))
+
+  (func log_writer_add ((LogWriter * w) (const LogEnt * e)) (out void)
+    (($ (-> w buf) push_back) (cof e))
+    (if (>= (cast int64_t (($ (-> w buf) size))) (-> w cap))
+        (log_writer_flush w)))
+
+  ;; the head, naming REPLACED (nil for none), and the run joins the
+  ;; directory
+  (func log_writer_end ((LogWriter * w) (logaddrs_t * replaced)) (out void)
+    (log_writer_flush w)
+    (let ((LogRecord rec)
+          (LogIndex * li . #'(-> w li))
+          (LogRun * run . #'(-> w run)))
+      (set (-> run tier) (log_tier_of (-> run count)))
+      (log_record_clear (aof rec) LOG_KIND_HEAD)
+      (set ($ rec a) (-> run id))
+      (set ($ rec b) (-> run tier))
+      (set ($ rec c) (-> run count))
+      (set ($ rec d) (cast int64_t (($ (-> run blocks) size))))
+      (if (!= replaced nil) (set ($ rec list) (cof replaced)))
+      (offline_insert (-> li m) (-> li key) (cast (BaseTable *) (aof rec)))
+      (set (-> run head) ($ ($ rec pointer) address))
+      (pthread_mutex_lock (aof (-> li access)))
+      (($ (-> li runs) push_back) run)
+      (pthread_mutex_unlock (aof (-> li access)))))
+
+  (func log_write_run ((LogIndex * li) (logents_t * ents) (logaddrs_t * replaced)) (out void)
+    (let ((LogWriter w))
+      (log_writer_begin li (aof w))
+      (for ((size_t i . 0)) (< i ((-> ents size))) ((++ i))
+        (log_writer_add (aof w) (aof (nth i (cof ents)))))
+      (log_writer_end (aof w) replaced)))
+
+  (func log_write_meta ((LogIndex * li)) (out void)
+    (let ((LogRecord rec))
+      (log_record_clear (aof rec) LOG_KIND_META)
+      (set ($ rec a) 1)
+      (offline_insert (-> li m) (-> li key) (cast (BaseTable *) (aof rec)))))
+
+  ;; ---- reading a run -----------------------------------------------
+  ;; whether the record at BR is still block BR of run R: a run a
+  ;; TRUNCATE dropped under a cursor's window reads as its end, never as
+  ;; whatever the page holds now
+  (func log_block_ok ((LogIndex * li) (LogRun * r) (LogBlockRef * br)) (out bool)
+    (let ((binarystream * dio . #'(data_in (-> li m)))
+          (int64_t hdr [7]))
+      (if (not (key_record_holds (-> li m) (-> li key) (-> br address))) (return #f))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (addr_data (-> br address)) std::ios::beg)
+      ((-> dio read) (cast (char *) hdr) 56)
+      (if (not ((-> dio good)))
+          (block
+            ((-> dio clear))
+            (return #f)))
+      (return (and (== (nth 0 hdr) LOG_KIND_BLOCK)
+                   (and (== (nth 1 hdr) (-> r id))
+                        (== (nth 6 hdr) (-> br count)))))))
+
+  ;; block BI of run R, whole, into OUT
+  (func log_read_block ((LogIndex * li) (LogRun * r) (size_t bi) (logents_t * out)) (out bool)
+    (let ((LogBlockRef * br . #'(aof (nth bi (-> r blocks))))
+          (binarystream * dio . #'(data_in (-> li m))))
+      ((-> out clear))
+      (if (not (log_block_ok li r br)) (return #f))
+      ((-> out resize) (cast size_t (-> br count)))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (+ (addr_data (-> br address)) LOG_ENTS_AT) std::ios::beg)
+      ((-> dio read) (cast (char *) ((-> out data))) (* 16 (-> br count)))
+      (if (not ((-> dio good)))
+          (block
+            ((-> dio clear))
+            ((-> out clear))
+            (return #f)))
+      (return #t)))
+
+  ;; the entry at POS of a block already checked
+  (func log_entry_at ((LogIndex * li) (LogBlockRef * br) (int64_t pos) (LogEnt * out)) (out void)
+    (let ((binarystream * dio . #'(data_in (-> li m))))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (+ (addr_data (-> br address)) (+ LOG_ENTS_AT (* pos 16))) std::ios::beg)
+      ((-> dio read) (cast (char *) out) 16)))
+
+  ;; every row run R holds under K: the directory names the blocks, and
+  ;; halving inside a block finds the first -- a few reads, not a block's
+  (func log_collect_eq ((LogIndex * li) (LogRun * r) (int64_t k) (logaddrs_t * out)) (out void)
+    (let ((size_t nb . #'(($ (-> r blocks) size)))
+          (size_t lo . 0)
+          (size_t hi . 0)
+          (size_t bi . 0)
+          (int more . 1))
+      (set hi nb)
+      ;; the first block whose last key is not below K
+      (while (< lo hi)
+        (let ((size_t mid . #'(/ (+ lo hi) 2)))
+          (if (< ($ (nth mid (-> r blocks)) last) k)
+              (set lo (+ mid 1))
+            (set hi mid))))
+      (set bi lo)
+      (while (and (== more 1) (< bi nb))
+        (let ((LogBlockRef * br . #'(aof (nth bi (-> r blocks))))
+              (int64_t pos . 0)
+              (int64_t top . 0)
+              (LogEnt ent))
+          (if (or (> (-> br first) k) (not (log_block_ok li r br)))
+              (set more 0)
+            (block
+              (set top (-> br count))
+              (while (< pos top)
+                (let ((int64_t mid . #'(/ (+ pos top) 2)))
+                  (log_entry_at li br mid (aof ent))
+                  (if (< ($ ent key) k)
+                      (set pos (+ mid 1))
+                    (set top mid))))
+              (while (and (== more 1) (< pos (-> br count)))
+                (log_entry_at li br pos (aof ent))
+                (if (!= ($ ent key) k)
+                    (set more 0)
+                  (block
+                    ((-> out push_back) ($ ent value))
+                    (set pos (+ pos 1)))))))
+          (set bi (+ bi 1))))))
+
+  ;; one run walked in key order, a block in memory at a time
+  (struct LogIter
+    (member LogRun * run)
+    (member size_t bi)
+    (member size_t pos)
+    (member int done)
+    (member logents_t ents))
+  (@define (code "logiters_t std::vector<LogIter>"))
+
+  ;; block BI into the iterator, or the run's end -- a block that will
+  ;; not read ends the walk of its run
+  (func log_iter_fill ((LogIndex * li) (LogIter * it)) (out void)
+    (if (>= (-> it bi) (($ (-> (-> it run) blocks) size)))
+        (block
+          (set (-> it done) 1)
+          (return)))
+    (if (not (log_read_block li (-> it run) (-> it bi) (aof (-> it ents))))
+        (set (-> it done) 1)))
+
+  ;; past the current block's end: on to the next one
+  (func log_iter_settle ((LogIndex * li) (LogIter * it)) (out void)
+    (while (and (== (-> it done) 0) (>= (-> it pos) (($ (-> it ents) size))))
+      (set (-> it bi) (+ (-> it bi) 1))
+      (set (-> it pos) 0)
+      (log_iter_fill li it)))
+
+  ;; at the first entry MODE can want: a bound found by halving for GT and
+  ;; GE, the run's first entry for everything else
+  (func log_iter_start ((LogIndex * li) (LogIter * it) (int mode) (int64_t k)) (out void)
+    (let ((int bounded . #'(? (or (== mode LOG_GT) (== mode LOG_GE)) 1 0)))
+      (set (-> it bi) 0)
+      (set (-> it pos) 0)
+      (set (-> it done) 0)
+      (if (== bounded 1)
+          (let ((size_t lo . 0)
+                (size_t hi . #'(($ (-> (-> it run) blocks) size))))
+            (while (< lo hi)
+              (let ((size_t mid . #'(/ (+ lo hi) 2))
+                    (int64_t last . #'($ (nth mid (-> (-> it run) blocks)) last)))
+                (if (or (< last k) (and (== mode LOG_GT) (== last k)))
+                    (set lo (+ mid 1))
+                  (set hi mid))))
+            (set (-> it bi) lo)))
+      (log_iter_fill li it)
+      (if (and (== bounded 1) (== (-> it done) 0))
+          (let ((size_t p . 0)
+                (size_t n . #'(($ (-> it ents) size))))
+            (while (and (< p n)
+                        (or (< ($ (nth p (-> it ents)) key) k)
+                            (and (== mode LOG_GT) (== ($ (nth p (-> it ents)) key) k))))
+              (set p (+ p 1)))
+            (set (-> it pos) p)))
+      (log_iter_settle li it)))
+
+  ;; the iterator at the smallest (key, row), or -1 when every one is done
+  (func log_iters_best ((logiters_t * its)) (out int64_t)
+    (let ((int64_t best . -1))
+      (for ((size_t i . 0)) (< i ((-> its size))) ((++ i))
+        (if (== ($ (nth i (cof its)) done) 0)
+            (if (or (< best 0)
+                    (log_ent_before (aof (nth ($ (nth i (cof its)) pos) ($ (nth i (cof its)) ents)))
+                                    (aof (nth ($ (nth best (cof its)) pos) ($ (nth best (cof its)) ents)))))
+                (set best (cast int64_t i)))))
+      (return best)))
+
+  ;; ---- what a row answers ------------------------------------------
+  ;; THE ROW ANSWERS. visible() is the reader's judgment of one version,
+  ;; except at SNAPSHOT, where it walks a chain from the NEWEST version
+  ;; back -- right for a page scan, which meets the newest first, and
+  ;; wrong for a log entry naming an OLD version under its old key. There
+  ;; the version's own lifetime is the answer; the newer version has an
+  ;; entry of its own.
+  (func log_row_visible ((Memory * m) (Pointer * p) (Streams * streams)) (out bool)
+    (if (and (-> m initialized)
+             (and (!= tl_txn nil) (== (-> tl_txn isolation_level) SNAPSHOT)))
+        (let ((Control c))
+          (control_clear (aof c))
+          (load_control m p (aof c))
+          (if (and (> ($ c transaction_id) 0) (== ($ c transaction_id) (-> tl_txn id)))
+              (return (== ($ c online_state) ROW_INSERTED)))
+          (return (alive_at (aof c) (-> tl_txn init_time)))))
+    (return (visible m p streams)))
+
+  ;; whether the row at ADDR is anything but settled dead -- what the
+  ;; tree's own truncate keeps (bt_unlink_dead_values)
+  (func log_row_alive ((LogIndex * li) (int64_t addr)) (out bool)
+    (let ((Memory * m . #'(-> li m))
+          (const uint8_t * table_key . #'(-> (-> li idx) table_key)))
+      (if (not (key_record_holds m table_key addr)) (return #f))
+      (let ((Pointer p . #'(pointer_at m table_key addr))
+            (Control c))
+        (control_clear (aof c))
+        (load_control m (aof p) (aof c))
+        (return (not (and (or (== ($ c offline_state) ROW_DELETED)
+                              (== ($ c offline_state) ROW_UPDATED))
+                          (and (== ($ c online_state) ROW_NONE)
+                               (== ($ c online_lock) LOCK_NONE))))))))
+
+  ;; when the row at ADDR was born, if it is a settled live row, else 0 --
+  ;; the rows a log hands back to a tree
+  (func log_row_born ((LogIndex * li) (int64_t addr)) (out int64_t)
+    (let ((Memory * m . #'(-> li m))
+          (const uint8_t * table_key . #'(-> (-> li idx) table_key)))
+      (if (not (key_record_holds m table_key addr)) (return 0))
+      (let ((Pointer p . #'(pointer_at m table_key addr))
+            (Control c))
+        (control_clear (aof c))
+        (load_control m (aof p) (aof c))
+        (if (or (!= ($ c offline_state) ROW_INSERTED)
+                (or (!= ($ c online_state) ROW_NONE)
+                    (!= ($ c online_lock) LOCK_NONE)))
+            (return 0))
+        (if (<= (cast int64_t ($ c create_time)) 0) (return 1))
+        (return (cast int64_t ($ c create_time))))))
+
+  ;; one row to the caller, if this reader may see it, with the streams
+  ;; handed back around the callback exactly as bt_output_vcb hands them
+  ;; back. Answers 0 when the callback ends the walk.
+  (func log_emit ((LogIndex * li) (int64_t addr) (void * user)
+                  (func rcb ((void * c) (Pointer * p)) (out bool))) (out int)
+    (let ((Memory * m . #'(-> li m))
+          (const uint8_t * table_key . #'(-> (-> li idx) table_key))
+          (Streams * held . #'(? (!= tl_streams_held nil)
+                                 (cast (Streams *) tl_streams_held)
+                                 (cast (Streams *) tl_streams_shared))))
+      (if (not (key_record_holds m table_key addr)) (return 1))
+      (let ((Pointer row . #'(pointer_at m table_key addr)))
+        (if (not (log_row_visible m (aof row) held)) (return 1))
+        (let ((int old_rm . tl_window_reads)
+              (int flip . #'(? (and (!= held nil) (== 1 (reader_eligible m))) 1 0))
+              (int cont . 1))
+          (if (!= held nil) ((-> held unlock)))
+          (if (== flip 1) (set tl_window_reads 1))
+          (set cont (? (rcb user (aof row)) 1 0))
+          (if (== flip 1) (set tl_window_reads old_rm))
+          (if (!= held nil) ((-> held lock)))
+          (return cont)))))
+
+  ;; the runs merged in key order, each (key, row) once, within MODE's
+  ;; bound: every cursor but equality
+  (func log_merge_walk ((LogIndex * li) (logruns_t * runs) (int mode) (int64_t k) (void * user)
+                        (func rcb ((void * c) (Pointer * p)) (out bool))) (out int)
+    (let ((logiters_t its)
+          (int cont . 1)
+          (int have_last . 0)
+          (LogEnt last))
+      (($ its resize) ((-> runs size)))
+      (for ((size_t i . 0)) (< i (($ its size))) ((++ i))
+        (set ($ (nth i its) run) (nth i (cof runs)))
+        (log_iter_start li (aof (nth i its)) mode k))
+      (while (== cont 1)
+        (let ((int64_t best . #'(log_iters_best (aof its))))
+          (if (< best 0) break)
+          (let ((LogIter * it . #'(aof (nth best its)))
+                (LogEnt ent))
+            (set ent (nth (-> it pos) (-> it ents)))
+            ;; past the bound, nothing later qualifies either
+            (if (or (and (== mode LOG_LT) (>= ($ ent key) k))
+                    (and (== mode LOG_LE) (> ($ ent key) k)))
+                break)
+            (set (-> it pos) (+ (-> it pos) 1))
+            (log_iter_settle li it)
+            (if (and (== have_last 1)
+                     (and (== ($ ent key) ($ last key)) (== ($ ent value) ($ last value))))
+                continue)
+            (set have_last 1)
+            (set last ent)
+            (if (and (== mode LOG_NE) (== ($ ent key) k)) continue)
+            (set cont (log_emit li ($ ent value) user rcb)))))
+      (return cont)))
+
+  (func log_cursor ((LogIndex * li) (int mode) (int64_t k) (void * user)
+                    (func rcb ((void * c) (Pointer * p)) (out bool))) (out bool)
+    ;; this transaction's own queued entries reach the log first
+    (idx_pending_apply)
+    (let ((Memory * m . #'(-> li m))
+          (int cont . 1))
+      ;; a read, so the shared side wherever the isolation writes nothing
+      (if (== 1 (reader_eligible m)) (set tl_want_shared 1))
+      (letin* ((statement (Statement m))
+               (streams (Streams m))
+               (snap (LogSnap li)))
+        (if (== mode LOG_EQ)
+            (let ((logaddrs_t addrs))
+              (for ((size_t i . 0)) (< i (($ ($ snap runs) size))) ((++ i))
+                (log_collect_eq li (nth i ($ snap runs)) k (aof addrs)))
+              (if (> (($ addrs size)) 1)
+                  (qsort (cast (void *) (($ addrs data))) (($ addrs size)) (sizeof int64_t) log_addr_cmp))
+              (for ((size_t i . 0)) (and (< i (($ addrs size))) (== cont 1)) ((++ i))
+                (if (or (== i 0) (!= (nth i addrs) (nth (- i 1) addrs)))
+                    (set cont (log_emit li (nth i addrs) user rcb)))))
+          (set cont (log_merge_walk li (aof ($ snap runs)) mode k user rcb)))
+        (cast void 0))
+      (return (== cont 1))))
+
+  ;; ---- the merge ---------------------------------------------------
+  ;; GROUP's runs into one, streamed: MODE 0 keeps every entry, 1 leaves
+  ;; key K out, 2 leaves out the entries of settled dead rows. The new
+  ;; run's head names the runs it replaces, and they leave the directory.
+  ;; Answers how many entries were left out. Under the caller's exclusive
+  ;; guard.
+  (func log_merge ((LogIndex * li) (logruns_t * group) (int mode) (int64_t k)) (out int64_t)
+    (let ((logiters_t its)
+          (logaddrs_t ids)
+          (LogWriter w)
+          (int64_t dropped . 0)
+          (int have_last . 0)
+          (LogEnt last))
+      (($ its resize) ((-> group size)))
+      (for ((size_t i . 0)) (< i (($ its size))) ((++ i))
+        (set ($ (nth i its) run) (nth i (cof group)))
+        (let ((LogRun * r . #'(nth i (cof group))))
+          (($ ids push_back) (-> r id)))
+        (log_iter_start li (aof (nth i its)) LOG_ALL 0))
+      (log_writer_begin li (aof w))
+      (while #t
+        (let ((int64_t best . #'(log_iters_best (aof its))))
+          (if (< best 0) break)
+          (let ((LogIter * it . #'(aof (nth best its)))
+                (LogEnt ent))
+            (set ent (nth (-> it pos) (-> it ents)))
+            (set (-> it pos) (+ (-> it pos) 1))
+            (log_iter_settle li it)
+            (if (and (== have_last 1)
+                     (and (== ($ ent key) ($ last key)) (== ($ ent value) ($ last value))))
+                continue)
+            (set have_last 1)
+            (set last ent)
+            (if (or (and (== mode 1) (== ($ ent key) k))
+                    (and (== mode 2) (not (log_row_alive li ($ ent value)))))
+                (set dropped (+ dropped 1))
+              (log_writer_add (aof w) (aof ent))))))
+      (log_writer_end (aof w) (aof ids))
+      (pthread_mutex_lock (aof (-> li access)))
+      (for ((size_t g . 0)) (< g ((-> group size))) ((++ g))
+        (log_unlist li (nth g (cof group))))
+      (pthread_mutex_unlock (aof (-> li access)))
+      (return dropped)))
+
+  ;; ---- the merge, paced ---------------------------------------------
+  ;; THE MERGE, PACED. A set merged whole in the commit that completed it
+  ;; is that commit's to pay, and a tier's merge is LOG_FANOUT times the
+  ;; one below: table-bench's 2 001-row blocks paid 0.2-0.4 s at blocks
+  ;; 256, 512 and 768 for ~0.05 s elsewhere, and the next would be four
+  ;; times that -- an insertion constant on average whose worst case grows
+  ;; with the index. Paced, its worst block was 0.14-0.16 s. So a merge is carried ACROSS commits: each commit that adds
+  ;; a run takes every merge under way LOG_PACE times its own entries
+  ;; further (LOG_BASE at least), lowest tier first. A tier's set
+  ;; takes its LOG_FANOUT runs' worth of commits to gather, and its merge
+  ;; half that at this pace, so a merge is done before its tier has
+  ;; another set; a commit's merge work is bounded by its own size times
+  ;; the tiers, whatever the index holds.
+  ;;
+  ;; A merge under way is a LogPend: the runs it holds (a hold each, so
+  ;; nothing frees a block it has yet to read), an iterator on each, and
+  ;; the writer of the run it makes, whose blocks are written as they fill
+  ;; and whose head is written last, when the inputs are spent -- in the
+  ;; commit that finishes it, which lists the run and lets the inputs go.
+  ;; Until then a cursor reads the inputs, which are still listed, and
+  ;; never the half-written run, which is not. A crash leaves the run's
+  ;; blocks headless, which the load frees; anything that takes runs out
+  ;; of the directory otherwise -- a drop, a truncate, an unmap_key, a
+  ;; store let go -- abandons the merges first (log_pend_abandon).
+  ;;
+  ;; WHY NOT A THREAD. One was built and measured first: a commit that
+  ;; completed a set only signalled, and a thread merged, a block each time
+  ;; it held the guard. Under the one exclusive guard its writes took turns
+  ;; with the inserts, and every commit's msync paid for the pages it had
+  ;; dirtied, so the cost moved to the next block and grew nothing smaller
+  ;; -- table-bench's merge blocks 0.23-0.43 s against 0.21-0.27 in the
+  ;; commit, its average 0.061-0.065 s against 0.054-0.055, and through
+  ;; the server,
+  ;; 1 000 blocks a client process each, 0.1470 s a block against 0.1465
+  ;; with the one slow block, 0.76 s and 0.78, at the same merge. Pacing
+  ;; needs no second writer at all. MVCCS_LOG_MERGE=0 in the environment
+  ;; merges whole in the commit, as before.
+  (var const int64_t LOG_PACE . 2)
+  ;; -1 until the environment has been read; then 0 whole, 1 paced
+  (var int g_log_paced . -1)
+
+  (func log_merge_paced () (out int)
+    (if (< g_log_paced 0)
+        (let ((const char * s . #'(getenv "MVCCS_LOG_MERGE")))
+          (set g_log_paced (? (and (!= s nil) (== (nth 0 s) (cast char 48))) 0 1))))
+    (return g_log_paced))
+
+  (struct LogPend
+    (member int64_t tier)
+    (member logruns_t runs)
+    (member logiters_t its)
+    (member logaddrs_t ids)
+    (member LogWriter w)
+    (member int have_last)
+    (member LogEnt last))
+
+  ;; P given up or done: its holds let go and the record of it deleted. A
+  ;; run it was still writing is headless; DOOM 1 sends its blocks to wait
+  ;; for a sync, 0 leaves them to go back with the log's pages (a drop) or
+  ;; to the next load. Caller holds li->access.
+  (func log_pend_free ((LogIndex * li) (LogPend * p) (int doom)) (out void)
+    (for ((size_t i . 0)) (< i (($ (-> p runs) size))) ((++ i))
+      (log_unref li (nth i (-> p runs))))
+    (let ((LogRun * run . #'($ (-> p w) run)))
+      (if (!= run nil)
+          (block
+            (if (== doom 1)
+                (for ((size_t bi . 0)) (< bi (($ (-> run blocks) size))) ((++ bi))
+                  (($ (-> li doomed) push_back) ($ (nth bi (-> run blocks)) address))))
+            (delete* run))))
+    (delete* p))
+
+  ;; every merge of LI under way, given up -- caller holds li->access
+  (func log_pend_abandon ((LogIndex * li) (int doom)) (out void)
+    (for ((int64_t t . 0)) (< t LOG_TIERS) ((++ t))
+      (let ((LogPend * p . #'(nth t (-> li pending))))
+        (if (!= p nil)
+            (block
+              (set (nth t (-> li pending)) nil)
+              (log_pend_free li p doom))))))
+
+  ;; TIER's runs, held, as a merge under way -- when the tier has a full
+  ;; set and no merge of its own yet. Under the caller's exclusive guard.
+  (func log_pend_start ((LogIndex * li) (int64_t tier)) (out LogPend *)
+    (let ((LogPend * p . nil)
+          (int64_t have . 0))
+      (pthread_mutex_lock (aof (-> li access)))
+      (if (== (nth tier (-> li pending)) nil)
+          (block
+            (for ((size_t i . 0)) (< i (($ (-> li runs) size))) ((++ i))
+              (let ((LogRun * r . #'(nth i (-> li runs))))
+                (if (== (-> r tier) tier) (set have (+ have 1)))))
+            (if (>= have LOG_FANOUT)
+                (block
+                  (set p (new* LogPend))
+                  (set (-> p tier) tier)
+                  (set (-> p have_last) 0)
+                  (set ($ (-> p w) run) nil)
+                  (for ((size_t i . 0)) (< i (($ (-> li runs) size))) ((++ i))
+                    (let ((LogRun * r . #'(nth i (-> li runs))))
+                      (if (== (-> r tier) tier)
+                          (block
+                            (set (-> r refs) (+ (-> r refs) 1))
+                            (($ (-> p runs) push_back) r)
+                            (($ (-> p ids) push_back) (-> r id))))))
+                  (set (nth tier (-> li pending)) p)))))
+      (pthread_mutex_unlock (aof (-> li access)))
+      (if (!= p nil)
+          (block
+            (($ (-> p its) resize) (($ (-> p runs) size)))
+            (for ((size_t i . 0)) (< i (($ (-> p its) size))) ((++ i))
+              (set ($ (nth i (-> p its)) run) (nth i (-> p runs)))
+              (log_iter_start li (aof (nth i (-> p its))) LOG_ALL 0))
+            (log_writer_begin li (aof (-> p w)))))
+      (return p)))
+
+  ;; P carried BUDGET of its inputs' entries further. Answers 1 when they
+  ;; are spent: the run's head written, the run listed, the inputs out of
+  ;; the directory and out of P. Under the caller's exclusive guard.
+  (func log_pend_step ((LogIndex * li) (LogPend * p) (int64_t budget)) (out int)
+    (let ((int64_t taken . 0))
+      (while (< taken budget)
+        (let ((int64_t best . #'(log_iters_best (aof (-> p its)))))
+          (if (< best 0)
+              (block
+                (log_writer_end (aof (-> p w)) (aof (-> p ids)))
+                (set ($ (-> p w) run) nil)
+                (pthread_mutex_lock (aof (-> li access)))
+                (for ((size_t i . 0)) (< i (($ (-> p runs) size))) ((++ i))
+                  (let ((LogRun * r . #'(nth i (-> p runs))))
+                    (log_unlist li r)
+                    (log_unref li r)))
+                (($ (-> p runs) clear))
+                (pthread_mutex_unlock (aof (-> li access)))
+                (return 1)))
+          (let ((LogIter * it . #'(aof (nth best (-> p its))))
+                (LogEnt ent))
+            (set ent (nth (-> it pos) (-> it ents)))
+            (set (-> it pos) (+ (-> it pos) 1))
+            (log_iter_settle li it)
+            (set taken (+ taken 1))
+            (if (or (== (-> p have_last) 0)
+                    (or (!= ($ ent key) ($ (-> p last) key)) (!= ($ ent value) ($ (-> p last) value))))
+                (block
+                  (set (-> p have_last) 1)
+                  (set (-> p last) ent)
+                  (log_writer_add (aof (-> p w)) (aof ent)))))))
+      (return 0)))
+
+  ;; a commit's share: every tier, lowest first, its set's merge begun if
+  ;; one is due and carried LOG_PACE times ADDED further -- LOG_BASE at
+  ;; least, so a small commit still finishes the merges of its own tier's
+  ;; size -- and a merge that finishes may complete a higher tier's set,
+  ;; which the same pass reaches
+  (func log_pace ((LogIndex * li) (int64_t added)) (out void)
+    (let ((int64_t budget . #'(* LOG_PACE added)))
+      (if (< budget LOG_BASE) (set budget LOG_BASE))
+      (for ((int64_t t . 0)) (< t LOG_TIERS) ((++ t))
+        (let ((LogPend * p . #'(nth t (-> li pending))))
+          (if (== p nil) (set p (log_pend_start li t)))
+          (if (!= p nil)
+              (if (== 1 (log_pend_step li p budget))
+                  (block
+                    (pthread_mutex_lock (aof (-> li access)))
+                    (set (nth t (-> li pending)) nil)
+                    (log_pend_free li p 0)
+                    (pthread_mutex_unlock (aof (-> li access))))))))))
+
+  ;; the lowest tier holding LOG_FANOUT runs, merged whole -- and round
+  ;; again, since the merged run may complete the next tier's set: the
+  ;; commit's way under MVCCS_LOG_MERGE=0, and a tree's move into a log
+  (func log_compact ((LogIndex * li)) (out void)
+    (pthread_mutex_lock (aof (-> li access)))
+    (log_pend_abandon li 1)
+    (pthread_mutex_unlock (aof (-> li access)))
+    (let ((int merged . 1))
+      (while (== merged 1)
+        (set merged 0)
+        (let ((logruns_t group)
+              (int64_t tier . -1))
+          (pthread_mutex_lock (aof (-> li access)))
+          (for ((int64_t t . 0)) (and (< t LOG_TIERS) (< tier 0)) ((++ t))
+            (let ((int64_t have . 0))
+              (for ((size_t i . 0)) (< i (($ (-> li runs) size))) ((++ i))
+                (let ((LogRun * r . #'(nth i (-> li runs))))
+                  (if (== (-> r tier) t) (set have (+ have 1)))))
+              (if (>= have LOG_FANOUT) (set tier t))))
+          (if (>= tier 0)
+              (for ((size_t i . 0)) (< i (($ (-> li runs) size))) ((++ i))
+                (let ((LogRun * r . #'(nth i (-> li runs))))
+                  (if (== (-> r tier) tier)
+                      (($ group push_back) r)))))
+          (pthread_mutex_unlock (aof (-> li access)))
+          (if (>= tier 0)
+              (block
+                (log_merge li (aof group) 0 0)
+                (set merged 1)))))))
+
+  ;; ---- the verbs the tree's functions hand a log -------------------
+  ;; one transaction's entries for one index as a run, and its share of
+  ;; the merges (whole ones under MVCCS_LOG_MERGE=0)
+  (func log_add_run ((LogIndex * li) (logents_t * ents)) (out void)
+    (if (== ((-> ents size)) 0) (return))
+    (qsort (cast (void *) ((-> ents data))) ((-> ents size)) (sizeof LogEnt) log_ent_cmp)
+    (set tl_want_shared 0)
+    (letin* ((streams (Streams (-> li m))))
+      (log_write_run li ents nil)
+      (if (== 1 (log_merge_paced))
+          (log_pace li (cast int64_t ((-> ents size))))
+        (log_compact li))
+      (cast void 0)))
+
+  ;; how many queued entries a mapping outside a row's insert -- a
+  ;; rebuild walking a whole table -- may hold before they go to a run
+  (var const int64_t LOG_QUEUE_LIMIT . 1048576)
+
+  ;; an entry joins this thread's queue; the next drain or the commit
+  ;; makes the queue a run. Outside a row's insert the queue is not
+  ;; bounded by the transaction's inserts, so it is drained every
+  ;; LOG_QUEUE_LIMIT entries: a run written early only names rows a
+  ;; reader judges anyway.
+  (func log_push ((LogIndex * li) (int64_t k) (int64_t value)) (out void)
+    (let ((int64_t ks [1]))
+      (set (nth 0 ks) k)
+      (idx_pending_push (-> li idx) ks value))
+    (if (and (!= tl_defer_maps 1) (>= (idx_pending_count) LOG_QUEUE_LIMIT))
+        (idx_pending_apply)))
+
+  ;; the log's pages back wholesale, the directory emptied (a merge under
+  ;; way with it), and a fresh META: the index stays a log, holding nothing
+  (func log_drop ((LogIndex * li)) (out void)
+    (set tl_want_shared 0)
+    (letin* ((streams (Streams (-> li m))))
+      (log_release_all li)
+      (drop_key_pages (-> li m) (-> li key))
+      (log_write_meta li)
+      ((-> (-> (-> li m) hexmap_io) flush))
+      ((-> (-> (-> li m) data_io) flush))
+      (cast void 0)))
+
+  ;; what TRUNCATE asks of an index: every run merged into one without
+  ;; the entries of settled dead rows -- a merge under way given up for
+  ;; it. Answers how many went.
+  (func log_truncate ((LogIndex * li)) (out size_t)
+    (let ((logruns_t group)
+          (int64_t dropped . 0))
+      (set tl_want_shared 0)
+      (letin* ((streams (Streams (-> li m))))
+        (pthread_mutex_lock (aof (-> li access)))
+        (log_pend_abandon li 1)
+        (set group (-> li runs))
+        (pthread_mutex_unlock (aof (-> li access)))
+        (if (> (($ group size)) 0)
+            (set dropped (log_merge li (aof group) 2 0)))
+        (cast void 0))
+      (return (cast size_t dropped))))
+
+  ;; TRUE key deletion: every run merged into one without K -- the queue
+  ;; drained first, so an entry still queued goes too, and a merge under
+  ;; way given up, so none writes K back
+  (func log_unmap_key ((LogIndex * li) (int64_t k)) (out void)
+    (idx_pending_apply)
+    (let ((logruns_t group))
+      (set tl_want_shared 0)
+      (letin* ((streams (Streams (-> li m))))
+        (pthread_mutex_lock (aof (-> li access)))
+        (log_pend_abandon li 1)
+        (set group (-> li runs))
+        (pthread_mutex_unlock (aof (-> li access)))
+        (if (> (($ group size)) 0)
+            (log_merge li (aof group) 1 k))
+        (cast void 0))))
+
+  ;; the records of released runs, freed: run after a commit's first sync,
+  ;; which made every run written before it durable
+  (func log_free_doomed ((LogIndex * li)) (out void)
+    (let ((logaddrs_t gone))
+      (pthread_mutex_lock (aof (-> li access)))
+      (($ gone swap) (-> li doomed))
+      (pthread_mutex_unlock (aof (-> li access)))
+      (for ((size_t i . 0)) (< i (($ gone size))) ((++ i))
+        (if (key_record_holds (-> li m) (-> li key) (nth i gone))
+            (let ((Pointer p . #'(pointer_at (-> li m) (-> li key) (nth i gone))))
+              (free_pointer (-> li m) (aof p)))))))
+
+  (func log_after_sync ((Memory * m)) (out void)
+    (if (== log_registry nil) (return))
+    (let ((logindexes_t mine))
+      (pthread_mutex_lock (aof log_registry_access))
+      (for ((size_t i . 0)) (< i ((-> log_registry size))) ((++ i))
+        (let ((LogIndex * cand . #'(nth i (cof log_registry))))
+          (if (== (-> cand m) m)
+              (($ mine push_back) cand))))
+      (pthread_mutex_unlock (aof log_registry_access))
+      (for ((size_t i . 0)) (< i (($ mine size))) ((++ i))
+        (log_free_doomed (nth i mine)))))
+
+  ;; a table's dead rows are about to be freed: its log indexes go first
+  ;; (see truncate_key). Answers 1 when there were any.
+  (func log_table_truncated ((Memory * m) (const uint8_t * table_key)) (out int)
+    (if (== log_registry nil) (return 0))
+    (let ((logindexes_t hit))
+      (pthread_mutex_lock (aof log_registry_access))
+      (for ((size_t i . 0)) (< i ((-> log_registry size))) ((++ i))
+        (let ((LogIndex * li . #'(nth i (cof log_registry))))
+          (if (and (== (-> li m) m)
+                   (== 0 (memcmp (-> (-> li idx) table_key) table_key (cast size_t HASHKEY_SIZE))))
+              (($ hit push_back) li))))
+      (pthread_mutex_unlock (aof log_registry_access))
+      (for ((size_t i . 0)) (< i (($ hit size))) ((++ i))
+        (log_drop (nth i hit)))
+      (return (? (> (($ hit size)) 0) 1 0))))
+
+  ;; IDX's entry for its store. Answers it with *KNOWN 1 when this store's
+  ;; directory is already in memory -- an attach run twice -- and otherwise
+  ;; made, or found for another store and EMPTIED, to be read again.
+  (func log_register ((BTreeIndex * idx) (int * known)) (out LogIndex *)
+    (let ((LogIndex * li . nil))
+      (set (cof known) 0)
+      (pthread_mutex_lock (aof log_registry_access))
+      (if (== log_registry nil) (set log_registry (new* logindexes_t)))
+      (for ((size_t i . 0)) (< i ((-> log_registry size))) ((++ i))
+        (let ((LogIndex * cand . #'(nth i (cof log_registry))))
+          (if (== (-> cand idx) idx)
+              (block
+                (set li cand)
+                break))))
+      (if (and (!= li nil) (== (-> li m) (-> idx m)))
+          (block
+            (pthread_mutex_unlock (aof log_registry_access))
+            (set (cof known) 1)
+            (return li)))
+      (if (== li nil)
+          (block
+            (set li (new* LogIndex))
+            (pthread_mutex_init (aof (-> li access)) nil)
+            (for ((int64_t t . 0)) (< t LOG_TIERS) ((++ t))
+              (set (nth t (-> li pending)) nil))
+            ((-> log_registry push_back) li)))
+      (pthread_mutex_unlock (aof log_registry_access))
+      (log_release_all li)
+      (pthread_mutex_lock (aof (-> li access)))
+      (set (-> li idx) idx)
+      (set (-> li m) (-> idx m))
+      (set (-> li key) (log_key_of idx))
+      (set (-> li next_id) 1)
+      (pthread_mutex_unlock (aof (-> li access)))
+      (return li)))
+
+  ;; every log of a store, forgotten: it is being opened afresh, or closed.
+  ;; An index still saying LOG_ROOT afterwards refuses until attached again.
+  (func log_forget_where ((Memory * m) (BTreeIndex * idx)) (out void)
+    (if (== log_registry nil) (return))
+    (pthread_mutex_lock (aof log_registry_access))
+    (let ((size_t w . 0))
+      (for ((size_t i . 0)) (< i ((-> log_registry size))) ((++ i))
+        (let ((LogIndex * li . #'(nth i (cof log_registry))))
+          (if (or (and (!= m nil) (== (-> li m) m))
+                  (and (!= idx nil) (== (-> li idx) idx)))
+              (block
+                (log_release_all li)
+                (pthread_mutex_destroy (aof (-> li access)))
+                (delete* li))
+            (block
+              (set (nth w (cof log_registry)) li)
+              (set w (+ w 1))))))
+      ((-> log_registry resize) w))
+    (pthread_mutex_unlock (aof log_registry_access)))
+
+  (func log_forget_memory ((Memory * m)) (out void)
+    (log_forget_where m nil))
+
+  ;; ---- the load and the moves across -------------------------------
+  (struct LogHeadInfo
+    (member int64_t address)
+    (member int64_t id)
+    (member int64_t tier)
+    (member int64_t count)
+    (member int64_t nblocks)
+    (member int whole)
+    (member logaddrs_t replaced))
+  (@define (code "logheads_t std::vector<LogHeadInfo>"))
+
+  (struct LogBlockInfo
+    (member int64_t address)
+    (member int64_t run)
+    (member int64_t seq)
+    (member int64_t count)
+    (member int64_t first)
+    (member int64_t last))
+  (@define (code "logbinfos_t std::vector<LogBlockInfo>"))
+
+  (struct LogLoad
+    (member Memory * m)
+    (member logaddrs_t metas)
+    (member logaddrs_t debris)
+    (member logheads_t heads)
+    (member logbinfos_t blocks))
+
+  (func log_binfo_cmp ((const void * a) (const void * b)) (out int)
+    (let ((const LogBlockInfo * x . #'(cast (const LogBlockInfo *) a))
+          (const LogBlockInfo * y . #'(cast (const LogBlockInfo *) b)))
+      (if (< (-> x run) (-> y run)) (return -1))
+      (if (> (-> x run) (-> y run)) (return 1))
+      (if (< (-> x seq) (-> y seq)) (return -1))
+      (if (> (-> x seq) (-> y seq)) (return 1))
+      (return 0)))
+
+  (func log_load_cb ((void * c) (Pointer * p)) (out void)
+    (let ((LogLoad * ld . #'(cast (LogLoad *) c))
+          (binarystream * dio . #'(data_in (-> ld m)))
+          (int64_t hdr [7]))
+      (if (not ((-> dio good))) ((-> dio clear)))
+      ((-> dio seekg) (ptr_data p) std::ios::beg)
+      ((-> dio read) (cast (char *) hdr) 56)
+      (if (not ((-> dio good)))
+          (block
+            ((-> dio clear))
+            (($ (-> ld debris) push_back) (-> p address))
+            (return)))
+      (cond
+        ((== (nth 0 hdr) LOG_KIND_META)
+         (($ (-> ld metas) push_back) (-> p address)))
+        ((and (== (nth 0 hdr) LOG_KIND_HEAD) (== (nth 6 hdr) 0))
+         (let ((LogHeadInfo h)
+               (int64_t nl . 0))
+           (set ($ h address) (-> p address))
+           (set ($ h id) (nth 1 hdr))
+           (set ($ h tier) (nth 2 hdr))
+           (set ($ h count) (nth 3 hdr))
+           (set ($ h nblocks) (nth 4 hdr))
+           (set ($ h whole) 0)
+           ((-> dio read_std_long) nl)
+           (if (and (not (not ((-> dio good)))) (and (>= nl 0) (<= nl 4096)))
+               (block
+                 (($ ($ h replaced) resize) (cast size_t nl))
+                 (if (> nl 0)
+                     ((-> dio read) (cast (char *) (($ ($ h replaced) data))) (* 8 nl)))))
+           (if (not ((-> dio good)))
+               (block
+                 ((-> dio clear))
+                 (($ ($ h replaced) clear))))
+           (($ (-> ld heads) push_back) h)))
+        ((and (== (nth 0 hdr) LOG_KIND_BLOCK) (> (nth 6 hdr) 0))
+         (let ((LogBlockInfo b)
+               (LogEnt e))
+           (set ($ b address) (-> p address))
+           (set ($ b run) (nth 1 hdr))
+           (set ($ b seq) (nth 2 hdr))
+           (set ($ b count) (nth 6 hdr))
+           ((-> dio read) (cast (char *) (aof e)) 16)
+           (set ($ b first) ($ e key))
+           ((-> dio seekg) (+ (ptr_data p) (+ LOG_ENTS_AT (* 16 (- (nth 6 hdr) 1)))) std::ios::beg)
+           ((-> dio read) (cast (char *) (aof e)) 16)
+           (set ($ b last) ($ e key))
+           (if (not (not ((-> dio good))))
+               (($ (-> ld blocks) push_back) b)
+             (block
+               ((-> dio clear))
+               (($ (-> ld debris) push_back) (-> p address))))))
+        (#t (($ (-> ld debris) push_back) (-> p address))))))
+
+  ;; THE DIRECTORY, READ BACK: every whole run nothing replaces, and the
+  ;; rest freed -- a run without its head, a run a merge's head names, a
+  ;; second META, whatever will not read: all a crash can leave behind.
+  ;; Answers whether the store already keeps this index as a log. Under
+  ;; the caller's exclusive guard.
+  (func log_load ((LogIndex * li)) (out int)
+    (let ((LogLoad ld)
+          (Memory * m . #'(-> li m))
+          (logaddrs_t replaced)
+          (logaddrs_t lose)
+          (int64_t top . 0))
+      (set ($ ld m) m)
+      (key_records m (-> li key) (cast (void *) (aof ld)) log_load_cb)
+      (if (> (($ ($ ld blocks) size)) 1)
+          (qsort (cast (void *) (($ ($ ld blocks) data))) (($ ($ ld blocks) size))
+                 (sizeof LogBlockInfo) log_binfo_cmp))
+      ;; whole: every block there, numbered from 0
+      (for ((size_t h . 0)) (< h (($ ($ ld heads) size))) ((++ h))
+        (let ((LogHeadInfo * hd . #'(aof (nth h ($ ld heads))))
+              (int64_t seen . 0))
+          (if (> (-> hd id) top) (set top (-> hd id)))
+          (for ((size_t b . 0)) (< b (($ ($ ld blocks) size))) ((++ b))
+            (if (and (== ($ (nth b ($ ld blocks)) run) (-> hd id))
+                     (== ($ (nth b ($ ld blocks)) seq) seen))
+                (set seen (+ seen 1))))
+          (if (== seen (-> hd nblocks))
+              (block
+                (set (-> hd whole) 1)
+                (($ replaced insert) (($ replaced end))
+                                     (($ (-> hd replaced) begin)) (($ (-> hd replaced) end)))))))
+      ;; kept: whole, and replaced by no whole run
+      (for ((size_t h . 0)) (< h (($ ($ ld heads) size))) ((++ h))
+        (let ((LogHeadInfo * hd . #'(aof (nth h ($ ld heads))))
+              (int gone . 0))
+          (for ((size_t r . 0)) (< r (($ replaced size))) ((++ r))
+            (if (== (nth r replaced) (-> hd id)) (set gone 1)))
+          (if (or (== (-> hd whole) 0) (== gone 1))
+              (block
+                (set (-> hd whole) 0)
+                (($ lose push_back) (-> hd address)))
+            (let ((LogRun * run . #'(new* LogRun)))
+              (set (-> run id) (-> hd id))
+              (set (-> run tier) (-> hd tier))
+              (set (-> run count) (-> hd count))
+              (set (-> run head) (-> hd address))
+              (set (-> run refs) 1)
+              (set (-> run dropped) 0)
+              (for ((size_t b . 0)) (< b (($ ($ ld blocks) size))) ((++ b))
+                (let ((LogBlockInfo * bi . #'(aof (nth b ($ ld blocks)))))
+                  (if (== (-> bi run) (-> hd id))
+                      (let ((LogBlockRef br))
+                        (set ($ br first) (-> bi first))
+                        (set ($ br last) (-> bi last))
+                        (set ($ br address) (-> bi address))
+                        (set ($ br count) (-> bi count))
+                        (($ (-> run blocks) push_back) br)))))
+              (pthread_mutex_lock (aof (-> li access)))
+              (($ (-> li runs) push_back) run)
+              (pthread_mutex_unlock (aof (-> li access)))))))
+      ;; the blocks of no kept run
+      (for ((size_t b . 0)) (< b (($ ($ ld blocks) size))) ((++ b))
+        (let ((LogBlockInfo * bi . #'(aof (nth b ($ ld blocks))))
+              (int kept . 0))
+          (if (> (-> bi run) top) (set top (-> bi run)))
+          (for ((size_t h . 0)) (< h (($ ($ ld heads) size))) ((++ h))
+            (if (and (== ($ (nth h ($ ld heads)) whole) 1)
+                     (== ($ (nth h ($ ld heads)) id) (-> bi run)))
+                (set kept 1)))
+          (if (== kept 0) (($ lose push_back) (-> bi address)))))
+      ;; one META is the mark; a second, and the debris, go too
+      (for ((size_t i . 1)) (< i (($ ($ ld metas) size))) ((++ i))
+        (($ lose push_back) (nth i ($ ld metas))))
+      (($ lose insert) (($ lose end)) (($ ($ ld debris) begin)) (($ ($ ld debris) end)))
+      (for ((size_t i . 0)) (< i (($ lose size))) ((++ i))
+        (if (key_record_holds m (-> li key) (nth i lose))
+            (let ((Pointer p . #'(pointer_at m (-> li key) (nth i lose))))
+              (free_pointer m (aof p)))))
+      (set (-> li next_id) (+ top 1))
+      (return (? (> (($ ($ ld metas) size)) 0) 1 0))))
+
+  (struct LogTreeCtx
+    (member BTreeIndex * idx)
+    (member logents_t * ents))
+
+  ;; every value of KEY's chain, whatever its visibility: a log holds the
+  ;; superset its rows judge (see "WHAT AN ENTRY MEANS")
+  (func log_tree_kcb ((void * c) (BTKey * key)) (out bool)
+    (let ((LogTreeCtx * tc . #'(cast (LogTreeCtx *) c))
+          (Memory * m . #'(-> (-> tc idx) m))
+          (int64_t tmp . #'(-> key values_address))
+          (int64_t brent_mark . -2)
+          (int64_t brent_steps . 0)
+          (int64_t brent_limit . 2))
+      (while (> tmp -1)
+        (if (not (chain_resolves m tmp)) break)
+        (if (== tmp brent_mark) break)
+        (set brent_steps (+ brent_steps 1))
+        (if (== brent_steps brent_limit)
+            (block
+              (set brent_mark tmp)
+              (set brent_steps 0)
+              (set brent_limit (* brent_limit 2))))
+        (let ((Pointer vp . #'(pointer_at m (-> (-> tc idx) hash_key) tmp))
+              (BTValue v)
+              (LogEnt e)
+              (binarystream * dio . #'(data_in m)))
+          (if (not ((-> dio good))) ((-> dio clear)))
+          ((-> dio seekg) (ptr_data (aof vp)) std::ios::beg)
+          (($ v unpack) (cof dio))
+          (set ($ e key) (-> key key))
+          (set ($ e value) ($ v value))
+          ((-> (-> tc ents) push_back) e)
+          (set tmp ($ v next_address))))
+      (return #t)))
+
+  ;; a tree the store kept for this index: its entries into one run, its
+  ;; storage back to the allocator, and the catalogue's root with it
+  (func log_from_tree ((LogIndex * li)) (out void)
+    (let ((BTreeIndex * idx . #'(-> li idx))
+          (logents_t ents)
+          (LogTreeCtx tc))
+      (set ($ tc idx) idx)
+      (set ($ tc ents) (aof ents))
+      (bt_walk_keys_rec idx (-> idx root_address) (cast (void *) (aof tc)) log_tree_kcb)
+      (if (> (($ ents size)) 1)
+          (qsort (cast (void *) (($ ents data))) (($ ents size)) (sizeof LogEnt) log_ent_cmp))
+      (if (> (($ ents size)) 0)
+          (block
+            (log_write_run li (aof ents) nil)
+            (log_compact li)))
+      (drop_key_pages (-> li m) (-> idx hash_key))
+      (set (-> idx root_address) -1)
+      (if (!= ($ (-> idx record_pointer) hash_key) nil)
+          (bt_update_record idx))))
+
+  ;; what the move back borrows -- the defer flag, and the offline stamp
+  ;; bt_insert_value reads -- handed back however the maps leave
+  (struct LogBackScope
+    (member int defer_)
+    (ctor ()
+      (init (defer_ 0))
+      (set ($ this defer_) tl_defer_maps)
+      (set tl_defer_maps 0))
+    (dtor ()
+      (set tl_defer_maps ($ this defer_))
+      (set tl_offline_values 0)))
+
+  ;; a log the store kept for an index that is a tree now: the entries of
+  ;; the rows still alive back into the tree -- each value committed as it
+  ;; is written and born when its row was, so every reader that could see
+  ;; the row finds it -- and the log's pages back to the allocator
+  (func log_to_tree ((BTreeIndex * idx) (const uint8_t * key)) (out void)
+    (let ((LogIndex * li . #'(new* LogIndex))
+          (logents_t all)
+          (logents_t blk)
+          (Memory * m . #'(-> idx m)))
+      (pthread_mutex_init (aof (-> li access)) nil)
+      (set (-> li idx) idx)
+      (set (-> li m) m)
+      (set (-> li key) key)
+      (set (-> li next_id) 1)
+      (log_load li)
+      (for ((size_t r . 0)) (< r (($ (-> li runs) size))) ((++ r))
+        (let ((LogRun * run . #'(nth r (-> li runs))))
+          (for ((size_t bi . 0)) (< bi (($ (-> run blocks) size))) ((++ bi))
+            (if (log_read_block li run bi (aof blk))
+                (($ all insert) (($ all end)) (($ blk begin)) (($ blk end)))))))
+      (if (> (($ all size)) 1)
+          (qsort (cast (void *) (($ all data))) (($ all size)) (sizeof LogEnt) log_ent_cmp))
+      (letin* ((scope (LogBackScope)))
+        (for ((size_t i . 0)) (< i (($ all size))) ((++ i))
+          (if (or (== i 0)
+                  (or (!= ($ (nth i all) key) ($ (nth (- i 1) all) key))
+                      (!= ($ (nth i all) value) ($ (nth (- i 1) all) value))))
+              (let ((int64_t born . #'(log_row_born li ($ (nth i all) value))))
+                (if (> born 0)
+                    (block
+                      (set tl_offline_values born)
+                      ;; a UNIQUE index now refuses what the log held twice
+                      (try (bt_map idx ($ (nth i all) key) ($ (nth i all) value))
+                           (catch ((const IndexException & x))
+                             (cast void x)))
+                      (set tl_offline_values 0))))))
+        (cast void 0))
+      (log_release_all li)
+      (pthread_mutex_destroy (aof (-> li access)))
+      (delete* li)
+      (drop_key_pages m key)))
+
+  ;; WHICH STRUCTURE, decided at an index's attach: a log where
+  ;; log_eligible says so, a tree everywhere else -- and the entries
+  ;; moved across when the store kept the index as the other
+  (func log_select ((BTreeIndex * idx)) (out void)
+    (if (== 1 (log_eligible idx))
+        (let ((int known . 0)
+              (LogIndex * li . #'(log_register idx (aof known))))
+          (if (== known 1)
+              (block
+                (set (-> idx root_address) LOG_ROOT)
+                (return)))
+          (set tl_want_shared 0)
+          (letin* ((streams (Streams (-> idx m))))
+            (let ((int had_meta . #'(log_load li)))
+              (if (> (-> idx root_address) -1)
+                  (log_from_tree li))
+              (if (== had_meta 0)
+                  (log_write_meta li))
+              (set (-> idx root_address) LOG_ROOT))
+            (cast void 0)))
+      (let ((const uint8_t * key . #'(log_key_of idx))
+            (int has . 0))
+        (log_forget_where nil idx)
+        (pthread_mutex_lock (aof (-> (-> idx m) page_list_access)))
+        (let ((PageEntry * e . #'(page_chain (-> idx m) key)))
+          (while (!= e nil)
+            (if (== (memcmp (-> e key) key (cast size_t HASHKEY_SIZE)) 0)
+                (block
+                  (set has 1)
+                  break))
+            (set e (-> e key_next))))
+        (pthread_mutex_unlock (aof (-> (-> idx m) page_list_access)))
+        (if (== has 1)
+            (block
+              (set tl_want_shared 0)
+              (letin* ((streams (Streams (-> idx m))))
+                (log_to_tree idx key)
+                (cast void 0)))))))
 
   ;; ==================================================================
   ;; The singleton registry -- the rest of Globals: the store's two
@@ -5655,6 +7326,12 @@
     (member int64_t from)
     (member int64_t to)
     (member int64_t step)
+    ;; 0 before the row was looked for, 1 once it exists, and from the
+    ;; first read on THE ROW'S ADDRESS -- see seq_with_current. No record
+    ;; starts at 0 or 1 (a page opens with its control area), and the
+    ;; address rides in this member rather than a new one because a
+    ;; generated sequence object owns the struct: a member it was compiled
+    ;; without would be a write past the end of its static.
     (member int64_t initialized)
     (member pthread_mutex_t guard))
 
@@ -5692,9 +7369,35 @@
 
   ;; the row, or a refusal that names the sequence -- a silent default
   ;; became "not null column" crashes several frames away upstream
+  ;; whether ADDRESS still holds this sequence's row: an allocated record
+  ;; in a page keyed to the sequence -- a sequence keeps one row, written
+  ;; in place, so that is the row. Under the caller's streams guard.
+  (func seq_row_holds ((Sequence * s) (int64_t address)) (out bool)
+    (return (key_record_holds (-> s m) (-> s hash_key) address)))
+
+  ;; THE ROW IS READ WHERE IT WAS FOUND. Every NEXT used to find its one
+  ;; row by a cursor walk -- a statement, the key's page list copied into
+  ;; fresh arrays twice (the walk's second round finds nothing new), a
+  ;; walked-page map allocated, and the page's hexmap judged a byte at a
+  ;; time, nearly all of it free. In a server on a 6.5 GB store, 2 001
+  ;; NEXTs inside one procedure took 16 ms (the median of nine; 2 to 3 us
+  ;; a call on a small store), the row id of every row of a 2 001-row
+  ;; block. The row is written in place (offline_update), so its address
+  ;; stands until the sequence's storage goes: the walk now runs once, the
+  ;; address is kept in `initialized', and each read first checks that
+  ;; the address still names an allocated record in a page keyed to this
+  ;; sequence, walking again when it does not. The same 2 001: 3 ms.
   (func seq_with_current ((Sequence * s) (SeqRow * out)) (out void)
     (if (== (-> s initialized) 0)
         (seq_initialize s))
+    (if (> (-> s initialized) 1)
+        (letin* ((streams (Streams (-> s m))))
+          (if (seq_row_holds s (-> s initialized))
+              (block
+                (set ($ (cof out) pointer) (pointer_at (-> s m) (-> s hash_key) (-> s initialized)))
+                (read_row (-> s m) (cast (BaseTable *) out))
+                (return)))
+          (set (-> s initialized) 1)))
     (let ((SeqFetchCtx fc))
       (set ($ fc m) (-> s m))
       (set ($ fc found) 0)
@@ -5704,7 +7407,9 @@
         (cast void 0))
       (if (== ($ fc found) 0)
           (throw* (SequenceException "sequence has no row: it was never created, or this transaction cannot see it")))
-      (set (cof out) ($ fc row))))
+      (set (cof out) ($ fc row))
+      (if (> ($ ($ fc row) pointer address) 1)
+          (set (-> s initialized) ($ ($ fc row) pointer address)))))
 
   (func seq_write ((Sequence * s) (SeqRow * row)) (out void)
     (letin* ((streams (Streams (-> s m))))

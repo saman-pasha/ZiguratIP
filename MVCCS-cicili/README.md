@@ -1313,7 +1313,180 @@ consulting the not-yet-applied entries in memory, and recovery replaying
 the journal. The other half of the bill -- three records rewritten in
 place per random insert -- is the key-list layout; a node stored as one
 record would rewrite one. Both change the store's layout, so both are a
-decision, not a fix.
+decision, not a fix. What was built (next section) keeps the one store and
+changes what such an index is instead; a thread was tried again there, on
+the merges, measured, and replaced by pacing them across commits.
+
+## The log index -- an insertion that does not grow with the index
+
+The bulk map at the commit took a quarter off and left the growth where
+it was: each random entry still rewrote a leaf and its two neighbouring
+key records in place, wherever they lived, and the commit's `msync`
+waited for every page that dirtied. No in-place tree gets out of that --
+a random key lands on a random page -- so for the indexes that can do
+without a tree's descent the structure changed: a **single-level,
+non-unique** index (a transaction id, any String key, a plain foreign
+key) is kept as sorted **runs**, written once and never edited -- a
+log-structured merge tree's shape, and that of the LevelDB a Bitcoin node
+keeps its transaction index in. A commit's index work is one sequential
+append of its sorted entries, whatever the index already holds.
+`mvccs-lib.cicili`, "THE LOG INDEX" and "THE MERGE, PACED", have the
+design; in short:
+
+* **An entry is `(key, row address)` and says nothing about the row's
+  life.** The tree's values are their rows' transactional twins; a log
+  entry is written once, at the commit or earlier, and the ROW answers
+  the visibility question when a cursor reaches it (`visible()` itself,
+  or at SNAPSHOT the version's own lifetime, because an entry can name an
+  old version under its old key). That is sound because a row version
+  never changes its columns -- an update writes a new version at a new
+  address -- and a row is never reclaimed except by TRUNCATE, which now
+  drops a table's log indexes, durably, before it frees a row
+  (`log_table_truncated`) and has them rebuilt after, as it always rebuilt
+  a tree. A delete, and an update's old version, write nothing at all.
+* **On disk**, records of the index's own key: one META, and for each run
+  its blocks (half a page of sorted pairs each) and then its head, written
+  last, so a run whose head is on disk is whole. A merge's head names the
+  runs it replaces. The load keeps every whole run nothing replaces and
+  frees the rest, which is everything a crash can leave behind.
+* **Cursors**: equality halves the in-memory block directory of each run
+  and then the block; the ranges, not-equal and the full walk merge the
+  runs in key order. Each row goes to the caller through the same window
+  `bt_output_vcb` opens.
+* **The merge**: a run's tier is its size (4 096 entries, then every
+  four-fold); four runs of a tier merge into one, streamed a block at a
+  time, so an entry is rewritten once per tier it climbs, sequentially.
+  The merged-away records are freed only after the next commit's first
+  sync has made the merge durable, and only once no cursor holds them.
+* **Which, and the switch.** A unique index must refuse at the insert and a
+  composite keeps its dependent trees; both stay trees. `MVCCS_LOG_INDEX=0`
+  keeps every index a tree. A store moves an index across at its attach:
+  a tree's entries into a log, or a log's live rows back into a tree, each
+  value committed as it is written and born when its row was.
+
+**The merge, paced.** Merged whole in the commit that completed its set,
+a tier's merge is that commit's to pay, and each tier's is four times the
+one below: on `table_bench` the blocks at 256, 512 and 768 took 0.2-0.4 s
+for 0.05 elsewhere, and the next, at 1 024, would be four times that -- an
+insertion constant on average whose worst case grows with the index. So a
+merge is carried across commits: every commit that adds a run takes each
+merge under way twice its own entries further (4 096 at least), lowest
+tier first. A set takes its four runs' worth of commits to gather and its
+merge half that at this pace, so a merge is done before its tier has
+another set, and a commit's merge work is bounded by its own size times
+the tiers, whatever the index holds. A merge under way holds its inputs
+(nothing frees a block it has yet to read) and writes its run's blocks as
+they fill; the head goes last, in the commit that finishes it, which lists
+the run and lets the inputs go. Until then a cursor reads the inputs,
+still listed, and never the half-written run, which is not; a crash
+leaves that run headless, and the load frees it. A drop, a truncate, an
+`unmap_key` or a store let go abandons the merges first.
+`MVCCS_LOG_MERGE=0` merges whole in the commit, as before.
+
+**The indexing thread, tried again and measured.** With the log, what was
+left to take off a commit was the merge, which rewrites runs already
+durable that nobody waits for -- the one place a second thread had work
+of its own. It was built first: a commit that completed a set only
+signalled, and the thread merged, a block each time it held the guard.
+Under the one exclusive guard its writes took turns with the inserts,
+and the next commit's `msync` paid for the pages it had dirtied, so the
+cost moved one block later, grew nothing smaller, and the average rose
+(the worst blocks fell at 257, 513 and 769 instead of 256, 512 and 768):
+
+| `table_bench 1000 pht`, two alternating pairs | merges in a thread | whole in the commit |
+|---|---|---|
+| a block, average | 0.065 s, 0.061 s | 0.055 s, 0.054 s |
+| the last 100 blocks | 0.081 s, 0.080 s | 0.068 s, 0.069 s |
+| the slowest block | 0.427 s, 0.243 s | 0.266 s, 0.257 s |
+
+and through the server -- 1 000 blocks, a client process each, so the
+server is idle between them -- 0.1470 s a block against 0.1465, the one
+slow block 0.76 s and 0.78 at the same merge: the gaps between blocks are
+shorter than a merge. Pacing needs no second writer, and it is what
+moved:
+
+| `table_bench 1000 pht`, two alternating pairs | paced | whole in the commit |
+|---|---|---|
+| a block, average | 0.055 s, 0.058 s | 0.056 s, 0.055 s |
+| the last 100 blocks | 0.069 s, 0.069 s | 0.066 s, 0.073 s |
+| the slowest block | **0.156 s, 0.138 s** | 0.429 s, 0.378 s |
+
+Through the server, the same 1 000 blocks, restarted with and without
+`MVCCS_LOG_MERGE=0` in one sitting: paced, the slowest block 0.226 s and
+none over 0.4; whole, 0.725 s at block 768. The averages, 0.147 s and
+0.140 a block, are one pair and inside this machine's drift between runs;
+the engine's two pairs above put them level.
+
+`log-check.cpp` pins it, in `build.sh`: every cursor of the family, own
+rows before the commit and nobody else's, deletes and key-changing
+updates, a rollback after its entries reached a run, 300 commits merged,
+`unmap_key`, the vacuum's shape and the reclaimed space written again, a
+SNAPSHOT reader across a key-changing update, 5 000 rows in one
+transaction -- the same answers with the log on, with it off, with whole
+merges, on the mapped store -- one store carried from a tree to a log,
+reopened, and back to a tree, a process each; and a merge left half done
+(`engine_log_state` says so) while cursors, the inserting transaction, a
+rollback, an `unmap_key`, a table's truncate and the vacuum's shape meet
+it, and one left under way as a process ends, which the next takes up
+again. Armed -- the abandon taken out of `unmap_key`, of the truncate or
+of the release -- each goes red, the process dying mid-phase and the next
+one losing rows.
+
+## The free list, one list per key and size
+
+With the index's growth gone, the inserts were what grew: 6 us a row at
+the first block, 64 at the thousandth. gdb put a quarter of the samples
+in `allocate`, and the allocator's free list -- one list of every key's
+free spans -- held 27 434 entries at block 1 000, 21 001 of them the
+rows' own: a fresh page leaves a tail too short for the next row of its
+key behind it for good, one a page, and every allocation that met no fit
+near the head walked them all, a cache miss a link. Now a span is chained
+by its key's bucket AND a power-of-two size class: an allocation walks
+its own class (bounded: it holds the spans just too short for it) and
+then takes the first span of its key in any larger class, which fits by
+construction. A short tail sits in a class nothing of its size asks for.
+One sitting, `table_bench 1000 pht`, merges in a thread both ways: a
+block 0.086 s on average with the one list, 0.066 with the classes; the
+last 100 blocks 0.113 s and 0.076; block 1 000 0.136 s and 0.062.
+
+## A sequence's NEXT, read where it was found
+
+Every NEXT found its one row by a cursor walk -- a statement, the key's
+page list copied twice, a walked-page map allocated, the page's hexmap
+judged a byte at a time, nearly all of it free. In the server on a 6.5 GB
+store, 2 001 NEXTs inside one procedure took 16 ms (the median of nine;
+2 to 3 us a call on a small store). The row is written in place, so its
+address stands until the sequence's storage goes: the walk now runs once,
+the address is kept in the sequence's `initialized` (no member added, so
+no compiled object changes shape), and each read first checks that the
+address still names an allocated record in a page keyed to this
+sequence, walking again when it does not. The same 2 001: 3 ms.
+`mvccs.cicili` checks that ten draws after the first walk no page, and
+that a draw whose row was freed underneath refuses, as it did when every
+draw walked, instead of reading where the row stood.
+
+## Where the growing table stands
+
+One sitting, `table_bench 1000 pht` (2 001-row blocks, a transaction
+each, the mapped store on 64 KiB pages), the engine before pacing:
+
+| | every index a tree | the log |
+|---|---|---|
+| block 1 | 0.065 s | 0.029 s |
+| block 1 000 | 0.599 s | 0.067 s |
+| the last 100 blocks | 0.629 s | 0.070 s |
+| a block, average | 0.411 s | 0.059 s |
+| the commit, average | 0.378 s | 0.029 s |
+
+Through the server, 1 000 blocks of 2 000 transactions written by a
+client process each in one procedure call, the server restarted with and
+without `MVCCS_LOG_INDEX=0` in one sitting (the merges then in a thread,
+which the server pair above shows made no difference): 0.160 s a block on
+average with the log, 0.387 s with every index a tree; block 1 000
+0.165 s and 0.450. **What is left** grows slowly and is not the hashed
+index: from block 1 to block 1 000 a row's insert goes from ~6 to ~20 us (the id's
+unique tree and the composite `(kb, height)` tree are still trees, and
+the rows' own allocation) and the commit from 0.017 to ~0.027 s.
 
 ## Hard debugging, without changing a line
 

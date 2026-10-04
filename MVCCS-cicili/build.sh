@@ -100,22 +100,30 @@ sbcl --script cicili.lisp --release $DEBUG_FLAG "$HERE/engine.cicili"
 # THE HEADER MAY NOT DRIFT. engine.hpp copies Pointer and BaseTable
 # verbatim from the emitted engine.cpp -- a generated table subclasses
 # BaseTable, so the vtable must match to the byte. A drift is a build
-# failure here, never a latent crash in a procedure object.
+# failure here, never a latent crash in a procedure object. And
+# engine-compat.hpp's Sequence: a generated sequence object owns the
+# struct the engine writes through, so a member the engine has and the
+# copy lacks is a write past the end of a static. Its header said it was
+# checked here; it was not, until now.
 MVCCS_HERE="$HERE" python3 - <<'PY'
 import io, re, sys
 import os
 here    = os.environ['MVCCS_HERE']
 emitted = io.open(os.path.join(here, 'engine.cpp'), encoding='utf-8').read()
 header  = io.open(os.path.join(here, 'engine.hpp'), encoding='utf-8').read()
+compat  = io.open(os.path.join(here, 'engine-compat.hpp'), encoding='utf-8').read()
 def block(src, name):
     m = re.search(r'struct %s \{.*?\n\};' % name, src, re.S)
     return re.sub(r'\s+', ' ', m.group(0)) if m else None
 bad = 0
-for name in ('Pointer','BaseTable','BTreeIndex'):
-    e, h = block(emitted, name), block(header, name)
+for name, copy, label in (('Pointer', header, 'engine.hpp'),
+                          ('BaseTable', header, 'engine.hpp'),
+                          ('BTreeIndex', header, 'engine.hpp'),
+                          ('Sequence', compat, 'engine-compat.hpp')):
+    e, h = block(emitted, name), block(copy, name)
     h = h and h.replace('Zigurat::binarystream','binarystream')
-    if e != h:
-        print('engine.hpp DRIFTED from engine.cpp on struct', name); bad = 1
+    if e is None or e != h:
+        print(label, 'DRIFTED from engine.cpp on struct', name); bad = 1
 sys.exit(bad)
 PY
 
@@ -175,3 +183,32 @@ LD_LIBRARY_PATH="$LIBDIR" "$HERE/ageing_test"
   -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
 LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"
 MVCCS_DEFER_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"
+# and the same two with every index a tree: with the log on, the plain
+# index there is a log, and the queue's tree half is the composite's alone
+MVCCS_LOG_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"
+MVCCS_LOG_INDEX=0 MVCCS_DEFER_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/defer_check"
+
+# THE LOG INDEX, pinned both ways and across the switch. A single-level,
+# non-unique index is kept as sorted runs whose entries the rows judge
+# (mvccs-lib.cicili, "THE LOG INDEX"); every cursor's answer must be the
+# same with MVCCS_LOG_INDEX=0, on either store; and one store is carried
+# from a tree to a log, read back, and to a tree again, each step a
+# process of its own because the moves happen at an index's attach.
+"$CXX" -O3 -std=c++17 "$HERE/log-check.cpp" -o "$HERE/log_check" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check"
+STORE_MAP=1 LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check"
+# and with every merge whole, in the commit that completes its set
+MVCCS_LOG_MERGE=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check"
+MVCCS_LOG_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check"
+MVCCS_LOG_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" tree
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" log
+LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" reopen
+MVCCS_LOG_INDEX=0 LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" back
+# a merge paced across commits, met half done and taken up again by the
+# next process -- paced (the default), whole, and with no log at all
+for knob in "" MVCCS_LOG_MERGE=0 MVCCS_LOG_INDEX=0; do
+  env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" pace
+  env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" pacereopen
+done

@@ -118,6 +118,13 @@ void engine_cursor (Memory * m, const uint8_t * hash_key, void * ctx,
 // the last inserted version, from the first of a row's history
 int64_t row_latest (Memory * m, Pointer * p);
 
+// the allocator's free list: its length, and KEY's entries in *of_key
+int64_t engine_free_entries (Memory * m, const uint8_t * key, int64_t * of_key);
+
+// 1 when IDX is kept as a log index, with its runs in *runs and the merges
+// under way in *pending; 0 (and both 0) for a tree
+int engine_log_state (BTreeIndex * idx, int64_t * runs, int64_t * pending);
+
 // -- the B-tree index tier ---------------------------------------------
 // A consumer holds a BTreeIndex instance by value at file scope, fills
 // its fields the way the defindex expansion's attach does -- intern_key

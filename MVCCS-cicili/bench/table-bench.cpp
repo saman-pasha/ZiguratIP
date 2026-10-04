@@ -20,6 +20,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <chrono>
 #include "engine.hpp"
 #include "filestream.hpp"
@@ -105,6 +107,10 @@ int main (int argc, char** argv) {
   Zigurat::binarystream* d = open_store(dp.c_str(), true);
   Memory* m = engine_memory_new();
   memory_open(m, h, d, page);
+  // a log index's merges paced across commits, or whole in the commit
+  // that completes a set (MVCCS_LOG_MERGE=0)
+  const char* lm = getenv("MVCCS_LOG_MERGE");
+  const bool paced = !(lm && lm[0] == '0');
   if (use_pk) attach(&PK, m, "PK", PK_KEY, 515151, 1, 1, nullptr);
   if (use_kh) attach(&KH, m, "KH", KH_KEY, 525252, 0, 2, KH_DEP);
   if (use_tx) attach(&TX, m, "TX", TX_KEY, 535353, 0, 1, nullptr);
@@ -115,10 +121,16 @@ int main (int argc, char** argv) {
               brest(part < 80000 ? 80000 - part : 0, 'd');
   for (size_t i = 0; i < b500.size(); i++) b500[i] = "0123456789abcdef"[(i * 7) & 15];
 
-  printf("table_bench: %ld blocks of %ld transactions, indexes \"%s\", page %lld, %s\n",
-         blocks, T, which, (long long)page, getenv("STORE_MAP") ? "mapped" : "filebuf");
+  printf("table_bench: %ld blocks of %ld transactions, indexes \"%s\", page %lld, %s, merges %s\n",
+         blocks, T, which, (long long)page, getenv("STORE_MAP") ? "mapped" : "filebuf",
+         paced ? "paced" : "whole");
   int64_t id = 0;
   double sum_ins = 0, sum_com = 0, max_blk = 0;
+  // the last tenth's average beside the whole run's: a cost that grows
+  // shows as the two parting, a spike as the slowest block alone
+  const long tail_from = blocks - blocks / 10;
+  double tail_sum = 0;
+  std::vector<double> ins, com;
   for (long b = 1; b <= blocks; b++) {
     double t0 = now();
     begin_transaction(m);
@@ -137,12 +149,31 @@ int main (int argc, char** argv) {
     commit_transaction(m);
     double t2 = now();
     sum_ins += t1 - t0; sum_com += t2 - t1; if (t2 - t0 > max_blk) max_blk = t2 - t0;
-    if (checkpoint(b))
-      printf("  block %5ld: %ld rows, inserts %.4f s (%.1f us/row), commit %.4f s, total %.4f s\n",
-             b, rows, t1 - t0, (t1 - t0) / rows * 1e6, t2 - t1, t2 - t0);
+    ins.push_back(t1 - t0); com.push_back(t2 - t1);
+    if (b > tail_from) tail_sum += t2 - t0;
+    if (checkpoint(b)) {
+      int64_t of_rows = 0, frees = engine_free_entries(m, ROW_KEY, &of_rows);
+      printf("  block %5ld: %ld rows, inserts %.4f s (%.1f us/row), commit %.4f s, total %.4f s; free list %lld (%lld the rows')\n",
+             b, rows, t1 - t0, (t1 - t0) / rows * 1e6, t2 - t1, t2 - t0, (long long)frees, (long long)of_rows);
+    }
   }
   printf("  average: inserts %.4f s, commit %.4f s a block; slowest block %.4f s\n",
          sum_ins / blocks, sum_com / blocks, max_blk);
+  if (blocks >= 10)
+    printf("  the last %ld blocks: %.4f s a block\n", blocks - tail_from, tail_sum / (blocks - tail_from));
+  // the slowest five, each split, and where they fell: a spike that is the
+  // commit and recurs at the same blocks is periodic work, not growth
+  std::vector<long> order((size_t)blocks);
+  for (long b = 0; b < blocks; b++) order[(size_t)b] = b;
+  const long top = blocks < 5 ? blocks : 5;
+  std::partial_sort(order.begin(), order.begin() + top, order.end(), [&] (long a, long c) {
+    return ins[(size_t)a] + com[(size_t)a] > ins[(size_t)c] + com[(size_t)c]; });
+  printf("  the slowest:");
+  for (long k = 0; k < top; k++) {
+    const size_t b = (size_t)order[(size_t)k];
+    printf("%s block %zu %.3f s (inserts %.3f, commit %.3f)", k ? ";" : "", b + 1, ins[b] + com[b], ins[b], com[b]);
+  }
+  printf("\n");
   engine_memory_delete(m);
   return 0;
 }

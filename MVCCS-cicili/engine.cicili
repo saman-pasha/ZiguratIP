@@ -78,6 +78,9 @@
     (return (new* Memory)))
 
   (func engine_memory_delete ((Memory * m)) (out void)
+    ;; the store's log indexes go with it, or a Memory made later at the
+    ;; same address would inherit their directories
+    (log_forget_memory m)
     (bt_cache_free m)
     (delete* m))
 
@@ -93,6 +96,40 @@
     (letin* ((streams (Streams m)))
       (cursor_walk m hash_key (aof streams) ctx cb)
       (cast void 0)))
+
+  ;; How long the allocator's free list is, and how many of its entries
+  ;; are KEY's (nil for none): a bench prints it beside the time a row's
+  ;; allocation takes, which walks it.
+  (func engine_free_entries ((Memory * m) (const uint8_t * key) (int64_t * of_key)) (out int64_t)
+    (let ((int64_t n . 0)
+          (int64_t mine . 0))
+      (pthread_mutex_lock (aof (-> m free_list_access)))
+      (for ((int64_t f . 0)) (< f FREE_SLOT_COUNT) ((++ f))
+        (let ((FreeEntry * e . #'(nth f (-> m free_heads))))
+          (while (!= e nil)
+            (set n (+ n 1))
+            (if (and (!= key nil) (== 0 (memcmp (-> e key) key (cast size_t HASHKEY_SIZE))))
+                (set mine (+ mine 1)))
+            (set e (-> e next)))))
+      (pthread_mutex_unlock (aof (-> m free_list_access)))
+      (if (!= of_key nil) (set (cof of_key) mine))
+      (return n)))
+
+  ;; how a log index stands: 1 when IDX is kept as one, its runs in *RUNS
+  ;; and the merges under way in *PENDING -- what a bench or a check reads
+  ;; to see a merge paced across commits
+  (func engine_log_state ((BTreeIndex * idx) (int64_t * runs) (int64_t * pending)) (out int)
+    (set (cof runs) 0)
+    (set (cof pending) 0)
+    (if (!= (-> idx root_address) LOG_ROOT) (return 0))
+    (let ((LogIndex * li . #'(log_of idx)))
+      (pthread_mutex_lock (aof (-> li access)))
+      (set (cof runs) (cast int64_t (($ (-> li runs) size))))
+      (for ((int64_t t . 0)) (< t LOG_TIERS) ((++ t))
+        (if (!= (nth t (-> li pending)) nil)
+            (set (cof pending) (+ (cof pending) 1))))
+      (pthread_mutex_unlock (aof (-> li access)))
+      (return 1)))
 
   ;; The transaction the thread is in is a thread-local; a consumer names
   ;; the level and the engine finds the transaction.
