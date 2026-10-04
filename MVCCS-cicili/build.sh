@@ -212,3 +212,18 @@ for knob in "" MVCCS_LOG_MERGE=0 MVCCS_LOG_INDEX=0; do
   env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" pace
   env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/log_check" pacereopen
 done
+
+# THE TAIL APPEND, and the split that counts its upper half. A key above
+# every key goes where the last one went while the hint recorded there
+# holds (mvccs-lib.cicili, "THE TAIL APPEND"); unmap_key's merges re-split
+# wider than an insert's split, which bt_split_node now counts. The same
+# answers with the hint off and with every index a tree (the plain index
+# then mapped in bulk at each commit), on either store, and a reopened
+# store in a process of its own.
+"$CXX" -O3 -std=c++17 "$HERE/tail-check.cpp" -o "$HERE/tail_check" \
+  -I"$HERE" -I"$INCDIR" \
+  -L"$LIBDIR" -lMVCCS -lCore -lStreamIO -lpthread -Wl,-rpath,"$LIBDIR"
+for knob in "" MVCCS_TAIL_HINT=0 MVCCS_LOG_INDEX=0 STORE_MAP=1; do
+  env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/tail_check"
+  env $knob LD_LIBRARY_PATH="$LIBDIR" "$HERE/tail_check" reopen
+done

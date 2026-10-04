@@ -3656,14 +3656,35 @@
   (struct BTKeySlot (member int64_t addr) (member BTKey key))
   (@define (code "btnodeslots_t std::vector<BTNodeSlot>"))
   (@define (code "btkeyslots_t std::vector<BTKeySlot>"))
+
+  ;; where an index's largest key was last appended -- the rightmost leaf,
+  ;; its head and degree then, the key's record and the key -- and the
+  ;; root it hung from; see "THE TAIL APPEND". KEY is the index's own hash
+  ;; key: the tree's identity in the store, so every BTreeIndex attached to
+  ;; one tree -- a server's compiled objects can each hold one -- reads and
+  ;; forgets the same hint.
+  (struct BTTail
+    (member const uint8_t * key)
+    (member int64_t root)
+    (member int64_t leaf)
+    (member int64_t head)
+    (member int64_t degree)
+    (member int64_t tail)
+    (member int64_t max_key))
+  (@define (code "bttails_t std::vector<BTTail>"))
+
   (struct BTCache
     (member pthread_mutex_t access)
     (member int64_t node_mask)
     (member int64_t key_mask)
     (member btnodeslots_t nodes)
-    (member btkeyslots_t keys))
+    (member btkeyslots_t keys)
+    (member bttails_t tails))
 
+  ;; every slot empty, and every tail hint with them: a reset is a store
+  ;; whose records may have moved under the cache
   (func bt_cache_clear_slots ((BTCache * c)) (out void)
+    (($ (-> c tails) clear))
     (let ((int64_t i . 0))
       (while (<= i (-> c node_mask))
         (set ($ (nth i (-> c nodes)) addr) -1)
@@ -3873,6 +3894,59 @@
       (set ($ dep record_pointer) (pointer_null))
       (return dep)))
 
+  ;; ---- the tail hint (see "THE TAIL APPEND", with the map) -----------
+  ;; Kept beside the record cache, so it goes with it: a store opened
+  ;; afresh, a reset (drop_key_pages), MVCCS_NO_CACHE (no hints at all).
+  ;; Only a writer under the exclusive guard reads or writes one; the
+  ;; cache's own mutex keeps the vector whole against a reset. An index
+  ;; keeps ONE entry for the store's life, interned once; a forgotten hint
+  ;; is an entry whose leaf is -1, so a split every 64 appends costs no
+  ;; intern_key (a lock and a walk of every key the process has interned).
+  (func bt_tail_get ((BTreeIndex * idx) (BTTail * out)) (out int)
+    (if (== (-> (-> idx m) bt_cache) nil) (return 0))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> (-> idx m) bt_cache)))
+          (int found . 0))
+      (pthread_mutex_lock (aof (-> c access)))
+      (for ((size_t i . 0)) (and (< i (($ (-> c tails) size))) (== found 0)) ((++ i))
+        (if (and (!= ($ (nth i (-> c tails)) leaf) -1)
+                 (== 0 (memcmp ($ (nth i (-> c tails)) key) (-> idx hash_key) (cast size_t HASHKEY_SIZE))))
+            (block
+              (set (cof out) (nth i (-> c tails)))
+              (set found 1))))
+      (pthread_mutex_unlock (aof (-> c access)))
+      (return found)))
+
+  ;; T as IDX's hint: into its entry, the entry's own key kept; the first
+  ;; time for this store, a new entry under the interned key
+  (func bt_tail_put ((BTreeIndex * idx) (const BTTail * t)) (out void)
+    (if (== (-> (-> idx m) bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> (-> idx m) bt_cache)))
+          (int found . 0))
+      (pthread_mutex_lock (aof (-> c access)))
+      (for ((size_t i . 0)) (and (< i (($ (-> c tails) size))) (== found 0)) ((++ i))
+        (if (== 0 (memcmp ($ (nth i (-> c tails)) key) (-> idx hash_key) (cast size_t HASHKEY_SIZE)))
+            (let ((const uint8_t * kept . #'($ (nth i (-> c tails)) key)))
+              (set (nth i (-> c tails)) (cof t))
+              (set ($ (nth i (-> c tails)) key) kept)
+              (set found 1))))
+      (if (== found 0)
+          (let ((BTTail fresh . #'(cof t)))
+            (set ($ fresh key) (intern_key (-> idx hash_key)))
+            (($ (-> c tails) push_back) fresh)))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
+  ;; IDX's hint forgotten -- or, with NODE not -1, only if it names that
+  ;; leaf. The entry stays, empty.
+  (func bt_tail_forget ((BTreeIndex * idx) (int64_t node)) (out void)
+    (if (== (-> (-> idx m) bt_cache) nil) (return))
+    (let ((BTCache * c . #'(cast (BTCache *) (-> (-> idx m) bt_cache))))
+      (pthread_mutex_lock (aof (-> c access)))
+      (for ((size_t i . 0)) (< i (($ (-> c tails) size))) ((++ i))
+        (if (and (== 0 (memcmp ($ (nth i (-> c tails)) key) (-> idx hash_key) (cast size_t HASHKEY_SIZE)))
+                 (or (== node -1) (== ($ (nth i (-> c tails)) leaf) node)))
+            (set ($ (nth i (-> c tails)) leaf) -1)))
+      (pthread_mutex_unlock (aof (-> c access)))))
+
   ;; ---- the catalogue (_insert/_select/_update_btreeindex) -----------
   (func bt_insert_record ((BTreeIndex * idx)) (out void)
     (let ((BTRecord rec))
@@ -4034,6 +4108,106 @@
                         (func vcb ((void * c) (int64_t counter) (BTValue * v)) (out bool)))
         (out void)
     (bt_walk_values_from idx (-> key values_address) ctx vcb))
+
+  ;; ---- the tail append ----------------------------------------------
+  ;; THE TAIL APPEND. A node's keys are a linked list read from its head,
+  ;; so a key larger than every key -- a sequence's id, a clock, a block
+  ;; height: the common insert -- walked EVERY key of every node on the
+  ;; rightmost path, 64 to 128 a level, the walk growing with the tree's
+  ;; depth. bench/table-bench.cpp's unique id alone took a row's insert
+  ;; from 6 us at the first block to 23 at the thousandth, and a third of
+  ;; the tree's time was bt_key_read (gdb, the "p" run past block 1 000),
+  ;; while the same rows with no index stayed flat.
+  ;;
+  ;; So a descent that took the last key at every level and appended at
+  ;; its leaf's end records where it did (BTTail), and the next key above
+  ;; that one is appended there directly -- the same writes, none of the
+  ;; reads. The hint is a hint: before it is used the leaf must still
+  ;; have the degree and head it had, be a leaf with room, the tail key
+  ;; must still end the list holding the largest key, both records must
+  ;; still be this index's, and the root the same; anything else and the
+  ;; descent runs as before. The rightmost leaf changes only by a split
+  ;; (which forgets the hint), by an unmap_key's deletes and combines
+  ;; (which forget it), or by its pages going back (drop_key_pages resets
+  ;; it with the cache); a key above the largest goes down the rightmost
+  ;; path and records the hint again. A dependent level is built on the
+  ;; stack per descent and never keeps one. MVCCS_TAIL_HINT=0 in the
+  ;; environment walks every time, as before.
+  (var int g_tail_hint . -1)
+
+  (func bt_tail_enabled () (out int)
+    (if (< g_tail_hint 0)
+        (let ((const char * s . #'(getenv "MVCCS_TAIL_HINT")))
+          (set g_tail_hint (? (and (!= s nil) (== (nth 0 s) (cast char 48))) 0 1))))
+    (return g_tail_hint))
+
+  ;; 1 while the descent bt_map began has taken the last key at every
+  ;; level; bt_map_rec clears it at any other turn
+  (thread-local) (var int tl_tail_path . 0)
+
+  ;; KEYS THIS THREAD APPENDED BY THE HINT, EVER -- what a check reads to
+  ;; know the hint was taken, not merely that the answers came out right
+  (thread-local) (var int64_t tl_tail_appends . 0)
+  (func mvccs_tail_appends () (out int64_t) (return tl_tail_appends))
+
+  ;; LEAF (its pointer set) just had NEW_KEY appended at its end as KEY K
+  (func bt_tail_record ((BTreeIndex * idx) (BTNode * leaf) (BTKey * new_key) (int64_t k)) (out void)
+    (let ((BTTail t))
+      ;; bt_tail_put keeps the entry's interned key, or interns it once
+      (set ($ t key) (-> idx hash_key))
+      (set ($ t root) (-> idx root_address))
+      (set ($ t leaf) ($ (-> leaf pointer) address))
+      (set ($ t head) (-> leaf keys_address))
+      (set ($ t degree) (-> leaf degree))
+      (set ($ t tail) ($ (-> new_key pointer) address))
+      (set ($ t max_key) k)
+      (bt_tail_put idx (aof t))))
+
+  (decl) (func key_record_holds ((Memory * m) (const uint8_t * key) (int64_t address)) (out bool))
+
+  ;; K appended at the rightmost leaf's end if the hint still holds and
+  ;; the leaf has room; answers 1 when it was, 0 for the descent. Under
+  ;; the caller's exclusive guard, for a single-level index's own level.
+  (func bt_tail_append ((BTreeIndex * idx) (int64_t k) (int64_t value)) (out int)
+    (let ((Memory * m . #'(-> idx m))
+          (BTTail t))
+      (if (== 0 (bt_tail_get idx (aof t))) (return 0))
+      (if (or (<= k ($ t max_key))
+              (or (!= ($ t root) (-> idx root_address))
+                  (>= ($ t degree) (-> idx max_degree))))
+          (return 0))
+      (if (or (not (key_record_holds m (-> idx hash_key) ($ t leaf)))
+              (not (key_record_holds m (-> idx hash_key) ($ t tail))))
+          (block
+            (bt_tail_forget idx -1)
+            (return 0)))
+      (let ((BTNode leaf)
+            (BTKey last))
+        (bt_node_read idx ($ t leaf) (aof leaf))
+        (bt_key_read idx ($ t tail) (aof last))
+        (if (or (!= ($ leaf is_internal) 0)
+                (or (!= ($ leaf degree) ($ t degree))
+                    (or (!= ($ leaf keys_address) ($ t head))
+                        (or (!= ($ last right_address) -1)
+                            (or (!= ($ last right_node_address) -1)
+                                (!= ($ last key) ($ t max_key)))))))
+            (block
+              (bt_tail_forget idx -1)
+              (return 0)))
+        ;; the leaf append, written exactly as bt_map_rec writes it
+        (let ((BTKey new_key))
+          (bt_key_clear (aof new_key))
+          (set ($ new_key key) k)
+          (set ($ new_key left_address) ($ ($ last pointer) address))
+          (offline_insert m (-> idx hash_key) (cast (BaseTable *) (aof new_key)))
+          (bt_insert_value idx (aof new_key) value)
+          (set ($ leaf degree) (+ ($ leaf degree) 1))
+          (offline_update m (cast (BaseTable *) (aof leaf)))
+          (set ($ last right_address) ($ ($ new_key pointer) address))
+          (offline_update m (cast (BaseTable *) (aof last)))
+          (bt_tail_record idx (aof leaf) (aof new_key) k)
+          (set tl_tail_appends (+ tl_tail_appends 1))))
+      (return 1)))
 
   ;; ---- map (insert) --------------------------------------------------
   (decl) (func bt_split_node ((BTreeIndex * idx) (BTNode ** ancestors) (int depth)
@@ -4300,7 +4474,21 @@
     (let ((Memory * m . #'(-> idx m))
           (BTNode new_node)
           (BTKey left_key)
-          (int have_left . 0))
+          (int have_left . 0)
+          ;; THE UPPER HALF HOLDS WHAT IS LEFT, not min_degree keys. A
+          ;; split after an insert has max_degree + 1 keys, and with
+          ;; max = 2 * min the two counts agree -- which hid that a merge
+          ;; re-split by bt_combine_nodes can hold up to min + max: its
+          ;; upper half was written with min_degree as its degree over a
+          ;; longer list, every walk that stops at degree - 1 then took a
+          ;; middle key for the last, the keys past it went unfound, and
+          ;; inserts were appended after the wrong key. 241 unmap_keys over
+          ;; 20 000 ids at degrees 64..128 lost 3 036 other keys;
+          ;; tail-check.cpp's section 5b pins it (286 unmap_keys, then
+          ;; appends) and goes red with the old count.
+          (int64_t upper . #'(- (-> node degree) (+ (-> idx min_degree) 1))))
+      ;; its upper half becomes the rightmost leaf, if it was that
+      (bt_tail_forget idx ($ (-> node pointer) address))
       (bt_node_clear (aof new_node))
       ;; the upper half is the same kind of node as the half it came from
       (set ($ new_node is_internal) (-> node is_internal))
@@ -4353,7 +4541,7 @@
                   ;; the first key of the upper half
                   (block
                     (set ($ cur left_address) -1)
-                    (set ($ new_node degree) (-> idx min_degree))
+                    (set ($ new_node degree) upper)
                     (set ($ new_node keys_address) ($ ($ cur pointer) address))
                     (offline_update m (cast (BaseTable *) (aof new_node)))
                     (offline_update m (cast (BaseTable *) (aof cur)))
@@ -4443,6 +4631,10 @@
               (set (-> node degree) 1)
               (set (-> node keys_address) ($ ($ new_key pointer) address))
               (offline_update m (cast (BaseTable *) node))
+              ;; an empty leaf reached down the rightmost path: the tree's
+              ;; first key, and its largest
+              (if (and (== tl_tail_path 1) (== (-> node is_internal) 0))
+                  (bt_tail_record idx node (aof new_key) k))
               (if (!= out_key nil) (set (cof out_key) new_key)))
             (return)))
 
@@ -4457,6 +4649,9 @@
 
             (cond
               ((< k ($ cur key))
+               (block
+               ;; not the last key: this descent leaves the rightmost path
+               (set tl_tail_path 0)
                (if (!= (-> node is_internal) 0)
                    (block
                      (let ((BTNode left_node))
@@ -4485,10 +4680,11 @@
                      (set ($ cur left_address) ($ ($ new_key pointer) address))
                      (offline_update m (cast (BaseTable *) (aof cur)))
                      (if (!= out_key nil) (set (cof out_key) new_key)))
-                   (set stop 1))))
+                   (set stop 1)))))
 
               ((== k ($ cur key))
                (block
+                 (set tl_tail_path 0)
                  ;; uniqueness is the whole tuple's: only the level holding
                  ;; the value chains can refuse
                  (if (and (!= (-> idx is_unique) 0) (== (-> idx levels) 1))
@@ -4525,6 +4721,10 @@
                          (offline_update m (cast (BaseTable *) node))
                          (set ($ cur right_address) ($ ($ new_key pointer) address))
                          (offline_update m (cast (BaseTable *) (aof cur)))
+                         ;; appended at the rightmost leaf's end: where the
+                         ;; next larger key goes (a split below forgets it)
+                         (if (== tl_tail_path 1)
+                             (bt_tail_record idx node (aof new_key) k))
                          (if (!= out_key nil) (set (cof out_key) new_key)))
                        (set stop 1))))))
 
@@ -4560,10 +4760,18 @@
                 (set (-> idx root_address) ($ ($ root pointer) address)))
               (if (== (-> idx is_dependent) 0)
                   (bt_update_record idx))))
-        (let ((BTNode root_node)
-              (BTNode * ancestors [64]))
-          (bt_node_read idx (-> idx root_address) (aof root_node))
-          (bt_map_rec idx ancestors 0 (aof root_node) k value nil))
+        ;; a key above the largest goes where the last one went, unread
+        (let ((int hinted . #'(? (and (== 1 (bt_tail_enabled))
+                                      (and (== (-> idx levels) 1) (== (-> idx is_dependent) 0)))
+                                 1 0)))
+          (if (and (== hinted 1) (== 1 (bt_tail_append idx k value)))
+              (return))
+          (let ((BTNode root_node)
+                (BTNode * ancestors [64]))
+            (set tl_tail_path hinted)
+            (bt_node_read idx (-> idx root_address) (aof root_node))
+            (bt_map_rec idx ancestors 0 (aof root_node) k value nil)
+            (set tl_tail_path 0)))
         (cast void 0))))
 
   ;; the composite map: each level maps its column's key WITHOUT a value
@@ -4599,6 +4807,8 @@
               (BTKey keyrec))
           (bt_key_clear (aof keyrec))
           (bt_node_read idx (-> idx root_address) (aof root_node))
+          ;; a composite's outer level keeps no tail hint
+          (set tl_tail_path 0)
           (bt_map_rec idx ancestors 0 (aof root_node) (nth 0 ks) value (aof keyrec))
           (let ((int64_t old_dep . #'($ keyrec dependents_address)))
             (let ((BTreeIndex dep . #'(bt_dependent idx old_dep)))
@@ -5103,6 +5313,8 @@
           (log_unmap_key (log_of idx) k)
           (return)))
     (letin* ((streams (Streams (-> idx m))))
+      ;; deletes and combines can move the rightmost leaf
+      (bt_tail_forget idx -1)
       (if (> (-> idx root_address) -1)
           (let ((BTNode root))
             (bt_node_read idx (-> idx root_address) (aof root))
@@ -5751,6 +5963,8 @@
         (return (log_truncate (log_of idx))))
     (block
       (letin* ((streams (Streams (-> idx m))))
+        ;; values only, the keys stay -- forgotten anyway, it is cheap
+        (bt_tail_forget idx -1)
         (bt_unlink_dead idx)
         (cast void 0)))
     (let ((size_t freed . #'(truncate_key m (-> idx hash_key))))

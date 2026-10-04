@@ -14,3 +14,4 @@ bench/grow_bench
 defer_check
 bench/table_bench
 log_check
+tail_check

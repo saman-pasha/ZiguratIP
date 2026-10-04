@@ -1486,7 +1486,101 @@ average with the log, 0.387 s with every index a tree; block 1 000
 0.165 s and 0.450. **What is left** grows slowly and is not the hashed
 index: from block 1 to block 1 000 a row's insert goes from ~6 to ~20 us (the id's
 unique tree and the composite `(kb, height)` tree are still trees, and
-the rows' own allocation) and the commit from 0.017 to ~0.027 s.
+the rows' own allocation) and the commit from 0.017 to ~0.027 s. The
+next section takes the id's tree out of that.
+
+## The tail append -- a key above every key, unread
+
+Run per index set, one sitting, the growth had one owner. With no index
+a block took 0.024 s at the first and 0.027 s over the last 100 -- flat;
+with the unique id alone (`p`) 0.027 s and 0.064 s, a row's insert going
+from 5.9 to 22.8 us; the composite and the hashed txid added little on
+top. gdb past block 1 000 of a `p` run put a third of the tree's time in
+`bt_key_read`, four levels of `bt_map_rec` deep. A node's keys are a
+linked list read from its head, so a key larger than every key -- a
+sequence's id, a clock, a block height, the common insert -- walked EVERY
+key of every node on the rightmost path, 64 to 128 a level, the walk
+growing with the tree's depth.
+
+So a descent that takes the last key at every level and appends at its
+leaf's end records where (`BTTail`: the leaf, its head and degree then,
+the new key's record, the key, the root), and the next key above that one
+is appended there directly -- the same writes, none of the reads
+(`mvccs-lib.cicili`, "THE TAIL APPEND"). The hint is a hint: before it is
+used the leaf must still have the degree and head it had and be a leaf
+with room, the tail key must still end the list holding the largest key,
+both records must still be this index's, and the root the same; anything
+else and the descent runs as before. Splits, `unmap_key` and the truncate
+forget it, and a reset of the record cache (`drop_key_pages`) clears it.
+It is kept per store beside the record cache, one entry an index, under
+the index's own hash key, so every `BTreeIndex` attached to one tree shares
+it; a dependent level never keeps one. `MVCCS_TAIL_HINT=0` walks every
+time.
+
+`tail-check.cpp` pins it, in `build.sh`, with the hint on and off, every
+index a tree, the mapped store, and a reopened store in a process of its
+own: ascending ids on a tree of two-to-four-key nodes (deep and splitting
+constantly), every id found and the walk in order, the hint TAKEN
+(`mvccs_tail_appends`); duplicates of the largest and of a middle key
+refused; keys below the largest among appends; appended keys rolled back
+and inserted again; `unmap_key` of the largest, a middle and the smallest
+key; and 3 000 steps from one seed mixing exactly what makes a hint stale
+-- inserts just below the largest key filling and splitting the rightmost
+leaf, `unmap_key` of the largest and its neighbours, rollbacks -- among
+appends, 610 of which went by the hint. The validation and the forgets
+are two guards for one rule: with either taken out the check stays green
+(the other covers it), with both taken out it aborts mid-run and the next
+process finds the tree broken.
+
+Measured, the same library with the hint on and off, two alternating
+pairs of each:
+
+| `table_bench 1000` | hint | `MVCCS_TAIL_HINT=0` |
+|---|---|---|
+| `pht`, inserts a block, average | **0.013 s, 0.014 s** | 0.024 s, 0.024 s |
+| `pht`, the last 100 blocks | **0.048 s, 0.051 s** | 0.058 s, 0.058 s |
+| `pht`, a row's insert, block 1 / block 1 000 | 4.9 / 5.3 us, 8.8 / 6.3 us | 6.6 / 13.0 us, 6.7 / 15.1 us |
+| `p`, the last 100 blocks | **0.029 s, 0.027 s** | 0.040 s, 0.047 s |
+| `p`, a row's insert, block 1 / block 1 000 | 5.1 / 6.0 us, 4.4 / 5.4 us | 6.3 / 13.0 us, 5.9 / 11.8 us |
+
+A row's insert no longer grows with the table. (The `p` table's last 100
+blocks, 0.027-0.029 s, are near the 0.027 s the same rows took with no
+index -- but that run was an earlier sitting, so it is a pointer, not a
+measurement.)
+
+Through the server -- 1 000 blocks of 2 000 transactions, a client process
+and one procedure call a block, the server restarted per arm -- two
+alternating pairs could not resolve it: 0.154 s a block with the hint,
+0.142 without, 0.136 with, 0.141 without; the last 100 blocks 0.153,
+0.137, 0.137, 0.142. The first arm of each sitting carries a warm-up (its
+first 100 blocks 0.18 s, the later arms' 0.13-0.15). What the hint saves
+there, a few milliseconds a block at block 1 000, is a few per cent of
+what the client process and the call cost, and this machine drifts more
+than that between runs.
+
+## A split that lost keys after `unmap_key` -- fixed
+
+`tail-check.cpp` found it, with the hint off as much as on: after
+`unmap_key` of 1 000 and then of 1 on a tree of two-to-four-key nodes,
+every id inserted afterwards was missing and the walk out of order. A
+scratch reproduction narrowed it to two deletes over ten ids (one other
+key lost) and showed it at the production size: 241 `unmap_key`s, 37 ids
+apart, over 20 000 ids at degrees 64..128 lost **3 036 other keys**. The
+cause: `bt_combine_nodes` merges an underflowing node with its sibling
+and, when the merge overflows, re-splits it through `bt_split_node`,
+which wrote the upper half's degree as `min_degree`. A split after an
+insert has `max_degree + 1` keys and, with `max = 2 * min`, an upper half
+of exactly `min_degree`; a merge holds up to `min + max`, so the upper
+half's recorded degree fell short of its list. Every walk that stops at
+`degree - 1` then took a middle key for the last: the keys past it went
+unfound, and inserts were appended after it, mid-list. `bt_split_node`
+now counts the upper half (`degree - min_degree - 1`). Section 5b of
+`tail-check.cpp` (286 `unmap_key`s, then appends) pins it and goes red
+with the old count; every scratch case loses nothing now, hint on or off.
+A store that ran `unmap_key` on a tree index before this fix can hold
+such nodes; rebuilding the index -- the vacuum's drop and remap -- writes
+it afresh. (A plain index kept as a log has its own `unmap_key` and never
+reached this.)
 
 ## Hard debugging, without changing a line
 
