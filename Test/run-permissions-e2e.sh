@@ -176,7 +176,7 @@ COMPILER:
 	# what that client sent. Allowed here because the server is this script's
 	# own, on loopback, for the length of one run. Nothing shipped enables it.
 	REMOTE_MODE: TRUE
-	CPP:       c++
+	CPP:       clang++
 	CPP_FLAGS: -Wall -std=c++17 -fPIC
 	LD_FLAGS:  -shared
 	TRACE_MODE: FALSE
