@@ -30,8 +30,13 @@ build against a live server.
   root outright, as Homebrew does.
 * `CICILI=/path` names a Cicili checkout elsewhere; the default is
   `../cicili`, and it is cloned there when absent.
-* `CICILI_CC=gcc CICILI_CXX=g++` builds with gcc and needs no clang at all
-  (Linux). On Red Hat Enterprise Linux and its rebuilds, `sbcl` is in EPEL. The wrappers in `tools/cc` read exactly those two.
+* `CICILI_CC=...`, `CICILI_CXX=...` name a particular clang (`clang-18`, a
+  path); the wrappers in `tools/cc` read exactly those two. Every build here
+  is clang — the libraries, the server and the Parsi objects it loads —
+  and the scripts refuse a compiler that is not. gcc's packages are still
+  installed, for the libstdc++ headers clang compiles against
+  (`--gcc-install-dir`); nothing is compiled by gcc.
+* On Red Hat Enterprise Linux and its rebuilds, `sbcl` is in EPEL.
 * `LOG=/path` moves the make log from `/tmp/ziguratip-install.log`. A log
   there that is not yours to write (an earlier run as root left it) is
   refused by name before anything is built, rather than read back as this
@@ -50,6 +55,18 @@ Quicklisp already, so your own `sbcl` has it too. `gnupg` is among the
 packages for this; with `NO_PACKAGES=1` and no `gpg`, the script stops and
 says so.
 
+`QUICKLISP_HOME` elsewhere than `~/quicklisp` wants Cicili 1.0.1 or later.
+The build runs `sbcl --script cicili.lisp` (`MVCCS-cicili/build.sh`), which
+reads no `~/.sbclrc`, so Cicili finds Quicklisp itself: from
+`$QUICKLISP_HOME`, or `~/quicklisp` when that is unset. An older Cicili loads
+`(user-homedir-pathname)/quicklisp/setup.lisp` and nothing else, and a
+Quicklisp anywhere else would install, load cicili, and then fail the build
+with `Component "str" not found` — so against such a checkout the scripts
+refuse it by name before Quicklisp is installed (update the checkout, or
+make `~/quicklisp` a symlink to it). It must be an absolute path, and it
+must stay exported for every later build too; the exports printed at the
+end include it.
+
 ## Two things the scripts know that cost real time
 
 **The compiler must exist before the first `make`.** Every project writes
@@ -62,7 +79,7 @@ before building; `make clean` is the cure by hand.
 
 **On Ubuntu 22.04 the apt clang is 14**, and `tools/cc/cxx` passes
 `--gcc-install-dir`, which exists from clang 16 — so the Linux script takes
-clang 18 from apt.llvm.org, or you build with g++.
+clang 18 from apt.llvm.org.
 
 ## What they do not do
 

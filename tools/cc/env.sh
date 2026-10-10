@@ -8,8 +8,8 @@
 # it names `gcc' and takes no override -- ends up with the same compiler
 # as everything else. See ./README.
 #
-# `CICILI_CC=gcc CICILI_CXX=g++ sh ...build.sh' builds with gcc, and still
-# agrees with itself: the wrappers read exactly those two.
+# Every build here is clang, the owner's rule: `CICILI_CC=... CICILI_CXX=...
+# sh ...build.sh' chooses WHICH clang, and the wrappers read exactly those two.
 CICILI_CC=${CICILI_CC:-clang}
 CICILI_CXX=${CICILI_CXX:-clang++}
 CC="$ROOT/tools/cc/cc"

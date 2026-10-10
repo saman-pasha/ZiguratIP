@@ -85,7 +85,7 @@ Enables tracing c++ header and implementation files and commands to produce them
 ## MEMORY/PAGE_SIZE
 
 Bytes per page of a NEW store: a multiple of 16, at most 65536, which is also
-the default (8192 before 0.1.23). `MEMORY/BLOCK_SIZE` and
+the default (8192 before 1.0.0). `MEMORY/BLOCK_SIZE` and
 `MEMORY/MEMORY_PAGE_SIZE` are older names for it. NOTICE: max row size
 computes as PAGE_SIZE - 96.
 

@@ -5,24 +5,25 @@
 # What it does, in order: find or clone the Cicili checkout; give SBCL the
 # four Lisp systems Cicili is built from; build ZiguratIP in Release and
 # check the ARTIFACTS rather than make's exit code, because the top-level
-# make steps over a failed project; and print the three exports a shell
-# needs afterwards.
+# make steps over a failed project; and print the exports a shell needs
+# afterwards.
 CICILI=${CICILI:-$(cd "$ROOT/.." && pwd)/cicili}
 QL=${QUICKLISP_HOME:-$HOME/quicklisp}
 step() { printf '== %s\n' "$*"; }
 say()  { printf '   %s\n' "$*"; }
 die()  { printf 'INSTALL RED: %s\n' "$*" >&2; exit 1; }
 
-# Is the C++ compiler the wrappers in tools/cc will call good for C++17?
-# The argument is the clang major that is enough on this OS: 16 on Linux,
-# where tools/cc/cxx passes --gcc-install-dir and older clangs reject it;
-# 10 on macOS, where the flag is never passed. g++ 7 speaks C++17.
+# Is the C++ compiler the wrappers in tools/cc will call a clang good for
+# C++17? The argument is the clang major that is enough on this OS: 16 on
+# Linux, where tools/cc/cxx passes --gcc-install-dir and older clangs reject
+# it; 10 on macOS, where the flag is never passed. Every build here is clang
+# (the owner's rule), so a compiler that is not clang fails this.
 cxx_ok() {
   cxx=${CICILI_CXX:-clang++}
   case "$cxx" in
     *clang*) v=$("$cxx" --version 2>/dev/null | grep -oE 'version [0-9]+' | grep -oE '[0-9]+' | head -1)
              [ "${v:-0}" -ge "$1" ] ;;
-    *)       v=$("$cxx" -dumpversion 2>/dev/null | cut -d. -f1); [ "${v:-0}" -ge 7 ] ;;
+    *)       return 1 ;;
   esac
 }
 
@@ -80,15 +81,49 @@ quicklisp_get() {
   rm -rf "$qt"
 }
 
+# CICILI'S BUILD FINDS QUICKLISP ITSELF. Every build runs `sbcl --script
+# cicili.lisp' (MVCCS-cicili/build.sh), and --script reads no ~/.sbclrc, so
+# what loads Quicklisp there is cicili.lisp's own lines: since Cicili 1.0.1
+# they read $QUICKLISP_HOME and fall back to ~/quicklisp; before, they named
+# (user-homedir-pathname)/quicklisp/setup.lisp and nothing else, and a
+# QUICKLISP_HOME elsewhere installed, loaded cicili below (lisp_side names
+# $QL/setup.lisp), and then the build died with `Component "str" not found'.
+# So a QUICKLISP_HOME elsewhere is taken when $CICILI's cicili.lisp reads it
+# -- exported for the build below, and printed by exports_hint for the ones
+# after -- and refused by name against an older checkout. It must be
+# absolute: each build reads it from a directory of its own. The same
+# directory by another path is ~/quicklisp, and so is $HOME/quicklisp as a
+# symlink to $QL, even before $QL exists. Asked in lisp_side, not when this
+# file is sourced: under sudo the packages' phase has root's $HOME, and the
+# checkout is cloned by then.
+ql_home_ok() {
+  case $QL in /*) ;; *) die "QUICKLISP_HOME=$QL is not an absolute path, and every build reads it from a directory of its own -- give it as /..., and re-run" ;; esac
+  q=$QL; while [ "${q%/}" != "$q" ]; do q=${q%/}; done
+  [ "$q" = "$HOME/quicklisp" ] && return 0
+  a=$(cd "$q" 2>/dev/null && pwd -P) || :
+  b=$(cd "$HOME/quicklisp" 2>/dev/null && pwd -P) || :
+  [ -n "$a" ] && [ "$a" = "$b" ] && return 0
+  r=$(readlink "$HOME/quicklisp" 2>/dev/null) || :
+  [ -n "$r" ] && [ "${r%/}" = "$q" ] && return 0
+  if grep -q 'getenv "QUICKLISP_HOME"' "$CICILI/cicili.lisp" 2>/dev/null; then
+    QUICKLISP_HOME=$QL; export QUICKLISP_HOME
+    say "QUICKLISP_HOME=$QL, which the Cicili at $CICILI reads -- keep it exported for every build"
+    return 0
+  fi
+  die "QUICKLISP_HOME=$QL is not $HOME/quicklisp, and the Cicili at $CICILI is older than 1.0.1, the first whose cicili.lisp reads QUICKLISP_HOME (sbcl --script reads no ~/.sbclrc, and an older one loads (user-homedir-pathname)/quicklisp/setup.lisp only) -- update it (git -C $CICILI pull), unset QUICKLISP_HOME, or make $HOME/quicklisp a symlink to $QL, and re-run"
+}
+
 lisp_side() {
   step "the Lisp systems Cicili is built from"
+  ql_home_ok
   if [ ! -f "$QL/setup.lisp" ]; then
     say "installing Quicklisp into $QL"
     quicklisp_get
   fi
   # the last step of Quicklisp's instructions, so the user's own sbcl loads
   # it. (ql:add-to-init-file) asks for Enter and appends at every call, hence
-  # the newline and the look first. Cicili's build loads ~/quicklisp itself.
+  # the newline and the look first. Cicili's build loads Quicklisp itself,
+  # from $QUICKLISP_HOME or ~/quicklisp (ql_home_ok).
   if grep -qE 'quicklisp-init|setup\.lisp' "$HOME/.sbclrc" 2>/dev/null; then
     say "$HOME/.sbclrc loads Quicklisp already"
   else
@@ -142,5 +177,6 @@ exports_hint() {
   echo "   export CICILI=$CICILI"
   echo "   export ZIGURATIP_HOME=$ROOT/home"
   echo "   export $LIBVAR=\$ZIGURATIP_HOME/lib"
+  [ -n "${QUICKLISP_HOME:-}" ] && echo "   export QUICKLISP_HOME=$QUICKLISP_HOME"
   say "check it: cd $ROOT && sh Test/run-e2e.sh   (starts a server on ports 2160/2190, runs every case, stops it)"
 }

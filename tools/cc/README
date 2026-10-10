@@ -45,7 +45,8 @@ EVERYTHING ELSE ALREADY HAD THE LEVER. Makefile.global reads COMPILER, so
 the C++ projects were always `make COMPILER=...'; the workspace Makefile
 now says which one rather than leaving it commented out.
 
-GOING BACK TO GCC: `make COMPILER=g++', or CICILI_CC=gcc CICILI_CXX=g++
-for the scripts. Nothing here is load-bearing on clang. What is
-load-bearing is that all of it agrees -- a program downstream links
-libCore into its own binary, so this is not a per-repository choice.
+NO GOING BACK TO GCC: every build is clang, the owner's rule (2026-10-08),
+and CICILI_CC and CICILI_CXX choose only WHICH clang (clang-18, a path);
+install/ refuses a compiler that is not clang. What is also load-bearing
+is that all of it agrees -- a program downstream links libCore into its
+own binary, so this is not a per-repository choice.

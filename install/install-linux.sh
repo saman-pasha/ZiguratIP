@@ -6,7 +6,9 @@
 #   NO_PACKAGES=1 ...                          no root, or apt already done
 #   CICILI=/path/to/cicili ...                 a Cicili checkout elsewhere
 #                                              (default ../cicili, cloned if absent)
-#   CICILI_CC=gcc CICILI_CXX=g++ ...           build with gcc; no clang needed
+#   CICILI_CC=... CICILI_CXX=... ...           a particular clang (clang-18, a path);
+#                                              every build here is clang, and a
+#                                              compiler that is not is refused
 #   sudo sh install/install-linux.sh           the packages as root, then the rest as
 #                                              the user who called sudo, in that
 #                                              user's own home
@@ -42,22 +44,24 @@ if [ "${NO_PACKAGES:-0}" != 1 ]; then
             $SUDO update-alternatives --install /usr/bin/$t $t /usr/bin/$t-18 100 >/dev/null
             $SUDO update-alternatives --set $t /usr/bin/$t-18 >/dev/null
           done ;;
-        *) die "${CICILI_CXX} is too old for C++17" ;;
+        *) die "CICILI_CXX=${CICILI_CXX} is not clang -- every build here is clang" ;;
       esac
     fi
   elif command -v dnf >/dev/null 2>&1; then
     # ---- Fedora, and the Red Hat family with EPEL for sbcl --------------
-    # Fedora's clang is 17 or newer, so it is taken as is; redhat-rpm-config
-    # provides the hardened-cc1 specs file that home/etc/ziguratip-RedHat.conf
-    # names in its CPP_FLAGS.
+    # Fedora's clang is 17 or newer, so it is taken as is. gcc-c++ is here
+    # for libstdc++'s headers and runtime, which clang compiles and links
+    # against; nothing is compiled by gcc. redhat-rpm-config provides the
+    # hardened-cc1 specs file that home/etc/ziguratip-RedHat.conf names in
+    # its CPP_FLAGS.
     $SUDO dnf -q install -y gcc gcc-c++ make git curl ca-certificates gnupg2 clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config >/dev/null
     say "gcc gcc-c++ make git curl gnupg2 clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config"
     cxx_ok 16 || case "${CICILI_CXX:-clang++}" in
-      *clang*) die "this clang is older than 16 and tools/cc/cxx needs --gcc-install-dir; dnf install a newer clang, or CICILI_CC=gcc CICILI_CXX=g++" ;;
-      *) die "${CICILI_CXX} is too old for C++17" ;;
+      *clang*) die "this clang is older than 16 and tools/cc/cxx needs --gcc-install-dir; dnf install a newer clang" ;;
+      *) die "CICILI_CXX=${CICILI_CXX} is not clang -- every build here is clang" ;;
     esac
   else
-    say "neither apt-get nor dnf here -- needed: a C++17 compiler (clang 16+, or g++ 7+ with CICILI_CXX=g++),"
+    say "neither apt-get nor dnf here -- needed: clang 16+ with libstdc++'s headers,"
     say "make, git, curl, gnupg, sbcl, GNU libtool, the OpenSSL, zlib headers, python3. Checking for them:"
   fi
 fi
@@ -80,7 +84,7 @@ if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; th
   exec sudo -u "$SUDO_USER" -H env "$@" sh "$HERE/install-linux.sh"
 fi
 
-cxx_ok 16 || die "no C++17 compiler for tools/cc: ${CICILI_CXX:-clang++} (clang 16+, or CICILI_CC=gcc CICILI_CXX=g++)"
+cxx_ok 16 || die "no clang 16+ for tools/cc: ${CICILI_CXX:-clang++}"
 for t in make git curl sbcl python3; do command -v $t >/dev/null 2>&1 || die "$t is not on PATH"; done
 say "compiler: $(${CICILI_CXX:-clang++} --version | head -1)"
 [ -f /usr/include/openssl/ssl.h ] || [ -n "$(ls /usr/include/*/openssl/ssl.h 2>/dev/null)" ] \

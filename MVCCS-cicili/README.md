@@ -17,7 +17,9 @@ MVCCS is responsible for, then try to write MVCCS again in Cicili with
   B-tree index tier**, written in Cicili's C++ layer, compiled against
   the **real** `StreamIO` and `Core` libraries (`Zigurat::binarystream`,
   `Zigurat::filestream`, `ZiguratException`, `Utility`). One source
-  target emits `mvccs.cpp`, compiles it with g++ and links `mvccs_test`.
+  target emits `mvccs.cpp`, compiles it with clang++ (Cicili names `g++`,
+  and `tools/cc` puts a shim onto clang++ first on PATH) and links
+  `mvccs_test`.
 * **`build.sh`** — `CICILI=$HOME/cicili sh build.sh`; the binary prints
   a check line per behaviour and exits with the failure count.
 

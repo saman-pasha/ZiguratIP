@@ -525,7 +525,7 @@ memory: the 7000-row commit went from 0.25 s to 0.008. The three
 
 `cursor_walk` and `dead_pointers` read a page's hexmap into `uint8_t
 hexbuf[4096]`, a byte for each 16-byte chunk: exactly a page of 65536
-bytes, the largest there is and, since 0.1.23, the default. A longer page
+bytes, the largest there is and, since 1.0.0, the default. A longer page
 would fail only when a walk reached it (`cursor_page_hexmap` throws), so
 the server refuses a `MEMORY/PAGE_SIZE` over 65536 at startup, by name.
 The snapshot arrays beside it were the ones that bit (see the README, "The

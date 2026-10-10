@@ -30,7 +30,8 @@ PROJECTS := Core \
 # the file existed, which meant the workspace built with whatever `g++'
 # happened to be -- and cocolog, which links libCore into its own binary,
 # built with something else again. One toolchain across the three
-# repositories is the point; `make COMPILER=g++' still works.
+# repositories is the point, and it is clang, the owner's rule
+# (2026-10-08): CICILI_CC and CICILI_CXX choose WHICH clang, never gcc.
 #
 # IT NAMES A WRAPPER, not clang++ itself, because clang borrows libstdc++
 # from the newest gcc it can find and on Ubuntu 24.04 that is gcc-14's
