@@ -129,7 +129,7 @@ The store is created on first run. The output names every setting it read, which
 is the quickest way to see whether it found your configuration:
 
 ```
-Memory page size: '8192'
+Memory page size: '65536'
 Server type: 'TCP'
 Server service: '2160'
 Server TLS mode: 'FALSE'
@@ -189,7 +189,7 @@ RESET_MODE: FALSE       # TRUE erases every table at startup
 TRACE_MODE: TRUE        # log each request and transaction; turn off when busy
 
 MEMORY:
-	PAGE_SIZE: 8192
+	PAGE_SIZE: 65536    # a new store's; a store keeps its own in data/pagesize
 
 TRANSACTION:
 	MODE: NON-AUTOCOMMIT

@@ -524,9 +524,11 @@ memory: the 7000-row commit went from 0.25 s to 0.008. The three
 ### The page cursor's other fixed buffer
 
 `cursor_walk` and `dead_pointers` read a page's hexmap into `uint8_t
-hexbuf[4096]`, which holds a page of 8192 bytes at 8 bytes a chunk and
-not one of 65536 (`MEMORY/PAGE_SIZE` is a setting). The snapshot arrays
-beside it were the ones that bit (see the README, "The page walk that
-stopped at 1024 pages") and are sized to the list now; this one waits
-for a page size that needs it.
+hexbuf[4096]`, a byte for each 16-byte chunk: exactly a page of 65536
+bytes, the largest there is and, since 0.1.23, the default. A longer page
+would fail only when a walk reached it (`cursor_page_hexmap` throws), so
+the server refuses a `MEMORY/PAGE_SIZE` over 65536 at startup, by name.
+The snapshot arrays beside it were the ones that bit (see the README, "The
+page walk that stopped at 1024 pages") and are sized to the list now; this
+one is sized to the page (`hbpp`) the day a larger page is wanted.
 

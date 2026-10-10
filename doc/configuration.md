@@ -82,9 +82,20 @@ Defines path where user headers and libraries should stored. Default value is ZI
 
 Enables tracing c++ header and implementation files and commands to produce them.
 
-## MEMORY/BLOCK_SIZE
+## MEMORY/PAGE_SIZE
 
-Specifies memory block size. NOTICE: max row size computes as BLOCK_SIZE - 96.
+Bytes per page of a NEW store: a multiple of 16, at most 65536, which is also
+the default (8192 before 0.1.23). `MEMORY/BLOCK_SIZE` and
+`MEMORY/MEMORY_PAGE_SIZE` are older names for it. NOTICE: max row size
+computes as PAGE_SIZE - 96.
+
+A store keeps its own page in `data/pagesize`, written at its first open, and
+opens at that page whatever the setting says later; the startup line
+`Memory page size:` names both when they differ. A store older than that file
+was made at the PAGE_SIZE of its day (8192 unless it was changed): it opens,
+and is marked, under 8192, and is refused under any other page until its page
+is written into `data/pagesize` by hand. Opened at a page it was not written
+at, a store would be rewritten, not read.
 
 ## SERVER/TYPE
 

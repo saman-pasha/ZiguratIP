@@ -104,7 +104,7 @@ namespace
       << "\t/LIBRARY_PATH               $HOME_PATH/ld" << std::endl
       << "\t/RESET_MODE                 FALSE  --! TRUE erases every table !--" << std::endl
       << "\t/TRACE_MODE                 TRUE   --! logs every request !--" << std::endl
-      << "\t/MEMORY/PAGE_SIZE           8192" << std::endl
+      << "\t/MEMORY/PAGE_SIZE           65536  --! a new store's; a store keeps its own !--" << std::endl
       << "\t/TRANSACTION/MODE           NON-AUTOCOMMIT | AUTOCOMMIT" << std::endl
       << "\t/TRANSACTION/ISOLATION_LEVEL READ-COMMITTED --! of five !--" << std::endl
       << "\t/LIBRARY/CACHE_MODE         NONE | GLOBAL | LOCAL" << std::endl
