@@ -7,6 +7,9 @@
 #   CICILI=/path/to/cicili ...                 a Cicili checkout elsewhere
 #                                              (default ../cicili, cloned if absent)
 #   CICILI_CC=gcc CICILI_CXX=g++ ...           build with gcc; no clang needed
+#   sudo sh install/install-linux.sh           the packages as root, then the rest as
+#                                              the user who called sudo, in that
+#                                              user's own home
 #
 # Idempotent: run it again after a failure and it continues. The compiler
 # comes first because a make without one leaves dependency files that
@@ -24,8 +27,8 @@ if [ "${NO_PACKAGES:-0}" != 1 ]; then
     # ---- Debian, Ubuntu ------------------------------------------------
     export DEBIAN_FRONTEND=noninteractive
     $SUDO apt-get -qq update
-    $SUDO apt-get -qq install -y build-essential make git curl ca-certificates sbcl libssl-dev zlib1g-dev python3 >/dev/null
-    say "build-essential make git curl sbcl libssl-dev zlib1g-dev python3"
+    $SUDO apt-get -qq install -y build-essential make git curl ca-certificates gnupg sbcl libssl-dev zlib1g-dev python3 >/dev/null
+    say "build-essential make git curl gnupg sbcl libssl-dev zlib1g-dev python3"
     if ! cxx_ok 16; then
       case "${CICILI_CXX:-clang++}" in
         *clang*)
@@ -47,22 +50,42 @@ if [ "${NO_PACKAGES:-0}" != 1 ]; then
     # Fedora's clang is 17 or newer, so it is taken as is; redhat-rpm-config
     # provides the hardened-cc1 specs file that home/etc/ziguratip-RedHat.conf
     # names in its CPP_FLAGS.
-    $SUDO dnf -q install -y gcc gcc-c++ make git curl ca-certificates clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config >/dev/null
-    say "gcc gcc-c++ make git curl clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config"
+    $SUDO dnf -q install -y gcc gcc-c++ make git curl ca-certificates gnupg2 clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config >/dev/null
+    say "gcc gcc-c++ make git curl gnupg2 clang sbcl openssl-devel zlib-devel python3 redhat-rpm-config"
     cxx_ok 16 || case "${CICILI_CXX:-clang++}" in
       *clang*) die "this clang is older than 16 and tools/cc/cxx needs --gcc-install-dir; dnf install a newer clang, or CICILI_CC=gcc CICILI_CXX=g++" ;;
       *) die "${CICILI_CXX} is too old for C++17" ;;
     esac
   else
     say "neither apt-get nor dnf here -- needed: a C++17 compiler (clang 16+, or g++ 7+ with CICILI_CXX=g++),"
-    say "make, git, curl, sbcl, GNU libtool, the OpenSSL, zlib headers, python3. Checking for them:"
+    say "make, git, curl, gnupg, sbcl, GNU libtool, the OpenSSL, zlib headers, python3. Checking for them:"
   fi
 fi
+
+# THE REST IS THE CALLING USER'S. Quicklisp and the ~/common-lisp tree are
+# found through $HOME -- SBCL's (user-homedir-pathname), ASDF's search of
+# ~/common-lisp -- and under `sudo sh install/install-linux.sh' $HOME is
+# /root: both would go to root's home, owned by root, where the user's own
+# sbcl never looks, and the build beside them would be root's too. So the
+# packages go in as root, and everything after them runs again as the user
+# who called sudo, in that user's own home (-H), with NO_PACKAGES=1 and this
+# run's options. A root login with no sudo (a container, Colab) is in its
+# own home already and goes on. cocolog's install-linux.sh does the same.
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  say "packages done as root; the rest as $SUDO_USER, in $(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  set -- NO_PACKAGES=1
+  for v in CICILI QUICKLISP_HOME CICILI_CC CICILI_CXX LOG; do
+    if eval "[ -n \"\${$v+set}\" ]"; then eval "set -- \"\$@\" \"$v=\$$v\""; fi
+  done
+  exec sudo -u "$SUDO_USER" -H env "$@" sh "$HERE/install-linux.sh"
+fi
+
 cxx_ok 16 || die "no C++17 compiler for tools/cc: ${CICILI_CXX:-clang++} (clang 16+, or CICILI_CC=gcc CICILI_CXX=g++)"
 for t in make git curl sbcl python3; do command -v $t >/dev/null 2>&1 || die "$t is not on PATH"; done
 say "compiler: $(${CICILI_CXX:-clang++} --version | head -1)"
 [ -f /usr/include/openssl/ssl.h ] || [ -n "$(ls /usr/include/*/openssl/ssl.h 2>/dev/null)" ] \
   || say "warning: no OpenSSL headers under /usr/include -- Cryptography and SocketIO need libssl-dev"
+log_ok "$LOG"
 
 checkout_cicili
 lisp_side

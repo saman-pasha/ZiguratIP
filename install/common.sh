@@ -36,14 +36,65 @@ checkout_cicili() {
   fi
 }
 
+# EACH FILE A BUILD WRITES ITS OUTPUT TO MUST BE THIS USER'S TO WRITE. A run
+# that was root's from end to end left its log in /tmp owned by root, and
+# /tmp is sticky: the user's `> $LOG' then fails, the `|| true' after the
+# build swallows it, and the artifact check reads root's OLD log and reports
+# a failure that is not this run's.
+log_ok() {
+  for f in "$@"; do
+    if [ -e "$f" ]; then [ -w "$f" ] || die "$f is not $(id -un)'s to write (an earlier run as root left it?) -- remove it, or LOG=/elsewhere"
+    else [ -w "$(dirname "$f")" ] || die "cannot write $f -- LOG=/elsewhere"; fi
+  done
+}
+
+# QUICKLISP AS ITS OWN PAGE SAYS (https://www.quicklisp.org/beta/): fetch
+# quicklisp.lisp and its signature, check the signature against Quicklisp's
+# release key, load it and install, then (ql:add-to-init-file) -- below, in
+# lisp_side. The key comes from the same server as the file, so it is held to
+# the fingerprint that page publishes. gpgv checks against a keyring of that
+# one key and starts no agent; gpg only turns the armored key into a keyring.
+# Everything goes in a directory of its own: a /tmp/quicklisp.lisp another
+# user's run left is not this user's to overwrite.
+QL_KEY=D7A3489DDEFE32B7D0E7CC61307965AB028B5FF7
+quicklisp_get() {
+  command -v gpg >/dev/null 2>&1 \
+    || die "gpg is needed to verify quicklisp.lisp, as Quicklisp's instructions do -- install gnupg, or Quicklisp by hand into $QL, and re-run"
+  gpgv=$(command -v gpgv 2>/dev/null || command -v gpgv2 2>/dev/null) \
+    || die "gpgv is needed to verify quicklisp.lisp (it comes with gnupg) -- or install Quicklisp by hand into $QL and re-run"
+  qt=$(mktemp -d "${TMPDIR:-/tmp}/quicklisp.XXXXXX")
+  for f in quicklisp.lisp quicklisp.lisp.asc release-key.txt; do
+    curl -fsSL -o "$qt/$f" "https://beta.quicklisp.org/$f" \
+      || { rm -rf "$qt"; die "cannot reach beta.quicklisp.org for $f -- install Quicklisp by hand into $QL and re-run"; }
+  done
+  gpg --homedir "$qt" --batch --dearmor < "$qt/release-key.txt" > "$qt/key.gpg" 2>/dev/null \
+    || { rm -rf "$qt"; die "gpg cannot read Quicklisp's release key"; }
+  if ! "$gpgv" --homedir "$qt" --keyring "$qt/key.gpg" --status-fd 1 "$qt/quicklisp.lisp.asc" "$qt/quicklisp.lisp" 2>/dev/null \
+       | grep -q "^\[GNUPG:\] VALIDSIG .* $QL_KEY\$"; then
+    rm -rf "$qt"; die "quicklisp.lisp does not verify against Quicklisp's release key $QL_KEY -- nothing installed"
+  fi
+  say "quicklisp.lisp verified: signed by $QL_KEY"
+  sbcl --non-interactive --load "$qt/quicklisp.lisp" \
+       --eval "(quicklisp-quickstart:install :path \"$QL/\")" >/dev/null \
+    || { rm -rf "$qt"; die "(quicklisp-quickstart:install) failed -- run it by hand: sbcl --load quicklisp.lisp"; }
+  rm -rf "$qt"
+}
+
 lisp_side() {
   step "the Lisp systems Cicili is built from"
   if [ ! -f "$QL/setup.lisp" ]; then
     say "installing Quicklisp into $QL"
-    curl -fsSL -o /tmp/quicklisp.lisp https://beta.quicklisp.org/quicklisp.lisp \
-      || die "cannot reach beta.quicklisp.org -- install Quicklisp by hand into $QL and re-run"
-    sbcl --non-interactive --load /tmp/quicklisp.lisp \
-         --eval "(quicklisp-quickstart:install :path \"$QL/\")" >/dev/null
+    quicklisp_get
+  fi
+  # the last step of Quicklisp's instructions, so the user's own sbcl loads
+  # it. (ql:add-to-init-file) asks for Enter and appends at every call, hence
+  # the newline and the look first. Cicili's build loads ~/quicklisp itself.
+  if grep -qE 'quicklisp-init|setup\.lisp' "$HOME/.sbclrc" 2>/dev/null; then
+    say "$HOME/.sbclrc loads Quicklisp already"
+  else
+    printf '\n' | sbcl --non-interactive --load "$QL/setup.lisp" --eval '(ql:add-to-init-file)' >/dev/null \
+      || die "(ql:add-to-init-file) failed -- run sbcl --load $QL/setup.lisp and call it by hand"
+    say "$HOME/.sbclrc loads Quicklisp now ((ql:add-to-init-file))"
   fi
   sbcl --non-interactive --load "$QL/setup.lisp" \
        --eval '(ql:quickload (list :str :cl-ppcre) :silent t)' >/dev/null

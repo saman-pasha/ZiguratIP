@@ -20,11 +20,35 @@ build against a live server.
 ## Knobs
 
 * `NO_PACKAGES=1` skips the package step: no root, or already done.
+* Run as yourself, the Linux script asks `sudo` only for the packages.
+  `sudo sh install/install-linux.sh` works too: the packages go in as root,
+  and everything after them runs again as the user who called `sudo`, in
+  that user's own home. Quicklisp and `~/common-lisp` are found through
+  `$HOME`, which `sudo` sets to `/root`, so done as root they landed where
+  the user's own `sbcl` never looks. A root login with no `sudo` (a
+  container) uses root's home, which is its own. The macOS script refuses
+  root outright, as Homebrew does.
 * `CICILI=/path` names a Cicili checkout elsewhere; the default is
   `../cicili`, and it is cloned there when absent.
 * `CICILI_CC=gcc CICILI_CXX=g++` builds with gcc and needs no clang at all
   (Linux). On Red Hat Enterprise Linux and its rebuilds, `sbcl` is in EPEL. The wrappers in `tools/cc` read exactly those two.
-* `LOG=/path` moves the make log from `/tmp/ziguratip-install.log`.
+* `LOG=/path` moves the make log from `/tmp/ziguratip-install.log`. A log
+  there that is not yours to write (an earlier run as root left it) is
+  refused by name before anything is built, rather than read back as this
+  run's failure.
+
+## Quicklisp
+
+When `$QUICKLISP_HOME` (`~/quicklisp`) has no Quicklisp, it is installed as
+[its own page](https://www.quicklisp.org/beta/) says: `quicklisp.lisp` and
+its signature are fetched, the signature is checked against Quicklisp's
+release key with `gpgv` — the key is held to the fingerprint that page
+publishes, `D7A3489DDEFE32B7D0E7CC61307965AB028B5FF7`, and nothing is
+installed when it does not verify — and then `(quicklisp-quickstart:install)`.
+Either way `(ql:add-to-init-file)` follows, unless `~/.sbclrc` loads a
+Quicklisp already, so your own `sbcl` has it too. `gnupg` is among the
+packages for this; with `NO_PACKAGES=1` and no `gpg`, the script stops and
+says so.
 
 ## Two things the scripts know that cost real time
 

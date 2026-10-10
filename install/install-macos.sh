@@ -9,11 +9,17 @@
 #
 # Apple's clang comes with the Xcode command line tools and speaks C++17;
 # Homebrew supplies sbcl, GNU libtool (as glibtool, which Cicili links
-# through) and OpenSSL 3, which Cryptography and SocketIO link. Idempotent.
+# through), OpenSSL 3, which Cryptography and SocketIO link, and gnupg to
+# verify Quicklisp. Idempotent.
+#
+# As yourself, never as root: Homebrew refuses root, and Quicklisp and
+# ~/common-lisp, found through $HOME, would be root's -- in root's home, or
+# owned by root in yours.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/.." && pwd)
 OS=macos; LIBVAR=DYLD_LIBRARY_PATH; SHIMS=$HERE/lisp; LOG=${LOG:-/tmp/ziguratip-install.log}
 . "$HERE/common.sh"
+[ "$(id -u)" != 0 ] || die "run this as yourself, not as root: Homebrew refuses root, and the Lisp side would go to root's home, where your own sbcl never looks"
 
 step "Xcode command line tools"
 xcode-select -p >/dev/null 2>&1 || die "run: xcode-select --install   (Apple's clang, make and git)"
@@ -23,12 +29,13 @@ say "$(${CICILI_CXX:-clang++} --version | head -1)"
 if [ "${NO_PACKAGES:-0}" != 1 ]; then
   step "Homebrew packages"
   command -v brew >/dev/null 2>&1 || die "Homebrew is not installed: https://brew.sh"
-  brew list --formula sbcl libtool openssl@3 >/dev/null 2>&1 || brew install sbcl libtool openssl@3
-  say "sbcl libtool openssl@3"
+  brew list --formula sbcl libtool openssl@3 gnupg >/dev/null 2>&1 || brew install sbcl libtool openssl@3 gnupg
+  say "sbcl libtool openssl@3 gnupg"
 fi
 for t in make git curl sbcl glibtool python3; do command -v $t >/dev/null 2>&1 || die "$t is not on PATH"; done
 BREW=$(brew --prefix 2>/dev/null || echo /usr/local)
 [ -f "$BREW/include/openssl/ssl.h" ] || say "warning: no openssl/ssl.h under $BREW/include -- try: brew link openssl@3"
+log_ok "$LOG"
 
 checkout_cicili
 lisp_side
