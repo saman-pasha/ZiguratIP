@@ -55,6 +55,15 @@ Quicklisp already, so your own `sbcl` has it too. `gnupg` is among the
 packages for this; with `NO_PACKAGES=1` and no `gpg`, the script stops and
 says so.
 
+A Quicklisp that is there and cannot find `str` (`System "str" not found`)
+is mended rather than reported: one whose dist never installed — a
+`quicklisp-quickstart:install` cut off after the client was in place leaves
+`setup.lisp` and no `dists/quicklisp/` — gets the dist, a dist turned off is
+turned on, and a dist older than `str` (2015's has none) is brought to the
+current version, which moves your other Quicklisp libraries to it too. The
+script says which it did; when it cannot (no network), it stops and names the
+condition.
+
 `QUICKLISP_HOME` elsewhere than `~/quicklisp` wants Cicili 1.0.1 or later.
 The build runs `sbcl --script cicili.lisp` (`MVCCS-cicili/build.sh`), which
 reads no `~/.sbclrc`, so Cicili finds Quicklisp itself: from

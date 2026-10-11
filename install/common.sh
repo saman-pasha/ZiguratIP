@@ -113,6 +113,40 @@ ql_home_ok() {
   die "QUICKLISP_HOME=$QL is not $HOME/quicklisp, and the Cicili at $CICILI is older than 1.0.1, the first whose cicili.lisp reads QUICKLISP_HOME (sbcl --script reads no ~/.sbclrc, and an older one loads (user-homedir-pathname)/quicklisp/setup.lisp only) -- update it (git -C $CICILI pull), unset QUICKLISP_HOME, or make $HOME/quicklisp a symlink to $QL, and re-run"
 }
 
+# A QUICKLISP THAT HAS NO str IN IT. lisp_side takes a Quicklisp whose
+# setup.lisp is there, and two such cannot find str ("System "str" not
+# found", the owner's run of 2026-10-11): one whose dist never installed --
+# (quicklisp-quickstart:install) puts the client in place first and fetches
+# the dist after, so a run cut off between the two leaves setup.lisp and no
+# dists/quicklisp/ -- and one whose dist is older than str (2015-01-13's has
+# none). The first gets the dist, a disabled one is enabled, and the second
+# is brought to the dist's current version, which moves this user's other
+# Quicklisp libraries on with it -- each said, so it is not done behind
+# anyone's back.
+ql_dist() {
+  out=$(sbcl --non-interactive --load "$QL/setup.lisp" --eval '
+    (let ((d (ql-dist:find-dist "quicklisp")))
+      (cond ((null d)
+             (ql-dist:install-dist "http://beta.quicklisp.org/dist/quicklisp.txt" :prompt nil)
+             (format t "~&QL-DIST installed ~a~%" (ql-dist:version (ql-dist:find-dist "quicklisp"))))
+            ((not (ql-dist:enabledp d))
+             (ql-dist:enable d)
+             (format t "~&QL-DIST enabled ~a~%" (ql-dist:version d))))
+      (unless (ql-dist:find-system "str")
+        (let ((was (ql-dist:version (ql-dist:find-dist "quicklisp"))))
+          (ql:update-dist "quicklisp" :prompt nil)
+          (format t "~&QL-DIST updated ~a ~a~%" was (ql-dist:version (ql-dist:find-dist "quicklisp"))))))' 2>&1) \
+    || { printf '%s\n' "$out" | grep -E -A2 '^Unhandled' | head -3 | sed 's/^/   /'; die "the Quicklisp in $QL has no dist with str in it, and installing or updating one failed -- in sbcl --load $QL/setup.lisp, (ql-dist:install-dist \"http://beta.quicklisp.org/dist/quicklisp.txt\") when it has no dist, (ql:update-dist \"quicklisp\") when it has one, shows why"; }
+  printf '%s\n' "$out" | while read -r tag what a b; do
+    [ "$tag" = QL-DIST ] || continue
+    case $what in
+      installed) say "the Quicklisp in $QL had no dist: installed it ($a)" ;;
+      enabled)   say "the Quicklisp in $QL had its dist turned off: turned it on ($a)" ;;
+      updated)   say "the Quicklisp in $QL had a dist ($a) older than str: updated it to $b" ;;
+    esac
+  done
+}
+
 lisp_side() {
   step "the Lisp systems Cicili is built from"
   ql_home_ok
@@ -131,8 +165,10 @@ lisp_side() {
       || die "(ql:add-to-init-file) failed -- run sbcl --load $QL/setup.lisp and call it by hand"
     say "$HOME/.sbclrc loads Quicklisp now ((ql:add-to-init-file))"
   fi
+  ql_dist
   sbcl --non-interactive --load "$QL/setup.lisp" \
-       --eval '(ql:quickload (list :str :cl-ppcre) :silent t)' >/dev/null
+       --eval '(ql:quickload (list :str :cl-ppcre) :silent t)' >/dev/null 2>&1 \
+    || die "str and cl-ppcre will not load from the Quicklisp in $QL -- run sbcl --load $QL/setup.lisp and (ql:quickload (list :str :cl-ppcre)) to see why"
   say "str and cl-ppcre: present (Quicklisp)"
   mkdir -p "$HOME/common-lisp"
   cp -R "$SHIMS/sha1" "$SHIMS/base64" "$HOME/common-lisp/"
