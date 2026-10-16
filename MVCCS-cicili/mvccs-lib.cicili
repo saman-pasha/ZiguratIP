@@ -1408,27 +1408,39 @@
       (return count)))
 
   ;; a Pointer read back from the hexmap chain at ADDRESS -- _pointer
+  ;;
+  ;; READ 64 BYTES AT A TIME, NOT ONE. Every row a cursor reads is measured
+  ;; here, and a byte a chunk through the stream -- a read and its sentry,
+  ;; ~130 instructions each -- was 1 300 instructions a row of a clause
+  ;; table, 10 % of fetching a predicate's 31 000 clauses. The bytes are
+  ;; the same bytes, decided in the same order: the answer and every throw
+  ;; are what they were, and a block read past the hexmap's end clears the
+  ;; stream before it answers, as a byte read that failed did.
   (func pointer_at ((Memory * m) (const uint8_t * key) (int64_t address)) (out Pointer)
-    (let ((uint8_t hex_byte . 0)
+    (let ((uint8_t blk [64])
           (int64_t size . 0)
           (binarystream * hio . #'(hex_in m)))
       ((-> hio seekg) (addr_hexmap_data address) std::ios::beg)
       (while #t
-        ((-> hio read_std_ubyte) hex_byte)
-        (if (not ((-> hio good)))
-            (block
-              ((-> hio clear))
-              (throw* (MemoryException "hexmap ends inside the chunk"))))
-        ;; Every chunk of a record is a DATA chunk: the high bit is set on
-        ;; all of them, standalone or not. A byte without it is free space,
-        ;; which is where a torn chain link points -- walked naively that is
-        ;; the hexmap read one free byte at a time to its end, and the C++
-        ;; twin measured exactly that as a vacuum spinning forever.
-        (if (!= (bitand hex_byte 128) 128)
-            (throw* (MemoryException "the chunk is not an allocated record -- a torn link")))
-        (if (== (bitand hex_byte 64) 64)
-            (return (pointer_make key address (+ size (size_remainder hex_byte)))))
-        (set size (+ size CHUNK_SIZE)))
+        ((-> hio read) (cast (char *) blk) 64)
+        (let ((int64_t got . #'(cast int64_t ((-> hio gcount))))
+              (bool partial . #'(not ((-> hio good)))))
+          (if partial ((-> hio clear)))
+          (for ((int64_t i . 0)) (< i got) ((++ i))
+            (let ((uint8_t hex_byte . #'(nth i blk)))
+              ;; Every chunk of a record is a DATA chunk: the high bit is set
+              ;; on all of them, standalone or not. A byte without it is free
+              ;; space, which is where a torn chain link points -- walked
+              ;; naively that is the hexmap read one free byte at a time to
+              ;; its end, and the C++ twin measured exactly that as a vacuum
+              ;; spinning forever.
+              (if (!= (bitand hex_byte 128) 128)
+                  (throw* (MemoryException "the chunk is not an allocated record -- a torn link")))
+              (if (== (bitand hex_byte 64) 64)
+                  (return (pointer_make key address (+ size (size_remainder hex_byte)))))
+              (set size (+ size CHUNK_SIZE))))
+          (if partial
+              (throw* (MemoryException "hexmap ends inside the chunk")))))
       (return (pointer_null))))
 
   ;; Whether ADDRESS names an allocated record: its first hexmap byte carries
@@ -3272,6 +3284,77 @@
       (set (-> ctx spent) d)
       (return #t)))
 
+  ;; ------------------------------------------------------------------
+  ;; THE OPEN'S WALK READS A PAGE'S HEXMAP ONCE. It read a byte a chunk
+  ;; through the stream -- a seekg and a read, a few hundred instructions
+  ;; each -- and that was 88 % of opening a store: 3.8 G instructions and
+  ;; 0.35 s for cocolog's 322 MB store of two taught languages, paid by
+  ;; every process that opens it. The walk reads the page's slice of the
+  ;; hexmap in one read and decides from it; what the slice cannot answer
+  ;; -- a record running past its page, a slice the hexmap ends inside, no
+  ;; buffer at all -- is read through the stream exactly as before, and a
+  ;; page whose locked records were settled, which writes the hexmap, has
+  ;; its slice read again.
+  ;; ------------------------------------------------------------------
+
+  ;; LEN bytes of the hexmap from BASE into BUF: how many the hexmap had
+  (func hex_slice_read ((Memory * m) (int64_t base) (int64_t len) (uint8_t * buf)) (out int64_t)
+    (if (== buf nil) (return 0))
+    (let ((binarystream * hio . #'(hex_in m))
+          (int64_t got . 0))
+      ((-> hio seekg) base std::ios::beg)
+      (if (not ((-> hio good)))
+          (block
+            ((-> hio clear))
+            (return 0)))
+      ((-> hio read) (cast (char *) buf) len)
+      (set got (cast int64_t ((-> hio gcount))))
+      (if (not ((-> hio good))) ((-> hio clear)))
+      (return got)))
+
+  ;; pointer_at_state over a slice whose record's head is at J: 1 and the
+  ;; pointer when the record ends inside the slice, 0 when only the stream
+  ;; can say
+  (func pointer_at_state_slice ((const uint8_t * buf) (int64_t avail) (int64_t j)
+                                (const uint8_t * key) (int64_t address)
+                                (bool * is_data) (RowState * online_state) (RowLock * online_lock)
+                                (Pointer * pointer))
+        (out int)
+    (let ((int64_t size . 0)
+          (int64_t k . #'(+ j CONTROL_COUNT)))
+      (if (>= j avail) (return 0))
+      (while (< k avail)
+        (let ((uint8_t b . #'(nth k buf)))
+          (if (== (bitand b 64) 64)
+              (block
+                (set (cof online_state) (cast RowState (bitand (nth j buf) 12)))
+                (set (cof online_lock) (cast RowLock (bitand (nth j buf) 3)))
+                (set (cof is_data) (== (bitand b 128) 128))
+                (set (cof pointer) (pointer_make key address (+ size (size_remainder b))))
+                (return 1)))
+          (set size (+ size CHUNK_SIZE))
+          (set k (+ k 1))))
+      (return 0)))
+
+  ;; free_run_count over a slice whose run begins at J: the count, or -1
+  ;; when only the stream can say
+  (func free_run_count_slice ((const uint8_t * buf) (int64_t avail) (int64_t j)
+                              (int64_t address) (int64_t end_address))
+        (out int64_t)
+    (let ((int64_t count . 0)
+          (int stop . 0))
+      (while (and (== stop 0) (< (+ address (* count CHUNK_SIZE)) end_address))
+        (if (>= (+ j count) avail) (return -1))
+        (let ((uint8_t b . #'(nth (+ j count) buf)))
+          ;; an allocated chunk is not part of this run
+          (if (== (bitand b 128) 128)
+              (set stop 1)
+            (block
+              (set count (+ count 1))
+              ;; standalone: the run ends here
+              (if (== (bitand b 64) 64) (set stop 1))))))
+      (return count)))
+
   (func memory_initialize ((Memory * m)) (out void)
     ;; every page's hash key into the page list
     (let ((int64_t i . 0))
@@ -3311,16 +3394,22 @@
       (cursor_walk m TRANSACTIONS_HASHKEY nil (cast (void *) (aof ctx)) initialize_txn_cb)
 
       ;; walk every page: finish uncommitted records the way their
-      ;; transaction's intention says; register every hole
-      (let ((PageEntry * e . #'(-> m pages)))
+      ;; transaction's intention says; register every hole -- from the
+      ;; page's slice of the hexmap, read once (above)
+      (let ((PageEntry * e . #'(-> m pages))
+            (int64_t hlen . #'(/ (-> m page_size) CHUNK_SIZE))
+            (uint8_t * hbuf . #'(cast (uint8_t *) (malloc (cast size_t (/ (-> m page_size) CHUNK_SIZE))))))
         (while (!= e nil)
           (let ((int64_t begin_address . #'(+ (-> e address) PAGEFILE_CONTROL_SIZE))
                 (int64_t end_address . #'(+ (-> e address) (-> m page_size)))
+                (int64_t hbase . #'(addr_hexmap (-> e address)))
+                (int64_t havail . 0)
                 (bool is_data . #f)
                 (RowState online_state . ROW_NONE)
                 (RowLock online_lock . LOCK_NONE)
                 (Control control))
             (control_clear (aof control))
+            (set havail (hex_slice_read m hbase hlen hbuf))
             ;; A CONTENT TEAR IS SALVAGED, NOT REFUSED. A kill can catch the
             ;; hexmap mid-write, leaving a page whose bytes claim a record
             ;; that runs past the end -- the walk used to throw there and
@@ -3339,19 +3428,25 @@
               ;; of step and rolling back live rows. A record's first chunk
               ;; is a control chunk and always carries the high bit; a free
               ;; chunk never does. One byte decides.
-              (let ((uint8_t head_byte . 0)
-                    (binarystream * hio . #'(hex_in m)))
-                ((-> hio seekg) (addr_hexmap begin_address) std::ios::beg)
-                ((-> hio read_std_ubyte) head_byte)
-                (if (not ((-> hio good)))
-                    (block
-                      ((-> hio clear))
-                      break))
-                (set is_data (== (bitand head_byte 128) 128)))
+              (let ((int64_t j . #'(/ (- begin_address (-> e address)) CHUNK_SIZE)))
+                (if (< j havail)
+                    (set is_data (== (bitand (nth j hbuf) 128) 128))
+                  (let ((uint8_t head_byte . 0)
+                        (binarystream * hio . #'(hex_in m)))
+                    ((-> hio seekg) (addr_hexmap begin_address) std::ios::beg)
+                    ((-> hio read_std_ubyte) head_byte)
+                    (if (not ((-> hio good)))
+                        (block
+                          ((-> hio clear))
+                          break))
+                    (set is_data (== (bitand head_byte 128) 128))))
               (let ((Pointer pointer . #'(pointer_null)))
                 (if is_data
-                    (set pointer (pointer_at_state m (-> e key) begin_address
-                                    (aof is_data) (aof online_state) (aof online_lock))))
+                    (if (not (pointer_at_state_slice hbuf havail j (-> e key) begin_address
+                                                     (aof is_data) (aof online_state) (aof online_lock)
+                                                     (aof pointer)))
+                        (set pointer (pointer_at_state m (-> e key) begin_address
+                                        (aof is_data) (aof online_state) (aof online_lock)))))
                 (if is_data
                     (block
                       (if (!= online_lock LOCK_NONE)
@@ -3367,16 +3462,19 @@
                                       (set resolved #t)))
                                 (set t (-> t next)))
                               (if (not resolved)
-                                  (rollback_pointer m (aof pointer))))))
+                                  (rollback_pointer m (aof pointer))))
+                            ;; settling wrote the hexmap: the slice again
+                            (set havail (hex_slice_read m hbase hlen hbuf))))
                       (set begin_address (+ begin_address (ptr_actual_size (aof pointer)))))
                   ;; a free run is not a record: measure it from the hexmap
-                  (let ((int64_t run . #'(free_run_count m begin_address end_address)))
+                  (let ((int64_t run . #'(free_run_count_slice hbuf havail j begin_address end_address)))
+                    (if (< run 0) (set run (free_run_count m begin_address end_address)))
                     (if (<= run 0)
                         (set begin_address end_address)   ;; must advance
                       (block
                         (free_list_insert m (-> e key) begin_address (* run CHUNK_SIZE))
                         ;; AND KEEP WALKING: free space is not always the tail
-                        (set begin_address (+ begin_address (* run CHUNK_SIZE)))))))))
+                        (set begin_address (+ begin_address (* run CHUNK_SIZE))))))))))
                 (cast void 0))
               (catch ((const ZiguratException & ex))
                 (cast void ex)
@@ -3391,7 +3489,8 @@
                       ((-> (-> m hexmap_io) flush))
                       (free_list_insert m (-> e key) begin_address
                                         (* remaining CHUNK_SIZE)))))))
-          (set e (-> e next))))
+          (set e (-> e next)))
+        (if (!= hbuf nil) (free (cast (void *) hbuf))))
 
       ;; the spent transaction records go back to the allocator
       (if (!= ($ ctx seen) nil)

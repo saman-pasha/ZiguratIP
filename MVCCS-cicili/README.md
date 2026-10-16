@@ -1649,6 +1649,47 @@ that opens no store 11-16 in both; the fresh store's process 35-36 MB
 resident against 9, and 8 132 minor faults against 1 410 (the build before
 the caps: 1 393).
 
+## The open reads a page's hexmap once (1.0.1)
+
+`memory_initialize` walks every record of every page when a store opens --
+to settle the records a transaction left locked and to list the holes for
+the allocator -- and it read the hexmap a byte a chunk through the stream:
+a `seekg` and a `read_std_ubyte`, the stream's sentry and the buffer's
+`xsgetn` each time, a few hundred instructions a byte. cocolog's store of
+two taught languages (322 MB, 452 515 live rows, 4 848 pages) took 3.80 G
+instructions to open -- 88 % of a process that then fetched a predicate of
+31 000 clauses -- and 0.42-0.69 s of CPU before its program began, paid by
+every process that opens it.
+
+**The walk reads the page's slice of the hexmap in one read** (`page_size
+/ 16` bytes, 4 KiB on 64 KiB pages) and decides from it: the head byte
+(free or record), the record's extent (`pointer_at_state_slice`), a free
+run (`free_run_count_slice`). Whatever the slice cannot answer -- a record
+whose end is past it, a slice the hexmap ends inside, no buffer at all --
+goes to the stream functions exactly as before, so a torn page is salvaged
+the way it was; and a page whose locked records were settled, which writes
+the hexmap, has its slice read again. 0.29 G instructions, 0.06 s; what
+is left is the walk itself, ~14 instructions a hexmap byte.
+
+**And a row's chain is read 64 bytes at a time** (`pointer_at`, which
+every cursor calls for every row): 1 300 instructions a row of a clause
+table to 660. The bytes are decided in the same order; a block read past
+the hexmap's end clears the stream before it answers or throws, as a byte
+read that failed did, and every hexmap read in the engine starts with its
+own `seekg`, so none depended on where the old one left the stream.
+
+**Proved by the bytes the allocator writes.** The free list the walk
+builds decides where every later record goes, so the same workload (300
+inserts, an update of a 10 808-row predicate, a delete, 40 more inserts)
+was run by the old engine twice and by the new once on copies of each
+store, and the hexmaps compared: identical on two taught stores and on
+four stores whose writer was killed mid-transaction after 1.2 to 3.5 s
+(42-115 MB of locked rows, rolled back at the open) -- the old engine
+against itself too, so the comparison can say something -- and the rows
+read back the same by either engine. `consumer_test`, `contention_test`,
+the carry-over, ageing, defer, log and tail checks are green, and all 111
+Parsi objects in `home/ld` resolve against the new `libMVCCS.so`.
+
 ## Hard debugging, without changing a line
 
 Cicili ships four logging macros — `info!`, `warn!`, `debug!`, `syslog!` —
