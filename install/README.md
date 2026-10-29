@@ -5,7 +5,7 @@ Two scripts, one per operating system, and the part they share:
 | file | what it is |
 |---|---|
 | `install-linux.sh` | Debian and Ubuntu through `apt-get`, Fedora and the Red Hat family through `dnf`: the packages, a clang 16+ (Fedora's own; on Ubuntu clang 18 from apt.llvm.org, because apt's is 14), then the common part |
-| `install-macos.sh` | macOS: the Xcode command line tools for clang, Homebrew for `sbcl`, `libtool` and `openssl@3`, then the common part |
+| `install-macos.sh` | macOS: the Xcode command line tools for clang, Homebrew for `sbcl`, `libtool` and `openssl@3` (whose headers and libraries, and Homebrew's, it hands clang through `CPATH` and `LIBRARY_PATH`), then the common part |
 | `common.sh` | sourced by both: the Cicili checkout (found or cloned beside this one), the four Lisp systems Cicili is built from, `make MODE=Release`, and a check of the **artifacts** — fourteen libraries and three programs — because the top-level make steps over a failed project and its exit code proves nothing |
 | `lisp/` | `sha1` and `base64`, the two Lisp systems Cicili depends on that are published nowhere; see the README there |
 
@@ -13,9 +13,18 @@ Two scripts, one per operating system, and the part they share:
 sh install/install-linux.sh        # or install-macos.sh
 ```
 
-Then put the three lines it prints — `CICILI`, `ZIGURATIP_HOME` and the
-library path — in your shell profile, and `sh Test/run-e2e.sh` proves the
-build against a live server.
+Then put the lines it prints — `CICILI`, `ZIGURATIP_HOME`, the library path,
+and on a Mac `CPATH` and `LIBRARY_PATH` — in your shell profile, and
+`sh Test/run-e2e.sh` proves the build against a live server.
+
+On a Mac, `CPATH` and `LIBRARY_PATH` name `openssl@3`'s headers and libraries,
+then Homebrew's own, for every compile and link. No makefile here names a
+Homebrew path, and Apple's clang searches `/usr/local` (Homebrew's prefix on
+an Intel Mac) but not `/opt/homebrew` (its prefix on Apple silicon). Worse,
+`openssl@3` is keg-only on both (Homebrew's reason: a versioned formula) and
+linked into neither prefix. So without them an Apple silicon Mac finds no
+`openssl/ssl.h`, which Cryptography and SocketIO include. A `make` in a later
+shell wants them too.
 
 ## Knobs
 

@@ -34,7 +34,21 @@ if [ "${NO_PACKAGES:-0}" != 1 ]; then
 fi
 for t in make git curl sbcl glibtool python3; do command -v $t >/dev/null 2>&1 || die "$t is not on PATH"; done
 BREW=$(brew --prefix 2>/dev/null || echo /usr/local)
-[ -f "$BREW/include/openssl/ssl.h" ] || say "warning: no openssl/ssl.h under $BREW/include -- try: brew link openssl@3"
+# HOMEBREW'S HEADERS AND LIBRARIES, FOR EVERY COMPILE AND LINK BELOW. No
+# makefile here names a Homebrew path: each leaves it to the compiler's own
+# search, and Apple's clang searches /usr/local -- Homebrew's prefix on an
+# Intel Mac -- but not /opt/homebrew, its prefix on Apple silicon. And
+# openssl@3, whose headers Cryptography and SocketIO compile against and whose
+# libssl and libcrypto they link, is keg-only on both (Homebrew's reason: a
+# versioned formula) and linked into no prefix, so unless it was `brew link'ed
+# by hand its headers were found nowhere. CPATH and LIBRARY_PATH are clang's
+# own variables for this: exported for the build below, and printed with the
+# exports at the end for the builds after it.
+OSSL=$(brew --prefix openssl@3 2>/dev/null) || OSSL=
+[ -f "$OSSL/include/openssl/ssl.h" ] || [ -f "$BREW/include/openssl/ssl.h" ] \
+  || say "warning: no openssl/ssl.h under ${OSSL:-$BREW}/include -- brew install openssl@3"
+CPATH="${OSSL:+$OSSL/include:}$BREW/include${CPATH:+:$CPATH}"; export CPATH
+LIBRARY_PATH="${OSSL:+$OSSL/lib:}$BREW/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"; export LIBRARY_PATH
 log_ok "$LOG"
 
 checkout_cicili

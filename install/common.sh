@@ -213,6 +213,10 @@ exports_hint() {
   echo "   export CICILI=$CICILI"
   echo "   export ZIGURATIP_HOME=$ROOT/home"
   echo "   export $LIBVAR=\$ZIGURATIP_HOME/lib"
+  if [ "$OS" = macos ] && [ -n "${CPATH:-}" ]; then   # Homebrew's, set by install-macos.sh
+    echo "   export CPATH=$CPATH"
+    echo "   export LIBRARY_PATH=${LIBRARY_PATH:-}"
+  fi
   [ -n "${QUICKLISP_HOME:-}" ] && echo "   export QUICKLISP_HOME=$QUICKLISP_HOME"
   say "check it: cd $ROOT && sh Test/run-e2e.sh   (starts a server on ports 2160/2190, runs every case, stops it)"
 }
